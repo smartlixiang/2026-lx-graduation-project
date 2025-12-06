@@ -31,13 +31,13 @@ class Normalizer:
     def _key(self, dataset_name: str) -> str:
         return dataset_name.lower()
 
-    def register_dataset_stats(self, name: str, mean: Sequence[float], std: Sequence[float]) -> None:
-        """注册新的数据集统计信息。"""
+    def register(self, name: str, mean: Sequence[float], std: Sequence[float]) -> None:
+        """登记数据集的均值和方差。"""
 
         self.dataset_stats[self._key(name)] = DatasetStats(mean=list(mean), std=list(std))
 
-    def get_normalization(self, dataset_name: str) -> Tuple[List[float], List[float]]:
-        """返回指定数据集的均值和标准差。"""
+    def stats(self, dataset_name: str) -> Tuple[List[float], List[float]]:
+        """返回均值和标准差。"""
 
         key = self._key(dataset_name)
         if key not in self.dataset_stats:
@@ -45,14 +45,14 @@ class Normalizer:
         stats = self.dataset_stats[key]
         return list(stats.mean), list(stats.std)
 
-    def build_train_transforms(
+    def train_tfms(
         self,
         dataset_name: str,
         normalize: bool = True,
         augment: bool = True,
         image_size: int | None = None,
     ) -> transforms.Compose:
-        """创建训练阶段的变换组合。"""
+        """训练阶段的增强与标准化流水线。"""
 
         ops: List[transforms.Transform] = []
         size = image_size or GLOBAL_CFG.image_size
@@ -68,20 +68,20 @@ class Normalizer:
         ops.append(transforms.ToTensor())
 
         if normalize:
-            mean, std = self.get_normalization(dataset_name)
+            mean, std = self.stats(dataset_name)
             ops.append(transforms.Normalize(mean=mean, std=std))
 
         return transforms.Compose(ops)
 
-    def build_eval_transforms(
+    def eval_tfms(
         self, dataset_name: str, normalize: bool = True, image_size: int | None = None
     ) -> transforms.Compose:
-        """创建验证/测试阶段的变换组合。"""
+        """验证/测试阶段的标准化流水线。"""
 
         _ = image_size  # 预留参数，当前评估阶段仅依赖 ToTensor/Normalize
         ops: List[transforms.Transform] = [transforms.ToTensor()]
         if normalize:
-            mean, std = self.get_normalization(dataset_name)
+            mean, std = self.stats(dataset_name)
             ops.append(transforms.Normalize(mean=mean, std=std))
         return transforms.Compose(ops)
 

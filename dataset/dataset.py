@@ -8,10 +8,7 @@ registering it with :func:`register_dataset`.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-<<<<<<< ours
-=======
 from importlib import import_module
->>>>>>> theirs
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,15 +24,9 @@ if importlib.util.find_spec("torchvision") is None:
     raise ImportError("torchvision 未安装，请先执行 `pip install torchvision` 后再使用数据集模块。")
 
 from torchvision import datasets
-<<<<<<< ours
-from torchvision.datasets import FakeData
-
-from utils.normalizer import build_eval_transforms, build_train_transforms
-=======
 
 GLOBAL_CFG = import_module("utils.global").CONFIG
 from utils.normalizer import NORMALIZER
->>>>>>> theirs
 
 
 DATASET_REGISTRY: Dict[str, Type["BaseDataset"]] = {}
@@ -59,26 +50,15 @@ def register_dataset(name: str):
 class SplitConfig:
     """Configuration for dataset splits and loading."""
 
-<<<<<<< ours
-    data_path: Path
-    batch_size: int = 128
-    num_workers: int = 4
-=======
     data_path: Path = GLOBAL_CFG.data_root
     batch_size: int = GLOBAL_CFG.default_batch_size
     num_workers: int = GLOBAL_CFG.num_workers
->>>>>>> theirs
     val_split: float = 0.1
     download: bool = True
     augment: bool = True
     normalize: bool = True
-<<<<<<< ours
-    seed: int = 42
-    pin_memory: bool = True
-=======
     seed: int = GLOBAL_CFG.global_seed
     pin_memory: bool = GLOBAL_CFG.pin_memory
->>>>>>> theirs
 
 
 class BaseDataset(ABC):
@@ -164,11 +144,7 @@ class Cifar10Dataset(BaseDataset):
         return self._num_classes
 
     def _build_train_set(self) -> Dataset:
-<<<<<<< ours
-        transform = build_train_transforms(
-=======
         transform = NORMALIZER.build_train_transforms(
->>>>>>> theirs
             self.dataset_name,
             normalize=self.config.normalize,
             augment=self.config.augment,
@@ -181,11 +157,7 @@ class Cifar10Dataset(BaseDataset):
         )
 
     def _build_test_set(self) -> Dataset:
-<<<<<<< ours
-        transform = build_eval_transforms(
-=======
         transform = NORMALIZER.build_eval_transforms(
->>>>>>> theirs
             self.dataset_name,
             normalize=self.config.normalize,
         )
@@ -211,11 +183,7 @@ class Cifar100Dataset(BaseDataset):
         return self._num_classes
 
     def _build_train_set(self) -> Dataset:
-<<<<<<< ours
-        transform = build_train_transforms(
-=======
         transform = NORMALIZER.build_train_transforms(
->>>>>>> theirs
             self.dataset_name,
             normalize=self.config.normalize,
             augment=self.config.augment,
@@ -228,11 +196,7 @@ class Cifar100Dataset(BaseDataset):
         )
 
     def _build_test_set(self) -> Dataset:
-<<<<<<< ours
-        transform = build_eval_transforms(
-=======
         transform = NORMALIZER.build_eval_transforms(
->>>>>>> theirs
             self.dataset_name,
             normalize=self.config.normalize,
         )
@@ -244,55 +208,6 @@ class Cifar100Dataset(BaseDataset):
         )
 
 
-<<<<<<< ours
-@register_dataset("fake")
-class FakeImageDataset(BaseDataset):
-    """Small synthetic dataset for quick functional checks."""
-
-    _dataset_name = "fake"
-    _num_classes = 10
-
-    def __init__(self, config: SplitConfig, train_size: int = 200, test_size: int = 50) -> None:
-        super().__init__(config)
-        self.train_size = train_size
-        self.test_size = test_size
-
-    @property
-    def dataset_name(self) -> str:
-        return self._dataset_name
-
-    @property
-    def num_classes(self) -> int:
-        return self._num_classes
-
-    def _build_train_set(self) -> Dataset:
-        transform = build_train_transforms(
-            self.dataset_name,
-            normalize=self.config.normalize,
-            augment=self.config.augment,
-        )
-        return FakeData(
-            size=self.train_size,
-            image_size=(3, 32, 32),
-            num_classes=self.num_classes,
-            transform=transform,
-        )
-
-    def _build_test_set(self) -> Dataset:
-        transform = build_eval_transforms(
-            self.dataset_name,
-            normalize=self.config.normalize,
-        )
-        return FakeData(
-            size=self.test_size,
-            image_size=(3, 32, 32),
-            num_classes=self.num_classes,
-            transform=transform,
-        )
-
-
-=======
->>>>>>> theirs
 class BaseDataLoader:
     """Factory-driven data loader for registered datasets.
 
@@ -305,51 +220,29 @@ class BaseDataLoader:
     def __init__(
         self,
         dataset: str,
-<<<<<<< ours
-        data_path: str | Path,
-        batch_size: int = 128,
-        num_workers: int = 4,
-=======
         data_path: str | Path | None = None,
         batch_size: int | None = None,
         num_workers: int | None = None,
->>>>>>> theirs
         val_split: float = 0.1,
         download: bool = True,
         augment: bool = True,
         normalize: bool = True,
-<<<<<<< ours
-        seed: int = 42,
-        pin_memory: bool = True,
-=======
         seed: int | None = None,
         pin_memory: bool | None = None,
->>>>>>> theirs
     ) -> None:
         if dataset not in DATASET_REGISTRY:
             raise ValueError(f"Dataset '{dataset}' is not registered. Available: {list(DATASET_REGISTRY.keys())}")
 
         config = SplitConfig(
-<<<<<<< ours
-            data_path=Path(data_path),
-            batch_size=batch_size,
-            num_workers=num_workers,
-=======
             data_path=Path(data_path) if data_path is not None else GLOBAL_CFG.ensure_data_dir(),
             batch_size=batch_size if batch_size is not None else GLOBAL_CFG.default_batch_size,
             num_workers=num_workers if num_workers is not None else GLOBAL_CFG.num_workers,
->>>>>>> theirs
             val_split=val_split,
             download=download,
             augment=augment,
             normalize=normalize,
-<<<<<<< ours
-            seed=seed,
-            pin_memory=pin_memory,
-=======
             seed=seed if seed is not None else GLOBAL_CFG.global_seed,
             pin_memory=pin_memory if pin_memory is not None else GLOBAL_CFG.pin_memory,
->>>>>>> theirs
         )
 
         dataset_cls = DATASET_REGISTRY[dataset]
@@ -374,10 +267,6 @@ __all__ = [
     "BaseDataLoader",
     "Cifar10Dataset",
     "Cifar100Dataset",
-<<<<<<< ours
-    "FakeImageDataset",
-=======
->>>>>>> theirs
     "DATASET_REGISTRY",
     "DatasetSubset",
     "register_dataset",

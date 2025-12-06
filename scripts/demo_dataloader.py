@@ -1,12 +1,7 @@
-"""Quick functional check for dataset/dataloader abstractions.
-
-This script avoids network downloads by relying on the synthetic
-`FakeImageDataset` registered in ``dataset.dataset``. It prints dataset
-sizes and the shape of one training batch to demonstrate that the
-registry, transforms, and split logic work end-to-end.
-"""
+"""Quick functional check for dataset/dataloader abstractions on CIFAR-10."""
 from pathlib import Path
 import sys
+from importlib import import_module
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -15,18 +10,20 @@ if str(PROJECT_ROOT) not in sys.path:
 from dataset.dataset import BaseDataLoader
 import torch
 
+GLOBAL_CFG = import_module("utils.global").CONFIG
+
 
 def main() -> None:
-    data_root = Path("./data")
+    data_root = GLOBAL_CFG.ensure_data_dir()
     loader = BaseDataLoader(
         dataset="cifar10",
         data_path=data_root,
-        batch_size=8,
+        batch_size=GLOBAL_CFG.default_batch_size,
         val_split=0.2,
         download=False,
         augment=True,
         normalize=True,
-        seed=123,
+        seed=GLOBAL_CFG.global_seed,
     )
 
     train_loader, val_loader, test_loader = loader.load()

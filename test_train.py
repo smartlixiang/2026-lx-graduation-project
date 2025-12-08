@@ -1,6 +1,5 @@
 # main.py
 import argparse
-from importlib import import_module
 
 import torch
 import torch.nn as nn
@@ -11,7 +10,7 @@ import torchvision.transforms as transforms
 
 from model.resnet import resnet18
 
-GLOBAL_CFG = import_module("utils.global").CONFIG
+from utils.global_config import CONFIG as GLOBAL_CFG
 
 
 def get_loader(dataset, data_dir, batch_size, num_workers=2):

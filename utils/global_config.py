@@ -10,6 +10,7 @@ class GlobalConfig:
     """项目级别的默认配置。"""
 
     data_root: Path = Path("./data")
+    adapter_weights: Path = Path("./adapter_weights")
     global_seed: int = 42
     default_batch_size: int = 128
     num_workers: int = 4
@@ -21,6 +22,12 @@ class GlobalConfig:
 
         self.data_root.mkdir(parents=True, exist_ok=True)
         return self.data_root
+
+    def ensure_adapter_dir(self) -> Path:
+        """确保 adapter 权重目录存在。"""
+
+        self.adapter_weights.mkdir(parents=True, exist_ok=True)
+        return self.adapter_weights
 
 
 CONFIG = GlobalConfig()

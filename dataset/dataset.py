@@ -8,7 +8,6 @@ registering it with :func:`register_dataset`.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from importlib import import_module
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +24,7 @@ if importlib.util.find_spec("torchvision") is None:
 
 from torchvision import datasets
 
-GLOBAL_CFG = import_module("utils.global").CONFIG
+from utils.global_config import CONFIG as GLOBAL_CFG
 from utils.normalizer import NORMALIZER
 
 

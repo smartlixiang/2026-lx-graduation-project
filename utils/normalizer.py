@@ -7,8 +7,8 @@ from typing import Dict, List, Sequence, Tuple
 from importlib import import_module
 from torchvision import transforms
 
-# 避免与关键字冲突，使用 import_module 导入全局配置
-GLOBAL_CFG = import_module("utils.global").CONFIG
+# 通过模块导入全局配置
+GLOBAL_CFG = import_module("utils.global_config").CONFIG
 
 
 @dataclass

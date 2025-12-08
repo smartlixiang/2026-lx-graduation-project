@@ -10,7 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from dataset.dataset import BaseDataLoader
 import torch
 
-GLOBAL_CFG = import_module("utils.global").CONFIG
+GLOBAL_CFG = import_module("utils.global_config").CONFIG
 
 
 def main() -> None:

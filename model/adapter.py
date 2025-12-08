@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import torch
 import torch.nn as nn
@@ -37,10 +37,11 @@ class CLIPFeatureExtractor:
 
     model_name: str = "ViT-B/32"
     device: torch.device | None = None
+    tokenizer: Callable[[Sequence[str] | Iterable[str]], torch.Tensor] | None = None
 
     def __post_init__(self) -> None:  # pragma: no cover - device binding
         self.device = self.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model, self.preprocess = clip.load(self.model_name, device=self.device)
+        self._load_model_and_preprocess()
         self.model.eval()
 
     @property
@@ -57,7 +58,10 @@ class CLIPFeatureExtractor:
     def encode_text(self, texts: Sequence[str] | Iterable[str]) -> torch.Tensor:
         """Encode texts with CLIP and return L2-normalized features."""
 
-        tokens = clip.tokenize(list(texts)).to(self.device)
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer not initialized; call after __post_init__ executes.")
+
+        tokens = self.tokenizer(list(texts)).to(self.device)
         with torch.no_grad():
             text_features = self.model.encode_text(tokens)
             return F.normalize(text_features, dim=-1)
@@ -71,6 +75,27 @@ class CLIPFeatureExtractor:
         self.device = torch.device(device)
         self.model = self.model.to(self.device)
         return self
+
+    def _load_model_and_preprocess(self) -> None:
+        """Load CLIP model + preprocess, supporting both openai/CLIP and open-clip."""
+
+        if hasattr(clip, "load"):
+            self.model, self.preprocess = clip.load(self.model_name, device=self.device)
+            self.tokenizer = clip.tokenize
+            return
+
+        try:
+            import open_clip  # type: ignore
+        except ImportError as exc:  # pragma: no cover - dependency guard
+            raise ImportError(
+                "The installed `clip` package does not expose `load`. Install `open-clip-torch` "
+                "or the official CLIP package."
+            ) from exc
+
+        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+            self.model_name, pretrained="openai", device=self.device
+        )
+        self.tokenizer = open_clip.get_tokenizer(self.model_name)
 
 
 __all__ = ["AdapterMLP", "CLIPFeatureExtractor"]

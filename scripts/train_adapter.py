@@ -10,11 +10,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets
 
 from model.adapter import AdapterMLP, CLIPFeatureExtractor
-<<<<<<< ours
-from utils.global import CONFIG
-=======
 from utils.global_config import CONFIG
->>>>>>> theirs
 
 
 def build_dataloaders(dataset_name: str, preprocess, batch_size: int, num_workers: int) -> tuple[DataLoader, List[str]]:

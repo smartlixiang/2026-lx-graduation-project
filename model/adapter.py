@@ -53,6 +53,7 @@ class CLIPFeatureExtractor:
 
         with torch.no_grad():
             image_features = self.model.encode_image(images.to(self.device))
+            image_features = image_features.float()
             return F.normalize(image_features, dim=-1)
 
     def encode_text(self, texts: Sequence[str] | Iterable[str]) -> torch.Tensor:
@@ -64,6 +65,7 @@ class CLIPFeatureExtractor:
         tokens = self.tokenizer(list(texts)).to(self.device)
         with torch.no_grad():
             text_features = self.model.encode_text(tokens)
+            text_features = text_features.float()
             return F.normalize(text_features, dim=-1)
 
     def preprocess_images(self, images: torch.Tensor) -> torch.Tensor:
@@ -77,25 +79,10 @@ class CLIPFeatureExtractor:
         return self
 
     def _load_model_and_preprocess(self) -> None:
-        """Load CLIP model + preprocess, supporting both openai/CLIP and open-clip."""
+        """Load CLIP model + preprocess via the official `clip` package."""
 
-        if hasattr(clip, "load"):
-            self.model, self.preprocess = clip.load(self.model_name, device=self.device)
-            self.tokenizer = clip.tokenize
-            return
-
-        try:
-            import open_clip  # type: ignore
-        except ImportError as exc:  # pragma: no cover - dependency guard
-            raise ImportError(
-                "The installed `clip` package does not expose `load`. Install `open-clip-torch` "
-                "or the official CLIP package."
-            ) from exc
-
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-            self.model_name, pretrained="openai", device=self.device
-        )
-        self.tokenizer = open_clip.get_tokenizer(self.model_name)
+        self.model, self.preprocess = clip.load(self.model_name, device=self.device)
+        self.tokenizer = clip.tokenize
 
 
 __all__ = ["AdapterMLP", "CLIPFeatureExtractor"]

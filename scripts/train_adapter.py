@@ -59,6 +59,10 @@ def visualize_adapter_effects(
 ) -> None:
     """生成单样本 top-5 置信度对比图，直观展示适配器训练前后的预测差异。"""
 
+    # 避免中文字符缺失导致的告警，将字体限定为通用无衬线字体
+    plt.rcParams["font.family"] = ["DejaVu Sans", "sans-serif"]
+    plt.rcParams["axes.unicode_minus"] = False
+
     adapter_device = next(adapter.parameters()).device
     adapter.eval()
     with torch.no_grad():
@@ -88,27 +92,31 @@ def visualize_adapter_effects(
         top_labels_before = [class_names[i] for i in topk_before.indices.tolist()]
         top_labels_after = [class_names[i] for i in topk_after.indices.tolist()]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
 
     axes[0].barh(range(5), topk_before.values.cpu().tolist(), color="#7FB3D5")
     axes[0].invert_yaxis()
     axes[0].set_yticks(range(5))
     axes[0].set_yticklabels(top_labels_before)
-    axes[0].set_xlabel("概率")
-    axes[0].set_title("训练前 (CLIP 原始特征)")
+    axes[0].set_xlabel("Probability")
+    axes[0].set_title("Before Training (CLIP features)")
 
     axes[1].barh(range(5), topk_after.values.cpu().tolist(), color="#F5B041")
     axes[1].invert_yaxis()
     axes[1].set_yticks(range(5))
     axes[1].set_yticklabels(top_labels_after)
-    axes[1].set_xlabel("概率")
-    axes[1].set_title("训练后 (Adapter 特征)")
+    axes[1].set_xlabel("Probability")
+    axes[1].set_title("After Training (Adapter features)")
 
     fig.suptitle(
-        f"样本真实标签: {class_names[gt_label]} | 训练前 Top-1 准确率: {baseline_acc:.2%}, 训练后: {adapted_acc:.2%}",
+        (
+            "Ground truth: {gt} | Top-1 accuracy before: {before:.2%}, "
+            "after: {after:.2%}"
+        ).format(
+            gt=class_names[gt_label], before=baseline_acc, after=adapted_acc
+        ),
         fontsize=12,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
@@ -128,7 +136,7 @@ def train_adapter(args: argparse.Namespace) -> None:
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     CONFIG.ensure_data_dir()
-    adapter_dir = CONFIG.ensure_adapter_dir()
+    adapter_dir = CONFIG.ensure_adapter_dir(args.dataset)
     save_path = adapter_dir / f"adapter_{args.dataset}_{args.clip_model.replace('/', '-')}.pt"
 
     adapter.train()

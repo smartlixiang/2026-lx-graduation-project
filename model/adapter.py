@@ -85,4 +85,26 @@ class CLIPFeatureExtractor:
         self.tokenizer = clip.tokenize
 
 
-__all__ = ["AdapterMLP", "CLIPFeatureExtractor"]
+def load_trained_adapter(
+    dataset_name: str,
+    clip_model: str,
+    input_dim: int,
+    hidden_dim: int = 1024,
+    map_location: torch.device | str | None = None,
+) -> AdapterMLP:
+    """根据数据集名称和 CLIP 规格加载本地训练好的 Adapter 参数。"""
+
+    dataset_dir = CONFIG.ensure_adapter_dir(dataset_name)
+    weight_path = dataset_dir / f"adapter_{dataset_name.lower()}_{clip_model.replace('/', '-')}.pt"
+    if not weight_path.exists():
+        raise FileNotFoundError(
+            f"未找到 {dataset_name} 的适配器权重: {weight_path}. 请先训练或检查路径。"
+        )
+
+    adapter = AdapterMLP(input_dim=input_dim, hidden_dim=hidden_dim)
+    state_dict = torch.load(weight_path, map_location=map_location)
+    adapter.load_state_dict(state_dict)
+    return adapter
+
+
+__all__ = ["AdapterMLP", "CLIPFeatureExtractor", "load_trained_adapter"]

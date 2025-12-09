@@ -1,1 +1,3 @@
 data/
+adapter_weights/
+pretrained_clip/

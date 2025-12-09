@@ -24,11 +24,22 @@ class GlobalConfig:
         self.data_root.mkdir(parents=True, exist_ok=True)
         return self.data_root
 
-    def ensure_adapter_dir(self) -> Path:
-        """确保 adapter 权重目录存在。"""
+    def ensure_adapter_dir(self, dataset_name: str | None = None) -> Path:
+        """确保 adapter 权重目录存在，可选按数据集划分子目录。"""
 
         self.adapter_weights.mkdir(parents=True, exist_ok=True)
-        return self.adapter_weights
+        if dataset_name is None:
+            return self.adapter_weights
+
+        dataset_dir = self.adapter_weights / dataset_name.lower()
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        return dataset_dir
+
+    def ensure_pretrained_clip_dir(self) -> Path:
+        """确保本地 CLIP 预训练模型缓存目录存在并返回路径。"""
+
+        self.pretrained_clip.mkdir(parents=True, exist_ok=True)
+        return self.pretrained_clip
 
     def ensure_pretrained_clip_dir(self) -> Path:
         """确保本地 CLIP 预训练模型缓存目录存在并返回路径。"""

@@ -1,0 +1,65 @@
+[
+  {
+    "id": 1,
+    "score": 0.5576,
+    "cosine": 0.6262,
+    "jaccard": 0.4545,
+    "ref_len": 15,
+    "cand_len": 17,
+    "note": "语义高度一致，表述略有差异"
+  },
+  {
+    "id": 2,
+    "score": 0.5858,
+    "cosine": 0.6574,
+    "jaccard": 0.4783,
+    "ref_len": 17,
+    "cand_len": 19,
+    "note": "部分矛盾，覆盖关键词但方向不同"
+  },
+  {
+    "id": 3,
+    "score": 0.3604,
+    "cosine": 0.3785,
+    "jaccard": 0.3333,
+    "ref_len": 16,
+    "cand_len": 15,
+    "note": "半对齐，覆盖手机号但缺失邮箱，含否定"
+  },
+  {
+    "id": 4,
+    "score": 0.1704,
+    "cosine": 0.207,
+    "jaccard": 0.1154,
+    "ref_len": 15,
+    "cand_len": 14,
+    "note": "几乎不相关，语义偏离"
+  },
+  {
+    "id": 5,
+    "score": 0.5122,
+    "cosine": 0.5809,
+    "jaccard": 0.4091,
+    "ref_len": 16,
+    "cand_len": 15,
+    "note": "高相似的指令改写"
+  },
+  {
+    "id": 6,
+    "score": 0.2647,
+    "cosine": 0.3162,
+    "jaccard": 0.1875,
+    "ref_len": 10,
+    "cand_len": 9,
+    "note": "英文高对齐"
+  },
+  {
+    "id": 7,
+    "score": 0.1425,
+    "cosine": 0.1672,
+    "jaccard": 0.1053,
+    "ref_len": 11,
+    "cand_len": 11,
+    "note": "语义反向，长度差异明显"
+  }
+]

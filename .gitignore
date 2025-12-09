@@ -1,3 +1,6 @@
 data/
 adapter_weights/
 pretrained_clip/
+
+
+__pycache__/

@@ -8,12 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    import clip  # type: ignore
-except ImportError as exc:  # pragma: no cover - dependency guard
-    raise ImportError(
-        "The 'clip' package is required. Install via `pip install git+https://github.com/openai/CLIP.git`."
-    ) from exc
+import clip  # type: ignore
+
+from utils.global_config import CONFIG
 
 
 class AdapterMLP(nn.Module):
@@ -81,7 +78,10 @@ class CLIPFeatureExtractor:
     def _load_model_and_preprocess(self) -> None:
         """Load CLIP model + preprocess via the official `clip` package."""
 
-        self.model, self.preprocess = clip.load(self.model_name, device=self.device)
+        cache_dir = CONFIG.ensure_pretrained_clip_dir()
+        self.model, self.preprocess = clip.load(
+            self.model_name, device=self.device, download_root=str(cache_dir)
+        )
         self.tokenizer = clip.tokenize
 
 

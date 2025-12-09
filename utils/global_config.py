@@ -11,6 +11,7 @@ class GlobalConfig:
 
     data_root: Path = Path("./data")
     adapter_weights: Path = Path("./adapter_weights")
+    pretrained_clip: Path = Path("./pretrained_clip")
     global_seed: int = 42
     default_batch_size: int = 128
     num_workers: int = 4
@@ -28,6 +29,12 @@ class GlobalConfig:
 
         self.adapter_weights.mkdir(parents=True, exist_ok=True)
         return self.adapter_weights
+
+    def ensure_pretrained_clip_dir(self) -> Path:
+        """确保本地 CLIP 预训练模型缓存目录存在并返回路径。"""
+
+        self.pretrained_clip.mkdir(parents=True, exist_ok=True)
+        return self.pretrained_clip
 
 
 CONFIG = GlobalConfig()

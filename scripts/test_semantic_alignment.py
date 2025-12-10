@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scoring import SemanticAlignment  # noqa: E402
+from utils.global_config import CONFIG  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,10 +26,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128, help="批大小")
     parser.add_argument("--num-workers", type=int, default=4, help="dataloader 的并行线程数")
     parser.add_argument("--clip-model", type=str, default="ViT-B/32", help="CLIP 模型规格")
+    parser.add_argument(
+        "--device", type=str, default=None, help="计算设备，例如 cuda 或 cpu，默认跟随全局配置"
+    )
     return parser.parse_args()
 
 
-def build_loader(args: argparse.Namespace, preprocess) -> DataLoader:
+def build_loader(args: argparse.Namespace, preprocess, device: torch.device) -> DataLoader:
     dataset = datasets.CIFAR10(
         root=args.data_root,
         train=True,
@@ -40,7 +44,7 @@ def build_loader(args: argparse.Namespace, preprocess) -> DataLoader:
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=device.type == "cuda",
     )
 
 
@@ -154,13 +158,17 @@ def main() -> None:
     output_dir = PROJECT_ROOT / "test_SA_result"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    device = torch.device(args.device) if args.device is not None else CONFIG.global_device
+
     # 读取类别名并初始化 SA
     dataset_for_names = datasets.CIFAR10(root=args.data_root, train=True, download=True)
     class_names = dataset_for_names.classes  # type: ignore[attr-defined]
-    sa_metric = SemanticAlignment(class_names=class_names, clip_model=args.clip_model)
+    sa_metric = SemanticAlignment(
+        class_names=class_names, clip_model=args.clip_model, device=device
+    )
 
     # 使用 CLIP 的官方预处理重新构建 dataloader
-    loader = build_loader(args, preprocess=sa_metric.extractor.preprocess)
+    loader = build_loader(args, preprocess=sa_metric.extractor.preprocess, device=device)
 
     start = time.perf_counter()
     result = sa_metric.score_dataset(loader)

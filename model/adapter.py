@@ -37,7 +37,10 @@ class CLIPFeatureExtractor:
     tokenizer: Callable[[Sequence[str] | Iterable[str]], torch.Tensor] | None = None
 
     def __post_init__(self) -> None:  # pragma: no cover - device binding
-        self.device = self.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device is None:
+            self.device = CONFIG.global_device
+        else:
+            self.device = torch.device(self.device)
         self._load_model_and_preprocess()
         self.model.eval()
 

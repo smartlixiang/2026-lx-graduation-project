@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from model.adapter import AdapterMLP, CLIPFeatureExtractor
+from utils.global_config import CONFIG
 
 
 @dataclass
@@ -49,7 +50,8 @@ class SemanticAlignment:
     ) -> None:
         self.class_names = [str(name) for name in class_names]
         self.prompt_template = prompt_template
-        self.extractor = CLIPFeatureExtractor(model_name=clip_model, device=device)
+        self.device = torch.device(device) if device is not None else CONFIG.global_device
+        self.extractor = CLIPFeatureExtractor(model_name=clip_model, device=self.device)
 
     def _build_text_features(self) -> torch.Tensor:
         prompts = [self.prompt_template.format(name) for name in self.class_names]
@@ -64,13 +66,15 @@ class SemanticAlignment:
         adapter_device = None
         if adapter is not None:
             adapter_device = next(adapter.parameters()).device
+        target_device = adapter_device or self.extractor.device
 
         for images, batch_labels in dataloader:
             image_features = self.extractor.encode_image(images)
             if adapter is not None:
                 image_features = adapter(image_features.to(adapter_device))
-            feats.append(image_features.cpu())
-            labels.append(batch_labels)
+            image_features = image_features.to(target_device)
+            feats.append(image_features)
+            labels.append(batch_labels.to(target_device))
 
         return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
 
@@ -89,19 +93,20 @@ class SemanticAlignment:
     def score_dataset(
         self, dataloader: DataLoader, adapter: AdapterMLP | None = None
     ) -> SAResult:
-        text_features = self._build_text_features()
+        text_features = self._build_text_features().to(self.device)
 
         if adapter is not None:
             adapter.eval()
 
         image_features, labels = self._encode_images(dataloader, adapter)
+        text_features = text_features.to(image_features.device)
         scores = self._margin_similarity(image_features, text_features, labels)
 
         return SAResult(
-            scores=scores.cpu(),
-            labels=labels.cpu(),
-            image_features=image_features.cpu(),
-            text_features=text_features.cpu(),
+            scores=scores.detach().cpu(),
+            labels=labels.detach().cpu(),
+            image_features=image_features.detach().cpu(),
+            text_features=text_features.detach().cpu(),
             class_names=self.class_names,
         )
 

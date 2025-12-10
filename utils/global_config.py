@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
+
 
 @dataclass
 class GlobalConfig:
@@ -17,6 +19,9 @@ class GlobalConfig:
     num_workers: int = 4
     pin_memory: bool = True
     image_size: int = 32
+    global_device: torch.device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
 
     def ensure_data_dir(self) -> Path:
         """确保数据目录存在并返回路径。"""

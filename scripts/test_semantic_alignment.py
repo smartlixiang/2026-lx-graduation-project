@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from model.adapter import AdapterMLP  # noqa: E402
 from scoring import SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 
@@ -26,6 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128, help="批大小")
     parser.add_argument("--num-workers", type=int, default=4, help="dataloader 的并行线程数")
     parser.add_argument("--clip-model", type=str, default="ViT-B/32", help="CLIP 模型规格")
+    parser.add_argument(
+        "--adapter-path",
+        type=str,
+        default="adapter_weights/cifar10/adapter_cifar10_ViT-B-32.pt",
+        help="本地已训练好的 adapter 权重路径，默认指向 CIFAR-10 模型",
+    )
     parser.add_argument(
         "--device", type=str, default=None, help="计算设备，例如 cuda 或 cpu，默认跟随全局配置"
     )
@@ -46,6 +53,18 @@ def build_loader(args: argparse.Namespace, preprocess, device: torch.device) -> 
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
+
+
+def load_adapter(adapter_path: Path, embed_dim: int, device: torch.device) -> AdapterMLP:
+    if not adapter_path.exists():
+        raise FileNotFoundError(f"未找到 adapter 权重: {adapter_path}")
+
+    adapter = AdapterMLP(input_dim=embed_dim)
+    state_dict = torch.load(adapter_path, map_location=device)
+    adapter.load_state_dict(state_dict)
+    adapter.to(device)
+    adapter.eval()
+    return adapter
 
 
 def visualize_results(
@@ -155,10 +174,11 @@ def visualize_results(
 
 def main() -> None:
     args = parse_args()
-    output_dir = PROJECT_ROOT / "test_SA_result"
+    output_dir = PROJECT_ROOT / "test_SA_with_adapter"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
+    adapter_path = (PROJECT_ROOT / args.adapter_path).resolve()
 
     # 读取类别名并初始化 SA
     dataset_for_names = datasets.CIFAR10(root=args.data_root, train=True, download=True)
@@ -167,11 +187,13 @@ def main() -> None:
         class_names=class_names, clip_model=args.clip_model, device=device
     )
 
+    adapter = load_adapter(adapter_path=adapter_path, embed_dim=sa_metric.extractor.embed_dim, device=device)
+
     # 使用 CLIP 的官方预处理重新构建 dataloader
     loader = build_loader(args, preprocess=sa_metric.extractor.preprocess, device=device)
 
     start = time.perf_counter()
-    result = sa_metric.score_dataset(loader)
+    result = sa_metric.score_dataset(loader, adapter=adapter)
     elapsed = time.perf_counter() - start
 
     scores = result.scores
@@ -188,6 +210,8 @@ def main() -> None:
         "score_max": float(scores.max()),
         "class_means": {name: float(m) for name, m in zip(class_names, class_means)},
         "elapsed_seconds": elapsed,
+        "adapter_path": str(adapter_path),
+        "device": str(device),
     }
     with open(output_dir / "sa_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -195,6 +219,7 @@ def main() -> None:
     visualize_results(scores, result.labels, class_means, output_dir, class_names)
 
     print(f"全部样本 SA 计算完成，用时 {elapsed:.2f} 秒。")
+    print(f"使用的 Adapter 权重: {adapter_path}")
     print(f"结果文件保存在: {output_dir}")
 
 

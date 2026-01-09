@@ -45,12 +45,14 @@ class Div:
         clip_model: str = "ViT-B/32",
         device: torch.device | None = None,
         chunk_size: int = 1024,
+        div_cdf: bool = False,
     ) -> None:
         if k < 1:
             raise ValueError("k 必须为正整数。")
         self.class_names = [str(name) for name in class_names]
         self.k = k
         self.chunk_size = chunk_size
+        self.div_cdf = div_cdf
         self.device = torch.device(device) if device is not None else CONFIG.global_device
         self.extractor = CLIPFeatureExtractor(model_name=clip_model, device=self.device)
 
@@ -102,6 +104,93 @@ class Div:
 
         return distances
 
+    @staticmethod
+    def _normal_cdf(x: torch.Tensor) -> torch.Tensor:
+        sqrt2 = torch.sqrt(torch.tensor(2.0, device=x.device, dtype=x.dtype))
+        return 0.5 * (1.0 + torch.erf(x / sqrt2))
+
+    @staticmethod
+    def _normal_ppf(x: torch.Tensor) -> torch.Tensor:
+        if hasattr(torch.special, "ndtri"):
+            return torch.special.ndtri(x)
+
+        a = torch.tensor(
+            [
+                -3.969683028665376e01,
+                2.209460984245205e02,
+                -2.759285104469687e02,
+                1.383577518672690e02,
+                -3.066479806614716e01,
+                2.506628277459239e00,
+            ],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        b = torch.tensor(
+            [
+                -5.447609879822406e01,
+                1.615858368580409e02,
+                -1.556989798598866e02,
+                6.680131188771972e01,
+                -1.328068155288572e01,
+            ],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        c = torch.tensor(
+            [
+                -7.784894002430293e-03,
+                -3.223964580411365e-01,
+                -2.400758277161838e00,
+                -2.549732539343734e00,
+                4.374664141464968e00,
+                2.938163982698783e00,
+            ],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        d = torch.tensor(
+            [
+                7.784695709041462e-03,
+                3.224671290700398e-01,
+                2.445134137142996e00,
+                3.754408661907416e00,
+            ],
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        plow = 0.02425
+        phigh = 1 - plow
+        q = torch.zeros_like(x)
+
+        mask_low = x < plow
+        if mask_low.any():
+            q_low = torch.sqrt(-2 * torch.log(x[mask_low]))
+            q[mask_low] = (
+                (((((c[0] * q_low + c[1]) * q_low + c[2]) * q_low + c[3]) * q_low + c[4]) * q_low + c[5])
+                / ((((d[0] * q_low + d[1]) * q_low + d[2]) * q_low + d[3]) * q_low + 1)
+            )
+
+        mask_mid = (x >= plow) & (x <= phigh)
+        if mask_mid.any():
+            q_mid = x[mask_mid] - 0.5
+            r = q_mid * q_mid
+            q[mask_mid] = (
+                (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q_mid
+                / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
+            )
+
+        mask_high = x > phigh
+        if mask_high.any():
+            q_high = torch.sqrt(-2 * torch.log(1 - x[mask_high]))
+            q[mask_high] = -(
+                (((((c[0] * q_high + c[1]) * q_high + c[2]) * q_high + c[3]) * q_high + c[4]) * q_high + c[5])
+                / ((((d[0] * q_high + d[1]) * q_high + d[2]) * q_high + d[3]) * q_high + 1)
+            )
+
+        return q
+
     def _rank_scores(self, distances: torch.Tensor) -> torch.Tensor:
         num_samples = distances.shape[0]
         if num_samples <= 1:
@@ -110,7 +199,25 @@ class Div:
         order = torch.argsort(distances)
         ranks = torch.empty(num_samples, device=distances.device, dtype=torch.long)
         ranks[order] = torch.arange(num_samples, device=distances.device)
-        return ranks.float() / float(num_samples - 1)
+        u = ranks.float() / float(num_samples - 1)
+        if not self.div_cdf:
+            return u
+
+        sigma = torch.sqrt(
+            torch.tensor(
+                (num_samples + 1) / (12 * (num_samples - 1)),
+                device=distances.device,
+                dtype=distances.dtype,
+            )
+        )
+        a = (0.0 - 0.5) / sigma
+        b = (1.0 - 0.5) / sigma
+        A = self._normal_cdf(a)
+        B = self._normal_cdf(b)
+        t = A + u * (B - A)
+        eps = 1e-6
+        t = torch.clamp(t, eps, 1 - eps)
+        return 0.5 + sigma * self._normal_ppf(t)
 
     def score_dataset(
         self, dataloader: DataLoader, adapter: AdapterMLP | None = None

@@ -1,0 +1,18 @@
+{
+  "num_samples": 50000,
+  "div_score_mean": 0.5,
+  "div_score_std": 0.2887357771396637,
+  "div_score_min": 0.0,
+  "div_score_max": 1.0,
+  "kdist_mean": 0.22996890544891357,
+  "kdist_std": 0.11962595582008362,
+  "kdist_min": 0.07395083457231522,
+  "kdist_max": 1.239514946937561,
+  "elapsed_seconds": 28.756561100002727,
+  "adapter_path": "D:\\221300096_李想_毕业设计\\code\\adapter_weights\\cifar10\\adapter_cifar10_ViT-B-32.pt",
+  "device": "cuda",
+  "k": 10,
+  "chunk_size": 1024,
+  "embed_method": "pca",
+  "seed": 42
+}

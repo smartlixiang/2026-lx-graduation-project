@@ -1,0 +1,57 @@
+{
+  "class": "bird",
+  "class_idx": 2,
+  "anchor_global_index": 40244,
+  "anchor_div": 0.9995999336242676,
+  "anchor_k_distance": 0.9060161709785461,
+  "neighbors": [
+    {
+      "rank": 1,
+      "global_index": 16690,
+      "div": 0.9607921838760376,
+      "euclidean_dist": 0.7302681803703308
+    },
+    {
+      "rank": 2,
+      "global_index": 37321,
+      "div": 0.9863973259925842,
+      "euclidean_dist": 0.7722558975219727
+    },
+    {
+      "rank": 3,
+      "global_index": 21746,
+      "div": 0.9315863251686096,
+      "euclidean_dist": 0.8393681049346924
+    },
+    {
+      "rank": 4,
+      "global_index": 19224,
+      "div": 0.9923985004425049,
+      "euclidean_dist": 0.8558555841445923
+    },
+    {
+      "rank": 5,
+      "global_index": 18210,
+      "div": 0.9919984340667725,
+      "euclidean_dist": 0.8578262329101562
+    },
+    {
+      "rank": 6,
+      "global_index": 31428,
+      "div": 0.9711942672729492,
+      "euclidean_dist": 0.8813673853874207
+    },
+    {
+      "rank": 7,
+      "global_index": 38434,
+      "div": 0.930986225605011,
+      "euclidean_dist": 0.886345386505127
+    },
+    {
+      "rank": 8,
+      "global_index": 11934,
+      "div": 0.9961992502212524,
+      "euclidean_dist": 0.8868899941444397
+    }
+  ]
+}

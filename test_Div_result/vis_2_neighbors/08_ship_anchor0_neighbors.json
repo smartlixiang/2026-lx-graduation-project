@@ -1,0 +1,57 @@
+{
+  "class": "ship",
+  "class_idx": 8,
+  "anchor_global_index": 10361,
+  "anchor_div": 1.0,
+  "anchor_k_distance": 0.8878307938575745,
+  "neighbors": [
+    {
+      "rank": 1,
+      "global_index": 38686,
+      "div": 0.981796383857727,
+      "euclidean_dist": 0.699766993522644
+    },
+    {
+      "rank": 2,
+      "global_index": 1702,
+      "div": 0.9937987923622131,
+      "euclidean_dist": 0.7217832207679749
+    },
+    {
+      "rank": 3,
+      "global_index": 46176,
+      "div": 0.9831966757774353,
+      "euclidean_dist": 0.7292497158050537
+    },
+    {
+      "rank": 4,
+      "global_index": 41950,
+      "div": 0.9433887004852295,
+      "euclidean_dist": 0.8391844630241394
+    },
+    {
+      "rank": 5,
+      "global_index": 41769,
+      "div": 0.940788209438324,
+      "euclidean_dist": 0.8399859070777893
+    },
+    {
+      "rank": 6,
+      "global_index": 42730,
+      "div": 0.9649930000305176,
+      "euclidean_dist": 0.8472958207130432
+    },
+    {
+      "rank": 7,
+      "global_index": 9258,
+      "div": 0.9707942008972168,
+      "euclidean_dist": 0.8625418543815613
+    },
+    {
+      "rank": 8,
+      "global_index": 23736,
+      "div": 0.9959992170333862,
+      "euclidean_dist": 0.8710368275642395
+    }
+  ]
+}

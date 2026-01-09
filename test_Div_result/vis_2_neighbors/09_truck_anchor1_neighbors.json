@@ -1,0 +1,57 @@
+{
+  "class": "truck",
+  "class_idx": 9,
+  "anchor_global_index": 27041,
+  "anchor_div": 0.9997999668121338,
+  "anchor_k_distance": 1.017133355140686,
+  "neighbors": [
+    {
+      "rank": 1,
+      "global_index": 4665,
+      "div": 0.9983996748924255,
+      "euclidean_dist": 0.5537722110748291
+    },
+    {
+      "rank": 2,
+      "global_index": 40350,
+      "div": 1.0,
+      "euclidean_dist": 0.9023408889770508
+    },
+    {
+      "rank": 3,
+      "global_index": 17590,
+      "div": 0.9967994093894958,
+      "euclidean_dist": 0.9840841889381409
+    },
+    {
+      "rank": 4,
+      "global_index": 23302,
+      "div": 0.994598925113678,
+      "euclidean_dist": 0.9935305714607239
+    },
+    {
+      "rank": 5,
+      "global_index": 35733,
+      "div": 0.9419884085655212,
+      "euclidean_dist": 0.9988105893135071
+    },
+    {
+      "rank": 6,
+      "global_index": 9911,
+      "div": 0.858771800994873,
+      "euclidean_dist": 1.0051560401916504
+    },
+    {
+      "rank": 7,
+      "global_index": 36719,
+      "div": 0.9979996085166931,
+      "euclidean_dist": 1.0098642110824585
+    },
+    {
+      "rank": 8,
+      "global_index": 29604,
+      "div": 0.9657931923866272,
+      "euclidean_dist": 1.0111089944839478
+    }
+  ]
+}

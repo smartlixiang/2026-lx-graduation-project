@@ -1,0 +1,57 @@
+{
+  "class": "airplane",
+  "class_idx": 0,
+  "anchor_global_index": 17103,
+  "anchor_div": 0.9995999336242676,
+  "anchor_k_distance": 0.8953261375427246,
+  "neighbors": [
+    {
+      "rank": 1,
+      "global_index": 23371,
+      "div": 0.9961992502212524,
+      "euclidean_dist": 0.5284168720245361
+    },
+    {
+      "rank": 2,
+      "global_index": 16346,
+      "div": 0.9983996748924255,
+      "euclidean_dist": 0.7647996544837952
+    },
+    {
+      "rank": 3,
+      "global_index": 47991,
+      "div": 0.9993999004364014,
+      "euclidean_dist": 0.825448215007782
+    },
+    {
+      "rank": 4,
+      "global_index": 9767,
+      "div": 0.9721944332122803,
+      "euclidean_dist": 0.8287639617919922
+    },
+    {
+      "rank": 5,
+      "global_index": 6098,
+      "div": 0.9919984340667725,
+      "euclidean_dist": 0.8327153325080872
+    },
+    {
+      "rank": 6,
+      "global_index": 29880,
+      "div": 0.9991998672485352,
+      "euclidean_dist": 0.8372461795806885
+    },
+    {
+      "rank": 7,
+      "global_index": 42166,
+      "div": 0.998999834060669,
+      "euclidean_dist": 0.8750423192977905
+    },
+    {
+      "rank": 8,
+      "global_index": 16375,
+      "div": 0.989197850227356,
+      "euclidean_dist": 0.8816688060760498
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "class": "frog",
+  "class_idx": 6,
+  "anchor_global_index": 39031,
+  "anchor_div": 0.9997999668121338,
+  "anchor_k_distance": 0.8502814769744873,
+  "neighbors": [
+    {
+      "rank": 1,
+      "global_index": 33990,
+      "div": 0.9977995753288269,
+      "euclidean_dist": 0.5482468008995056
+    },
+    {
+      "rank": 2,
+      "global_index": 6101,
+      "div": 0.9931986927986145,
+      "euclidean_dist": 0.605837881565094
+    },
+    {
+      "rank": 3,
+      "global_index": 16945,
+      "div": 0.9803960919380188,
+      "euclidean_dist": 0.757453441619873
+    },
+    {
+      "rank": 4,
+      "global_index": 36561,
+      "div": 0.9935987591743469,
+      "euclidean_dist": 0.7791337966918945
+    },
+    {
+      "rank": 5,
+      "global_index": 15492,
+      "div": 0.9387877583503723,
+      "euclidean_dist": 0.7928457856178284
+    },
+    {
+      "rank": 6,
+      "global_index": 29119,
+      "div": 0.9699940085411072,
+      "euclidean_dist": 0.8089715242385864
+    },
+    {
+      "rank": 7,
+      "global_index": 29573,
+      "div": 0.9339868426322937,
+      "euclidean_dist": 0.8262278437614441
+    },
+    {
+      "rank": 8,
+      "global_index": 19645,
+      "div": 0.989197850227356,
+      "euclidean_dist": 0.829307496547699
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "class": "cat",
+  "class_idx": 3,
+  "anchor_global_index": 42789,
+  "anchor_div": 0.9995999336242676,
+  "anchor_k_distance": 0.9631472229957581,
+  "neighbors": [
+    {
+      "rank": 1,
+      "global_index": 32621,
+      "div": 1.0,
+      "euclidean_dist": 0.7777220606803894
+    },
+    {
+      "rank": 2,
+      "global_index": 47075,
+      "div": 0.9955991506576538,
+      "euclidean_dist": 0.7823545932769775
+    },
+    {
+      "rank": 3,
+      "global_index": 11623,
+      "div": 0.9725945591926575,
+      "euclidean_dist": 0.8250962495803833
+    },
+    {
+      "rank": 4,
+      "global_index": 46542,
+      "div": 0.9993999004364014,
+      "euclidean_dist": 0.855032742023468
+    },
+    {
+      "rank": 5,
+      "global_index": 2307,
+      "div": 0.9735947251319885,
+      "euclidean_dist": 0.8640830516815186
+    },
+    {
+      "rank": 6,
+      "global_index": 14647,
+      "div": 0.9985997676849365,
+      "euclidean_dist": 0.9029553532600403
+    },
+    {
+      "rank": 7,
+      "global_index": 38931,
+      "div": 0.9831966757774353,
+      "euclidean_dist": 0.9117851853370667
+    },
+    {
+      "rank": 8,
+      "global_index": 26934,
+      "div": 0.9639928340911865,
+      "euclidean_dist": 0.9371340274810791
+    }
+  ]
+}

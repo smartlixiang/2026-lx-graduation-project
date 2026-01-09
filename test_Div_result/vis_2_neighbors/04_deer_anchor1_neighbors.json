@@ -1,0 +1,57 @@
+{
+  "class": "deer",
+  "class_idx": 4,
+  "anchor_global_index": 43793,
+  "anchor_div": 0.9997999668121338,
+  "anchor_k_distance": 0.9644619226455688,
+  "neighbors": [
+    {
+      "rank": 1,
+      "global_index": 42401,
+      "div": 0.9977995753288269,
+      "euclidean_dist": 0.7314802408218384
+    },
+    {
+      "rank": 2,
+      "global_index": 13815,
+      "div": 0.9991998672485352,
+      "euclidean_dist": 0.7317490577697754
+    },
+    {
+      "rank": 3,
+      "global_index": 16525,
+      "div": 0.9339868426322937,
+      "euclidean_dist": 0.8882890939712524
+    },
+    {
+      "rank": 4,
+      "global_index": 725,
+      "div": 0.9969994425773621,
+      "euclidean_dist": 0.9056382775306702
+    },
+    {
+      "rank": 5,
+      "global_index": 39169,
+      "div": 0.9479896426200867,
+      "euclidean_dist": 0.9211763143539429
+    },
+    {
+      "rank": 6,
+      "global_index": 10299,
+      "div": 0.9641928672790527,
+      "euclidean_dist": 0.9270356893539429
+    },
+    {
+      "rank": 7,
+      "global_index": 4924,
+      "div": 0.9939988255500793,
+      "euclidean_dist": 0.9545983076095581
+    },
+    {
+      "rank": 8,
+      "global_index": 1968,
+      "div": 0.9149830341339111,
+      "euclidean_dist": 0.9570151567459106
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "class": "automobile",
+  "class_idx": 1,
+  "anchor_global_index": 9988,
+  "anchor_div": 1.0,
+  "anchor_k_distance": 0.9017394185066223,
+  "neighbors": [
+    {
+      "rank": 1,
+      "global_index": 7659,
+      "div": 0.9901980757713318,
+      "euclidean_dist": 0.7983452081680298
+    },
+    {
+      "rank": 2,
+      "global_index": 43267,
+      "div": 0.9967994093894958,
+      "euclidean_dist": 0.8167898654937744
+    },
+    {
+      "rank": 3,
+      "global_index": 21150,
+      "div": 0.9895979166030884,
+      "euclidean_dist": 0.8546370267868042
+    },
+    {
+      "rank": 4,
+      "global_index": 38031,
+      "div": 0.9701940417289734,
+      "euclidean_dist": 0.8710725903511047
+    },
+    {
+      "rank": 5,
+      "global_index": 393,
+      "div": 0.9951990842819214,
+      "euclidean_dist": 0.8792936205863953
+    },
+    {
+      "rank": 6,
+      "global_index": 12389,
+      "div": 0.9779956340789795,
+      "euclidean_dist": 0.8816355466842651
+    },
+    {
+      "rank": 7,
+      "global_index": 22490,
+      "div": 0.981796383857727,
+      "euclidean_dist": 0.8985168933868408
+    },
+    {
+      "rank": 8,
+      "global_index": 49999,
+      "div": 0.9855971336364746,
+      "euclidean_dist": 0.8992074131965637
+    }
+  ]
+}

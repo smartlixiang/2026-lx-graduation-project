@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.adapter import AdapterMLP  # noqa: E402
+from dataset.dataset_config import CIFAR10  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.normalizer import NORMALIZER  # noqa: E402
@@ -36,15 +37,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def ensure_scoring_weights(path: Path) -> dict[str, float]:
-    data: dict[str, dict[str, float]] = {}
+def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, float]:
+    data: dict[str, dict[str, dict[str, float]]] = {}
     updated = False
     if path.exists():
         with open(path, "r", encoding="utf-8") as f:
             loaded = json.load(f)
             if isinstance(loaded, dict):
                 data = loaded
-    naive = data.get("naive")
+    dataset_entry = data.get(dataset_name)
+    if not isinstance(dataset_entry, dict):
+        dataset_entry = {}
+        updated = True
+    naive = dataset_entry.get("naive")
     if not isinstance(naive, dict):
         naive = {}
         updated = True
@@ -52,7 +57,8 @@ def ensure_scoring_weights(path: Path) -> dict[str, float]:
         if key not in naive:
             naive[key] = 1.0
             updated = True
-    data["naive"] = naive
+    dataset_entry["naive"] = naive
+    data[dataset_name] = dataset_entry
     if updated or not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -162,8 +168,8 @@ def main() -> None:
         raise ValueError("cr 必须在 1-100 之间。")
 
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
-    weights_path = PROJECT_ROOT / "scoring" / "scoring_weights.json"
-    weights = ensure_scoring_weights(weights_path)
+    weights_path = PROJECT_ROOT / "weights" / "scoring_weights.json"
+    weights = ensure_scoring_weights(weights_path, CIFAR10)
 
     dataset_for_names = datasets.CIFAR10(
         root=args.data_root, train=True, download=True, transform=None
@@ -233,8 +239,8 @@ def main() -> None:
     )
     selected_indices = select_indices(total_scores, args.cr)
 
-    train_tfms = NORMALIZER.train_tfms("cifar10")
-    eval_tfms = NORMALIZER.eval_tfms("cifar10")
+    train_tfms = NORMALIZER.train_tfms(CIFAR10)
+    eval_tfms = NORMALIZER.eval_tfms(CIFAR10)
     full_train_dataset = datasets.CIFAR10(
         root=args.data_root, train=True, download=True, transform=train_tfms
     )

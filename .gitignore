@@ -1,6 +1,6 @@
 data/
 adapter_weights/
 pretrained_clip/
-
+weights/proxy_logs/
 
 __pycache__/

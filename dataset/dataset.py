@@ -24,6 +24,7 @@ if importlib.util.find_spec("torchvision") is None:
 
 from torchvision import datasets
 
+from dataset.dataset_config import CIFAR10, CIFAR100
 from utils.global_config import CONFIG as GLOBAL_CFG
 from utils.normalizer import NORMALIZER
 
@@ -129,9 +130,9 @@ class DatasetSubset(Dataset):
         return self.dataset[self.indices[idx]]
 
 
-@register_dataset("cifar10")
+@register_dataset(CIFAR10)
 class Cifar10Dataset(BaseDataset):
-    _dataset_name = "cifar10"
+    _dataset_name = CIFAR10
     _num_classes = 10
 
     @property
@@ -143,7 +144,7 @@ class Cifar10Dataset(BaseDataset):
         return self._num_classes
 
     def _build_train_set(self) -> Dataset:
-        transform = NORMALIZER.build_train_transforms(
+        transform = NORMALIZER.train_tfms(
             self.dataset_name,
             normalize=self.config.normalize,
             augment=self.config.augment,
@@ -156,7 +157,7 @@ class Cifar10Dataset(BaseDataset):
         )
 
     def _build_test_set(self) -> Dataset:
-        transform = NORMALIZER.build_eval_transforms(
+        transform = NORMALIZER.eval_tfms(
             self.dataset_name,
             normalize=self.config.normalize,
         )
@@ -168,9 +169,9 @@ class Cifar10Dataset(BaseDataset):
         )
 
 
-@register_dataset("cifar100")
+@register_dataset(CIFAR100)
 class Cifar100Dataset(BaseDataset):
-    _dataset_name = "cifar100"
+    _dataset_name = CIFAR100
     _num_classes = 100
 
     @property
@@ -182,7 +183,7 @@ class Cifar100Dataset(BaseDataset):
         return self._num_classes
 
     def _build_train_set(self) -> Dataset:
-        transform = NORMALIZER.build_train_transforms(
+        transform = NORMALIZER.train_tfms(
             self.dataset_name,
             normalize=self.config.normalize,
             augment=self.config.augment,
@@ -195,7 +196,7 @@ class Cifar100Dataset(BaseDataset):
         )
 
     def _build_test_set(self) -> Dataset:
-        transform = NORMALIZER.build_eval_transforms(
+        transform = NORMALIZER.eval_tfms(
             self.dataset_name,
             normalize=self.config.normalize,
         )

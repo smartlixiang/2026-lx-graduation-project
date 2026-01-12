@@ -9,6 +9,7 @@ from torchvision import transforms
 
 # 通过模块导入全局配置
 GLOBAL_CFG = import_module("utils.global_config").CONFIG
+DATASET_CONFIG = import_module("dataset.dataset_config")
 
 
 @dataclass
@@ -23,8 +24,14 @@ class Normalizer:
 
     dataset_stats: Dict[str, DatasetStats] = field(
         default_factory=lambda: {
-            "cifar10": DatasetStats(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616]),
-            "cifar100": DatasetStats(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616]),
+            DATASET_CONFIG.CIFAR10: DatasetStats(
+                mean=[0.4914, 0.4822, 0.4465],
+                std=[0.2470, 0.2435, 0.2616],
+            ),
+            DATASET_CONFIG.CIFAR100: DatasetStats(
+                mean=[0.4914, 0.4822, 0.4465],
+                std=[0.2470, 0.2435, 0.2616],
+            ),
         }
     )
 

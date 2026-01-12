@@ -16,7 +16,7 @@
     "ship": 0.0004535488551482558,
     "truck": 0.0005733177531510592
   },
-  "elapsed_seconds": 28.14307689999987,
+  "elapsed_seconds": 30.53007129999969,
   "adapter_path": "D:\\221300096_李想_毕业设计\\code\\adapter_weights\\cifar10\\adapter_cifar10_ViT-B-32.pt",
   "device": "cuda",
   "k_input": 10,

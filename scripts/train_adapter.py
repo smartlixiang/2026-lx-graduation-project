@@ -1,5 +1,7 @@
 """Train a lightweight adapter on top of frozen CLIP image features."""
 from __future__ import annotations
+from utils.global_config import CONFIG
+from model.adapter import AdapterMLP, CLIPFeatureExtractor
 
 import argparse
 from typing import List
@@ -17,9 +19,6 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from model.adapter import AdapterMLP, CLIPFeatureExtractor
-from utils.global_config import CONFIG
 
 
 def build_dataloaders(dataset_name: str, preprocess, batch_size: int, num_workers: int) -> tuple[DataLoader, List[str]]:
@@ -188,7 +187,7 @@ def train_adapter(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train CLIP adapter with contrastive loss")
     parser.add_argument("--dataset", type=str, default="cifar10", help="Dataset name: cifar10 or cifar100")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=CONFIG.default_batch_size, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW")

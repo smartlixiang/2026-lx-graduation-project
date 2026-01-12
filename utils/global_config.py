@@ -46,12 +46,6 @@ class GlobalConfig:
         self.pretrained_clip.mkdir(parents=True, exist_ok=True)
         return self.pretrained_clip
 
-    def ensure_pretrained_clip_dir(self) -> Path:
-        """确保本地 CLIP 预训练模型缓存目录存在并返回路径。"""
-
-        self.pretrained_clip.mkdir(parents=True, exist_ok=True)
-        return self.pretrained_clip
-
 
 CONFIG = GlobalConfig()
 

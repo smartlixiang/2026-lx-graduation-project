@@ -45,7 +45,7 @@ class Div:
         clip_model: str = "ViT-B/32",
         device: torch.device | None = None,
         chunk_size: int = 1024,
-        div_cdf: bool = False,
+        div_cdf: bool = True,
     ) -> None:
         if k < 1:
             raise ValueError("k 必须为正整数。")

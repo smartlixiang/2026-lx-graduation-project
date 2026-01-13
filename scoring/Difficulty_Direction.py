@@ -101,6 +101,14 @@ class DifficultyDirection:
         scores = projections.abs().sum(dim=1)
         return scores, mean
 
+    @staticmethod
+    def _min_max_normalize(values: torch.Tensor) -> torch.Tensor:
+        min_val = values.min()
+        max_val = values.max()
+        if torch.isclose(min_val, max_val):
+            return torch.zeros_like(values)
+        return (values - min_val) / (max_val - min_val)
+
     def score_dataset(
         self, dataloader: DataLoader, adapter: AdapterMLP | None = None
     ) -> DDSResult:
@@ -118,6 +126,8 @@ class DifficultyDirection:
             class_features = image_features[mask]
             class_scores, _ = self._dds_from_pca(class_features, resolved_k)
             scores[mask] = class_scores
+
+        scores = self._min_max_normalize(scores)
 
         return DDSResult(
             scores=scores.detach().cpu(),

@@ -90,6 +90,14 @@ class SemanticAlignment:
         negative_max = sims.masked_fill(~mask, float("-inf")).max(dim=1).values
         return target_sim - negative_max
 
+    @staticmethod
+    def _min_max_normalize(values: torch.Tensor) -> torch.Tensor:
+        min_val = values.min()
+        max_val = values.max()
+        if torch.isclose(min_val, max_val):
+            return torch.zeros_like(values)
+        return (values - min_val) / (max_val - min_val)
+
     def score_dataset(
         self, dataloader: DataLoader, adapter: AdapterMLP | None = None
     ) -> SAResult:
@@ -101,6 +109,7 @@ class SemanticAlignment:
         image_features, labels = self._encode_images(dataloader, adapter)
         text_features = text_features.to(image_features.device)
         scores = self._margin_similarity(image_features, text_features, labels)
+        scores = self._min_max_normalize(scores)
 
         return SAResult(
             scores=scores.detach().cpu(),

@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
         default="weights/proxy_logs/cifar10_resnet18_2026_01_12_14_31.npz",
         help="Path to proxy training log (.npz).",
     )
-    parser.add_argument("--adapter-path", type=str, default=None, help="Optional adapter path.")
+    parser.add_argument("--adapter-path", type=str, default="adapter_weights/cifar10/adapter_cifar10_ViT-B-32.pt", help="Optional adapter path.")
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dds-k", type=float, default=10)
     parser.add_argument("--early-epochs", type=int, default=None)
     parser.add_argument("--margin-delta", type=float, default=1.0)
-    parser.add_argument("--ridge-lambda", type=float, default=1e-1)
+    parser.add_argument("--ridge-lambda", type=float, default=1e-2)
     parser.add_argument(
         "--output",
         type=str,

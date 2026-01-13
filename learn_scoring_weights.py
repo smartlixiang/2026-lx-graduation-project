@@ -42,7 +42,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dds-k", type=float, default=10)
     parser.add_argument("--early-epochs", type=int, default=None)
     parser.add_argument("--margin-delta", type=float, default=1.0)
-    parser.add_argument("--ridge-lambda", type=float, default=1e-2)
+    parser.add_argument("--ridge-lambda", type=float, default=1e-1)
+    parser.add_argument("--learning-rate", type=float, default=1e-2)
+    parser.add_argument("--max-iter", type=int, default=1000)
+    parser.add_argument("--tol", type=float, default=1e-6)
     parser.add_argument(
         "--output",
         type=str,
@@ -95,8 +98,13 @@ def load_adapter(adapter_path: str | None, input_dim: int, device: torch.device)
     return adapter
 
 
-def fit_ridge_regression(
-    features: np.ndarray, targets: np.ndarray, l2_lambda: float
+def fit_ridge_regression_nonnegative(
+    features: np.ndarray,
+    targets: np.ndarray,
+    l2_lambda: float,
+    learning_rate: float,
+    max_iter: int,
+    tol: float,
 ) -> tuple[np.ndarray, float]:
     if features.ndim != 2:
         raise ValueError("features must be a 2D array.")
@@ -106,27 +114,46 @@ def fit_ridge_regression(
         raise ValueError("features and targets must have the same number of samples.")
     if l2_lambda < 0:
         raise ValueError("ridge-lambda must be non-negative.")
+    if learning_rate <= 0:
+        raise ValueError("learning-rate must be positive.")
+    if max_iter <= 0:
+        raise ValueError("max-iter must be positive.")
+    if tol <= 0:
+        raise ValueError("tol must be positive.")
 
     num_samples, num_features = features.shape
-    ones = np.ones((num_samples, 1), dtype=features.dtype)
-    features_bias = np.concatenate([features, ones], axis=1)
+    weights = np.full(num_features, 1.0 / num_features, dtype=np.float64)
+    bias = float(targets.mean())
 
-    xtx = features_bias.T @ features_bias
-    reg = np.zeros_like(xtx)
-    reg[:num_features, :num_features] = l2_lambda * np.eye(num_features, dtype=features.dtype)
-    solution = np.linalg.solve(xtx + reg, features_bias.T @ targets)
+    features = features.astype(np.float64)
+    targets = targets.astype(np.float64)
 
-    weights = solution[:num_features]
-    bias = float(solution[-1])
-    return weights, bias
+    for _ in range(max_iter):
+        preds = features @ weights + bias
+        errors = preds - targets
+        grad_w = (features.T @ errors) / num_samples + l2_lambda * weights
+        grad_b = errors.mean()
+
+        next_weights = weights - learning_rate * grad_w
+        next_weights = np.maximum(next_weights, 0.0)
+        next_bias = bias - learning_rate * grad_b
+
+        if np.linalg.norm(next_weights - weights) < tol and abs(next_bias - bias) < tol:
+            weights = next_weights
+            bias = next_bias
+            break
+
+        weights = next_weights
+        bias = next_bias
+
+    return weights, float(bias)
 
 
 def normalize_weights(weights: np.ndarray) -> np.ndarray:
-    clipped = np.maximum(weights, 0.0)
-    total = float(clipped.sum())
+    total = float(weights.sum())
     if total <= 0:
-        return np.full_like(clipped, 1.0 / clipped.size, dtype=np.float64)
-    return (clipped / total).astype(np.float64)
+        return np.full_like(weights, 1.0 / weights.size, dtype=np.float64)
+    return (weights / total).astype(np.float64)
 
 
 def main() -> None:
@@ -209,7 +236,14 @@ def main() -> None:
     ).astype(np.float64)
     dynamic_scores = dynamic_scores.astype(np.float64)
 
-    weights, bias = fit_ridge_regression(static_features, dynamic_scores, args.ridge_lambda)
+    weights, bias = fit_ridge_regression_nonnegative(
+        static_features,
+        dynamic_scores,
+        args.ridge_lambda,
+        args.learning_rate,
+        args.max_iter,
+        args.tol,
+    )
     normalized = normalize_weights(weights)
 
     output_path = Path(args.output)

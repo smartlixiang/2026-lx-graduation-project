@@ -1,6 +1,7 @@
 """Train a lightweight adapter on top of frozen CLIP image features."""
 from __future__ import annotations
 from utils.global_config import CONFIG
+from utils.seed import parse_seed_list, set_seed
 from model.adapter import AdapterMLP, CLIPFeatureExtractor
 
 import argparse
@@ -21,7 +22,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-def build_dataloaders(dataset_name: str, preprocess, batch_size: int, num_workers: int) -> tuple[DataLoader, List[str]]:
+def build_dataloaders(
+    dataset_name: str,
+    preprocess,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+) -> tuple[DataLoader, List[str]]:
     dataset_name = dataset_name.lower()
     if dataset_name not in {"cifar10", "cifar100"}:
         raise ValueError("Only cifar10/cifar100 are currently supported.")
@@ -29,10 +36,12 @@ def build_dataloaders(dataset_name: str, preprocess, batch_size: int, num_worker
     dataset_cls = datasets.CIFAR10 if dataset_name == "cifar10" else datasets.CIFAR100
     train_set = dataset_cls(root=str(CONFIG.data_root), train=True, download=True, transform=preprocess)
     classes = list(train_set.classes)
+    generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
         shuffle=True,
+        generator=generator,
         num_workers=num_workers,
         pin_memory=CONFIG.pin_memory,
     )
@@ -121,12 +130,17 @@ def visualize_adapter_effects(
     plt.close(fig)
 
 
-def train_adapter(args: argparse.Namespace) -> None:
+def train_adapter(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
+    set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     clip_encoder = CLIPFeatureExtractor(args.clip_model, device=device)
 
     train_loader, class_names = build_dataloaders(
-        args.dataset, clip_encoder.preprocess, args.batch_size, CONFIG.num_workers
+        args.dataset,
+        clip_encoder.preprocess,
+        args.batch_size,
+        CONFIG.num_workers,
+        seed,
     )
     text_prompts = [f"a photo of a {name}" for name in class_names]
     text_features = clip_encoder.encode_text(text_prompts)
@@ -136,7 +150,8 @@ def train_adapter(args: argparse.Namespace) -> None:
 
     CONFIG.ensure_data_dir()
     adapter_dir = CONFIG.ensure_adapter_dir(args.dataset)
-    save_path = adapter_dir / f"adapter_{args.dataset}_{args.clip_model.replace('/', '-')}.pt"
+    seed_suffix = f"_seed{seed}" if multi_seed else ""
+    save_path = adapter_dir / f"adapter_{args.dataset}_{args.clip_model.replace('/', '-')}{seed_suffix}.pt"
 
     adapter.train()
     for epoch in range(args.epochs):
@@ -171,7 +186,10 @@ def train_adapter(args: argparse.Namespace) -> None:
         num_workers=CONFIG.num_workers,
         pin_memory=CONFIG.pin_memory,
     )
-    viz_path = adapter_dir / f"adapter_{args.dataset}_{args.clip_model.replace('/', '-')}_viz.png"
+    viz_path = (
+        adapter_dir
+        / f"adapter_{args.dataset}_{args.clip_model.replace('/', '-')}{seed_suffix}_viz.png"
+    )
     visualize_adapter_effects(
         clip_encoder,
         adapter,
@@ -194,9 +212,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.07, help="Contrastive temperature")
     parser.add_argument("--hidden_dim", type=int, default=1024, help="Hidden dimension of adapter MLP")
     parser.add_argument("--clip_model", type=str, default="ViT-B/32", help="CLIP model variant")
+    parser.add_argument(
+        "--seed",
+        type=str,
+        default=",".join(str(s) for s in CONFIG.exp_seeds),
+        help="随机种子，支持单个整数或逗号分隔列表",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    train_adapter(args)
+    seeds = parse_seed_list(args.seed)
+    multi_seed = len(seeds) > 1
+    for seed in seeds:
+        train_adapter(args, seed, multi_seed)

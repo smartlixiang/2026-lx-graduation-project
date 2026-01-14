@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
 import sys
 import time
 from pathlib import Path
@@ -24,6 +23,7 @@ from dataset.dataset_config import CIFAR10  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.normalizer import NORMALIZER  # noqa: E402
+from utils.seed import parse_seed_list, set_seed  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +38,12 @@ def parse_args() -> argparse.Namespace:
         help="adapter 权重路径",
     )
     parser.add_argument("--device", type=str, default=None, help="设备，例如 cuda 或 cpu")
-    parser.add_argument("--seeds", type=str, default="0,1,2", help="随机种子列表，逗号分隔")
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default=str(CONFIG.global_seed),
+        help="随机种子列表，逗号分隔",
+    )
     parser.add_argument(
         "--weight-group",
         type=str,
@@ -103,14 +108,6 @@ def load_scoring_weights(
         except (TypeError, ValueError) as exc:
             raise ValueError(f"权重组 {group} 的 {key} 无法转换为 float。") from exc
     return weights
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def build_score_loader(
@@ -292,7 +289,7 @@ def main() -> None:
         root=args.data_root, train=False, download=True, transform=eval_tfms
     )
 
-    seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+    seeds = parse_seed_list(args.seeds)
     accuracies: list[float] = []
     train_times: list[float] = []
     for seed in seeds:

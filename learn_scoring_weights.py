@@ -15,6 +15,7 @@ from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100
 from model.adapter import AdapterMLP
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.global_config import CONFIG
+from utils.seed import parse_seed_list, set_seed
 from weights import EarlyLossScore, ForgettingScore, MarginScore
 
 
@@ -52,6 +53,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to write learned weights JSON.",
     )
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--seed",
+        type=str,
+        default=",".join(str(s) for s in CONFIG.exp_seeds),
+        help="随机种子，支持单个整数或逗号分隔列表",
+    )
     return parser.parse_args()
 
 
@@ -155,8 +162,15 @@ def normalize_weights(weights: np.ndarray) -> np.ndarray:
     return (weights / total).astype(np.float64)
 
 
-def main() -> None:
-    args = parse_args()
+def build_output_path(base_path: str, seed: int, multi_seed: bool) -> Path:
+    output_path = Path(base_path)
+    if not multi_seed:
+        return output_path
+    return output_path.with_name(f"{output_path.stem}_seed{seed}{output_path.suffix}")
+
+
+def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
+    set_seed(seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
     proxy_log = Path(args.proxy_log)
     if not proxy_log.exists():
@@ -244,7 +258,7 @@ def main() -> None:
     )
     normalized = normalize_weights(weights)
 
-    output_path = Path(args.output)
+    output_path = build_output_path(args.output, seed, multi_seed)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     data: dict[str, dict[str, dict[str, float]]] = {}
     if output_path.exists():
@@ -277,4 +291,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    seeds = parse_seed_list(args.seed)
+    multi_seed = len(seeds) > 1
+    for seed in seeds:
+        run_for_seed(args, seed, multi_seed)

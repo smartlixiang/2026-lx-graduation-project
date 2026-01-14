@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from model.adapter import AdapterMLP  # noqa: E402
 from scoring import SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
+from utils.seed import set_seed  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device", type=str, default=None, help="计算设备，例如 cuda 或 cpu，默认跟随全局配置"
     )
+    parser.add_argument("--seed", type=int, default=CONFIG.global_seed, help="随机种子")
     return parser.parse_args()
 
 
@@ -174,6 +176,7 @@ def visualize_results(
 
 def main() -> None:
     args = parse_args()
+    set_seed(args.seed)
     output_dir = PROJECT_ROOT / "test_SA_with_adapter"
     output_dir.mkdir(parents=True, exist_ok=True)
 

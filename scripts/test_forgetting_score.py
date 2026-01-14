@@ -11,6 +11,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from weights import ForgettingScore  # noqa: E402
+from utils.global_config import CONFIG  # noqa: E402
+from utils.seed import set_seed  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,11 +23,13 @@ def parse_args() -> argparse.Namespace:
         default=Path("weights/proxy_logs/cifar10_resnet18_2026_01_12_14_31.npz"),
         help="Path to the proxy log .npz file.",
     )
+    parser.add_argument("--seed", type=int, default=CONFIG.global_seed, help="随机种子")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    set_seed(args.seed)
     scorer = ForgettingScore(args.npz_path)
 
     start = time.perf_counter()

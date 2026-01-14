@@ -11,6 +11,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from weights import EarlyLossScore  # noqa: E402
+from utils.global_config import CONFIG  # noqa: E402
+from utils.seed import set_seed  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,11 +29,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override number of early epochs used for EarlyLossScore.",
     )
+    parser.add_argument("--seed", type=int, default=CONFIG.global_seed, help="随机种子")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    set_seed(args.seed)
     scorer = EarlyLossScore(args.npz_path, early_epochs=args.early_epochs)
 
     start = time.perf_counter()

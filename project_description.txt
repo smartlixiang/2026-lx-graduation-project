@@ -1,1 +1,107 @@
 --- 本文件用于描述本项目所有代码文件的功能、设计要点和运行细节 ---
+
+# 1. 项目整体说明
+本项目旨在实现一个面向图像分类的数据评分与数据选择框架，通过静态指标（SA/Div/DDS）评价样本质量，并用代理模型训练动态学习静态指标的权重。整体流程详见 plan.txt，但本文件重点帮助 Codex 快速定位代码功能与注意事项。
+
+# 2. 随机种子约定（实验复现规则）
+- 全项目实验种子统一由 utils/global_config.py 维护：exp_seeds = [22, 42, 96]（文件内已加注释）。
+- 任何“正式实验运行脚本”（文件名不包含 test 等测试字段）必须提供 seed 超参数：
+  - 传入单个正整数 → 只运行一次该 seed。
+  - 传入种子列表（如 "22,42,96" 或 "[22, 42, 96]"）→ 按顺序逐个运行。
+  - 默认不显式传参时读取 CONFIG.exp_seeds。
+- “非正式测试脚本”（文件名带 test）默认使用 global_seed=42。
+- 统一的解析/设种工具在 utils/seed.py：
+  - parse_seed_list(seed) 解析字符串/列表/单个整数。
+  - set_seed(seed) 同步设置 Python/NumPy/PyTorch 随机种子。
+
+# 3. 重要目录与核心文件
+以下重点描述 dataset、model、scoring、utils 目录。每个文件仅描述关键功能和易错点。
+
+## 3.1 dataset 目录
+### dataset/dataset_config.py
+- 统一管理数据集名称常量（CIFAR10、CIFAR100），并提供 AVAILABLE_DATASETS 元组供 argparse choices 使用。
+
+### dataset/dataset.py
+- 数据集加载与分割的核心封装。
+- 关键结构：
+  - SplitConfig：保存 data_path、batch_size、num_workers、val_split、download、augment、normalize、seed、pin_memory 等参数。注意 seed 默认来自 CONFIG.global_seed，并用于随机划分训练/验证集。
+  - BaseDataset：抽象类，定义 dataset_name/num_classes/_build_train_set/_build_test_set 四个接口。
+  - register_dataset 装饰器：把数据集子类注册进 DATASET_REGISTRY。新增数据集时必须注册。
+  - Cifar10Dataset / Cifar100Dataset：标准实现，内部依赖 utils/normalizer.NORMALIZER 生成训练/测试变换。
+  - BaseDataLoader：统一入口，使用 SplitConfig + 注册表构建 DataLoader；seed 参数会传入 SplitConfig，使随机划分可复现。
+- 容易忽视的细节：
+  - _split_train_val 使用 torch.Generator().manual_seed(seed) 控制划分一致性。
+  - DataLoader 只负责 batch/并行配置，随机种子主要控制划分而不是 shuffle（shuffle 与 torch 默认 RNG 相关）。
+
+## 3.2 model 目录
+### model/adapter.py
+- AdapterMLP：两层 MLP + GELU + L2 normalize 输出，用于适配 CLIP 特征。
+- CLIPFeatureExtractor：封装 openai/clip 的模型加载与特征提取。
+  - __post_init__ 会自动加载模型并设置 eval。
+  - encode_image/encode_text 会返回 L2-normalized 特征，避免后续指标使用不同尺度。
+- load_trained_adapter：根据 dataset_name + clip_model 拼接权重路径并加载。
+  - 注意 weight_path 的命名规则依赖训练脚本，若种子后缀存在，需要显式指定。
+
+### model/resnet.py
+- CIFAR 版本的 ResNet-18：
+  - conv1 使用 3x3 stride=1，去掉 maxpool，这是 CIFAR 经典配置。
+  - resnet18() 是快速工厂函数。
+
+## 3.3 scoring 目录
+### scoring/__init__.py
+- 统一导出 Div / DifficultyDirection / SemanticAlignment 以及对应 Result 容器，供外部直接 import scoring.* 使用。
+
+### scoring/Semantic_Alignment.py
+- 语义对齐度 SA：图像特征与其类别文本特征的“正类相似度 - 最大负类相似度”。
+- 关键函数：
+  - _build_text_features：生成 prompt 并编码文本。
+  - _margin_similarity：核心公式，注意先排除目标类别，再取最大负类相似度。
+  - _quantile_normalize：按类别做分位点归一化，避免不同类的数值尺度不一致。
+- 易错点：
+  - adapter 的设备与 CLIP 设备可能不一致，_encode_images 内会在 adapter_device 和 extractor.device 之间对齐。
+
+### scoring/Diversity.py
+- 多样性覆盖度 Div：类内 kNN 距离均值，反映样本在类内分布的稀疏程度。
+- 关键函数：
+  - _knn_mean_distance：手动分块计算全量相似度矩阵，chunk_size 决定内存占用。
+  - _quantile_normalize：同样按类别归一化。
+- 易错点：k 必须为正整数；实际使用时 k 会被限制为不超过类内样本数-1。
+
+### scoring/Difficulty_Direction.py
+- 类内难度方向 DDS：
+  - 对类内特征做 PCA，选择“低方差方向”投影，投影绝对值越大表示样本更偏离主流分布。
+- 关键函数：
+  - _resolve_k：k 允许为整数（方向数量）或 0~1 小数（按比例）；超出范围会报错。
+  - _dds_from_pca：对类内特征求协方差、特征分解，并计算低方差方向投影。
+  - _quantile_normalize：按类别归一化，保证不同类可比。
+
+## 3.4 utils 目录
+### utils/global_config.py
+- 集中维护项目级别默认配置（data_root、adapter_weights、pretrained_clip、global_seed 等）。
+- exp_seeds = [22, 42, 96] 是实验默认随机种子列表；正式实验脚本默认从这里读取。
+
+### utils/normalizer.py
+- Normalizer 负责数据集标准化与数据增强流水线：
+  - train_tfms：可选 RandomCrop + RandomHorizontalFlip，再 ToTensor + Normalize。
+  - eval_tfms：仅 ToTensor + Normalize。
+- dataset_stats 用来维护不同数据集的均值方差；新增数据集需调用 register。
+
+### utils/seed.py
+- 实验复现工具：
+  - parse_seed_list 可解析单个整数或列表字符串（"22,42,96" / "[22, 42, 96]"）。
+  - set_seed 统一设置 Python/NumPy/PyTorch 以及 CUDA 随机种子。
+
+# 4. 重要脚本与调用方式补充
+- scripts/train_adapter.py（正式脚本）：
+  - --seed 支持单个或列表；默认 CONFIG.exp_seeds。
+  - 训练 Adapter，输出权重与可视化图；多 seed 情况下文件名会追加 _seed{seed}。
+- train_proxy.py（正式脚本）：
+  - 训练 ResNet-18 代理模型并记录训练动态，日志文件名会带 seed 后缀防止覆盖。
+- learn_scoring_weights.py（正式脚本）：
+  - 基于代理日志计算 EarlyLoss/Margin/Forgetting，再回归学习 SA/Div/DDS 权重。
+  - 多 seed 时会输出带 seed 后缀的权重文件。
+- scripts/diagnose_div_correlation.py（正式脚本）：
+  - 用于分析静态指标与动态目标的相关性，输出分布图；多 seed 时输出到 seed 子目录。
+- scripts/test_* / test_scoring.py（测试脚本）：
+  - 默认种子为 CONFIG.global_seed=42。
+  - 主要用于指标/代理日志的快速自检与可视化，不作为正式实验结果。

@@ -19,6 +19,7 @@ from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100  # noqa
 from model.adapter import AdapterMLP  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
+from utils.seed import parse_seed_list, set_seed  # noqa: E402
 from weights import EarlyLossScore, ForgettingScore, MarginScore  # noqa: E402
 
 
@@ -41,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--margin-delta", type=float, default=1.0)
     parser.add_argument("--output-dir", type=str, default="diagnostics")
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--seed",
+        type=str,
+        default=",".join(str(s) for s in CONFIG.exp_seeds),
+        help="随机种子，支持单个整数或逗号分隔列表",
+    )
     return parser.parse_args()
 
 
@@ -121,8 +128,15 @@ def plot_distributions(output_dir: Path, sa: np.ndarray, div: np.ndarray, dds: n
     plt.close()
 
 
-def main() -> None:
-    args = parse_args()
+def resolve_output_dir(base_dir: str, seed: int, multi_seed: bool) -> Path:
+    output_dir = Path(base_dir)
+    if not multi_seed:
+        return output_dir
+    return output_dir / f"seed_{seed}"
+
+
+def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
+    set_seed(seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
 
     proxy_log = Path(args.proxy_log)
@@ -203,10 +217,14 @@ def main() -> None:
             f"spearman={spearman_corr(values, dynamic):.4f}"
         )
 
-    output_dir = Path(args.output_dir)
+    output_dir = resolve_output_dir(args.output_dir, seed, multi_seed)
     plot_distributions(output_dir, sa, div, dds)
     print("Saved distribution plot to", output_dir / "static_score_distributions.png")
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    seeds = parse_seed_list(args.seed)
+    multi_seed = len(seeds) > 1
+    for seed in seeds:
+        run_for_seed(args, seed, multi_seed)

@@ -36,6 +36,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from model.adapter import AdapterMLP  # noqa: E402
 from scoring import Div  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
+from utils.seed import set_seed  # noqa: E402
 
 
 # -----------------------------
@@ -61,16 +62,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embed-method", type=str, default="pca", choices=["pca", "tsne", "umap"], help="(4) 2D 嵌入方法")
     parser.add_argument("--embed-max-per-class", type=int, default=2000, help="(4) 每类最多画多少点（太大很慢）")
 
-    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--seed", type=int, default=CONFIG.global_seed, help="随机种子")
     parser.add_argument("--output-dir", type=str, default="", help="输出目录（默认 PROJECT_ROOT/test_Div_result）")
     return parser.parse_args()
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
 def ensure_dir(p: Path) -> None:

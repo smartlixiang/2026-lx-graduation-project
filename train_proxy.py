@@ -13,9 +13,9 @@ from torch.optim import SGD
 from tqdm import tqdm
 
 from dataset.dataset import BaseDataLoader
-from dataset.dataset_config import CIFAR10
 from model.resnet import resnet18
 from utils.global_config import CONFIG
+from utils.seed import parse_seed_list, set_seed
 
 
 class IndexedDataset(torch.utils.data.Dataset):
@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight_decay", type=float, default=5e-4)
     parser.add_argument("--device", type=str, default="")
+    parser.add_argument(
+        "--seed",
+        type=str,
+        default=",".join(str(s) for s in CONFIG.exp_seeds),
+        help="随机种子，支持单个整数或逗号分隔列表",
+    )
     return parser.parse_args()
 
 
@@ -62,8 +68,8 @@ def evaluate(model: nn.Module, loader: torch.utils.data.DataLoader, device: torc
     return correct / total if total else 0.0
 
 
-def main() -> None:
-    args = parse_args()
+def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
+    set_seed(seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
 
     data_loader = BaseDataLoader(
@@ -72,14 +78,17 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         val_split=0.0,
+        seed=seed,
     )
     train_loader, _, test_loader = data_loader.load()
 
     indexed_train_dataset = IndexedDataset(train_loader.dataset)
+    generator = torch.Generator().manual_seed(seed)
     train_loader = torch.utils.data.DataLoader(
         indexed_train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        generator=generator,
         num_workers=args.num_workers,
         drop_last=False,
     )
@@ -99,7 +108,8 @@ def main() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
-    log_stem = f"{args.dataset}_resnet18_{timestamp}"
+    seed_suffix = f"_seed{seed}" if multi_seed else ""
+    log_stem = f"{args.dataset}_resnet18_{timestamp}{seed_suffix}"
 
     # Use memmap for low-RAM logging during training, then pack everything into a single .npz
     loss_path = log_dir / f"{log_stem}_loss.dat"
@@ -209,6 +219,14 @@ def main() -> None:
             p.unlink()
         except FileNotFoundError:
             pass
+
+
+def main() -> None:
+    args = parse_args()
+    seeds = parse_seed_list(args.seed)
+    multi_seed = len(seeds) > 1
+    for seed in seeds:
+        run_for_seed(args, seed, multi_seed)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """集中管理全局可复用的实验超参数与路径配置。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -14,6 +14,8 @@ class GlobalConfig:
     data_root: Path = Path("./data")
     adapter_weights: Path = Path("./adapter_weights")
     pretrained_clip: Path = Path("./pretrained_clip")
+    # 实验默认随机种子列表：exp_seeds=[22, 42, 96]
+    exp_seeds: list[int] = field(default_factory=lambda: [22, 42, 96])
     global_seed: int = 42
     default_batch_size: int = 128
     num_workers: int = 4

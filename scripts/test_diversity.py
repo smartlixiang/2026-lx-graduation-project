@@ -3,7 +3,7 @@
 
 (1) 每类 Top/Bottom Div 样本拼图（直观看 Div 是否在挑“稀疏/覆盖”样本）
 (2) 高 Div 样本 + 同类最近邻对照（看它到底“稀疏”还是“噪声/离群”）
-(3) kNN 距离（k_distances）分布：总体直方图 + 各类箱线图（替代几乎必然平的 rank 直方图）
+(3) kNN 距离均值（k_distances）分布：总体直方图 + 各类箱线图（替代几乎必然平的 rank 直方图）
 (4) 类内 2D 嵌入散点图：点颜色=Div（看高 Div 是否落在类内边缘/稀疏区域）
 
 用法示例：
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128, help="批大小")
     parser.add_argument("--num-workers", type=int, default=4, help="dataloader 并行线程数")
     parser.add_argument("--clip-model", type=str, default="ViT-B/32", help="CLIP 模型规格")
-    parser.add_argument("--k", type=int, default=10, help="kNN 中的 k（第 k 个最近邻距离）")
+    parser.add_argument("--k", type=int, default=10, help="kNN 中的 k（前 k 个近邻距离均值）")
     parser.add_argument("--chunk-size", type=int, default=1024, help="相似度计算的分块大小")
 
     parser.add_argument("--adapter-path", type=str, default="adapter_weights/cifar10/adapter_cifar10_ViT-B-32.pt",
@@ -172,7 +172,7 @@ def compute_kdistance_all_with_div(div_metric: Div, loader: DataLoader, adapter:
     """
     Use Div internals once:
     - encode all images -> image_features, labels
-    - compute per-class kth neighbor distances and rank-based scores
+    - compute per-class kNN mean distances and quantile-normalized scores
 
     Returns: (scores_cpu, labels_cpu, k_distances_cpu, class_names)
     """
@@ -278,7 +278,7 @@ def vis_anchor_and_neighbors(
 
             # images: [anchor] + neighbors
             imgs: List[torch.Tensor] = [pil_to_tensor(raw_dataset[int(gidx)][0])]
-            captions = [f"anchor Div={scores[gidx]:.3f}  d_k={k_distances[gidx]:.3f}"]
+            captions = [f"anchor Div={scores[gidx]:.3f}  d_mean={k_distances[gidx]:.3f}"]
 
             for j, (lidx, dist) in enumerate(zip(nn_local.tolist(), nn_dist.tolist())):
                 ng = int(idxs[lidx].item())
@@ -303,7 +303,7 @@ def vis_anchor_and_neighbors(
                 "class_idx": c,
                 "anchor_global_index": int(gidx),
                 "anchor_div": float(scores[gidx]),
-                "anchor_k_distance": float(k_distances[gidx]),
+                "anchor_k_distance_mean": float(k_distances[gidx]),
                 "neighbors": [],
             }
             for j, (lidx, dist) in enumerate(zip(nn_local.tolist(), nn_dist.tolist())):
@@ -338,8 +338,8 @@ def vis_kdistance_distributions(
     # overall histogram
     plt.figure()
     plt.hist(kd, bins=60)
-    plt.title("k-th NN Euclidean distance distribution (all samples)")
-    plt.xlabel("k-distance")
+    plt.title("kNN mean Euclidean distance distribution (all samples)")
+    plt.xlabel("kNN mean distance")
     plt.ylabel("count")
     plt.tight_layout()
     plt.savefig(out / "kdistance_hist_all.png", dpi=160)
@@ -357,9 +357,9 @@ def vis_kdistance_distributions(
 
     plt.figure(figsize=(max(10, len(valid_names) * 0.9), 5))
     plt.boxplot(data, showfliers=False)
-    plt.title("k-distance boxplot by class (fliers hidden)")
+    plt.title("kNN mean distance boxplot by class (fliers hidden)")
     plt.xlabel("class")
-    plt.ylabel("k-distance")
+    plt.ylabel("kNN mean distance")
     plt.xticks(ticks=np.arange(1, len(valid_names) + 1), labels=valid_names, rotation=45, ha="right")
     plt.tight_layout()
     plt.savefig(out / "kdistance_boxplot_by_class.png", dpi=160)
@@ -552,7 +552,7 @@ def main() -> None:
     )
 
     # -------------------------
-    # (3) k-distance distributions
+    # (3) kNN mean distance distributions
     # -------------------------
     vis_kdistance_distributions(
         k_distances=k_distances,
@@ -583,7 +583,7 @@ def main() -> None:
     print("  - div_scores.pt / div_labels.pt / div_k_distances.pt / div_summary.json")
     print("  - vis_1_top_bottom/  (每类 top/bottom 拼图)")
     print("  - vis_2_neighbors/   (anchor + 最近邻对照 + json 细节)")
-    print("  - vis_3_kdistance/   (k-distance 总体直方图 + 各类箱线图)")
+    print("  - vis_3_kdistance/   (kNN mean distance 总体直方图 + 各类箱线图)")
     print("  - vis_4_embedding/   (类内 2D 嵌入散点图，点颜色=Div)")
 
 

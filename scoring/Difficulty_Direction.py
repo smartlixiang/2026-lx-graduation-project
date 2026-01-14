@@ -102,12 +102,27 @@ class DifficultyDirection:
         return scores, mean
 
     @staticmethod
-    def _min_max_normalize(values: torch.Tensor) -> torch.Tensor:
-        min_val = values.min()
-        max_val = values.max()
-        if torch.isclose(min_val, max_val):
-            return torch.zeros_like(values)
-        return (values - min_val) / (max_val - min_val)
+    def _quantile_normalize(
+        values: torch.Tensor,
+        labels: torch.Tensor,
+        num_classes: int,
+        low_q: float = 0.01,
+        high_q: float = 0.99,
+    ) -> torch.Tensor:
+        scores = torch.zeros_like(values)
+        for class_idx in range(num_classes):
+            mask = labels == class_idx
+            if not mask.any():
+                continue
+            class_values = values[mask]
+            q_low = torch.quantile(class_values, low_q)
+            q_high = torch.quantile(class_values, high_q)
+            if torch.isclose(q_low, q_high):
+                scores[mask] = 0.5
+                continue
+            scaled = (class_values - q_low) / (q_high - q_low)
+            scores[mask] = torch.clamp(scaled, 0.0, 1.0)
+        return scores
 
     def score_dataset(
         self, dataloader: DataLoader, adapter: AdapterMLP | None = None
@@ -127,7 +142,7 @@ class DifficultyDirection:
             class_scores, _ = self._dds_from_pca(class_features, resolved_k)
             scores[mask] = class_scores
 
-        scores = self._min_max_normalize(scores)
+        scores = self._quantile_normalize(scores, labels, len(self.class_names))
 
         return DDSResult(
             scores=scores.detach().cpu(),

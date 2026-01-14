@@ -36,7 +36,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--div-k", type=int, default=10)
-    parser.add_argument("--div-cdf", action="store_true")
     parser.add_argument("--dds-k", type=float, default=10)
     parser.add_argument("--early-epochs", type=int, default=None)
     parser.add_argument("--margin-delta", type=float, default=1.0)
@@ -152,7 +151,6 @@ def main() -> None:
         clip_model=args.clip_model,
         device=device,
         k=args.div_k,
-        div_cdf=args.div_cdf,
     )
     sa_metric = SemanticAlignment(
         class_names=class_names, clip_model=args.clip_model, device=device

@@ -45,12 +45,6 @@ def parse_args() -> argparse.Namespace:
         default="naive",
         help="scoring_weights.json 中的权重组名",
     )
-    parser.add_argument(
-        "--div-cdf",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Div 指标是否启用 CDF 修正",
-    )
     return parser.parse_args()
 
 
@@ -229,7 +223,6 @@ def main() -> None:
         class_names=class_names,
         clip_model=args.clip_model,
         device=device,
-        div_cdf=args.div_cdf,
     )
     sa_metric = SemanticAlignment(
         class_names=class_names, clip_model=args.clip_model, device=device

@@ -6,7 +6,7 @@
     "cut_ratio": 60,
     "selection_method": "random",
     "seed": 22,
-    "epochs": 10,
+    "epochs": 200,
     "batch_size": 128,
     "optimizer": "SGD",
     "momentum": 0.9,
@@ -24,6 +24,6 @@
     "num_selected": 30000,
     "num_total": 50000
   },
-  "accuracy": 0.43590999999999996,
-  "time_seconds": 461.88745188713074
+  "accuracy": 0.9319,
+  "time_seconds": 8704.911536931992
 }

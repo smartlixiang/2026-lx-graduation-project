@@ -25,7 +25,7 @@
     "num_total": 50000
   },
   "metrics": {
-    "test_top1_accuracy": 0.9429
+    "accuracy": 0.9429
   },
   "time_seconds": 12860.067261457443
 }

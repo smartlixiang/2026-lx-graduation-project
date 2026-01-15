@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10"])
     parser.add_argument("--data_root", type=str, default=str(Path("data")))
     parser.add_argument(
-        "--cut_ratios",
+        "--cr",  # cut ratios
         type=str,
         default="20,30,40,60,70,80,90,100",
         help="裁剪比例列表（百分比），支持逗号分隔或单值",
@@ -199,7 +199,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     train_dataset = train_loader.dataset
 
     model_name = args.model
-    cut_ratios = parse_ratio_list(args.cut_ratios)
+    cut_ratios = parse_ratio_list(args.cr)
     model_factory = get_model(model_name)
 
     for cut_ratio in cut_ratios:

@@ -132,4 +132,4 @@
   - result/[数据集名]/[模型名]/[随机种子]/result_[裁剪比例]_[数据选择方法].json
   - JSON 内容包含训练元数据、最后 10 轮测试集准确率均值（key=accuracy）、以及总运行时间（秒）。
 - 使用示例：
-  - python train_after_selection.py --dataset cifar10 --mode random --cut_ratios 100 --seed 22,42,96
+  - python train_after_selection.py --dataset cifar10 --mode random --cr 100 --seed 22,42,96

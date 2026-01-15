@@ -105,3 +105,31 @@
 - scripts/test_* / test_scoring.py（测试脚本）：
   - 默认种子为 CONFIG.global_seed=42。
   - 主要用于指标/代理日志的快速自检与可视化，不作为正式实验结果。
+
+# 5. CIFAR-10 数据选择实验配置（写入实验汇报用）
+- 数据集：
+  - 使用 CIFAR-10（训练集做子集选择；测试集评测 top-1 accuracy）。
+  - 数据集存放在本项目的 data/ 目录。
+- Backbone：ResNet-50，每个 cut_ratio 均从头训练（不 warm-start）。
+- cut_ratio 扫描：cr ∈ {20, 30, 40, 60, 70, 80, 90, 100}（单位 %；100 表示全训练集）。
+- 固定训练超参（不做网格搜索）：
+  - optimizer: SGD
+  - momentum: 0.9
+  - weight_decay: 5e-4
+  - batch_size: 128
+  - init_lr: 0.1
+  - epochs: 200
+  - LR schedule: epoch = 60 / 120 / 160 时将 lr *= 0.2（除以 5）
+- 重复次数/随机种子：
+  - 每个 (cr, 方法) 跑 3 个随机种子，报告 mean/std。
+  - 随机种子来自 utils/global_config.py 中的 CONFIG.exp_seeds。
+  - naive 随机子集采样使用与训练相同的 seed。
+
+## train_after_selection.py（正式脚本）
+- 作用：对“数据选择后”的子集进行训练并评估，保存结果到 result/ 目录。
+- 目前已实现 random 模式（不加载选择结果，直接随机选样训练）；其他方法加载选择掩码的逻辑预留为 TODO。
+- 结果保存结构：
+  - result/[数据集名]/[模型名]/[随机种子]/result_[裁剪比例]_[数据选择方法].json
+  - JSON 内容包含训练元数据、最后 10 轮测试集准确率均值（key=accuracy）、以及总运行时间（秒）。
+- 使用示例：
+  - python train_after_selection.py --dataset cifar10 --mode random --cut_ratios 100 --seed 22,42,96

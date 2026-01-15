@@ -2,6 +2,8 @@
 import torch
 import torch.nn as nn
 
+from model.model_config import register_model
+
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -25,6 +27,37 @@ class BasicBlock(nn.Module):
         identity = x
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        return self.relu(out)
+
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_planes, planes, stride=1, downsample=None):
+        super().__init__()
+        width = planes
+        self.conv1 = nn.Conv2d(in_planes, width, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(width)
+        self.conv2 = nn.Conv2d(
+            width, width, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(width)
+        self.conv3 = nn.Conv2d(width, planes * self.expansion, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x
+
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
 
         if self.downsample is not None:
             identity = self.downsample(x)
@@ -95,5 +128,11 @@ class ResNet(nn.Module):
         return self.fc(x)
 
 
+@register_model("resnet18")
 def resnet18(num_classes=10):
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
+
+
+@register_model("resnet50")
+def resnet50(num_classes=10):
+    return ResNet(Bottleneck, [3, 4, 6, 3], num_classes=num_classes)

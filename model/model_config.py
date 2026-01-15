@@ -5,19 +5,12 @@ from collections.abc import Callable
 
 from torch import nn
 
-MODEL_REGISTRY: dict[str, Callable[..., nn.Module]] = {}
+from model.resnet import resnet18, resnet50
 
-
-def register_model(name: str) -> Callable[[Callable[..., nn.Module]], Callable[..., nn.Module]]:
-    """Register a model factory under a name."""
-
-    def decorator(factory: Callable[..., nn.Module]) -> Callable[..., nn.Module]:
-        if name in MODEL_REGISTRY:
-            raise ValueError(f"Model name '{name}' is already registered")
-        MODEL_REGISTRY[name] = factory
-        return factory
-
-    return decorator
+MODEL_REGISTRY: dict[str, Callable[..., nn.Module]] = {
+    "resnet18": resnet18,
+    "resnet50": resnet50,
+}
 
 
 def get_model(name: str) -> Callable[..., nn.Module]:
@@ -27,4 +20,4 @@ def get_model(name: str) -> Callable[..., nn.Module]:
     return MODEL_REGISTRY[name]
 
 
-__all__ = ["MODEL_REGISTRY", "register_model", "get_model"]
+__all__ = ["MODEL_REGISTRY", "get_model"]

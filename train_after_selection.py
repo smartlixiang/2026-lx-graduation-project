@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
         help="随机种子，支持单个整数或逗号分隔列表",
     )
     parser.add_argument("--result_root", type=str, default="result")
+    parser.add_argument(
+        "--skip_saved",
+        action="store_true",
+        help="跳过已经保存的结果文件",
+    )
     return parser.parse_args()
 
 
@@ -198,6 +203,11 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     model_factory = get_model(model_name)
 
     for cut_ratio in cut_ratios:
+        result_dir = Path(args.result_root) / args.dataset / model_name / str(seed)
+        result_path = result_dir / f"result_{cut_ratio}_{args.mode}.json"
+        if args.skip_saved and result_path.exists():
+            continue
+
         start_time = time.time()
         selected_indices = prepare_selection_indices(
             args.dataset,
@@ -248,10 +258,9 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
         total_time = time.time() - start_time
         accuracy = float(np.mean(accuracy_samples)) if accuracy_samples else 0.0
+        accuracy = round(accuracy, 4)
 
-        result_dir = Path(args.result_root) / args.dataset / model_name / str(seed)
         result_dir.mkdir(parents=True, exist_ok=True)
-        result_path = result_dir / f"result_{cut_ratio}_{args.mode}.json"
 
         result_payload = {
             "metadata": {

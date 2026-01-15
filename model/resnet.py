@@ -2,8 +2,6 @@
 import torch
 import torch.nn as nn
 
-from model.model_config import register_model
-
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -128,11 +126,9 @@ class ResNet(nn.Module):
         return self.fc(x)
 
 
-@register_model("resnet18")
 def resnet18(num_classes=10):
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
 
 
-@register_model("resnet50")
 def resnet50(num_classes=10):
     return ResNet(Bottleneck, [3, 4, 6, 3], num_classes=num_classes)

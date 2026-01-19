@@ -254,7 +254,12 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             )
             scheduler.step()
             if epoch >= start_eval_epoch:
-                accuracy_samples.append(evaluate(model, test_loader, device))
+                eval_accuracy = round(
+                    float(evaluate(model, test_loader, device)),
+                    4,
+                )
+                accuracy_samples.append(eval_accuracy)
+                print(f"Test accuracy at epoch {epoch}: {eval_accuracy:.4f}")
 
         total_time = time.time() - start_time
         accuracy = float(np.mean(accuracy_samples)) if accuracy_samples else 0.0
@@ -285,6 +290,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 "num_total": len(train_dataset),
             },
             "accuracy": accuracy,
+            "accuracy_samples": accuracy_samples,
             "time_seconds": total_time,
         }
 

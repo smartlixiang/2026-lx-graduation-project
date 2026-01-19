@@ -102,9 +102,9 @@
   - 多 seed 时会输出带 seed 后缀的权重文件。
 - scripts/diagnose_div_correlation.py（正式脚本）：
   - 用于分析静态指标与动态目标的相关性，输出分布图；多 seed 时输出到 seed 子目录。
-- scripts/test_* / test_scoring.py（测试脚本）：
+- scripts/test_* / calculate_my_mask.py（测试脚本）：
   - 默认种子为 CONFIG.global_seed=42。
-  - 主要用于指标/代理日志的快速自检与可视化，不作为正式实验结果。
+  - calculate_my_mask.py 负责计算数据选择 0/1 mask，并保存到 mask/ 路径供 train_after_selection.py 加载。
 
 # 5. CIFAR-10 数据选择实验配置（写入实验汇报用）
 - 数据集：
@@ -127,9 +127,18 @@
 
 ## train_after_selection.py（正式脚本）
 - 作用：对“数据选择后”的子集进行训练并评估，保存结果到 result/ 目录。
-- 目前已实现 random 模式（不加载选择结果，直接随机选样训练）；其他方法加载选择掩码的逻辑预留为 TODO。
+- 目前 random 模式为随机采样；其他方法会加载 mask/ 下对应的 0/1 mask。
 - 结果保存结构：
   - result/[数据集名]/[模型名]/[随机种子]/result_[裁剪比例]_[数据选择方法].json
   - JSON 内容包含训练元数据、最后 10 轮测试集准确率均值（key=accuracy）、以及总运行时间（秒）。
 - 使用示例：
   - python train_after_selection.py --dataset cifar10 --mode random --cr 100 --seed 22,42,96 --skip_saved
+
+## calculate_my_mask.py（测试脚本）
+- 作用：计算基于 SA/Div/DDS 权重的样本评分，并按类别 top-k（k 由裁剪比例 cr 决定）生成 0/1 mask。
+- method 命名约定：
+  - 本方法默认使用 my_naive 或 my_learned（分别对应 weight_group=naive 与其他权重组）。
+  - 如需自定义方法名，可显式传入 --method 覆盖。
+- mask 保存结构：
+  - mask/[方法名]/[数据集名]/[模型名]/[随机种子]/mask_[裁剪比例].npz
+  - 同目录下保存 meta_info.json，记录权重组、CLIP 规格、adapter 路径、裁剪比例与统计信息等。

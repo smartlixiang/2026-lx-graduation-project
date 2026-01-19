@@ -109,17 +109,33 @@ def load_selection_mask(
     mode: str,
     cut_ratio: int,
     seed: int,
-    data_root: Path,
+    model_name: str,
 ) -> np.ndarray:
     """Load a 0/1 mask for a selection method.
 
-    TODO: Replace this stub with real loading logic once the selection artifacts
-    (e.g., .npz masks) are finalized. The mask should have shape (N,) and values
-    in {0, 1}, where 1 indicates the sample is selected.
+    The mask should have shape (N,) and values in {0, 1}, where 1 indicates
+    the sample is selected.
     """
-    raise NotImplementedError(
-        f"Selection loading for mode='{mode}' is not implemented yet."
+    project_root = Path(__file__).resolve().parent
+    mask_path = (
+        project_root
+        / "mask"
+        / mode
+        / dataset_name
+        / model_name
+        / str(seed)
+        / f"mask_{cut_ratio}.npz"
     )
+    if not mask_path.exists():
+        raise FileNotFoundError(f"未找到 mask 文件: {mask_path}")
+    with np.load(mask_path) as data:
+        if "mask" in data:
+            mask = data["mask"]
+        elif len(data.files) == 1:
+            mask = data[data.files[0]]
+        else:
+            raise ValueError(f"mask 文件格式不正确: {mask_path}")
+    return np.asarray(mask)
 
 
 @torch.no_grad()
@@ -172,13 +188,13 @@ def prepare_selection_indices(
     seed: int,
     dataset: torch.utils.data.Dataset,
     num_classes: int,
-    data_root: Path,
+    model_name: str,
 ) -> np.ndarray:
     if mode == "random":
         labels = _extract_labels(dataset)
         return select_random_indices_by_class(labels, num_classes, cut_ratio, seed)
 
-    mask = load_selection_mask(dataset_name, mode, cut_ratio, seed, data_root)
+    mask = load_selection_mask(dataset_name, mode, cut_ratio, seed, model_name)
     mask = np.asarray(mask).astype(bool)
     return np.flatnonzero(mask)
 
@@ -216,7 +232,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             seed,
             train_dataset,
             data_loader.num_classes,
-            Path(args.data_root),
+            model_name,
         )
         subset = Subset(train_dataset, selected_indices.tolist())
 

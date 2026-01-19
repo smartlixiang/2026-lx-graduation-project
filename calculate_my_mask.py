@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch import nn
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, models
+from torch.utils.data import DataLoader
+from torchvision import datasets
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -22,12 +20,11 @@ from model.adapter import AdapterMLP  # noqa: E402
 from dataset.dataset_config import CIFAR10  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
-from utils.normalizer import NORMALIZER  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Scoring selection effectiveness (CIFAR-10)")
+    parser = argparse.ArgumentParser(description="Calculate selection masks (CIFAR-10)")
     parser.add_argument("--data-root", type=str, default="./data", help="数据根目录")
     parser.add_argument("--cr", type=int, default=80, help="cut_ratio (百分比)")
     parser.add_argument("--clip-model", type=str, default="ViT-B/32", help="CLIP 模型规格")
@@ -49,6 +46,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="naive",
         help="scoring_weights.json 中的权重组名",
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="",
+        help="mask 保存时使用的方法名（默认按 weight-group 映射为 my_naive 或 my_learned）",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="resnet50",
+        help="mask 保存路径中的模型名称",
     )
     return parser.parse_args()
 
@@ -123,85 +132,38 @@ def build_score_loader(
     )
 
 
-def select_indices(scores: torch.Tensor, cr: int) -> list[int]:
-    num_samples = scores.numel()
-    select_num = int(math.ceil(num_samples * cr / 100.0))
-    select_num = max(1, min(select_num, num_samples))
-    topk = torch.topk(scores, k=select_num, largest=True).indices
-    return topk.cpu().tolist()
-
-
-def train_one_seed(
-    seed: int,
-    train_dataset,
-    test_dataset,
-    device: torch.device,
-    batch_size: int,
-    num_workers: int,
-) -> float:
-    set_seed(seed)
-    generator = torch.Generator().manual_seed(seed)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-        generator=generator,
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-    )
-
-    model = models.resnet50(num_classes=10)
-    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    model.maxpool = nn.Identity()
-    model = model.to(device)
-    optimizer = torch.optim.SGD(
-        model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4
-    )
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=[60, 120, 160], gamma=0.2
-    )
-    criterion = nn.CrossEntropyLoss()
-
-    for epoch in range(200):
-        model.train()
-        progress = tqdm(train_loader, desc=f"Seed {seed} Epoch {epoch + 1}/200", unit="batch")
-        for images, labels in progress:
-            images = images.to(device)
-            labels = labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-        scheduler.step()
-
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            outputs = model(images)
-            preds = outputs.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-    return correct / total if total else 0.0
+def select_topk_mask(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    num_classes: int,
+    cut_ratio: int,
+) -> tuple[np.ndarray, dict[int, int]]:
+    if cut_ratio <= 0 or cut_ratio > 100:
+        raise ValueError("cr 必须在 1-100 之间。")
+    mask = np.zeros(scores.shape[0], dtype=np.uint8)
+    selected_by_class: dict[int, int] = {}
+    ratio = cut_ratio / 100.0
+    for class_id in range(num_classes):
+        class_indices = np.flatnonzero(labels == class_id)
+        if class_indices.size == 0:
+            selected_by_class[class_id] = 0
+            continue
+        if cut_ratio == 100:
+            num_select = class_indices.size
+        else:
+            num_select = max(1, int(class_indices.size * ratio))
+        class_scores = scores[class_indices]
+        topk_indices = class_indices[
+            np.argpartition(-class_scores, num_select - 1)[:num_select]
+        ]
+        mask[topk_indices] = 1
+        selected_by_class[class_id] = int(num_select)
+    return mask, selected_by_class
 
 
 def main() -> None:
     total_start = time.perf_counter()
     args = parse_args()
-    if args.cr <= 0 or args.cr > 100:
-        raise ValueError("cr 必须在 1-100 之间。")
 
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
     weights_path = PROJECT_ROOT / "weights" / "scoring_weights.json"
@@ -277,69 +239,59 @@ def main() -> None:
         + weights["div"] * div_scores
         + weights["sa"] * sa_scores
     )
-    selected_indices = select_indices(total_scores, args.cr)
-
-    train_tfms = NORMALIZER.train_tfms(CIFAR10)
-    eval_tfms = NORMALIZER.eval_tfms(CIFAR10)
-    full_train_dataset = datasets.CIFAR10(
-        root=args.data_root, train=True, download=True, transform=train_tfms
+    labels = np.asarray(dataset_for_names.targets)
+    total_scores_np = np.asarray(total_scores)
+    mask, selected_by_class = select_topk_mask(
+        total_scores_np, labels, num_classes=len(class_names), cut_ratio=args.cr
     )
-    train_dataset = Subset(full_train_dataset, selected_indices)
-    test_dataset = datasets.CIFAR10(
-        root=args.data_root, train=False, download=True, transform=eval_tfms
-    )
-
-    seeds = parse_seed_list(args.seeds)
-    accuracies: list[float] = []
-    train_times: list[float] = []
-    for seed in seeds:
-        train_start = time.perf_counter()
-        acc = train_one_seed(
-            seed, train_dataset, test_dataset, device, batch_size, num_workers
-        )
-        train_time = time.perf_counter() - train_start
-        print(f"seed={seed} train_time={train_time:.2f}s")
-        accuracies.append(acc)
-        train_times.append(train_time)
-
-    mean_acc = float(np.mean(accuracies))
-    std_acc = float(np.std(accuracies))
     total_time = time.perf_counter() - total_start
 
-    result_dir = PROJECT_ROOT / "test_scoring_result"
-    result_dir.mkdir(parents=True, exist_ok=True)
-    result_path = result_dir / f"{args.weight_group}_scoring_cr{args.cr}.json"
-    result_payload = {
-        "cr": args.cr,
-        "selected_count": len(selected_indices),
-        "weight_group": args.weight_group,
-        "seeds": seeds,
-        "accuracies": accuracies,
-        "mean": mean_acc,
-        "std": std_acc,
-        "timing": {
-            "dds_seconds": dds_time,
-            "div_seconds": div_time,
-            "sa_seconds": sa_time,
-            "train_seconds": train_times,
-            "total_seconds": total_time,
-        },
-    }
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(result_payload, f, ensure_ascii=False, indent=2)
+    if args.method.strip():
+        method_name = args.method.strip()
+    elif args.weight_group == "naive":
+        method_name = "my_naive"
+    else:
+        method_name = "my_learned"
+    seeds = parse_seed_list(args.seeds)
+    for seed in seeds:
+        set_seed(seed)
+        mask_dir = (
+            PROJECT_ROOT
+            / "mask"
+            / method_name
+            / "cifar10"
+            / args.model_name
+            / str(seed)
+        )
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        mask_path = mask_dir / f"mask_{args.cr}.npz"
+        np.savez_compressed(mask_path, mask=mask.astype(np.uint8))
 
-    print(f"cr={args.cr} | selected={len(selected_indices)}")
-    for seed, acc in zip(seeds, accuracies):
-        print(f"seed={seed} acc={acc:.4f}")
-    print(f"mean={mean_acc:.4f} std={std_acc:.4f}")
-    print(
-        "timing: "
-        f"dds={dds_time:.2f}s "
-        f"div={div_time:.2f}s "
-        f"sa={sa_time:.2f}s "
-        f"total={total_time:.2f}s"
-    )
-    print(f"结果保存至: {result_path}")
+        meta_info = {
+            "dataset": "cifar10",
+            "model_name": args.model_name,
+            "method": method_name,
+            "weight_group": args.weight_group,
+            "clip_model": args.clip_model,
+            "adapter_path": str(Path(args.adapter_path)),
+            "cr": args.cr,
+            "num_samples": int(mask.shape[0]),
+            "selected_count": int(mask.sum()),
+            "selected_by_class": selected_by_class,
+            "selection_strategy": "topk_per_class",
+            "seeds": seeds,
+            "timing": {
+                "dds_seconds": dds_time,
+                "div_seconds": div_time,
+                "sa_seconds": sa_time,
+                "total_seconds": total_time,
+            },
+        }
+        with open(mask_dir / "meta_info.json", "w", encoding="utf-8") as f:
+            json.dump(meta_info, f, ensure_ascii=False, indent=2)
+
+        print(f"seed={seed} | cr={args.cr} | selected={int(mask.sum())}")
+        print(f"mask saved to: {mask_path}")
 
 
 if __name__ == "__main__":

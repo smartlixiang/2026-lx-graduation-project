@@ -1,7 +1,0 @@
-SA（Semantic Alignment）实现说明：
-1）实现方式：在 scoring/Semantic_Alignment.py 中封装 SemanticAlignment 类，使用 CLIPFeatureExtractor 生成文本与图像特征。支持在全局配置 utils/global_config.py 中设定默认计算设备 global_device，同时也可以在实例化时传入自定义 device。针对每个样本，先计算图像特征与所有类别文本特征的余弦相似度，再取标签类别相似度与最相似的非目标类别相似度之差作为 SA 分值，形成 margin 样的可解释度量。封装 SAResult 便于保存分值、特征以及按类统计。
-2）测试脚本：scripts/test_semantic_alignment.py 提供一键测试。脚本默认在 CIFAR-10 上加载 CLIP 预处理的数据集，遍历全部样本计算 SA，并统计总耗时。运行后会在 test_SA_result/ 中导出：
-   - sa_scores.pt、sa_labels.pt：保存所有样本分值与标签；
-   - sa_summary.json：记录样本数、分值统计以及总耗时；
-   - sa_histogram.png、sa_boxplot.png、sa_class_mean.png、sa_scatter.png：使用 PIL 绘制的分值分布、各类箱线图、平均分折线、抽样散点图。
-3）当前环境依赖缺失说明：执行脚本时需要 torch/torchvision 及 clip，可视化使用 PIL（已随脚本内置）。若未安装对应依赖请先安装后再运行脚本以生成完整结果与时间开销日志。

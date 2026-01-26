@@ -96,15 +96,18 @@
   - --seed 支持单个或列表；默认 CONFIG.exp_seeds。
   - 训练 Adapter，输出权重与可视化图；多 seed 情况下文件名会追加 _seed{seed}。
 - train_proxy.py（正式脚本）：
-  - 训练 ResNet-18 代理模型并记录训练动态，日志文件名会带 seed 后缀防止覆盖。
+  - 训练 ResNet-18 代理模型并记录训练动态，日志保存到 weights/proxy_logs/[seed]/ 目录。
+  - 代理训练日志体积较大，weights/proxy_logs 不会随仓库上传，需要本地生成。
 - learn_scoring_weights.py（正式脚本）：
   - 基于代理日志计算 EarlyLoss/Margin/Forgetting，再回归学习 SA/Div/DDS 权重。
-  - 多 seed 时会输出带 seed 后缀的权重文件。
+  - 权重 JSON 以 seed 作为 key（例如 "22"），元信息使用 "{seed}_meta" 保存。
+  - 若未显式指定有效的 .npz 日志文件，会根据 seed + dataset 在对应日志目录下选择第一个 .npz。
 - scripts/diagnose_div_correlation.py（正式脚本）：
   - 用于分析静态指标与动态目标的相关性，输出分布图；多 seed 时输出到 seed 子目录。
 - scripts/test_* / calculate_my_mask.py（测试脚本）：
   - 默认种子为 CONFIG.global_seed=42。
   - calculate_my_mask.py 负责计算数据选择 0/1 mask，并保存到 mask/ 路径供 train_after_selection.py 加载。
+  - 部分无用的测试脚本与历史测试结果已清理，不再随仓库保留。
 
 # 5. CIFAR-10 数据选择实验配置（写入实验汇报用）
 - 数据集：
@@ -142,3 +145,4 @@
 - mask 保存结构：
   - mask/[方法名]/[数据集名]/[模型名]/[随机种子]/mask_[裁剪比例].npz
   - 同目录下保存 meta_info.json，记录权重组、CLIP 规格、adapter 路径、裁剪比例与统计信息等。
+  - my_naive 默认使用 CONFIG.global_seed 作为 mask 路径中的随机种子。

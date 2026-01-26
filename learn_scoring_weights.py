@@ -162,19 +162,45 @@ def normalize_weights(weights: np.ndarray) -> np.ndarray:
     return (weights / total).astype(np.float64)
 
 
-def build_output_path(base_path: str, seed: int, multi_seed: bool) -> Path:
-    output_path = Path(base_path)
-    if not multi_seed:
-        return output_path
-    return output_path.with_name(f"{output_path.stem}_seed{seed}{output_path.suffix}")
+def build_output_path(base_path: str) -> Path:
+    return Path(base_path)
+
+
+def resolve_proxy_log_path(proxy_log_arg: str, dataset: str, seed: int) -> Path:
+    candidate = Path(proxy_log_arg)
+    if candidate.suffix == ".npz" and candidate.exists():
+        return candidate
+
+    if candidate.is_dir():
+        base_dir = candidate
+    else:
+        base_dir = candidate.parent
+
+    if not base_dir.exists():
+        base_dir = Path("weights") / "proxy_logs" / str(seed)
+
+    if not base_dir.exists() or not base_dir.is_dir():
+        raise FileNotFoundError(f"未找到代理训练日志目录: {base_dir}")
+
+    matches = sorted(base_dir.glob(f"{dataset}_resnet18_*.npz"))
+    if not matches:
+        matches = sorted(base_dir.glob("*.npz"))
+    if not matches:
+        seed_dir = base_dir / str(seed)
+        if seed_dir.exists() and seed_dir.is_dir():
+            matches = sorted(seed_dir.glob(f"{dataset}_resnet18_*.npz"))
+            if not matches:
+                matches = sorted(seed_dir.glob("*.npz"))
+            if matches:
+                return matches[0]
+        raise FileNotFoundError(f"未找到代理训练日志文件: {base_dir}")
+    return matches[0]
 
 
 def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     set_seed(seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
-    proxy_log = Path(args.proxy_log)
-    if not proxy_log.exists():
-        raise FileNotFoundError(f"未找到代理训练日志: {proxy_log}")
+    proxy_log = resolve_proxy_log_path(args.proxy_log, args.dataset, seed)
 
     early_result = EarlyLossScore(proxy_log, early_epochs=args.early_epochs).compute()
     margin_result = MarginScore(proxy_log, delta=args.margin_delta).compute()
@@ -258,9 +284,9 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     )
     normalized = normalize_weights(weights)
 
-    output_path = build_output_path(args.output, seed, multi_seed)
+    output_path = build_output_path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    data: dict[str, dict[str, dict[str, float]]] = {}
+    data: dict[str, dict[str, dict[str, object]]] = {}
     if output_path.exists():
         with open(output_path, "r", encoding="utf-8") as f:
             loaded = json.load(f)
@@ -268,12 +294,13 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 data = loaded
 
     dataset_entry = data.get(args.dataset, {})
-    dataset_entry["learned"] = {
+    seed_key = str(seed)
+    dataset_entry[seed_key] = {
         "sa": float(normalized[0]),
         "div": float(normalized[1]),
         "dds": float(normalized[2]),
     }
-    dataset_entry["learned_meta"] = {
+    dataset_entry[f"{seed_key}_meta"] = {
         "raw_sa": float(weights[0]),
         "raw_div": float(weights[1]),
         "raw_dds": float(weights[2]),
@@ -287,7 +314,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
     print("Learned weights saved to", output_path)
-    print("Normalized weights:", dataset_entry["learned"])
+    print("Normalized weights:", dataset_entry[seed_key])
 
 
 if __name__ == "__main__":

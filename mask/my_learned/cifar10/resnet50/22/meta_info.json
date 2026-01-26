@@ -1,35 +1,33 @@
 {
   "dataset": "cifar10",
   "model_name": "resnet50",
-  "method": "my",
-  "weight_group": "naive",
+  "method": "my_learned",
+  "weight_group": "22",
   "clip_model": "ViT-B/32",
   "adapter_path": "adapter_weights\\cifar10\\adapter_cifar10_ViT-B-32.pt",
-  "cr": 60,
+  "cr": 30,
   "num_samples": 50000,
-  "selected_count": 30000,
+  "selected_count": 15000,
   "selected_by_class": {
-    "0": 3000,
-    "1": 3000,
-    "2": 3000,
-    "3": 3000,
-    "4": 3000,
-    "5": 3000,
-    "6": 3000,
-    "7": 3000,
-    "8": 3000,
-    "9": 3000
+    "0": 1500,
+    "1": 1500,
+    "2": 1500,
+    "3": 1500,
+    "4": 1500,
+    "5": 1500,
+    "6": 1500,
+    "7": 1500,
+    "8": 1500,
+    "9": 1500
   },
   "selection_strategy": "topk_per_class",
   "seeds": [
-    22,
-    42,
-    96
+    22
   ],
   "timing": {
-    "dds_seconds": 35.22728620000089,
-    "div_seconds": 34.45592949999991,
-    "sa_seconds": 34.30432479999945,
-    "total_seconds": 110.59378889999971
+    "dds_seconds": 36.156818200004636,
+    "div_seconds": 34.66255809999711,
+    "sa_seconds": 34.17820429999847,
+    "total_seconds": 112.3646477000002
   }
 }

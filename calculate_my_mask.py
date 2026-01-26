@@ -253,7 +253,11 @@ def main() -> None:
     else:
         method_name = "my_learned"
     seeds = parse_seed_list(args.seeds)
-    for seed in seeds:
+    if method_name == "my_naive":
+        save_seeds = [CONFIG.global_seed]
+    else:
+        save_seeds = seeds
+    for seed in save_seeds:
         set_seed(seed)
         mask_dir = (
             PROJECT_ROOT
@@ -279,7 +283,7 @@ def main() -> None:
             "selected_count": int(mask.sum()),
             "selected_by_class": selected_by_class,
             "selection_strategy": "topk_per_class",
-            "seeds": seeds,
+            "seeds": save_seeds,
             "timing": {
                 "dds_seconds": dds_time,
                 "div_seconds": div_time,

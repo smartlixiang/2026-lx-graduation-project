@@ -117,13 +117,14 @@ def load_selection_mask(
     the sample is selected.
     """
     project_root = Path(__file__).resolve().parent
+    mask_seed = CONFIG.global_seed if mode == "my_naive" else seed
     mask_path = (
         project_root
         / "mask"
         / mode
         / dataset_name
         / model_name
-        / str(seed)
+        / str(mask_seed)
         / f"mask_{cut_ratio}.npz"
     )
     if not mask_path.exists():

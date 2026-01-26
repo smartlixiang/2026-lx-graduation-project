@@ -104,12 +104,11 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
     num_samples = len(indexed_train_dataset)
     num_classes = data_loader.num_classes
-    log_dir = Path("weights") / "proxy_logs"
+    log_dir = Path("weights") / "proxy_logs" / str(seed)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
-    seed_suffix = f"_seed{seed}" if multi_seed else ""
-    log_stem = f"{args.dataset}_resnet18_{timestamp}{seed_suffix}"
+    log_stem = f"{args.dataset}_resnet18_{timestamp}"
 
     # Use memmap for low-RAM logging during training, then pack everything into a single .npz
     loss_path = log_dir / f"{log_stem}_loss.dat"

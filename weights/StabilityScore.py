@@ -1,4 +1,8 @@
-"""StabilityScore implementation based on proxy training dynamics."""
+"""StabilityScore implementation based on proxy training dynamics.
+
+Score formula (learnable samples only):
+score = a * S + b * (L * S) + c * (L * (1 - S))
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,8 +24,9 @@ class StabilityResult:
     labels: Optional[np.ndarray]
     indices: np.ndarray
     window: int
-    beta: float
-    penalty: float
+    stable_weight: float
+    late_bonus: float
+    unstable_weight: float
 
 
 class StabilityScore:
@@ -30,14 +35,16 @@ class StabilityScore:
     def __init__(
         self,
         npz_path: str | Path,
-        window: int = 3,
-        beta: float = 0.30,
-        penalty: float = 0.20,
+        window: int = 10,
+        stable_weight: float = 0.85,
+        late_bonus: float = 0.15,
+        unstable_weight: float = 0.20,
     ) -> None:
         self.npz_path = Path(npz_path)
         self.window = int(window)
-        self.beta = float(beta)
-        self.penalty = float(penalty)
+        self.stable_weight = float(stable_weight)
+        self.late_bonus = float(late_bonus)
+        self.unstable_weight = float(unstable_weight)
 
     @staticmethod
     def _validate_correct(correct: np.ndarray) -> None:
@@ -76,6 +83,10 @@ class StabilityScore:
     def compute(self) -> StabilityResult:
         if self.window <= 0:
             raise ValueError("window must be a positive integer.")
+        if self.stable_weight < 0 or self.late_bonus < 0 or self.unstable_weight < 0:
+            raise ValueError("stability weights must be non-negative.")
+        if not np.isclose(self.stable_weight + self.late_bonus, 1.0):
+            raise ValueError("stable_weight + late_bonus must equal 1.")
 
         data = np.load(self.npz_path)
         correct, labels = self._build_correct(data)
@@ -130,9 +141,9 @@ class StabilityScore:
 
             learnable_float = learnable_mask.astype(np.float32)
             raw_scores = (
-                post_stability
-                + self.beta * (learn_time_normalized * post_stability)
-                - self.penalty * (1.0 - post_stability)
+                self.stable_weight * post_stability
+                + self.late_bonus * (learn_time_normalized * post_stability)
+                + self.unstable_weight * (learn_time_normalized * (1.0 - post_stability))
             )
             raw_scores = np.clip(raw_scores, 0.0, 1.0)
             scores = (learnable_float * raw_scores).astype(np.float32)
@@ -157,8 +168,9 @@ class StabilityScore:
             labels=labels,
             indices=indices,
             window=self.window,
-            beta=self.beta,
-            penalty=self.penalty,
+            stable_weight=self.stable_weight,
+            late_bonus=self.late_bonus,
+            unstable_weight=self.unstable_weight,
         )
 
 

@@ -3,7 +3,7 @@ import numpy as np
 
 from weights import StabilityScore
 
-NPZ_PATH = r"weights/proxy_logs/22/cifar10_resnet18_2026_01_20_11_42.npz"
+NPZ_PATH = r"weights/proxy_logs/22/cifar10_resnet18_2026_01_27_16_00.npz"
 TOPK = 10000
 
 

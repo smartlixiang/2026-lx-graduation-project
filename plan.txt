@@ -583,49 +583,144 @@ MarginScore_i = ( \bar s_i + 1 ) / 2
 
 经常正确且 margin 接近阈值 → \bar s_i 接近 1 → MarginScore 高（典型边界样本）。
 
-5.5 ForgettingScore：基于遗忘与正确率的稳定性指标
+5.5 StabilityScore：LearnTime + PostLearnStability 的稳定性难例指标
 
-目的：区分以下几类样本：
+目的：
 
-难学但有价值：正确率低但不乱忘；
+本指标用于在代理模型训练动态中显式识别并奖励“前期学不好，但一旦学会后就保持稳定、不容易退化”的样本（late-learn & stable）。同时，通过“稳定学会门控”抑制在整个训练过程中始终无法稳定学会的样本，避免不可学/异常样本被误判为高价值样本。
 
-简单典型：正确率高且不乱忘；
+输入与符号：
 
-噪声样本：正确率低且频繁遗忘；
+代理模型在完整训练集上训练 E 个 epoch，记录每个样本 i 在每个 epoch 的正确性轨迹：
 
-不稳定坏样本：正确率高但频繁遗忘。
+c_t(i) ∈ {0,1}, t = 1,2,…,E
 
-做法：
+其中 c_t(i)=1 表示第 t 个 epoch 预测正确，否则为 0。
 
-(1) 整体正确率：
+固定超参数：
 
-r_i = (1 / E) Σ_{t=1}^E c_t(i) ∈ [0,1]
+连续正确窗口长度：m = 3
+late-learn 强度：α = 2
+post-stability 强度：γ = 3
 
-(2) 后半程遗忘次数：
+(1) LearnTime：首次稳定学会时刻
 
-在 t > E/2 的 epoch 范围内统计从 1→0 的转变次数：
+定义样本 i 的“首次稳定学会时刻” t_learn(i) 为第一次出现连续 m 个 epoch 都预测正确的位置：
 
-F_i = #{ t ∈ (E/2, E−1] : c_t(i)=1 且 c_{t+1}(i)=0 }
+t_learn(i) = min { t | Π_{k=0..m-1} c_{t+k}(i) = 1 }
 
-(3) 将 F_i 做 min-max 归一化，得到 \tilde F_i ∈ [0,1]。
+若不存在满足条件的 t，则认为该样本在整个训练过程中从未稳定学会，记为：
 
-(4) 基于 (r_i, \tilde F_i) 定义 ForgettingScore_i = g(r_i, \tilde F_i) ∈ [0,1]，例如：
+t_learn(i) = +∞
 
-r_i 低、\tilde F_i 低：难学但不乱忘 → 高分（如 0.9）；
+将 LearnTime 归一化为“学会得有多晚”指标 L_i ∈ [0,1]：
 
-r_i 高、\tilde F_i 低：简单典型样本 → 中等偏上（如 0.7）；
+若 t_learn(i) < +∞：
+L_i = (t_learn(i) - 1) / (E - m)
 
-r_i 低、\tilde F_i 高：难且乱忘 → 噪声疑似 → 低分（如 0.1）；
+若 t_learn(i) = +∞：
+L_i = 1
 
-r_i 高、\tilde F_i 高：正确率高但不断遗忘 → 不稳定 → 低分（如 0.2）。
+解释：
 
-中间区域可以用线性插值，使 g(·,·) 连续。
+L_i 越大表示学会得越晚，更接近“难例/边界样本”；从未稳定学会则 L_i=1（最晚）。
+
+(2) PostLearnStability：学会后的稳定性
+
+当 t_learn(i) < +∞ 时，定义“学会后区间”为：
+
+T_post(i) = { t_learn(i), t_learn(i)+1, …, E }
+
+并定义学会后的稳定性 S_i ∈ [0,1] 为该区间上的平均正确率：
+
+S_i = (1 / |T_post(i)|) · Σ_{t ∈ T_post(i)} c_t(i)
+
+当 t_learn(i) = +∞ 时，直接令：
+
+S_i = 0
+
+解释：
+
+S_i 越大表示“学会后越稳定、越不容易掉回错误”；未学会样本被强制设为 0，以实现可学性门控。
+
+(3) StabilityScore：late-learn & stable 的动态效用得分
+
+定义可学性门控变量：
+
+I_i = 1{ t_learn(i) < +∞ }
+
+最终得分定义为：
+
+StabilityScore_i = I_i · (L_i)^α · (S_i)^γ
+
+其中 α=2，γ=3，保证：
+
+未稳定学会：I_i=0 ⇒ StabilityScore_i=0（强抑制，不参与奖励）
+
+学会早且稳定：L_i 小、S_i 大 ⇒ 得分中等
+
+学会晚且稳定（目标样本）：L_i 大、S_i 大 ⇒ 得分最高
+
+学会晚但不稳定：L_i 大、S_i 小 ⇒ 得分被稳定性项显著压低
+
+该得分天然落在 [0,1] 区间，无需额外 min-max。
+
+(4) 代码实现策略（高效、可复现、可缓存）
+
+输入来自代理训练日志（npz）：
+
+logits：z_t(i) ∈ R^C（或直接存储的 correct）
+
+labels：y_i
+
+indices：样本索引（用于对齐其他动态指标）
+
+实现步骤：
+
+A. 构造 correct 矩阵（E×N）：
+
+pred_t(i) = argmax_c z_t(i,c)
+correct[t,i] = 1{ pred_t(i) = y_i }
+
+若日志已提供 correct，则直接读取。
+
+B. 计算 t_learn(i)（稳定学会时刻）：
+
+对每个样本 i，在时间轴上做长度 m=3 的滑动窗口，判断窗口内 correct 是否全为 1。
+
+实现上用“窗口求和”等价判定：
+
+win_sum[t,i] = correct[t,i] + correct[t+1,i] + correct[t+2,i]
+
+learnable[t,i] = 1{ win_sum[t,i] = 3 }
+
+t_learn(i) 取 learnable[:,i] 为 1 的最小 t；若全为 0，则置为 +∞。
+
+C. 计算 S_i（学会后稳定性）：
+
+对每个样本 i：
+
+若 t_learn(i) < +∞：
+S_i = mean( correct[t_learn(i):E, i] )
+
+否则：
+S_i = 0
+
+D. 计算 L_i 与 StabilityScore_i：
+
+若 t_learn(i) < +∞：
+L_i = (t_learn(i)-1)/(E-3)，I_i=1
+
+否则：
+L_i = 1，I_i=0
+
+StabilityScore_i = I_i * (L_i^2) * (S_i^3)
 
 5.6 综合动态效用标签 u_i
 
 三项动态指标均在 [0,1] 后，取算术平均：
 
-u_i = ( EarlyLossScore_i + MarginScore_i + ForgettingScore_i ) / 3
+u_i = ( EarlyLossScore_i + MarginScore_i + StabilityScore_i ) / 3
 
 u_i 可视为代理模型对样本“综合训练价值”的连续软标签。
 

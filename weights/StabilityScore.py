@@ -20,8 +20,8 @@ class StabilityResult:
     labels: Optional[np.ndarray]
     indices: np.ndarray
     window: int
-    alpha: float
-    gamma: float
+    beta: float
+    penalty: float
 
 
 class StabilityScore:
@@ -30,14 +30,14 @@ class StabilityScore:
     def __init__(
         self,
         npz_path: str | Path,
-        window: int = 5,
-        alpha: float = 2.0,
-        gamma: float = 3.0,
+        window: int = 3,
+        beta: float = 0.30,
+        penalty: float = 0.20,
     ) -> None:
         self.npz_path = Path(npz_path)
         self.window = int(window)
-        self.alpha = float(alpha)
-        self.gamma = float(gamma)
+        self.beta = float(beta)
+        self.penalty = float(penalty)
 
     @staticmethod
     def _validate_correct(correct: np.ndarray) -> None:
@@ -129,11 +129,13 @@ class StabilityScore:
                 )
 
             learnable_float = learnable_mask.astype(np.float32)
-            scores = (
-                learnable_float
-                * np.power(learn_time_normalized, self.alpha)
-                * np.power(post_stability, self.gamma)
-            ).astype(np.float32)
+            raw_scores = (
+                post_stability
+                + self.beta * (learn_time_normalized * post_stability)
+                - self.penalty * (1.0 - post_stability)
+            )
+            raw_scores = np.clip(raw_scores, 0.0, 1.0)
+            scores = (learnable_float * raw_scores).astype(np.float32)
 
         if not np.array_equal(indices, np.arange(len(indices))):
             order = np.argsort(indices)
@@ -155,8 +157,8 @@ class StabilityScore:
             labels=labels,
             indices=indices,
             window=self.window,
-            alpha=self.alpha,
-            gamma=self.gamma,
+            beta=self.beta,
+            penalty=self.penalty,
         )
 
 

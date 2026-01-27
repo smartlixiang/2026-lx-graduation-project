@@ -583,166 +583,159 @@ MarginScore_i = ( \bar s_i + 1 ) / 2
 
 经常正确且 margin 接近阈值 → \bar s_i 接近 1 → MarginScore 高（典型边界样本）。
 
-5.5 StabilityScore：LearnTime + PostLearnStability 的稳定性样本价值指标（动态效用标签的一部分）
+5.5 StabilityScore：LearnTime + PostLearnStability 的稳定性样本价值指标（动态效用标签的一部分，软门控版本）
 
 目的：
-
 本指标用于在代理模型训练动态中区分并打分四类样本，并满足以下设计目标：
-
-学会早且稳定（easy & stable）：数量最多，应获得“中高分”（作为可靠、典型的有效训练样本）
-
-学会晚但稳定（late-learn & stable）：数量较少，应获得“高分”（作为有价值的困难样本/边界样本）
-
-学得会但不稳定（learnable but unstable）：应“轻惩罚”，不至于被完全压到接近 0
-
-根本学不会（never learn）：应“重惩罚”，直接压到极低（接近 0）
-
-同时要求公式简单、可向量化实现、得分分布合理（简单数据集上应出现大量中高分的 easy&stable 样本）。
+(1) 学会早且稳定（easy & stable）：数量最多，应获得“中高分”（可靠、典型的有效训练样本）
+(2) 学会晚但稳定（late-learn & stable）：数量较少，应获得“高分”（有价值的困难样本/边界样本）
+(3) 学得会但不稳定（learnable but unstable）：应“轻惩罚”，但不给 0 分，保留一定价值（避免分数塌缩）
+(4) 根本学不好（never / hardly learn）：应“重惩罚”，分数应显著更低
+同时要求：公式简单、可向量化实现、分数分布连续平滑（避免大量样本被硬阈值一刀切压到 0），并保持一定区分度（组内不挤死、组间可有交集但整体可分）。
 
 训练动态序列与符号定义
-
 代理模型训练 E 个 epoch，记录每个样本 i 在每个 epoch 的正确性：
-
 c_t(i) ∈ {0,1}, t = 1,2,…,E
-
 其中 c_t(i)=1 表示第 t 个 epoch 预测正确，否则为 0。
 
-固定超参数：
+固定超参数（建议默认值，可按数据集/轮数微调）：
+窗口长度：m（例如 m=10）
+窗口学会阈值：p0（例如 p0=0.9，表示窗口内正确率≥90%视作“学会”）
+软门控温度：τ（例如 τ=0.04，控制“接近学会”的过渡宽度）
+（可选）形状拉伸：γ（例如 γ=1.0~1.2，用于轻微增强高分段区分度）
 
-连续正确窗口长度：m = 3
-Late-stable 额外奖励系数：b = 0.05
-稳定性主奖励系数：a = 0.95
-不稳定样本“轻惩罚保留项”系数：c = 0.20
+核心思路概述（对应 1/2/3 三个关键改动）：
 
-（注意：a+b=1，保证稳定样本最高分可达 1；c 用于给“学得会但不稳定”的样本保留一定分数，不让其全部塌缩到 0。）
+learnability 不再采用硬 0/1 门控（I_i∈{0,1}），而采用“软 learnability 置信度” I_i∈[0,1]；
+——避免因训练轮数不足或阈值偏严格导致大量样本被直接压到 0，从而产生分布空洞。
 
-LearnTime：首次稳定学会时刻（learnability 门控）
+t_learn(i) 不再要求“连续 m 次全对”，改为“窗口正确率≥p0 的首次时刻”；
+——在短训练（如 50 epoch）或较大窗口（如 m=10）时更合理、更符合“基本学会”的语义。
 
-定义样本 i 的“首次稳定学会时刻” t_learn(i)：
+StabilityScore 的最终组合不再用“稳定项抬底+交叉项”的结构，而用“上界线/下界线插值”；
+——使得分在 [0,1] 内连续可控：稳定样本随 L 有梯度；不稳定样本也不被挤成一小撮；组内更有层次。
 
-t_learn(i) = min { t | Π_{k=0..m-1} c_{t+k}(i) = 1 }
+A. 软 learnability 置信度 I_i（Smooth Gate）
+定义滑动窗口正确率：
+r_{t,i} = (1/m) · Σ_{k=0}^{m-1} c_{t+k}(i), t = 1,2,…,E-m+1
+定义样本 i 在训练全过程中“最好窗口表现”：
+M_i = max_t r_{t,i} ∈ [0,1]
 
-若不存在满足条件的 t，则认为该样本在整个训练过程中从未稳定学会，记为：
-
-t_learn(i) = +∞
-
-定义 learnability 门控：
-
-I_i = 1{ t_learn(i) < +∞ }
-
-归一化 LearnTime（越晚学会越大）：
-
-若 t_learn(i) < +∞：
-L_i = (t_learn(i) - 1) / (E - m)
-
-若 t_learn(i) = +∞：
-L_i = 1
+用 sigmoid 将 “是否接近学会” 软化为置信度：
+I_i = σ( (M_i - p0) / τ ) ∈ (0,1)
+其中 σ(x)=1/(1+exp(-x))。
 
 解释：
 
-L_i 越大表示“学会得越晚”，更接近困难样本
+若样本在某个窗口内能达到或超过阈值（M_i≫p0），则 I_i≈1；
 
-I_i 明确实现“学不会样本的重惩罚”：I_i=0 时最终得分直接为 0
+若样本经常“差一点点”（M_i≈p0），则 I_i 处于中间值（如 0.2~0.8），最终得分不会被硬砍为 0；
 
-PostLearnStability：学会后的稳定性
+若样本一直学不好（M_i≪p0），则 I_i≈0，最终得分会被显著压低（重惩罚仍然存在，但表现为“软压低”而非“一刀切”）。
 
-当 t_learn(i) < +∞ 时，定义学会后区间：
+B. LearnTime：首次达到“窗口学会阈值”的时刻（并为未达阈值样本定义 t*）
+定义“学会事件”：
+t_learn(i) = min { t | r_{t,i} ≥ p0 }
+若不存在满足条件的 t，则认为该样本在训练过程中从未达到学会阈值，但仍可定义其“最接近学会的时刻”：
+t*(i) = argmax_t r_{t,i}
 
-T_post(i) = { t_learn(i), t_learn(i)+1, …, E }
+为了统一后续计算，定义锚点时刻：
+t_anchor(i) = t_learn(i)（若存在），否则 t_anchor(i)=t*(i)
 
-定义学会后的稳定性（学会后平均正确率）：
-
-S_i = (1 / |T_post(i)|) · Σ_{t ∈ T_post(i)} c_t(i)
-
-当 t_learn(i) = +∞ 时：
-
-S_i = 0
+归一化 LearnTime（越晚越大）：
+L_i = (t_anchor(i) - 1) / (E - m) ∈ [0,1]
 
 解释：
 
-S_i 越大表示“学会后越稳定、越不容易退化”
+L_i 反映“达到（或最接近达到）学会阈值的时间位置”，与困难程度相关；
 
-未学会样本 S_i 强制为 0，使其不可能通过任何形式的稳定性获得分数
+与硬门控不同，这里即使从未达到阈值也不会强行令 L_i=1 并直接得 0 分，而是通过 I_i（很小）实现重惩罚，同时保留连续性。
 
-StabilityScore：非乘积塌缩的简单组合得分
+C. PostLearnStability：学会/最接近学会之后的稳定性 S_i
+定义锚点后的区间：
+T_post(i) = { t_anchor(i), t_anchor(i)+1, …, E }
 
-核心问题：
+定义稳定性（锚点后平均正确率）：
+S_i = (1 / |T_post(i)|) · Σ_{t ∈ T_post(i)} c_t(i) ∈ [0,1]
 
-若直接采用 L 与 S 的纯乘积（例如 L*S 或 L^α * S^γ），则任一项接近 0 会导致整体接近 0，使得“学会早且稳定”的大量样本无法在分布上形成中高分主峰，且简单数据集上容易出现整体分数偏低、峰值上不去的问题。
+解释：
 
-因此采用“以稳定性为主的加权和 + 对 late-stable 的增益项 + 对 learnable-unstable 的轻惩罚保留项”的线性组合：
+S_i 越大表示“在接近学会（或已学会）之后越稳定、越不容易退化”；
 
-StabilityScore_i = I_i · [ a·S_i + b·(L_i·S_i) + c·(L_i·(1 - S_i)) ]
+对真正学不好的样本，通常 M_i 低、I_i 低，且 S_i 也往往不高，因此最终得分仍会被显著压低；
 
-其中：
+相比将未学会样本强制 S_i=0 的做法，该定义更连续，利于形成更平滑的分布。
 
-a·S_i：稳定性主项，确保“学会早且稳定”的样本数量最多且得分集中在中高区域（S_i≈1 ⇒ 得分≈a）
+D. StabilityScore：上界线/下界线插值（可控、连续、有区分度）
+核心想法：
+用两条关于 LearnTime 的线性“基准分界线”描述稳定与不稳定的期望得分区间：
+稳定上界线（稳定样本的目标分段）：
+U(L) = u0 + u1 · L
+不稳定下界线（不稳定但可学样本的保留分段）：
+V(L) = v0 + v1 · L
+其中 u0,u1,v0,v1 ≥ 0，且通常取 U(L) > V(L)。
 
-b·(L_i·S_i)：late-stable 增益项，只在稳定（S_i高）时随 L_i 增长，奖励“学会晚但稳定”的困难样本
+用稳定性 S 在两条线之间插值：
+Raw_i = V(L_i) + ( U(L_i) - V(L_i) ) · S_i
+将 Raw_i 截断到 [0,1]：
+Raw_i = clip(Raw_i, 0, 1)
 
-c·(L_i·(1-S_i))：轻惩罚保留项，对“学得会但不稳定”的样本不给 0 分（避免塌缩），并使“更难（L_i大）的不稳定样本”比“更易（L_i小）的不稳定样本”稍高一些（轻惩罚而非一刀切）
+最终得分采用软门控：
+StabilityScore_i = I_i · Raw_i
+（可选）为了轻微增强高分段区分度，可做形状拉伸：
+StabilityScore_i = (StabilityScore_i)^γ （γ≈1.0~1.2）
 
-边界性质：
+推荐默认参数（经验可用起点，后续可按数据集校准）：
+m=10, p0=0.9, τ=0.04
+u0=0.65, u1=0.35 （稳定易样本≈0.65；稳定难样本最高≈1.0）
+v0=0.05, v1=0.20 （不稳定但可学样本≈0.05~0.25，作为“轻惩罚保留”区间）
+γ=1.0（若觉得高分段仍挤，可设 γ=1.1~1.2）
 
-never learn：I_i=0 ⇒ StabilityScore_i=0（重惩罚）
+边界性质（直观可解释、便于写论文）：
+(1) easy & stable：L_i 小、S_i≈1、I_i≈1
+Raw≈U(L_i)≈u0，形成中高分主峰（不依赖“硬抬底”，且主峰位置由 u0 可控）
+(2) late-learn & stable：L_i 大、S_i≈1、I_i≈1
+Raw≈U(L_i)≈u0+u1，获得更高分（奖励困难但稳定样本）
+(3) learnable but unstable：S_i 较低但 I_i 仍可能中等/偏高
+Raw 落在 V(L_i) 与 U(L_i) 之间，且 V(L_i) 提供“非零保留”，避免全部塌缩到 0（轻惩罚）
+(4) never / hardly learn：M_i≪p0 ⇒ I_i≈0
+即便 Raw 不为 0，最终分数也会被 I_i 显著压低（重惩罚），同时分布仍连续平滑（不再出现大量硬 0）
 
-easy & stable：L_i 小、S_i≈1 ⇒ 得分≈a（约 0.95，为中高分主峰）
-
-late-learn & stable：L_i 大、S_i≈1 ⇒ 得分≈a + b（最高约 1.0）
-
-learnable but unstable：S_i 低 ⇒ a·S_i 下降，但 c·L_i·(1-S_i) 提供保留，不至于全部压到接近 0（轻惩罚）
-
-输出范围：
-
-a,b,c 为非负且 a+b=1，S_i∈[0,1]，L_i∈[0,1]，因此得分天然落在 [0, 1+c]。实际实现中对输出做一次截断即可：
-
-StabilityScore_i = clip(StabilityScore_i, 0, 1)
-
-（这样保证最终动态效用标签稳定处于 [0,1]，便于与其他动态指标做平均/回归。）
-
-代码实现策略（高效、可复现、可缓存）
-
+E. 代码实现策略（高效、可复现、可缓存；完全向量化）
 输入（npz）：
-
-logits（E×N×C）或 correct（E×N）
-
-labels（N）
-
-indices（N，用于对齐其他动态指标）
+logits（E×N×C）或 correct（E×N），labels（N），indices（N）
 
 实现步骤：
-
-A. 由 logits 构造 correct（E×N）：
-
+A1. 若提供 logits，则构造 correct：
 pred[t,i] = argmax_c logits[t,i,c]
 correct[t,i] = 1{ pred[t,i] == labels[i] }
-
 若日志已提供 correct，直接读取。
 
-B. 计算 t_learn(i)（连续 m=3 次正确的首次位置）：
+B1. 计算窗口和/均值（滑动窗口向量化）：
+win_sum[t,i] = Σ_{k=0}^{m-1} correct[t+k,i]
+r[t,i] = win_sum[t,i] / m
 
-用滑动窗口求和替代乘积判定：
+B2. 计算 M_i = max_t r[t,i]，并得 I_i = sigmoid((M_i - p0)/τ)
 
-win_sum[t,i] = correct[t,i] + correct[t+1,i] + correct[t+2,i]
-learnable[t,i] = 1{ win_sum[t,i] = 3 }
+C1. 计算 reach[t,i] = 1{ r[t,i] ≥ p0 }，得到是否达到阈值：
+has_reach[i] = any_t reach[t,i]
 
-t_learn(i) 取 learnable[:,i] 为 1 的最小 t；若全为 0，则 t_learn(i)=+∞，并置 I_i=0。
+C2. 计算 t_anchor：
+若 has_reach[i]=1：t_anchor = first_t reach[t,i]=1
+否则：t_anchor = argmax_t r[t,i]
 
-C. 计算 L_i 与 S_i：
+C3. 计算 L_i = (t_anchor-1)/(E-m)
 
-learnable 样本：L_i = (t_learn(i)-1)/(E-3)
+D1. 计算 S_i：
+S_i = mean(correct[t_anchor:E, i])
 
-learnable 样本：S_i = mean(correct[t_learn(i):E, i])
+E1. 计算 U(L_i), V(L_i)，插值得到 Raw_i，clip 到 [0,1]
 
-non-learnable：L_i=1，S_i=0
+E2. 最终得分：
+StabilityScore_i = I_i · Raw_i
+（可选）StabilityScore_i = (StabilityScore_i)^γ
 
-D. 计算 StabilityScore_i：
-
-score = I * ( aS + b(LS) + c(L*(1-S)) )
-score = clip(score, 0, 1)
-
-E. 输出与对齐：
-
+E3. 输出与对齐：
 输出 StabilityScore 时保持 indices 顺序，用于与 EarlyLossScore、MarginScore 等动态指标按 indices 对齐后合成综合动态效用标签 u_i，并进入后续权重学习模块。
 
 5.6 综合动态效用标签 u_i

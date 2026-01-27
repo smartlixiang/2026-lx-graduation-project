@@ -99,7 +99,7 @@
   - 训练 ResNet-18 代理模型并记录训练动态，日志保存到 weights/proxy_logs/[seed]/ 目录。
   - 代理训练日志体积较大，weights/proxy_logs 不会随仓库上传，需要本地生成。
 - learn_scoring_weights.py（正式脚本）：
-  - 基于代理日志计算 EarlyLoss/Margin/Forgetting，再回归学习 SA/Div/DDS 权重。
+  - 基于代理日志计算 EarlyLoss/Margin/Stability，再回归学习 SA/Div/DDS 权重。
   - 权重 JSON 以 seed 作为 key（例如 "22"），元信息使用 "{seed}_meta" 保存。
   - 若未显式指定有效的 .npz 日志文件，会根据 seed + dataset 在对应日志目录下选择第一个 .npz。
 - scripts/diagnose_div_correlation.py（正式脚本）：

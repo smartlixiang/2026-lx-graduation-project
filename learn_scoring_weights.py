@@ -16,7 +16,7 @@ from model.adapter import AdapterMLP
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.global_config import CONFIG
 from utils.seed import parse_seed_list, set_seed
-from weights import EarlyLossScore, ForgettingScore, MarginScore
+from weights import EarlyLossScore, MarginScore, StabilityScore
 
 
 def parse_args() -> argparse.Namespace:
@@ -204,15 +204,15 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
     early_result = EarlyLossScore(proxy_log, early_epochs=args.early_epochs).compute()
     margin_result = MarginScore(proxy_log, delta=args.margin_delta).compute()
-    forgetting_result = ForgettingScore(proxy_log).compute()
+    stability_result = StabilityScore(proxy_log).compute()
 
     if not np.array_equal(early_result.indices, margin_result.indices) or not np.array_equal(
-        early_result.indices, forgetting_result.indices
+        early_result.indices, stability_result.indices
     ):
         raise ValueError("动态指标的 indices 不一致，无法对齐样本。")
 
     dynamic_scores = (
-        early_result.scores + margin_result.scores + forgetting_result.scores
+        early_result.scores + margin_result.scores + stability_result.scores
     ) / 3.0
 
     class_names = load_class_names(args.dataset, args.data_root)

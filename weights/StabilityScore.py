@@ -1,8 +1,4 @@
-"""StabilityScore implementation based on proxy training dynamics.
-
-Score formula (learnable samples only):
-score = a * S + b * (L * S) + c * (L * (1 - S))
-"""
+"""StabilityScore implementation based on proxy training dynamics."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,13 +16,18 @@ class StabilityResult:
     learn_time: np.ndarray
     learn_time_normalized: np.ndarray
     post_stability: np.ndarray
+    learnability: np.ndarray
     learnable_mask: np.ndarray
     labels: Optional[np.ndarray]
     indices: np.ndarray
     window: int
-    stable_weight: float
-    late_bonus: float
-    unstable_weight: float
+    threshold: float
+    temperature: float
+    u0: float
+    u1: float
+    v0: float
+    v1: float
+    gamma: float
 
 
 class StabilityScore:
@@ -36,15 +37,27 @@ class StabilityScore:
         self,
         npz_path: str | Path,
         window: int = 10,
-        stable_weight: float = 0.85,
-        late_bonus: float = 0.15,
-        unstable_weight: float = 0.20,
+        threshold: float = 0.9,
+        temperature: float = 0.04,
+        u0: float = 0.65,
+        u1: float = 0.35,
+        v0: float = 0.05,
+        v1: float = 0.20,
+        gamma: float = 1.0,
     ) -> None:
         self.npz_path = Path(npz_path)
         self.window = int(window)
-        self.stable_weight = float(stable_weight)
-        self.late_bonus = float(late_bonus)
-        self.unstable_weight = float(unstable_weight)
+        self.threshold = float(threshold)
+        self.temperature = float(temperature)
+        self.u0 = float(u0)
+        self.u1 = float(u1)
+        self.v0 = float(v0)
+        self.v1 = float(v1)
+        self.gamma = float(gamma)
+
+    @staticmethod
+    def _sigmoid(values: np.ndarray) -> np.ndarray:
+        return 1.0 / (1.0 + np.exp(-values))
 
     @staticmethod
     def _validate_correct(correct: np.ndarray) -> None:
@@ -83,10 +96,14 @@ class StabilityScore:
     def compute(self) -> StabilityResult:
         if self.window <= 0:
             raise ValueError("window must be a positive integer.")
-        if self.stable_weight < 0 or self.late_bonus < 0 or self.unstable_weight < 0:
-            raise ValueError("stability weights must be non-negative.")
-        if not np.isclose(self.stable_weight + self.late_bonus, 1.0):
-            raise ValueError("stable_weight + late_bonus must equal 1.")
+        if not 0.0 <= self.threshold <= 1.0:
+            raise ValueError("threshold must be in [0, 1].")
+        if self.temperature <= 0:
+            raise ValueError("temperature must be positive.")
+        if min(self.u0, self.u1, self.v0, self.v1) < 0:
+            raise ValueError("u0/u1/v0/v1 must be non-negative.")
+        if self.gamma <= 0:
+            raise ValueError("gamma must be positive.")
 
         data = np.load(self.npz_path)
         correct, labels = self._build_correct(data)
@@ -103,50 +120,46 @@ class StabilityScore:
         correct = correct.astype(bool)
         learnable_mask = np.zeros(num_samples, dtype=bool)
         learn_time = np.full(num_samples, -1, dtype=np.int32)
-        learn_time_normalized = np.ones(num_samples, dtype=np.float32)
+        learn_time_normalized = np.zeros(num_samples, dtype=np.float32)
         post_stability = np.zeros(num_samples, dtype=np.float32)
+        learnability = np.zeros(num_samples, dtype=np.float32)
         scores = np.zeros(num_samples, dtype=np.float32)
 
-        if num_epochs >= self.window:
-            correct_int = correct.astype(np.int32)
-            cumsum = np.cumsum(correct_int, axis=0)
-            pad = np.zeros((1, num_samples), dtype=cumsum.dtype)
-            window_sum = cumsum[self.window - 1:] - np.concatenate(
-                [pad, cumsum[: -self.window]], axis=0
-            )
-            learnable = window_sum == self.window
-            learnable_mask = learnable.any(axis=0)
+        effective_window = min(self.window, num_epochs)
+        correct_int = correct.astype(np.int32)
+        cumsum = np.cumsum(correct_int, axis=0)
+        pad = np.zeros((1, num_samples), dtype=cumsum.dtype)
+        window_sum = cumsum[effective_window - 1:] - np.concatenate(
+            [pad, cumsum[: -effective_window]], axis=0
+        )
+        r_values = window_sum.astype(np.float32) / float(effective_window)
+        learnability = self._sigmoid((r_values.max(axis=0) - self.threshold) / self.temperature)
 
-            first_idx = np.argmax(learnable, axis=0)
-            t_learn0 = np.where(learnable_mask, first_idx, -1)
-            learn_time = np.where(learnable_mask, t_learn0 + 1, -1).astype(np.int32)
+        reach = r_values >= self.threshold
+        learnable_mask = reach.any(axis=0)
+        t_reach0 = np.argmax(reach, axis=0)
+        t_star0 = np.argmax(r_values, axis=0)
+        t_anchor0 = np.where(learnable_mask, t_reach0, t_star0).astype(np.int32)
 
-            denom = max(1, num_epochs - self.window)
-            learn_time_normalized = np.where(
-                learnable_mask,
-                t_learn0.astype(np.float32) / float(denom),
-                1.0,
-            ).astype(np.float32)
+        learn_time = (t_anchor0 + 1).astype(np.int32)
+        denom = max(1, num_epochs - effective_window)
+        learn_time_normalized = (t_anchor0.astype(np.float32) / float(denom)).astype(np.float32)
 
-            correct_float = correct.astype(np.float32)
-            cumsum_tail = np.cumsum(correct_float[::-1], axis=0)[::-1]
-            lengths = np.arange(num_epochs, 0, -1, dtype=np.float32)
-            sample_indices = np.arange(num_samples)
-            valid_samples = sample_indices[learnable_mask]
-            if valid_samples.size > 0:
-                post_stability[valid_samples] = (
-                    cumsum_tail[t_learn0[valid_samples], valid_samples]
-                    / lengths[t_learn0[valid_samples]]
-                )
+        correct_float = correct.astype(np.float32)
+        cumsum_tail = np.cumsum(correct_float[::-1], axis=0)[::-1]
+        lengths = np.arange(num_epochs, 0, -1, dtype=np.float32)
+        sample_indices = np.arange(num_samples)
+        post_stability[sample_indices] = (
+            cumsum_tail[t_anchor0, sample_indices] / lengths[t_anchor0]
+        )
 
-            learnable_float = learnable_mask.astype(np.float32)
-            raw_scores = (
-                self.stable_weight * post_stability
-                + self.late_bonus * (learn_time_normalized * post_stability)
-                + self.unstable_weight * (learn_time_normalized * (1.0 - post_stability))
-            )
-            raw_scores = np.clip(raw_scores, 0.0, 1.0)
-            scores = (learnable_float * raw_scores).astype(np.float32)
+        upper = self.u0 + self.u1 * learn_time_normalized
+        lower = self.v0 + self.v1 * learn_time_normalized
+        raw_scores = lower + (upper - lower) * post_stability
+        raw_scores = np.clip(raw_scores, 0.0, 1.0)
+        scores = (learnability * raw_scores).astype(np.float32)
+        if not np.isclose(self.gamma, 1.0):
+            scores = np.power(scores, self.gamma, dtype=np.float32)
 
         if not np.array_equal(indices, np.arange(len(indices))):
             order = np.argsort(indices)
@@ -154,6 +167,7 @@ class StabilityScore:
             learn_time = learn_time[order]
             learn_time_normalized = learn_time_normalized[order]
             post_stability = post_stability[order]
+            learnability = learnability[order]
             learnable_mask = learnable_mask[order]
             indices = indices[order]
             if labels is not None:
@@ -164,13 +178,18 @@ class StabilityScore:
             learn_time=learn_time,
             learn_time_normalized=learn_time_normalized,
             post_stability=post_stability,
+            learnability=learnability,
             learnable_mask=learnable_mask,
             labels=labels,
             indices=indices,
             window=self.window,
-            stable_weight=self.stable_weight,
-            late_bonus=self.late_bonus,
-            unstable_weight=self.unstable_weight,
+            threshold=self.threshold,
+            temperature=self.temperature,
+            u0=self.u0,
+            u1=self.u1,
+            v0=self.v0,
+            v1=self.v1,
+            gamma=self.gamma,
         )
 
 

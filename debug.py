@@ -13,10 +13,22 @@ NPZ_PATH = r"weights/proxy_logs/22/cifar10_resnet18_2026_01_20_11_42.npz"
 
 # If you changed StabilityScore defaults in code, keep these as None.
 # Otherwise, set explicit overrides here to match the run you want to debug.
-WINDOW_OVERRIDE = None          # e.g. 10
-STABLE_WEIGHT_OVERRIDE = None   # e.g. 0.85
-LATE_BONUS_OVERRIDE = None      # e.g. 0.15
-UNSTABLE_WEIGHT_OVERRIDE = None  # e.g. 0.20
+BETA_OVERRIDE = None
+THETA_OVERRIDE = None
+LAMBDA_OVERRIDE = None
+T_LEARN_OVERRIDE = None
+B_MIN_OVERRIDE = None
+B_MAX_OVERRIDE = None
+GAMMA_S_OVERRIDE = None
+DELTA_MAX_OVERRIDE = None
+GAMMA_DELTA_OVERRIDE = None
+PEN_OVERRIDE = None
+GAMMA_PEN_OVERRIDE = None
+U_MAX_OVERRIDE = None
+GAMMA_U_OVERRIDE = None
+
+# Diagnostics window length for M_i visualization
+WINDOW_OVERRIDE = None  # e.g. 10
 
 TOPK = 50000  # for reporting top-k by score
 
@@ -231,14 +243,32 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
 def main() -> None:
     # ---- Compute StabilityScore using the main implementation
     ss_kwargs = {}
-    if WINDOW_OVERRIDE is not None:
-        ss_kwargs["window"] = int(WINDOW_OVERRIDE)
-    if STABLE_WEIGHT_OVERRIDE is not None:
-        ss_kwargs["stable_weight"] = float(STABLE_WEIGHT_OVERRIDE)
-    if LATE_BONUS_OVERRIDE is not None:
-        ss_kwargs["late_bonus"] = float(LATE_BONUS_OVERRIDE)
-    if UNSTABLE_WEIGHT_OVERRIDE is not None:
-        ss_kwargs["unstable_weight"] = float(UNSTABLE_WEIGHT_OVERRIDE)
+    if BETA_OVERRIDE is not None:
+        ss_kwargs["beta"] = float(BETA_OVERRIDE)
+    if THETA_OVERRIDE is not None:
+        ss_kwargs["theta"] = float(THETA_OVERRIDE)
+    if LAMBDA_OVERRIDE is not None:
+        ss_kwargs["lam"] = float(LAMBDA_OVERRIDE)
+    if T_LEARN_OVERRIDE is not None:
+        ss_kwargs["t_learn"] = float(T_LEARN_OVERRIDE)
+    if B_MIN_OVERRIDE is not None:
+        ss_kwargs["b_min"] = float(B_MIN_OVERRIDE)
+    if B_MAX_OVERRIDE is not None:
+        ss_kwargs["b_max"] = float(B_MAX_OVERRIDE)
+    if GAMMA_S_OVERRIDE is not None:
+        ss_kwargs["gamma_s"] = float(GAMMA_S_OVERRIDE)
+    if DELTA_MAX_OVERRIDE is not None:
+        ss_kwargs["delta_max"] = float(DELTA_MAX_OVERRIDE)
+    if GAMMA_DELTA_OVERRIDE is not None:
+        ss_kwargs["gamma_delta"] = float(GAMMA_DELTA_OVERRIDE)
+    if PEN_OVERRIDE is not None:
+        ss_kwargs["pen"] = float(PEN_OVERRIDE)
+    if GAMMA_PEN_OVERRIDE is not None:
+        ss_kwargs["gamma_pen"] = float(GAMMA_PEN_OVERRIDE)
+    if U_MAX_OVERRIDE is not None:
+        ss_kwargs["u_max"] = float(U_MAX_OVERRIDE)
+    if GAMMA_U_OVERRIDE is not None:
+        ss_kwargs["gamma_u"] = float(GAMMA_U_OVERRIDE)
 
     result = StabilityScore(NPZ_PATH, **ss_kwargs).compute()
 
@@ -251,9 +281,7 @@ def main() -> None:
     meta = _parse_npz_name(NPZ_PATH)
     correct = _load_correct(NPZ_PATH)
     E, N = correct.shape
-    window_used = int(getattr(result, "window", ss_kwargs.get("window", 0) or 0))
-    if window_used <= 0:
-        window_used = int(WINDOW_OVERRIDE or 3)
+    window_used = int(WINDOW_OVERRIDE or 3)
 
     tag = f"{meta['dataset']}_{meta['model']}_E{E}_w{window_used}_p{P0:.2f}_tau{TAU:.2f}"
     _ensure_dir(OUT_DIR)

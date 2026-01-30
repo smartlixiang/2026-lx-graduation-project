@@ -605,39 +605,182 @@ EarlyLearnabilityScore_i = σ(\hat r_i / τ) = 1 / (1 + exp(−\hat r_i / τ)),
 
 最终得到 EarlyLearnabilityScore_i ∈ [0,1]。该得分与 MarginScore、StabilityScore 一起构造样本效用标签 u_i
 
-5.4 MarginScore：基于 margin 的边界价值指标
+5.4 BoundaryInfoScore 设计方案
 
-目的：识别在训练过程中经常处于决策边界附近的“有效边界样本”。
+【定位与目标】
+BoundaryInfoScore 是基于代理模型训练动态信息的第三个动态指标，用于刻画样本在“可学会”前提下的边界信息量：样本是否长期处于决策边界附近、同时又不像噪声/冲突样本那样经常被模型强烈反对真标签。它旨在补充“早期难度/学习速度”和“学会后稳定性”两类信号，从“边界信息价值”角度进一步区分样本好坏。
 
-做法：
+好样本（从 BoundaryInfo 角度）应满足：
+1）可学会：代理模型能在训练过程中稳定地提高对真标签的信心；
+2）贴边界但仍正确：训练后期经常处于“小正间隔”，即决策边界附近的正确样本（具有判别边界信息）；
+3）非噪声/非冲突：训练后期不应频繁出现“强负间隔”（模型持续强烈反对真标签），否则更像错标/语义冲突样本。
 
-(1) 定义每轮 margin：
+最终得分需满足：
 
-m_t(i) = z_{t,y_i}(i) − max_{c≠y_i} z_{t,c}(i)
+分布平滑（避免离散/塌缩）
 
-(2) 选择一个 margin 阈值 δ>0，根据 margin 和是否预测正确定义单轮评分 s_t(i)：
+数值落在 [0,1]
 
-若 c_t(i) = 0（分错）：s_t(i) = −1；
+对不同训练日志的 logit 尺度变化具有鲁棒性（通过自适应尺度与可选 prob-gap 实现）
 
-若 c_t(i) = 1 且 m_t(i) ≤ δ：s_t(i) = +1（正确但靠近边界）；
+【输入与输出】
+输入（来自代理模型训练日志 npz）：
 
-若 c_t(i) = 1 且 m_t(i) > δ：s_t(i) = 0（正确且远离边界）。
+logits: 形状 (E, N, C)，E=epoch 数，N=样本数，C=类别数
 
-(3) 对所有 epoch 取平均：
+labels: 形状 (N,)
 
-\bar s_i = (1 / E) Σ_{t=1}^E s_t(i) ∈ [−1, 1]
+indices: 形状 (N,)（可选；用于与其他指标对齐）
 
-(4) 映射到 [0,1]：
+输出（BoundaryInfoResult）：
 
-MarginScore_i = ( \bar s_i + 1 ) / 2
+scores: 形状 (N,)，最终 BoundaryInfoScore ∈ [0,1]
 
-解释：
+boundary_closeness: 形状 (N,)，边界贴近度 B(i) ∈ [0,1]
 
-经常被错分 → \bar s_i 接近 −1 → MarginScore 低；
+noise_penalty: 形状 (N,)，噪声惩罚 N(i) ∈ [0,1]
 
-经常正确且 margin 很大 → \bar s_i 接近 0 → MarginScore 中等偏低（典型易例）；
+g_learn: 形状 (N,)，可学会门控 g_learn(i) ∈ [0,1]
 
-经常正确且 margin 接近阈值 → \bar s_i 接近 1 → MarginScore 高（典型边界样本）。
+labels, indices: 用于对齐和可视化
+
+【核心数学定义】
+
+（0）记号
+
+第 t 个 epoch、样本 i 的 logits 向量为 z_{t,i} ∈ R^C
+
+样本 i 的真标签为 y_i
+
+softmax 概率为 p_{t,i} = softmax(z_{t,i})
+
+（1）可学会门控 g_learn(i)
+先计算真类概率：
+p_true(t,i) = p_{t,i}[y_i]
+
+对 p_true 做 EMA 平滑（抑制短期抖动）：
+ema_{t,i} = β * ema_{t-1,i} + (1-β) * p_true(t,i)
+
+取全程最大值：
+a_max(i) = max_t ema_{t,i}
+
+用 sigmoid 做连续门控：
+g_learn(i) = sigmoid( (a_max(i) - θ) / t_learn )
+
+直觉：
+
+若样本可学会，a_max 趋近 1，则 g_learn ≈ 1
+
+若样本长期学不会/疑似错标，a_max 低，则 g_learn ≈ 0
+
+t_learn 控制门控平滑程度（越大越平滑，越小越接近硬阈值）
+
+（2）后期窗口（late window）
+只使用训练后期的动态，定义：
+T_late = {E - L, …, E-1}
+其中 L = late_epochs（若 E < L，则从 0 开始）
+
+（3）间隔信号 m(t,i)：两种可选定义
+默认使用 logit margin（B11）：
+m(t,i) = z_{t,i}[y_i] - max_{c≠y_i} z_{t,i}[c]
+
+可选使用 prob-gap（更鲁棒，尺度固定在 [-1,1]）：
+gap(t,i) = p_true(t,i) - p_2nd(t,i)
+其中 p_2nd(t,i) = max_{c≠y_i} p_{t,i}[c]
+当 use_prob_gap=True 时，用 gap(t,i) 取代 m(t,i) 进入后续计算。
+
+（4）边界贴近度 B(i)：只关注正侧距离边界
+pos(t,i) = max( m(t,i), 0 )
+
+核心思想：margin 越大（非常容易）越不贴边界；margin 小但为正（贴边界且正确）信息量更高。
+为避免 logit 尺度导致核函数下溢/饱和，采用自适应尺度 σ_eff：
+σ_eff = percentile( { pos(t,i) | t∈T_late, i∈[1..N], pos(t,i)>0 }, q )
+
+其中 q = sigma_q（如 60），用数据本身的后期正间隔分布确定尺度。
+
+边界贴近度定义为软核平均（使用更“软”的 exp(-x) 以避免过快衰减）：
+B(i) = mean_{t∈T_late} exp( - pos(t,i) / (σ_eff + ε) )
+
+直觉：
+
+pos 大（容易样本）⇒ exp(-pos/σ_eff) 很小 ⇒ B 低
+
+pos 小但 >0（贴边界正确样本）⇒ exp(-pos/σ_eff) 较大 ⇒ B 高
+
+（5）噪声惩罚 N(i)：负间隔越频繁/越强，惩罚越大
+N(i) = mean_{t∈T_late} sigmoid( (-m(t,i)) / τ_n )
+
+直觉：
+
+若后期经常 m(t,i) << 0（模型持续反对真标签）⇒ N 接近 1 ⇒ 强惩罚
+
+若后期 m(t,i) 多为正 ⇒ N 接近 0 ⇒ 几乎不惩罚
+
+（6）Raw 分数合成与鲁棒归一化
+Raw(i) = g_learn(i) * B(i) * (1 - N(i))
+
+为保证落在 [0,1] 且分布不被极端值支配，采用 robust 分位点 min-max：
+lo = percentile(Raw, 1)
+hi = percentile(Raw, 99)
+score(i) = clip( (Raw(i) - lo) / (hi - lo + ε), 0, 1 )
+
+【面向代码的实现细节（工程约束）】
+
+（1）数值稳定与精度
+
+softmax 计算需对 logits 做稳定化（减去每样本 max logit）
+
+exp(-x) 计算建议使用 float64，避免下溢导致 B 全变 0
+
+sigmoid 输入建议裁剪到有限范围（如 [-50,50]），避免溢出
+
+（2）indices 对齐
+
+若 npz 中提供 indices，则所有输出数组需按 indices 升序统一重排，保证与其他指标一一对应
+
+若缺失 indices，则默认 indices = arange(N)
+
+（3）复杂度
+
+主要开销在读取 logits 并计算 margin / softmax：
+O(E * N * C)
+
+其余计算（EMA、核平均、分位点）为 O(E*N) 或 O(N log N)
+
+（4）可选开关 use_prob_gap（鲁棒性优先）
+
+当不同代理模型、不同训练设置导致 logit 尺度变化很大时，建议开启 use_prob_gap=True
+
+prob-gap 的尺度固定在 [-1,1]，通常更不易出现分布塌缩或极端偏置
+
+【默认超参数（建议起点）与调参方向】
+
+默认值（建议与代码保持一致）：
+
+beta = 0.9：EMA 平滑系数
+
+theta = 0.7：可学会阈值中心
+
+t_learn = 0.2：门控温度（越大越平滑）
+
+late_epochs = 20：后期窗口长度
+
+sigma_q = 60：σ_eff 的分位数（边界贴近核的尺度关键旋钮）
+
+tau_n = 1.0：噪声惩罚温度
+
+eps = 1e-8：数值稳定
+
+use_prob_gap = False：默认使用 logit margin
+
+调参效果（“增大”的方向）：
+1）beta ↑：EMA 更平滑，g_learn 更保守，抑制短期偶然学会的样本（门控更严格）
+2）theta ↑：更严格的“可学会”判定，更多样本被压低（scores 整体下移）
+3）t_learn ↑：门控更连续，减少 0/1 硬切分造成的团块分布
+4）late_epochs ↑：纳入更长后期轨迹，信号更稳定但可能混入收敛前波动（与早期动态耦合增大）
+5）sigma_q ↑：σ_eff 变大，exp(-pos/σ_eff) 衰减更慢，易样本不再被压到接近 0，整体分布更“铺开”
+6）tau_n ↑：噪声惩罚变弱，负间隔样本不易被判为强冲突（scores 上移，容忍度更高）
+7）use_prob_gap=True：提升对 logit 尺度变化的鲁棒性，通常可显著降低分布塌缩风险
 
 5.5 StabilityScore（v5）——基于代理模型训练动态信息的样本稳定性评分
 

@@ -16,7 +16,7 @@ from model.adapter import AdapterMLP
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.global_config import CONFIG
 from utils.seed import parse_seed_list, set_seed
-from weights import EarlyLossScore, MarginScore, StabilityScore
+from weights import BoundaryInfoScore, EarlyLearnabilityScore, MarginScore, StabilityScore
 
 
 def parse_args() -> argparse.Namespace:
@@ -162,6 +162,18 @@ def normalize_weights(weights: np.ndarray) -> np.ndarray:
     return (weights / total).astype(np.float64)
 
 
+def normalize_scores_with_quantiles(
+    scores: np.ndarray, lower_q: float = 0.001, upper_q: float = 0.999
+) -> np.ndarray:
+    lower = float(np.quantile(scores, lower_q))
+    upper = float(np.quantile(scores, upper_q))
+    if upper <= lower:
+        return np.zeros_like(scores, dtype=np.float64)
+    clipped = np.clip(scores, lower, upper)
+    normalized = (clipped - lower) / (upper - lower)
+    return normalized.astype(np.float64)
+
+
 def build_output_path(base_path: str) -> Path:
     return Path(base_path)
 
@@ -202,18 +214,24 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     device = torch.device(args.device) if args.device else CONFIG.global_device
     proxy_log = resolve_proxy_log_path(args.proxy_log, args.dataset, seed)
 
-    early_result = EarlyLossScore(proxy_log, early_epochs=args.early_epochs).compute()
+    early_result = EarlyLearnabilityScore(
+        proxy_log, early_epochs=args.early_epochs
+    ).compute()
     margin_result = MarginScore(proxy_log, delta=args.margin_delta).compute()
     stability_result = StabilityScore(proxy_log).compute()
+    boundary_result = BoundaryInfoScore(proxy_log).compute()
 
-    if not np.array_equal(early_result.indices, margin_result.indices) or not np.array_equal(
-        early_result.indices, stability_result.indices
+    if (
+        not np.array_equal(early_result.indices, margin_result.indices)
+        or not np.array_equal(early_result.indices, stability_result.indices)
+        or not np.array_equal(early_result.indices, boundary_result.indices)
     ):
         raise ValueError("动态指标的 indices 不一致，无法对齐样本。")
 
     dynamic_scores = (
-        early_result.scores + margin_result.scores + stability_result.scores
+        boundary_result.scores + stability_result.scores + early_result.scores
     ) / 3.0
+    dynamic_scores = normalize_scores_with_quantiles(dynamic_scores)
 
     class_names = load_class_names(args.dataset, args.data_root)
     dds_metric = DifficultyDirection(

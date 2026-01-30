@@ -1,8 +1,8 @@
 """Generate utility label distributions from proxy training logs.
 
 This script computes two variants of utility labels:
-1) ForgettingScore + MarginScore + EarlyLossScore
-2) StabilityScore + MarginScore + EarlyLossScore
+1) ForgettingScore + MarginScore + EarlyLearnabilityScore
+2) StabilityScore + MarginScore + EarlyLearnabilityScore
 Then plots histogram distributions and saves images.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ import numpy as np
 
 from weights import (
     BoundaryInfoScore,
-    EarlyLossScore,
+    EarlyLearnabilityScore,
     ForgettingScore,
     MarginScore,
     StabilityScore,
@@ -119,6 +119,18 @@ def _plot_hist(values: np.ndarray, title: str, xlabel: str, output_path: Path, b
     plt.savefig(output_path, dpi=200)
     print(f"Saved: {output_path}")
     plt.close()
+
+
+def _normalize_with_quantiles(
+    values: np.ndarray, lower_q: float = 0.001, upper_q: float = 0.999
+) -> np.ndarray:
+    lower = float(np.quantile(values, lower_q))
+    upper = float(np.quantile(values, upper_q))
+    if upper <= lower:
+        return np.zeros_like(values, dtype=np.float64)
+    clipped = np.clip(values, lower, upper)
+    normalized = (clipped - lower) / (upper - lower)
+    return normalized.astype(np.float64)
 
 
 def _parse_topk_fracs(text: str) -> list[float]:
@@ -331,7 +343,9 @@ def main() -> None:
         tau_m=args.margin_tau,
         start_ratio=args.margin_start_ratio,
     ).compute()
-    early_result = EarlyLossScore(proxy_log, early_epochs=args.early_epochs).compute()
+    early_result = EarlyLearnabilityScore(
+        proxy_log, early_epochs=args.early_epochs
+    ).compute()
     stability_result = StabilityScore(proxy_log).compute()
     boundary_result = None
     if has_logits:
@@ -361,26 +375,29 @@ def main() -> None:
     utility_forgetting = (
         forgetting_result.scores + margin_result.scores + early_result.scores
     ) / 3.0
+    utility_forgetting = _normalize_with_quantiles(utility_forgetting)
     utility_stability = (
         stability_result.scores + margin_result.scores + early_result.scores
     ) / 3.0
+    utility_stability = _normalize_with_quantiles(utility_stability)
     utility_boundary = None
     if boundary_result is not None:
         utility_boundary = (
             boundary_result.scores + early_result.scores + stability_result.scores
         ) / 3.0
+        utility_boundary = _normalize_with_quantiles(utility_boundary)
 
     output_dir = Path(args.output_dir)
     _plot_hist(
         utility_forgetting,
-        "Utility label distribution (Forgetting + Margin + EarlyLoss)",
+        "Utility label distribution (Forgetting + Margin + EarlyLearnability)",
         "Utility label score",
         output_dir / "utility_hist_forgetting.png",
         args.bins,
     )
     _plot_hist(
         utility_stability,
-        "Utility label distribution (Stability + Margin + EarlyLoss)",
+        "Utility label distribution (Stability + Margin + EarlyLearnability)",
         "Utility label score",
         output_dir / "utility_hist_stability.png",
         args.bins,
@@ -388,16 +405,47 @@ def main() -> None:
     if utility_boundary is not None:
         _plot_hist(
             utility_boundary,
-            "BoundaryInfoScore + EarlyLossScore + StabilityScore (mean)",
-            "Utility label score",
+            "BoundaryInfoScore + EarlyLearnabilityScore + StabilityScore (mean)",
+            "Utility label score (normalized)",
             output_dir / "utility_hist_boundary_early_stability.png",
+            args.bins,
+        )
+    if boundary_result is not None:
+        utility_boundary_stability = _normalize_with_quantiles(
+            (boundary_result.scores + stability_result.scores) / 2.0
+        )
+        utility_boundary_early = _normalize_with_quantiles(
+            (boundary_result.scores + early_result.scores) / 2.0
+        )
+        utility_stability_early = _normalize_with_quantiles(
+            (stability_result.scores + early_result.scores) / 2.0
+        )
+        _plot_hist(
+            utility_boundary_stability,
+            "BoundaryInfoScore + StabilityScore (mean)",
+            "Utility label score (normalized)",
+            output_dir / "utility_hist_boundary_stability.png",
+            args.bins,
+        )
+        _plot_hist(
+            utility_boundary_early,
+            "BoundaryInfoScore + EarlyLearnabilityScore (mean)",
+            "Utility label score (normalized)",
+            output_dir / "utility_hist_boundary_early.png",
+            args.bins,
+        )
+        _plot_hist(
+            utility_stability_early,
+            "StabilityScore + EarlyLearnabilityScore (mean)",
+            "Utility label score (normalized)",
+            output_dir / "utility_hist_stability_early.png",
             args.bins,
         )
     _plot_hist(
         early_result.scores,
-        "EarlyLossScore distribution",
-        "EarlyLossScore",
-        output_dir / "early_loss_hist.png",
+        "EarlyLearnabilityScore distribution",
+        "EarlyLearnabilityScore",
+        output_dir / "early_learnability_hist.png",
         args.bins,
     )
     _plot_hist(
@@ -430,12 +478,12 @@ def main() -> None:
             args.bins,
         )
 
-    # 计算 EarlyLossScore 与 StabilityScore / ForgettingScore 的 Pearson 相关系数并打印
+    # 计算 EarlyLearnabilityScore 与 StabilityScore / ForgettingScore 的 Pearson 相关系数并打印
     corr_early_stability = np.corrcoef(early_result.scores, stability_result.scores)[0, 1]
     corr_early_forgetting = np.corrcoef(early_result.scores, forgetting_result.scores)[0, 1]
 
-    print(f"Correlation EarlyLoss vs Stability: {corr_early_stability:.6f}")
-    print(f"Correlation EarlyLoss vs Forgetting: {corr_early_forgetting:.6f}")
+    print(f"Correlation EarlyLearnability vs Stability: {corr_early_stability:.6f}")
+    print(f"Correlation EarlyLearnability vs Forgetting: {corr_early_forgetting:.6f}")
     if boundary_result is not None:
         corr_boundary_early = np.corrcoef(boundary_result.scores, early_result.scores)[
             0, 1
@@ -443,13 +491,13 @@ def main() -> None:
         corr_boundary_stability = np.corrcoef(
             boundary_result.scores, stability_result.scores
         )[0, 1]
-        print(f"Correlation BoundaryInfo vs EarlyLoss: {corr_boundary_early:.6f}")
+        print(f"Correlation BoundaryInfo vs EarlyLearnability: {corr_boundary_early:.6f}")
         print(f"Correlation BoundaryInfo vs Stability: {corr_boundary_stability:.6f}")
 
     saved_paths = [
         output_dir / "utility_hist_forgetting.png",
         output_dir / "utility_hist_stability.png",
-        output_dir / "early_loss_hist.png",
+        output_dir / "early_learnability_hist.png",
         output_dir / "margin_hist.png",
         output_dir / "forgetting_hist.png",
         output_dir / "stability_hist.png",
@@ -458,6 +506,13 @@ def main() -> None:
         saved_paths.append(output_dir / "utility_hist_boundary_early_stability.png")
     if boundary_result is not None:
         saved_paths.append(output_dir / "boundary_info_hist.png")
+        saved_paths.extend(
+            [
+                output_dir / "utility_hist_boundary_stability.png",
+                output_dir / "utility_hist_boundary_early.png",
+                output_dir / "utility_hist_stability_early.png",
+            ]
+        )
 
     print("Saved histogram images to:", *saved_paths)
 

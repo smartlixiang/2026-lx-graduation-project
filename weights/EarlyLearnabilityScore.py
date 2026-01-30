@@ -1,4 +1,4 @@
-"""EarlyLossScore implementation based on proxy training dynamics."""
+"""EarlyLearnabilityScore implementation based on proxy training dynamics."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,8 +9,8 @@ import numpy as np
 
 
 @dataclass
-class EarlyLossResult:
-    """Container for EarlyLossScore outputs."""
+class EarlyLearnabilityResult:
+    """Container for EarlyLearnabilityScore outputs."""
 
     scores: np.ndarray
     early_loss: np.ndarray
@@ -23,8 +23,8 @@ class EarlyLossResult:
     early_epochs: int
 
 
-class EarlyLossScore:
-    """Compute EarlyLossScore from proxy training logs (.npz)."""
+class EarlyLearnabilityScore:
+    """Compute EarlyLearnabilityScore from proxy training logs (.npz)."""
 
     def __init__(
         self,
@@ -63,7 +63,7 @@ class EarlyLossScore:
         result[negative] = exp_vals / (1.0 + exp_vals)
         return result
 
-    def compute(self) -> EarlyLossResult:
+    def compute(self) -> EarlyLearnabilityResult:
         data = np.load(self.npz_path)
         losses = data["loss"]
         labels = data["labels"] if "labels" in data else None
@@ -103,7 +103,7 @@ class EarlyLossScore:
             if labels is not None:
                 labels = labels[order]
 
-        return EarlyLossResult(
+        return EarlyLearnabilityResult(
             scores=scores,
             early_loss=raw_score,
             level=level,
@@ -116,4 +116,4 @@ class EarlyLossScore:
         )
 
 
-__all__ = ["EarlyLossResult", "EarlyLossScore"]
+__all__ = ["EarlyLearnabilityResult", "EarlyLearnabilityScore"]

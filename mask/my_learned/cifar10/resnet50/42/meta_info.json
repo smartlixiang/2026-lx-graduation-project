@@ -5,29 +5,29 @@
   "weight_group": "42",
   "clip_model": "ViT-B/32",
   "adapter_path": "adapter_weights\\cifar10\\adapter_cifar10_ViT-B-32.pt",
-  "cr": 30,
+  "cr": 70,
   "num_samples": 50000,
-  "selected_count": 15000,
+  "selected_count": 35000,
   "selected_by_class": {
-    "0": 1500,
-    "1": 1500,
-    "2": 1500,
-    "3": 1500,
-    "4": 1500,
-    "5": 1500,
-    "6": 1500,
-    "7": 1500,
-    "8": 1500,
-    "9": 1500
+    "0": 3500,
+    "1": 3500,
+    "2": 3500,
+    "3": 3500,
+    "4": 3500,
+    "5": 3500,
+    "6": 3500,
+    "7": 3500,
+    "8": 3500,
+    "9": 3500
   },
   "selection_strategy": "topk_per_class",
   "seeds": [
     42
   ],
   "timing": {
-    "dds_seconds": 43.02253689999634,
-    "div_seconds": 41.9637636999978,
-    "sa_seconds": 42.239809600003355,
-    "total_seconds": 134.57297950000066
+    "dds_seconds": 34.99630010000146,
+    "div_seconds": 34.14704080000047,
+    "sa_seconds": 33.98153000000093,
+    "total_seconds": 109.70890429999963
   }
 }

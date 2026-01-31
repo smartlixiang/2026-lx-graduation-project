@@ -33,9 +33,9 @@ class BoundaryInfoScore:
         npz_path: str | Path,
         *,
         beta: float = 0.9,
-        theta: float = 0.5,
-        t_learn: float = 0.3,
-        late_epochs: int = 30,
+        theta: float = 0.6,
+        t_learn: float = 0.2,
+        late_epochs: int = 40,
         sigma: float = 1.0,
         sigma_q: float = 60.0,
         tau_n: float = 1.0,
@@ -182,9 +182,17 @@ class BoundaryInfoScore:
                 "BoundaryInfoScore raw percentiles (1/50/99): "
                 f"{raw_q[0]:.6f}, {raw_q[1]:.6f}, {raw_q[2]:.6f}"
             )
-        lo = float(np.percentile(raw, 1))
-        hi = float(np.percentile(raw, 99))
-        scores = np.clip((raw - lo) / (hi - lo + self.eps), 0.0, 1.0).astype(np.float32)
+        scores = np.zeros_like(raw, dtype=np.float32)
+        for cls in np.unique(labels):
+            mask = labels == cls
+            if not np.any(mask):
+                continue
+            class_raw = raw[mask]
+            lo = float(np.percentile(class_raw, 1))
+            hi = float(np.percentile(class_raw, 99))
+            scores[mask] = np.clip(
+                (class_raw - lo) / (hi - lo + self.eps), 0.0, 1.0
+            ).astype(np.float32)
 
         if not np.array_equal(indices, np.arange(len(indices))):
             order = np.argsort(indices)

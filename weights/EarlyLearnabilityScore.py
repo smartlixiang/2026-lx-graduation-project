@@ -71,14 +71,27 @@ class EarlyLearnabilityScore:
 
         if losses.ndim != 2:
             raise ValueError("loss array should have shape (epochs, num_samples).")
+        if labels is None:
+            raise ValueError("labels are required to compute class-wise EarlyLearnabilityScore.")
+        labels = labels.astype(np.int64)
+        if labels.ndim != 1:
+            raise ValueError("labels array should have shape (num_samples,).")
+        if labels.shape[0] != losses.shape[1]:
+            raise ValueError("labels length must match number of samples.")
         if indices.shape[0] != losses.shape[1]:
             raise ValueError("indices length must match number of samples.")
 
         early_epochs = self._resolve_early_epochs(losses.shape[0])
         early_losses = np.log1p(losses[:early_epochs])
-        medians = np.median(early_losses, axis=1, keepdims=True)
-        mads = np.median(np.abs(early_losses - medians), axis=1, keepdims=True)
-        z_scores = (early_losses - medians) / (mads + self.eps)
+        z_scores = np.zeros_like(early_losses, dtype=np.float32)
+        for cls in np.unique(labels):
+            mask = labels == cls
+            if not np.any(mask):
+                continue
+            class_losses = early_losses[:, mask]
+            medians = np.median(class_losses, axis=1, keepdims=True)
+            mads = np.median(np.abs(class_losses - medians), axis=1, keepdims=True)
+            z_scores[:, mask] = (class_losses - medians) / (mads + self.eps)
 
         level = z_scores.mean(axis=0)
         if early_epochs == 1:
@@ -87,9 +100,15 @@ class EarlyLearnabilityScore:
             progress = z_scores[0, :] - z_scores[-1, :]
 
         raw_score = self.alpha * level + self.beta * progress
-        raw_median = np.median(raw_score)
-        raw_mad = np.median(np.abs(raw_score - raw_median))
-        standardized = (raw_score - raw_median) / (raw_mad + self.eps)
+        standardized = np.zeros_like(raw_score, dtype=np.float32)
+        for cls in np.unique(labels):
+            mask = labels == cls
+            if not np.any(mask):
+                continue
+            class_raw = raw_score[mask]
+            raw_median = np.median(class_raw)
+            raw_mad = np.median(np.abs(class_raw - raw_median))
+            standardized[mask] = (class_raw - raw_median) / (raw_mad + self.eps)
         scores = self._stable_sigmoid(standardized / self.tau)
 
         if not np.array_equal(indices, np.arange(len(indices))):

@@ -32,7 +32,7 @@ class StabilityScore:
         theta: float = 0.7,
         lam: float = 1.0,
         t_learn: float = 0.2,
-        b_min: float = 0.80,
+        b_min: float = 0.75,
         b_max: float = 1.00,
         gamma_s: float = 1.0,
         delta_max: float = 0.15,
@@ -150,11 +150,17 @@ class StabilityScore:
             sigma_post[i] = float(np.std(post))
 
         post_stability_raw = mu_post - self.lam * sigma_post
-        lo = float(np.percentile(post_stability_raw, 1))
-        hi = float(np.percentile(post_stability_raw, 99))
-        post_stability = np.clip(
-            (post_stability_raw - lo) / (hi - lo + self.eps), 0.0, 1.0
-        ).astype(np.float32)
+        post_stability = np.zeros_like(post_stability_raw, dtype=np.float32)
+        for cls in np.unique(labels):
+            mask = labels == cls
+            if not np.any(mask):
+                continue
+            class_raw = post_stability_raw[mask]
+            lo = float(np.percentile(class_raw, 1))
+            hi = float(np.percentile(class_raw, 99))
+            post_stability[mask] = np.clip(
+                (class_raw - lo) / (hi - lo + self.eps), 0.0, 1.0
+            ).astype(np.float32)
 
         b_term = self.b_min + (self.b_max - self.b_min) * (post_stability**self.gamma_s)
         delta_term = self.delta_max * (post_stability**self.gamma_delta)

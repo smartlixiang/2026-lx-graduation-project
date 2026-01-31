@@ -16,7 +16,7 @@ from model.adapter import AdapterMLP
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.global_config import CONFIG
 from utils.seed import parse_seed_list, set_seed
-from weights import CoverageGainScore, EarlyLearnabilityScore, MarginScore, StabilityScore
+from weights import CoverageGainScore, EarlyLearnabilityScore, StabilityScore
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,7 +41,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--div-k", type=int, default=10)
     parser.add_argument("--dds-k", type=float, default=10)
     parser.add_argument("--early-epochs", type=int, default=None)
-    parser.add_argument("--margin-delta", type=float, default=1.0)
     parser.add_argument("--coverage-tau-g", type=float, default=0.15)
     parser.add_argument("--coverage-s-g", type=float, default=0.07)
     parser.add_argument("--coverage-k", type=int, default=10)
@@ -247,7 +246,6 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     early_result = EarlyLearnabilityScore(
         proxy_log, early_epochs=args.early_epochs
     ).compute()
-    margin_result = MarginScore(proxy_log, delta=args.margin_delta).compute()
     stability_result = StabilityScore(proxy_log).compute()
     coverage_result = CoverageGainScore(
         proxy_log,
@@ -260,8 +258,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     ).compute()
 
     if (
-        not np.array_equal(early_result.indices, margin_result.indices)
-        or not np.array_equal(early_result.indices, stability_result.indices)
+        not np.array_equal(early_result.indices, stability_result.indices)
         or not np.array_equal(early_result.indices, coverage_result.indices)
     ):
         raise ValueError("动态指标的 indices 不一致，无法对齐样本。")

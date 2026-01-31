@@ -220,8 +220,14 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     model_factory = get_model(model_name)
 
     for cut_ratio in cut_ratios:
-        result_dir = Path(args.result_root) / args.dataset / model_name / str(seed)
-        result_path = result_dir / f"result_{cut_ratio}_{args.mode}.json"
+        result_dir = (
+            Path(args.result_root)
+            / args.mode
+            / args.dataset
+            / model_name
+            / str(seed)
+        )
+        result_path = result_dir / f"result_{cut_ratio}.json"
         if args.skip_saved and result_path.exists():
             continue
 

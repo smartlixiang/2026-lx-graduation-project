@@ -16,7 +16,7 @@ from model.adapter import AdapterMLP
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.global_config import CONFIG
 from utils.seed import parse_seed_list, set_seed
-from weights import BoundaryInfoScore, EarlyLearnabilityScore, MarginScore, StabilityScore
+from weights import CoverageGainScore, EarlyLearnabilityScore, MarginScore, StabilityScore
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,7 +42,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dds-k", type=float, default=10)
     parser.add_argument("--early-epochs", type=int, default=None)
     parser.add_argument("--margin-delta", type=float, default=1.0)
-    parser.add_argument("--ridge-lambda", type=float, default=1e-1)
+    parser.add_argument("--coverage-tau-g", type=float, default=0.15)
+    parser.add_argument("--coverage-s-g", type=float, default=0.07)
+    parser.add_argument("--coverage-k", type=int, default=10)
+    parser.add_argument("--coverage-gamma", type=float, default=1.0)
+    parser.add_argument("--coverage-q-low", type=float, default=0.01)
+    parser.add_argument("--coverage-q-high", type=float, default=0.99)
+    parser.add_argument("--ridge-lambda", type=float, default=1e-2)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=1000)
     parser.add_argument("--tol", type=float, default=1e-6)
@@ -219,21 +225,26 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     ).compute()
     margin_result = MarginScore(proxy_log, delta=args.margin_delta).compute()
     stability_result = StabilityScore(proxy_log).compute()
-    boundary_result = BoundaryInfoScore(proxy_log).compute()
+    coverage_result = CoverageGainScore(
+        proxy_log,
+        tau_g=args.coverage_tau_g,
+        s_g=args.coverage_s_g,
+        k=args.coverage_k,
+        gamma=args.coverage_gamma,
+        q_low=args.coverage_q_low,
+        q_high=args.coverage_q_high,
+    ).compute()
 
     if (
         not np.array_equal(early_result.indices, margin_result.indices)
         or not np.array_equal(early_result.indices, stability_result.indices)
-        or not np.array_equal(early_result.indices, boundary_result.indices)
+        or not np.array_equal(early_result.indices, coverage_result.indices)
     ):
         raise ValueError("动态指标的 indices 不一致，无法对齐样本。")
 
-    # dynamic_scores = (
-    #     boundary_result.scores + stability_result.scores + early_result.scores
-    # ) / 3.0
     dynamic_scores = (
-        stability_result.scores + early_result.scores
-    ) / 2.0
+        stability_result.scores + early_result.scores + coverage_result.scores
+    ) / 3.0
     dynamic_scores = normalize_scores_with_quantiles(dynamic_scores)
 
     class_names = load_class_names(args.dataset, args.data_root)

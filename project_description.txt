@@ -132,7 +132,7 @@
 - 作用：对“数据选择后”的子集进行训练并评估，保存结果到 result/ 目录。
 - 目前 random 模式为随机采样；其他方法会加载 mask/ 下对应的 0/1 mask。
 - 结果保存结构：
-  - result/[数据集名]/[模型名]/[随机种子]/result_[裁剪比例]_[数据选择方法].json
+  - result/[方法名]/[数据集名]/[模型名]/[随机种子]/result_[裁剪比例].json
   - JSON 内容包含训练元数据、最后 10 轮测试集准确率均值（key=accuracy）、以及总运行时间（秒）。
 - 使用示例：
   - python train_after_selection.py --dataset cifar10 --mode random --cr 100 --seed 22,42,96 --skip_saved

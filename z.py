@@ -1,8 +1,9 @@
 """Generate utility label distributions from proxy training logs.
 
-This script computes two variants of utility labels:
+This script computes multiple variants of utility labels:
 1) ForgettingScore + MarginScore + EarlyLearnabilityScore
 2) StabilityScore + MarginScore + EarlyLearnabilityScore
+3) CoverageGainScore + EarlyLearnabilityScore + StabilityScore (if logits available)
 Then plots histogram distributions and saves images.
 """
 from __future__ import annotations
@@ -15,7 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from weights import (
-    BoundaryInfoScore,
+    CoverageGainScore,
     EarlyLearnabilityScore,
     ForgettingScore,
     MarginScore,
@@ -347,12 +348,12 @@ def main() -> None:
         proxy_log, early_epochs=args.early_epochs
     ).compute()
     stability_result = StabilityScore(proxy_log).compute()
-    boundary_result = None
+    coverage_result = None
     if has_logits:
-        boundary_result = BoundaryInfoScore(proxy_log).compute()
+        coverage_result = CoverageGainScore(proxy_log).compute()
     else:
         print(
-            "Skipping BoundaryInfoScore: proxy log missing required logits/labels arrays."
+            "Skipping CoverageGainScore: proxy log missing required logits/labels arrays."
         )
 
     _ensure_same_indices(
@@ -363,10 +364,10 @@ def main() -> None:
             "stability": stability_result.indices,
         }
     )
-    if boundary_result is not None:
+    if coverage_result is not None:
         _ensure_same_indices(
             {
-                "boundary": boundary_result.indices,
+                "coverage": coverage_result.indices,
                 "early": early_result.indices,
                 "stability": stability_result.indices,
             }
@@ -380,12 +381,12 @@ def main() -> None:
         stability_result.scores + margin_result.scores + early_result.scores
     ) / 3.0
     utility_stability = _normalize_with_quantiles(utility_stability)
-    utility_boundary = None
-    if boundary_result is not None:
-        utility_boundary = (
-            boundary_result.scores + early_result.scores + stability_result.scores
+    utility_coverage = None
+    if coverage_result is not None:
+        utility_coverage = (
+            coverage_result.scores + early_result.scores + stability_result.scores
         ) / 3.0
-        utility_boundary = _normalize_with_quantiles(utility_boundary)
+        utility_coverage = _normalize_with_quantiles(utility_coverage)
 
     output_dir = Path(args.output_dir)
     _plot_hist(
@@ -402,36 +403,36 @@ def main() -> None:
         output_dir / "utility_hist_stability.png",
         args.bins,
     )
-    if utility_boundary is not None:
+    if utility_coverage is not None:
         _plot_hist(
-            utility_boundary,
-            "BoundaryInfoScore + EarlyLearnabilityScore + StabilityScore (mean)",
+            utility_coverage,
+            "CoverageGainScore + EarlyLearnabilityScore + StabilityScore (mean)",
             "Utility label score (normalized)",
-            output_dir / "utility_hist_boundary_early_stability.png",
+            output_dir / "utility_hist_coverage_early_stability.png",
             args.bins,
         )
-    if boundary_result is not None:
-        utility_boundary_stability = _normalize_with_quantiles(
-            (boundary_result.scores + stability_result.scores) / 2.0
+    if coverage_result is not None:
+        utility_coverage_stability = _normalize_with_quantiles(
+            (coverage_result.scores + stability_result.scores) / 2.0
         )
-        utility_boundary_early = _normalize_with_quantiles(
-            (boundary_result.scores + early_result.scores) / 2.0
+        utility_coverage_early = _normalize_with_quantiles(
+            (coverage_result.scores + early_result.scores) / 2.0
         )
         utility_stability_early = _normalize_with_quantiles(
             (stability_result.scores + early_result.scores) / 2.0
         )
         _plot_hist(
-            utility_boundary_stability,
-            "BoundaryInfoScore + StabilityScore (mean)",
+            utility_coverage_stability,
+            "CoverageGainScore + StabilityScore (mean)",
             "Utility label score (normalized)",
-            output_dir / "utility_hist_boundary_stability.png",
+            output_dir / "utility_hist_coverage_stability.png",
             args.bins,
         )
         _plot_hist(
-            utility_boundary_early,
-            "BoundaryInfoScore + EarlyLearnabilityScore (mean)",
+            utility_coverage_early,
+            "CoverageGainScore + EarlyLearnabilityScore (mean)",
             "Utility label score (normalized)",
-            output_dir / "utility_hist_boundary_early.png",
+            output_dir / "utility_hist_coverage_early.png",
             args.bins,
         )
         _plot_hist(
@@ -469,12 +470,12 @@ def main() -> None:
         output_dir / "stability_hist.png",
         args.bins,
     )
-    if boundary_result is not None:
+    if coverage_result is not None:
         _plot_hist(
-            boundary_result.scores,
-            "BoundaryInfoScore distribution",
-            "BoundaryInfoScore",
-            output_dir / "boundary_info_hist.png",
+            coverage_result.scores,
+            "CoverageGainScore distribution",
+            "CoverageGainScore",
+            output_dir / "coverage_gain_hist.png",
             args.bins,
         )
 
@@ -484,15 +485,15 @@ def main() -> None:
 
     print(f"Correlation EarlyLearnability vs Stability: {corr_early_stability:.6f}")
     print(f"Correlation EarlyLearnability vs Forgetting: {corr_early_forgetting:.6f}")
-    if boundary_result is not None:
-        corr_boundary_early = np.corrcoef(boundary_result.scores, early_result.scores)[
+    if coverage_result is not None:
+        corr_coverage_early = np.corrcoef(coverage_result.scores, early_result.scores)[
             0, 1
         ]
-        corr_boundary_stability = np.corrcoef(
-            boundary_result.scores, stability_result.scores
+        corr_coverage_stability = np.corrcoef(
+            coverage_result.scores, stability_result.scores
         )[0, 1]
-        print(f"Correlation BoundaryInfo vs EarlyLearnability: {corr_boundary_early:.6f}")
-        print(f"Correlation BoundaryInfo vs Stability: {corr_boundary_stability:.6f}")
+        print(f"Correlation CoverageGain vs EarlyLearnability: {corr_coverage_early:.6f}")
+        print(f"Correlation CoverageGain vs Stability: {corr_coverage_stability:.6f}")
 
     saved_paths = [
         output_dir / "utility_hist_forgetting.png",
@@ -502,14 +503,14 @@ def main() -> None:
         output_dir / "forgetting_hist.png",
         output_dir / "stability_hist.png",
     ]
-    if utility_boundary is not None:
-        saved_paths.append(output_dir / "utility_hist_boundary_early_stability.png")
-    if boundary_result is not None:
-        saved_paths.append(output_dir / "boundary_info_hist.png")
+    if utility_coverage is not None:
+        saved_paths.append(output_dir / "utility_hist_coverage_early_stability.png")
+    if coverage_result is not None:
+        saved_paths.append(output_dir / "coverage_gain_hist.png")
         saved_paths.extend(
             [
-                output_dir / "utility_hist_boundary_stability.png",
-                output_dir / "utility_hist_boundary_early.png",
+                output_dir / "utility_hist_coverage_stability.png",
+                output_dir / "utility_hist_coverage_early.png",
                 output_dir / "utility_hist_stability_early.png",
             ]
         )

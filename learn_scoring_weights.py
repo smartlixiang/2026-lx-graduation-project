@@ -169,14 +169,26 @@ def normalize_weights(weights: np.ndarray) -> np.ndarray:
 
 
 def normalize_scores_with_quantiles(
-    scores: np.ndarray, lower_q: float = 0.001, upper_q: float = 0.999
+    scores: np.ndarray,
+    labels: np.ndarray,
+    lower_q: float = 0.001,
+    upper_q: float = 0.999,
 ) -> np.ndarray:
-    lower = float(np.quantile(scores, lower_q))
-    upper = float(np.quantile(scores, upper_q))
-    if upper <= lower:
-        return np.zeros_like(scores, dtype=np.float64)
-    clipped = np.clip(scores, lower, upper)
-    normalized = (clipped - lower) / (upper - lower)
+    if labels.shape[0] != scores.shape[0]:
+        raise ValueError("labels length must match scores length.")
+    normalized = np.zeros_like(scores, dtype=np.float64)
+    for cls in np.unique(labels):
+        mask = labels == cls
+        if not np.any(mask):
+            continue
+        class_scores = scores[mask]
+        lower = float(np.quantile(class_scores, lower_q))
+        upper = float(np.quantile(class_scores, upper_q))
+        if upper <= lower:
+            normalized[mask] = 0.5
+            continue
+        clipped = np.clip(class_scores, lower, upper)
+        normalized[mask] = (clipped - lower) / (upper - lower)
     return normalized.astype(np.float64)
 
 
@@ -245,7 +257,9 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     dynamic_scores = (
         stability_result.scores + early_result.scores + coverage_result.scores
     ) / 3.0
-    dynamic_scores = normalize_scores_with_quantiles(dynamic_scores)
+    if early_result.labels is None:
+        raise ValueError("代理训练日志缺少 labels，无法按类别归一化动态分数。")
+    dynamic_scores = normalize_scores_with_quantiles(dynamic_scores, early_result.labels)
 
     class_names = load_class_names(args.dataset, args.data_root)
     dds_metric = DifficultyDirection(

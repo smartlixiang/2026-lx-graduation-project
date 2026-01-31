@@ -228,9 +228,12 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     ):
         raise ValueError("动态指标的 indices 不一致，无法对齐样本。")
 
+    # dynamic_scores = (
+    #     boundary_result.scores + stability_result.scores + early_result.scores
+    # ) / 3.0
     dynamic_scores = (
-        boundary_result.scores + stability_result.scores + early_result.scores
-    ) / 3.0
+        stability_result.scores + early_result.scores
+    ) / 2.0
     dynamic_scores = normalize_scores_with_quantiles(dynamic_scores)
 
     class_names = load_class_names(args.dataset, args.data_root)

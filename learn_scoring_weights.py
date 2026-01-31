@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coverage-s-g", type=float, default=0.07)
     parser.add_argument("--coverage-k", type=int, default=10)
     parser.add_argument("--coverage-gamma", type=float, default=1.0)
-    parser.add_argument("--coverage-q-low", type=float, default=0.01)
+    parser.add_argument("--coverage-q-low", type=float, default=0.1)
     parser.add_argument("--coverage-q-high", type=float, default=0.99)
     parser.add_argument("--ridge-lambda", type=float, default=1e-2)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
@@ -146,8 +146,7 @@ def fit_ridge_regression_nonnegative(
         grad_w = (features.T @ errors) / num_samples + l2_lambda * weights
         grad_b = errors.mean()
 
-        next_weights = weights - learning_rate * grad_w
-        next_weights = np.maximum(next_weights, 0.0)
+        next_weights = project_to_simplex(weights - learning_rate * grad_w)
         next_bias = bias - learning_rate * grad_b
 
         if np.linalg.norm(next_weights - weights) < tol and abs(next_bias - bias) < tol:
@@ -161,11 +160,24 @@ def fit_ridge_regression_nonnegative(
     return weights, float(bias)
 
 
-def normalize_weights(weights: np.ndarray) -> np.ndarray:
-    total = float(weights.sum())
-    if total <= 0:
-        return np.full_like(weights, 1.0 / weights.size, dtype=np.float64)
-    return (weights / total).astype(np.float64)
+def project_to_simplex(vector: np.ndarray) -> np.ndarray:
+    if vector.ndim != 1:
+        raise ValueError("vector must be a 1D array.")
+    if vector.size == 0:
+        raise ValueError("vector must be non-empty.")
+    sorted_vec = np.sort(vector)[::-1]
+    cumulative_sum = np.cumsum(sorted_vec)
+    rho_candidates = sorted_vec - (cumulative_sum - 1) / np.arange(1, vector.size + 1)
+    rho_indices = np.where(rho_candidates > 0)[0]
+    if rho_indices.size == 0:
+        return np.full_like(vector, 1.0 / vector.size, dtype=np.float64)
+    rho = rho_indices[-1]
+    theta = (cumulative_sum[rho] - 1) / (rho + 1)
+    projected = np.maximum(vector - theta, 0.0)
+    projected_sum = projected.sum()
+    if projected_sum <= 0:
+        return np.full_like(vector, 1.0 / vector.size, dtype=np.float64)
+    return (projected / projected_sum).astype(np.float64)
 
 
 def normalize_scores_with_quantiles(
@@ -328,7 +340,6 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         args.max_iter,
         args.tol,
     )
-    normalized = normalize_weights(weights)
 
     output_path = build_output_path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -342,9 +353,9 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     dataset_entry = data.get(args.dataset, {})
     seed_key = str(seed)
     dataset_entry[seed_key] = {
-        "sa": float(normalized[0]),
-        "div": float(normalized[1]),
-        "dds": float(normalized[2]),
+        "sa": float(weights[0]),
+        "div": float(weights[1]),
+        "dds": float(weights[2]),
     }
     dataset_entry[f"{seed_key}_meta"] = {
         "raw_sa": float(weights[0]),
@@ -360,7 +371,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
     print("Learned weights saved to", output_path)
-    print("Normalized weights:", dataset_entry[seed_key])
+    print("Learned weights:", dataset_entry[seed_key])
 
 
 if __name__ == "__main__":

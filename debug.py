@@ -1,478 +1,366 @@
-import re
+"""End-to-end debug script for CIFAR-10 selection + training using proxy dynamics.
+
+This version implements the user's intended baseline:
+- Compute utility score u = mean(CoverageGainScore, StabilityScore, EarlyLearnabilityScore)
+- Normalize u within each true class (quantile-based min-max)
+- Select top-k within each true class proportional to cut_ratio
+- Train downstream model on the selected subset (true labels)
+"""
+from __future__ import annotations
+
+import json
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
+import torch
+from torch import nn
+from torch.optim import SGD
+from torch.optim.lr_scheduler import MultiStepLR
+from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
 
-from weights import StabilityScore
+from dataset.dataset import BaseDataLoader
+from model.model_config import get_model
+from utils.global_config import CONFIG
+from utils.seed import set_seed
+
+# NEW: import dynamic scoring terms (must exist in your repo)
+from weights.CoverageGainScore import CoverageGainScore
+from weights.EarlyLearnabilityScore import EarlyLearnabilityScore
+from weights.StabilityScore import StabilityScore
 
 # =========================
 # User config
 # =========================
-NPZ_PATH = r"weights/proxy_logs/22/cifar10_resnet18_2026_01_20_11_42.npz"
+DATASET = "cifar10"
+MODEL_NAME = "resnet50"
+SEED = 22
+CUT_RATIOS = [30, 50, 70]
+PROXY_LOG_DIR = Path("weights") / "proxy_logs" / str(SEED)
+OUT_DIR = Path("debug")
 
-# If you changed StabilityScore defaults in code, keep these as None.
-# Otherwise, set explicit overrides here to match the run you want to debug.
-BETA_OVERRIDE = None
-THETA_OVERRIDE = None
-LAMBDA_OVERRIDE = None
-T_LEARN_OVERRIDE = None
-B_MIN_OVERRIDE = None
-B_MAX_OVERRIDE = None
-GAMMA_S_OVERRIDE = None
-DELTA_MAX_OVERRIDE = None
-GAMMA_DELTA_OVERRIDE = None
-PEN_OVERRIDE = None
-GAMMA_PEN_OVERRIDE = None
-U_MAX_OVERRIDE = None
-GAMMA_U_OVERRIDE = None
-
-# Diagnostics window length for M_i visualization
-WINDOW_OVERRIDE = None  # e.g. 10
-
-TOPK = 50000  # for reporting top-k by score
-
-# Diagnostics hyperparams for "soft learnability" visualization only
-# (If your current StabilityScore is still hard-gated, we still plot M_i and show threshold lines.)
-P0 = 0.90   # window-accuracy threshold used to visualize "learnability"
-TAU = 0.04  # sigmoid temperature for I_i visualization (soft learnability)
-
-# Scatter downsampling
-SCATTER_MAX_POINTS = 10000
-SCATTER_SEED = 42
-
-# Quadrant thresholds (if None, use quantiles on learnable subset)
-L_TH = None           # e.g. 0.5
-S_TH = None           # e.g. 0.90
-L_TH_QUANTILE = 0.50  # default median
-S_TH_QUANTILE = 0.75  # default upper quartile
-
-OUT_DIR = Path("./debug_outputs")
+EPOCHS = 200
+BATCH_SIZE = 128
+NUM_WORKERS = 4
+INIT_LR = 0.1
+MOMENTUM = 0.9
+WEIGHT_DECAY = 5e-4
 
 
 # =========================
 # Utilities
 # =========================
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
-def _parse_npz_name(npz_path: str) -> dict:
-    """Best-effort parse dataset/model from filename like cifar10_resnet18_YYYY_MM_DD_HH_MM.npz"""
-    name = Path(npz_path).stem
-    m = re.match(r"(?P<ds>[^_]+)_(?P<model>[^_]+)_(?P<rest>.+)", name)
-    if not m:
-        return {"dataset": "unknown", "model": "unknown", "tag": name}
-    return {"dataset": m.group("ds"), "model": m.group("model"), "tag": name}
+def _find_latest_npz(log_dir: Path) -> Path:
+    if not log_dir.exists():
+        raise FileNotFoundError(f"Proxy log directory not found: {log_dir}")
+    candidates = sorted(log_dir.glob("*.npz"), key=lambda p: p.stat().st_mtime)
+    if not candidates:
+        raise FileNotFoundError(f"No proxy log .npz files found in: {log_dir}")
+    return candidates[-1]
 
 
-def _describe(x: np.ndarray) -> dict:
-    x = np.asarray(x, dtype=np.float32)
-    if x.size == 0:
-        return {"n": 0}
-    return {
-        "n": int(x.size),
-        "mean": float(np.mean(x)),
-        "std": float(np.std(x)),
-        "min": float(np.min(x)),
-        "p10": float(np.percentile(x, 10)),
-        "p25": float(np.percentile(x, 25)),
-        "p50": float(np.percentile(x, 50)),
-        "p75": float(np.percentile(x, 75)),
-        "p90": float(np.percentile(x, 90)),
-        "max": float(np.max(x)),
-    }
+def _softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
+    max_logits = np.max(logits, axis=axis, keepdims=True)
+    exp_logits = np.exp(logits - max_logits)
+    return exp_logits / np.sum(exp_logits, axis=axis, keepdims=True)
 
 
-def _print_stats(title: str, stats: dict) -> None:
-    if stats.get("n", 0) == 0:
-        print(f"{title}: n=0")
-        return
-    print(
-        f"{title}: n={stats['n']} | mean={stats['mean']:.4f}, std={stats['std']:.4f}, "
-        f"min={stats['min']:.4f}, p10={stats['p10']:.4f}, p25={stats['p25']:.4f}, "
-        f"p50={stats['p50']:.4f}, p75={stats['p75']:.4f}, p90={stats['p90']:.4f}, max={stats['max']:.4f}"
-    )
+def _load_proxy_logits_and_labels(npz_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load proxy logits/labels/indices, and reorder them by ascending indices if needed."""
+    data = np.load(npz_path)
+    if "logits" not in data:
+        raise ValueError(f"Proxy log missing logits: {npz_path}")
+    if "labels" not in data:
+        raise ValueError(f"Proxy log missing labels: {npz_path}")
+
+    logits = data["logits"].astype(np.float32)
+    labels = data["labels"].astype(np.int64)
+    if logits.ndim != 3:
+        raise ValueError("Proxy logits should have shape (epochs, num_samples, num_classes)")
+    if labels.ndim != 1:
+        raise ValueError("Proxy labels should have shape (num_samples,)")
+
+    indices = data["indices"] if "indices" in data else np.arange(logits.shape[1])
+    if indices.shape[0] != logits.shape[1]:
+        raise ValueError("Proxy log indices length mismatch")
+    if labels.shape[0] != logits.shape[1]:
+        raise ValueError("Proxy log labels length mismatch")
+
+    # Ensure logits/labels are aligned to dataset order (ascending indices)
+    if not np.array_equal(indices, np.arange(len(indices))):
+        order = np.argsort(indices)
+        logits = logits[:, order, :]
+        labels = labels[order]
+        indices = indices[order]
+
+    return logits, labels, indices
 
 
-def _save_hist(
-    x: np.ndarray,
+def _normalize_scores_with_quantiles(
+    scores: np.ndarray,
+    labels: np.ndarray,
     *,
-    title: str,
-    xlabel: str,
-    out_path: Path,
-    bins: int = 40,
-    vlines: list[tuple[float, str]] | None = None,
-) -> None:
-    plt.figure()
-    plt.hist(x, bins=bins)
-    if vlines:
-        for v, lab in vlines:
-            plt.axvline(v, linestyle="--", alpha=0.8, label=lab)
-        plt.legend()
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel("Count")
-    plt.grid(True, linestyle="--", alpha=0.35)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
+    q_low: float = 0.01,
+    q_high: float = 0.99,
+    eps: float = 1e-8,
+) -> np.ndarray:
+    """Class-wise quantile min-max normalization to [0, 1]."""
+    if scores.ndim != 1 or labels.ndim != 1 or scores.shape[0] != labels.shape[0]:
+        raise ValueError("scores and labels must be 1D arrays with same length")
+    if not (0.0 <= q_low < q_high <= 1.0):
+        raise ValueError("q_low and q_high must satisfy 0<=q_low<q_high<=1")
 
-
-def _save_scatter(
-    x: np.ndarray,
-    y: np.ndarray,
-    c: np.ndarray,
-    *,
-    title: str,
-    xlabel: str,
-    ylabel: str,
-    out_path: Path,
-    max_points: int = SCATTER_MAX_POINTS,
-    seed: int = SCATTER_SEED,
-) -> None:
-    x = np.asarray(x)
-    y = np.asarray(y)
-    c = np.asarray(c)
-
-    n = x.size
-    if n == 0:
-        return
-
-    if n > max_points:
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(n, size=max_points, replace=False)
-        x = x[idx]
-        y = y[idx]
-        c = c[idx]
-
-    plt.figure()
-    sc = plt.scatter(x, y, c=c, s=6, alpha=0.7)
-    plt.colorbar(sc, label="StabilityScore")
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.grid(True, linestyle="--", alpha=0.35)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-
-
-def _quadrant_stats(L: np.ndarray, S: np.ndarray, score: np.ndarray, L_th: float, S_th: float) -> list[dict]:
-    """Return quadrant stats for (L,S) split by thresholds."""
-    masks = {
-        "Q1 (L low, S high)": (L < L_th) & (S >= S_th),
-        "Q2 (L high, S high)": (L >= L_th) & (S >= S_th),
-        "Q3 (L low, S low)": (L < L_th) & (S < S_th),
-        "Q4 (L high, S low)": (L >= L_th) & (S < S_th),
-    }
-    out = []
-    total = L.size if L is not None else 0
-    for name, m in masks.items():
-        s = score[m]
-        st = _describe(s)
-        out.append(
-            {
-                "name": name,
-                "count": int(m.sum()),
-                "ratio": float(m.sum() / max(1, total)),
-                "score_stats": st,
-            }
-        )
+    out = np.zeros_like(scores, dtype=np.float32)
+    classes = np.unique(labels)
+    for c in classes:
+        idx = np.flatnonzero(labels == c)
+        if idx.size == 0:
+            continue
+        s = scores[idx].astype(np.float32, copy=False)
+        lo = float(np.quantile(s, q_low))
+        hi = float(np.quantile(s, q_high))
+        denom = (hi - lo) + eps
+        normed = (s - lo) / denom
+        out[idx] = np.clip(normed, 0.0, 1.0)
     return out
 
 
-def _print_quadrants(qs: list[dict], *, title: str) -> None:
-    print(f"\n=== {title} ===")
-    for q in qs:
-        st = q["score_stats"]
-        if st.get("n", 0) == 0:
-            print(f"{q['name']}: count={q['count']} ({q['ratio'] * 100:.2f}%), score: n=0")
+def _compute_u_scores_from_proxy_log(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Compute u = mean(CoverageGain, Stability, EarlyLearnability), then class-wise normalize.
+
+    Returns:
+        u_norm: shape (N,) float32 in [0,1], aligned to dataset index order
+        labels: shape (N,) int64 true labels, aligned to dataset index order
+    """
+    # Load labels/indices for alignment sanity
+    _, labels_proxy, indices_proxy = _load_proxy_logits_and_labels(npz_path)
+
+    # Compute three dynamic scores (each should return per-sample scores + indices)
+    stab_res = StabilityScore(npz_path).compute()
+    early_res = EarlyLearnabilityScore(npz_path).compute()
+    cov_res = CoverageGainScore(npz_path).compute()
+
+    # Build map from index -> position for each result to align robustly
+    def _to_full(scores: np.ndarray, indices: np.ndarray, n: int) -> np.ndarray:
+        full = np.full((n,), np.nan, dtype=np.float32)
+        if indices.shape[0] != scores.shape[0]:
+            raise ValueError("indices and scores length mismatch in a score result")
+        if np.min(indices) < 0 or np.max(indices) >= n:
+            raise ValueError("score result indices out of range")
+        full[indices.astype(np.int64)] = scores.astype(np.float32)
+        return full
+
+    n = labels_proxy.shape[0]
+    s_full = _to_full(stab_res.scores, stab_res.indices, n)
+    e_full = _to_full(early_res.scores, early_res.indices, n)
+    c_full = _to_full(cov_res.scores, cov_res.indices, n)
+
+    if np.any(np.isnan(s_full)) or np.any(np.isnan(e_full)) or np.any(np.isnan(c_full)):
+        raise RuntimeError("Failed to align some dynamic scores to full index space (NaNs found).")
+
+    u = (s_full + e_full + c_full) / 3.0
+
+    # Ensure labels are aligned to dataset index order 0..N-1
+    labels_full = np.full((n,), -1, dtype=np.int64)
+    labels_full[indices_proxy.astype(np.int64)] = labels_proxy
+    if np.any(labels_full < 0):
+        raise RuntimeError("Failed to align proxy labels to full index space.")
+
+    # Class-wise normalization to [0,1] (matches your weight-learning normalization style)
+    u_norm = _normalize_scores_with_quantiles(u.astype(np.float32), labels_full, q_low=0.01, q_high=0.99)
+    return u_norm, labels_full
+
+
+def _select_topk_indices(
+    true_labels: np.ndarray,
+    scores: np.ndarray,
+    num_classes: int,
+    cut_ratio: int,
+) -> np.ndarray:
+    """Select class-proportional top-k within each TRUE class by scores."""
+    if not 0 < cut_ratio <= 100:
+        raise ValueError("cut_ratio must be in (0, 100]")
+    if true_labels.shape[0] != scores.shape[0]:
+        raise ValueError("true_labels and scores must have the same length")
+
+    selected: list[int] = []
+    ratio = cut_ratio / 100.0
+
+    for class_id in range(num_classes):
+        class_indices = np.flatnonzero(true_labels == class_id)
+        if class_indices.size == 0:
+            continue
+        if cut_ratio == 100:
+            num_select = class_indices.size
         else:
-            print(
-                f"{q['name']}: count={q['count']} ({q['ratio'] * 100:.2f}%), "
-                f"score mean={st['mean']:.4f}, p25={st['p25']:.4f}, p50={st['p50']:.4f}, p75={st['p75']:.4f}, p90={st['p90']:.4f}"
-            )
+            num_select = max(1, int(class_indices.size * ratio))
+        class_scores = scores[class_indices]
+        topk = class_indices[np.argsort(-class_scores)[:num_select]]
+        selected.extend(topk.tolist())
+
+    return np.sort(np.asarray(selected, dtype=np.int64))
 
 
-# =========================
-# Correct / M_i (max window acc) computation for diagnostics
-# =========================
-def _load_correct(npz_path: str) -> np.ndarray:
-    data = np.load(npz_path)
-    if "correct" in data:
-        correct = data["correct"]
-        if correct.ndim != 2:
-            raise ValueError("npz['correct'] must be shape (epochs, num_samples)")
-        return correct.astype(bool)
-
-    if "logits" not in data:
-        raise ValueError("npz must contain either 'correct' or ('logits' and 'labels').")
-    if "labels" not in data:
-        raise ValueError("npz['labels'] is required to compute correct from logits.")
-
-    logits = data["logits"]
-    labels = data["labels"].astype(np.int64)
-    if logits.ndim != 3:
-        raise ValueError("npz['logits'] must be shape (epochs, num_samples, num_classes)")
-    preds = logits.argmax(axis=2)
-    correct = preds == labels.reshape(1, -1)
-    return correct.astype(bool)
+@torch.no_grad()
+def _evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    for images, labels in loader:
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs = model(images)
+        preds = outputs.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+    return correct / total if total else 0.0
 
 
-def _max_window_acc(correct: np.ndarray, window: int) -> np.ndarray:
-    """M_i = max_t mean(correct[t:t+w]) for each sample."""
-    num_epochs, num_samples = correct.shape
-    if num_epochs < window:
-        # If not enough epochs, M_i reduces to overall accuracy.
-        return correct.astype(np.float32).mean(axis=0)
+def _train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
+    device: torch.device,
+    epochs: int,
+) -> dict:
+    criterion = nn.CrossEntropyLoss()
+    optimizer = SGD(
+        model.parameters(),
+        lr=INIT_LR,
+        momentum=MOMENTUM,
+        weight_decay=WEIGHT_DECAY,
+    )
+    scheduler = MultiStepLR(optimizer, milestones=[60, 120, 160], gamma=0.2)
 
-    correct_int = correct.astype(np.int32)
-    cumsum = np.cumsum(correct_int, axis=0)
-    pad = np.zeros((1, num_samples), dtype=cumsum.dtype)
-    window_sum = cumsum[window - 1:] - np.concatenate([pad, cumsum[: -window]], axis=0)
-    window_mean = window_sum.astype(np.float32) / float(window)  # (E-w+1, N)
-    return window_mean.max(axis=0)
+    history = {
+        "train_loss": [],
+        "test_acc": [],
+    }
 
+    start_eval_epoch = max(1, epochs - 9)
 
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    x = np.clip(x, -50.0, 50.0)
-    return 1.0 / (1.0 + np.exp(-x))
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running_loss = 0.0
+        progress = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", unit="batch")
+        for images, labels in progress:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * images.size(0)
+            progress.set_postfix(loss=f"{loss.item():.4f}")
+
+        epoch_loss = running_loss / len(train_loader.dataset)
+        scheduler.step()
+
+        history["train_loss"].append(epoch_loss)
+        if epoch >= start_eval_epoch:
+            test_acc = _evaluate(model, test_loader, device)
+            history["test_acc"].append(test_acc)
+            print(f"Epoch {epoch}: train_loss={epoch_loss:.4f}, test_acc={test_acc:.4f}")
+        else:
+            print(f"Epoch {epoch}: train_loss={epoch_loss:.4f}")
+
+    return history
 
 
 def main() -> None:
-    # ---- Compute StabilityScore using the main implementation
-    ss_kwargs = {}
-    if BETA_OVERRIDE is not None:
-        ss_kwargs["beta"] = float(BETA_OVERRIDE)
-    if THETA_OVERRIDE is not None:
-        ss_kwargs["theta"] = float(THETA_OVERRIDE)
-    if LAMBDA_OVERRIDE is not None:
-        ss_kwargs["lam"] = float(LAMBDA_OVERRIDE)
-    if T_LEARN_OVERRIDE is not None:
-        ss_kwargs["t_learn"] = float(T_LEARN_OVERRIDE)
-    if B_MIN_OVERRIDE is not None:
-        ss_kwargs["b_min"] = float(B_MIN_OVERRIDE)
-    if B_MAX_OVERRIDE is not None:
-        ss_kwargs["b_max"] = float(B_MAX_OVERRIDE)
-    if GAMMA_S_OVERRIDE is not None:
-        ss_kwargs["gamma_s"] = float(GAMMA_S_OVERRIDE)
-    if DELTA_MAX_OVERRIDE is not None:
-        ss_kwargs["delta_max"] = float(DELTA_MAX_OVERRIDE)
-    if GAMMA_DELTA_OVERRIDE is not None:
-        ss_kwargs["gamma_delta"] = float(GAMMA_DELTA_OVERRIDE)
-    if PEN_OVERRIDE is not None:
-        ss_kwargs["pen"] = float(PEN_OVERRIDE)
-    if GAMMA_PEN_OVERRIDE is not None:
-        ss_kwargs["gamma_pen"] = float(GAMMA_PEN_OVERRIDE)
-    if U_MAX_OVERRIDE is not None:
-        ss_kwargs["u_max"] = float(U_MAX_OVERRIDE)
-    if GAMMA_U_OVERRIDE is not None:
-        ss_kwargs["gamma_u"] = float(GAMMA_U_OVERRIDE)
+    set_seed(SEED)
+    device = CONFIG.global_device
 
-    result = StabilityScore(NPZ_PATH, **ss_kwargs).compute()
-
-    scores = result.scores
-    L = result.learn_time_normalized
-    S = result.post_stability
-    learnable_mask = result.learnable_mask.astype(bool)
-
-    # ---- Basic info
-    meta = _parse_npz_name(NPZ_PATH)
-    correct = _load_correct(NPZ_PATH)
-    E, N = correct.shape
-    window_used = int(WINDOW_OVERRIDE or 3)
-
-    tag = f"{meta['dataset']}_{meta['model']}_E{E}_w{window_used}_p{P0:.2f}_tau{TAU:.2f}"
     _ensure_dir(OUT_DIR)
 
-    print(f"Loaded: {NPZ_PATH}")
-    print(f"Parsed: dataset={meta['dataset']}, model={meta['model']}")
-    print(f"Epochs={E}, Samples={N}, window={window_used}")
-    print(f"Learnable (hard threshold) samples: {int(learnable_mask.sum())} ({learnable_mask.mean() * 100:.2f}%)")
-    print(f"Non-learnable samples: {int((~learnable_mask).sum())} ({(~learnable_mask).mean() * 100:.2f}%)")
+    proxy_npz = _find_latest_npz(PROXY_LOG_DIR)
+    print(f"Using proxy log: {proxy_npz}")
 
-    # ---- Compute M_i and I_i for diagnostics (even if main scoring is hard-gated)
-    M = _max_window_acc(correct, window_used)
-    I = _sigmoid((M - P0) / TAU)
+    # Compute the intended utility score u (aligned to dataset order)
+    u_scores, labels_full = _compute_u_scores_from_proxy_log(proxy_npz)
 
-    # =========================
-    # Top-k report
-    # =========================
-    topk = min(TOPK, scores.size)
-    top_idx = np.argsort(-scores)[:topk]
-    top_L = L[top_idx]
-    top_S = S[top_idx]
-    print(f"\n=== Top-{topk} StabilityScore samples (by score) ===")
-    _print_stats("Top-k LearnTime L_i", _describe(top_L))
-    _print_stats("Top-k PostLearnStability S_i", _describe(top_S))
+    # Data
+    data_loader = BaseDataLoader(
+        DATASET,
+        data_path=CONFIG.data_root,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        val_split=0.0,
+        seed=SEED,
+    )
+    train_loader, _, test_loader = data_loader.load()
+    train_dataset = train_loader.dataset
 
-    # =========================
-    # Core diagnostics 1: split learnable vs non-learnable
-    # =========================
-    L_learn = L[learnable_mask]
-    S_learn = S[learnable_mask]
-    score_learn = scores[learnable_mask]
+    # Basic alignment sanity check (optional but helps catch index mismatch early)
+    if len(train_dataset) != u_scores.shape[0]:
+        raise RuntimeError(
+            f"Dataset length mismatch: len(train_dataset)={len(train_dataset)} vs u_scores={u_scores.shape[0]}. "
+            "Your proxy log indices likely do not correspond to this training dataset ordering."
+        )
 
-    L_non = L[~learnable_mask]
-    S_non = S[~learnable_mask]
-    score_non = scores[~learnable_mask]
-    M_non = M[~learnable_mask]
+    results = {
+        "dataset": DATASET,
+        "model": MODEL_NAME,
+        "seed": SEED,
+        "proxy_log": str(proxy_npz),
+        "cut_ratios": CUT_RATIOS,
+        "epochs": EPOCHS,
+        "metrics": {},
+    }
 
-    print("\n=== Stats: learnable subset (hard threshold) ===")
-    _print_stats("L_i", _describe(L_learn))
-    _print_stats("S_i", _describe(S_learn))
-    _print_stats("Score", _describe(score_learn))
+    num_classes = data_loader.num_classes
 
-    print("\n=== Stats: non-learnable subset (hard threshold) ===")
-    _print_stats("L_i", _describe(L_non))
-    _print_stats("S_i", _describe(S_non))
-    _print_stats("Score", _describe(score_non))
-    _print_stats("M_i (max window acc)", _describe(M_non))
+    for cut_ratio in CUT_RATIOS:
+        selected_indices = _select_topk_indices(labels_full, u_scores, num_classes, cut_ratio)
+        subset = Subset(train_dataset, selected_indices.tolist())
+        generator = torch.Generator().manual_seed(SEED)
+        train_subset_loader = DataLoader(
+            subset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            generator=generator,
+            num_workers=NUM_WORKERS,
+            pin_memory=CONFIG.pin_memory,
+            drop_last=False,
+        )
 
-    # Global stats for M/I
-    print("\n=== Stats: learnability diagnostics ===")
-    _print_stats("M_i (max window acc) [all]", _describe(M))
-    _print_stats("I_i (soft learnability) [all]", _describe(I))
+        model_fn = get_model(MODEL_NAME)
+        model = model_fn(num_classes=num_classes).to(device)
 
-    # =========================
-    # Plots: distributions
-    # =========================
-    # Original/global distributions
-    _save_hist(
-        scores,
-        title=f"StabilityScore distribution ({tag})",
-        xlabel="StabilityScore",
-        out_path=OUT_DIR / f"{tag}__score_all.png",
-        bins=40,
-    )
-    _save_hist(
-        L,
-        title=f"LearnTime L_i distribution ({tag})",
-        xlabel="L_i",
-        out_path=OUT_DIR / f"{tag}__L_all.png",
-        bins=40,
-    )
-    _save_hist(
-        S,
-        title=f"PostLearnStability S_i distribution ({tag})",
-        xlabel="S_i",
-        out_path=OUT_DIR / f"{tag}__S_all.png",
-        bins=40,
-    )
+        print(f"\nTraining with cut_ratio={cut_ratio} (selected={len(subset)})")
+        history = _train_model(model, train_subset_loader, test_loader, device, EPOCHS)
 
-    # Split distributions
-    _save_hist(
-        score_learn,
-        title=f"Score distribution - learnable ({tag})",
-        xlabel="StabilityScore",
-        out_path=OUT_DIR / f"{tag}__score_learnable.png",
-        bins=40,
-    )
-    _save_hist(
-        score_non,
-        title=f"Score distribution - non-learnable ({tag})",
-        xlabel="StabilityScore",
-        out_path=OUT_DIR / f"{tag}__score_nonlearnable.png",
-        bins=40,
-    )
-    _save_hist(
-        L_learn,
-        title=f"L_i distribution - learnable ({tag})",
-        xlabel="L_i",
-        out_path=OUT_DIR / f"{tag}__L_learnable.png",
-        bins=40,
-    )
-    _save_hist(
-        L_non,
-        title=f"L_i distribution - non-learnable ({tag})",
-        xlabel="L_i",
-        out_path=OUT_DIR / f"{tag}__L_nonlearnable.png",
-        bins=40,
-    )
-    _save_hist(
-        S_learn,
-        title=f"S_i distribution - learnable ({tag})",
-        xlabel="S_i",
-        out_path=OUT_DIR / f"{tag}__S_learnable.png",
-        bins=40,
-    )
-    _save_hist(
-        S_non,
-        title=f"S_i distribution - non-learnable ({tag})",
-        xlabel="S_i",
-        out_path=OUT_DIR / f"{tag}__S_nonlearnable.png",
-        bins=40,
-    )
+        test_acc_samples = history["test_acc"]
+        metrics = {
+            "selected": int(len(subset)),
+            "final_test_acc": float(test_acc_samples[-1]) if test_acc_samples else 0.0,
+            "best_test_acc": float(np.max(test_acc_samples)) if test_acc_samples else 0.0,
+            "avg_test_acc": float(np.mean(test_acc_samples)) if test_acc_samples else 0.0,
+        }
+        results["metrics"][str(cut_ratio)] = metrics
 
-    # Learnability histograms (M_i and optionally I_i)
-    _save_hist(
-        M,
-        title=f"M_i = max window acc ({tag})",
-        xlabel="M_i",
-        out_path=OUT_DIR / f"{tag}__M_all.png",
-        bins=40,
-        vlines=[(P0, f"p0={P0:.2f}")],
-    )
-    _save_hist(
-        I,
-        title=f"I_i = sigmoid((M_i-p0)/tau) ({tag})",
-        xlabel="I_i",
-        out_path=OUT_DIR / f"{tag}__I_all.png",
-        bins=40,
-        vlines=[(0.5, "0.5")],
-    )
-    _save_hist(
-        M_non,
-        title=f"M_i distribution - non-learnable ({tag})",
-        xlabel="M_i",
-        out_path=OUT_DIR / f"{tag}__M_nonlearnable.png",
-        bins=40,
-        vlines=[(P0, f"p0={P0:.2f}")],
-    )
+        selection_path = OUT_DIR / f"selection_cr{cut_ratio}.npz"
+        np.savez(
+            selection_path,
+            indices=selected_indices,
+            labels=labels_full[selected_indices],
+            u_scores=u_scores[selected_indices],
+        )
 
-    # =========================
-    # Core diagnostics 2: scatter L vs S colored by score
-    # =========================
-    # Learnable-only scatter
-    _save_scatter(
-        L_learn,
-        S_learn,
-        score_learn,
-        title=f"L vs S (learnable only), color=score ({tag})",
-        xlabel="L_i",
-        ylabel="S_i",
-        out_path=OUT_DIR / f"{tag}__scatter_LS_learnable.png",
-    )
-    # All-samples scatter
-    _save_scatter(
-        L,
-        S,
-        scores,
-        title=f"L vs S (all), color=score ({tag})",
-        xlabel="L_i",
-        ylabel="S_i",
-        out_path=OUT_DIR / f"{tag}__scatter_LS_all.png",
-    )
+        history_path = OUT_DIR / f"history_cr{cut_ratio}.json"
+        history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
-    # =========================
-    # Optional: quadrant stats
-    # =========================
-    if L_learn.size > 0 and S_learn.size > 0:
-        L_th_val = float(L_TH) if L_TH is not None else float(np.quantile(L_learn, L_TH_QUANTILE))
-        S_th_val = float(S_TH) if S_TH is not None else float(np.quantile(S_learn, S_TH_QUANTILE))
-        print(f"\nQuadrant thresholds (learnable subset): L_th={L_th_val:.4f}, S_th={S_th_val:.4f}")
-        qs = _quadrant_stats(L_learn, S_learn, score_learn, L_th_val, S_th_val)
-        _print_quadrants(qs, title="Quadrant stats on learnable subset (L vs S)")
-
-    # =========================
-    # Final summary
-    # =========================
-    print("\n=== Summary ===")
-    _print_stats("Score [all]", _describe(scores))
-    _print_stats("Score [learnable]", _describe(score_learn))
-    _print_stats("Score [non-learnable]", _describe(score_non))
-    print(f"Saved plots to: {OUT_DIR.resolve()}")
+    summary_path = OUT_DIR / "summary.json"
+    summary_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Saved results to {OUT_DIR}")
 
 
 if __name__ == "__main__":

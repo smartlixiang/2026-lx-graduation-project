@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from dataset.dataset import BaseDataLoader
+from dataset.dataset_config import AVAILABLE_DATASETS
 from model.model_config import get_model
 from utils.global_config import CONFIG
 from utils.seed import parse_seed_list, set_seed
@@ -22,7 +23,12 @@ from utils.seed import parse_seed_list, set_seed
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10"])
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar10",
+        choices=AVAILABLE_DATASETS,
+    )
     parser.add_argument("--data_root", type=str, default=str(Path("data")))
     parser.add_argument(
         "--cr",  # cut ratios

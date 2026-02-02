@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for histogram plots.",
     )
     parser.add_argument("--bins", type=int, default=50, help="Histogram bins.")
-    parser.add_argument("--no_pause", action="store_true", help="Disable input() pause.")
+    parser.add_argument("--no_pause", action="store_true", default=True, help="Disable input() pause.")
     return parser.parse_args()
 
 
@@ -53,7 +53,7 @@ def _to_full(scores: np.ndarray, indices: np.ndarray, n: int) -> np.ndarray:
 
 def _compute_components(
     proxy_log: Path,
-) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray]:
     absorption_res = AbsorptionEfficiencyScore(proxy_log).compute()
     informativeness_res = InformativenessScore(proxy_log).compute()
     coverage_res = CoverageGainScore(proxy_log).compute()
@@ -75,6 +75,8 @@ def _compute_components(
     b_full = _to_full(informativeness_res.scores, informativeness_res.indices, n)
     b_raw_full = _to_full(informativeness_res.raw_score, informativeness_res.indices, n)
     c_full = _to_full(coverage_res.scores, coverage_res.indices, n)
+    c_raw = getattr(coverage_res, "raw_score", coverage_res.scores)
+    c_raw_full = _to_full(c_raw, coverage_res.indices, n)
     r_full = _to_full(risk_res.scores, risk_res.indices, n)
     r_raw_full = _to_full(risk_res.raw_score, risk_res.indices, n)
 
@@ -84,6 +86,7 @@ def _compute_components(
         or np.any(np.isnan(b_full))
         or np.any(np.isnan(b_raw_full))
         or np.any(np.isnan(c_full))
+        or np.any(np.isnan(c_raw_full))
         or np.any(np.isnan(r_full))
         or np.any(np.isnan(r_raw_full))
     ):
@@ -98,13 +101,14 @@ def _compute_components(
         "R": r_full.astype(np.float32),
         "u": u_norm.astype(np.float32),
     }
-    return (
-        components,
-        a_raw_full.astype(np.float32),
-        b_raw_full.astype(np.float32),
-        r_raw_full.astype(np.float32),
-        absorption_res.labels.astype(np.int64),
-    )
+    raw_components = {
+        "A_raw": a_raw_full.astype(np.float32),
+        "B_raw": b_raw_full.astype(np.float32),
+        "C_raw": c_raw_full.astype(np.float32),
+        "R_raw": r_raw_full.astype(np.float32),
+        "u_raw": u_raw.astype(np.float32),
+    }
+    return components, raw_components, absorption_res.labels.astype(np.int64)
 
 
 def _print_quantiles(values: np.ndarray, name: str) -> None:
@@ -161,9 +165,12 @@ def main() -> None:
     if not proxy_log.exists():
         raise FileNotFoundError(f"Proxy log not found: {proxy_log}")
 
-    arrays, a_raw, b_raw, r_raw, labels = _compute_components(proxy_log)
+    arrays, raw_arrays, labels = _compute_components(proxy_log)
     num_samples = labels.shape[0]
     for key, values in arrays.items():
+        if values.shape[0] != num_samples:
+            raise ValueError(f"{key} length does not match labels length.")
+    for key, values in raw_arrays.items():
         if values.shape[0] != num_samples:
             raise ValueError(f"{key} length does not match labels length.")
 
@@ -178,7 +185,7 @@ def main() -> None:
         plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.hist(b_raw, bins=args.bins, color="#55A868", alpha=0.85)
+    ax.hist(raw_arrays["B_raw"], bins=args.bins, color="#55A868", alpha=0.85)
     ax.set_title("B_raw Histogram")
     ax.set_xlabel("Value")
     ax.set_ylabel("Count")
@@ -197,6 +204,17 @@ def main() -> None:
     fig.savefig(out_dir / "hist_overview.png", dpi=150)
     plt.close(fig)
 
+    fig, axes = plt.subplots(2, 3, figsize=(12, 7))
+    axes = axes.ravel()
+    for idx, name in enumerate(["A_raw", "B_raw", "C_raw", "R_raw", "u_raw"]):
+        ax = axes[idx]
+        ax.hist(raw_arrays[name], bins=args.bins, color="#C44E52", alpha=0.85)
+        ax.set_title(name)
+    axes[-1].axis("off")
+    fig.tight_layout()
+    fig.savefig(out_dir / "hist_overview_raw.png", dpi=150)
+    plt.close(fig)
+
     names = ["A", "B", "C", "R", "u"]
     matrix = np.vstack([arrays[name] for name in names])
     pearson = np.corrcoef(matrix)
@@ -205,10 +223,10 @@ def main() -> None:
     print(f"Loaded proxy log: {proxy_log}")
     print(f"Saved histogram plots to: {out_dir}")
     _print_quantiles(arrays["A"], "A_score")
-    _print_quantiles(a_raw, "A_raw")
-    _print_quantiles(b_raw, "B_raw")
+    _print_quantiles(raw_arrays["A_raw"], "A_raw")
+    _print_quantiles(raw_arrays["B_raw"], "B_raw")
     _print_quantiles(arrays["R"], "R_score")
-    _print_quantiles(r_raw, "R_raw")
+    _print_quantiles(raw_arrays["R_raw"], "R_raw")
     _print_zero_one_counts(arrays["A"], "A_score")
     _print_zero_one_counts(arrays["R"], "R_score")
     _print_corr_table(names, pearson, "Pearson Correlation")

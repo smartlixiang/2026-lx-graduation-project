@@ -40,11 +40,15 @@ class AbsorptionEfficiencyScore:
         *,
         q_low: float = 0.01,
         q_high: float = 0.99,
+        temp_progress: float = 2.0,
+        sigma_level: float = 2.0,
         eps: float = 1e-6,
     ) -> None:
         self.npz_path = Path(npz_path)
         self.q_low = float(q_low)
         self.q_high = float(q_high)
+        self.temp_progress = float(temp_progress)
+        self.sigma_level = float(sigma_level)
         self.eps = float(eps)
 
     def _load_loss(self, data: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -82,9 +86,9 @@ class AbsorptionEfficiencyScore:
         level_z = robust_z_by_class(level, labels, eps=self.eps)
         progress_z = robust_z_by_class(progress, labels, eps=self.eps)
 
-        speed = stable_sigmoid(progress_z)
-        moderate = np.exp(-0.5 * (level_z**2)).astype(np.float32)
-        raw_score = (speed * moderate).astype(np.float32)
+        speed = stable_sigmoid(progress_z / self.temp_progress)
+        moderate = np.exp(-0.5 * ((level_z / self.sigma_level) ** 2)).astype(np.float32)
+        raw_score = np.sqrt(np.clip(speed * moderate, 0.0, 1.0) + self.eps).astype(np.float32)
 
         scores = quantile_minmax_by_class(
             raw_score, labels, q_low=self.q_low, q_high=self.q_high, eps=self.eps

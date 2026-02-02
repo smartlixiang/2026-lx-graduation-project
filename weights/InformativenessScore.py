@@ -10,11 +10,7 @@ from typing import Optional
 
 import numpy as np
 
-from utils.score_utils import (
-    quantile_minmax_by_class,
-    resolve_window_length,
-    stable_sigmoid,
-)
+from utils.score_utils import quantile_minmax_by_class, resolve_window_length
 
 
 @dataclass
@@ -38,17 +34,11 @@ class InformativenessScore:
         self,
         npz_path: str | Path,
         *,
-        tau_g: float = 0.10,
-        s_g: float = 0.03,
-        tau_delta: float = 0.05,
         q_low: float = 0.01,
         q_high: float = 0.99,
         eps: float = 1e-8,
     ) -> None:
         self.npz_path = Path(npz_path)
-        self.tau_g = float(tau_g)
-        self.s_g = float(s_g)
-        self.tau_delta = float(tau_delta)
         self.q_low = float(q_low)
         self.q_high = float(q_high)
         self.eps = float(eps)
@@ -80,10 +70,6 @@ class InformativenessScore:
         return exp_shifted / (sum_exp + self.eps)
 
     def compute(self, proxy_logs: Optional[dict[str, np.ndarray]] = None) -> InformativenessResult:
-        if self.s_g <= 0.0:
-            raise ValueError("s_g must be positive.")
-        if self.tau_delta <= 0.0:
-            raise ValueError("tau_delta must be positive.")
         data = proxy_logs if proxy_logs is not None else np.load(self.npz_path)
         logits, labels, indices = self._load_logits(data)
 
@@ -100,17 +86,20 @@ class InformativenessScore:
         p_other_max = probs_other.max(axis=2)
         gap = p_true - p_other_max
 
-        alpha = stable_sigmoid((self.tau_g - gap) / self.s_g)
-
-        early_slice = slice(0, early_epochs)
         late_slice = slice(num_epochs - late_epochs, num_epochs)
 
-        hardness = alpha[late_slice].mean(axis=0).astype(np.float32)
-        delta_gap = (
-            gap[late_slice].mean(axis=0) - gap[early_slice].mean(axis=0)
-        ).astype(np.float32)
-        improve = stable_sigmoid(delta_gap / self.tau_delta)
-        raw_score = (hardness * improve).astype(np.float32)
+        gL = gap[late_slice].mean(axis=0)
+        mu_b = np.percentile(gL, 30)
+        sigma_b = 0.5 * (np.percentile(gL, 75) - np.percentile(gL, 25)) + self.eps
+        w = np.exp(-0.5 * ((gap - mu_b) / sigma_b) ** 2)
+
+        tau_p = 0.02
+        dp = gap[1:] - gap[:-1]
+        scaled_dp = dp / tau_p
+        softplus = np.log1p(np.exp(-np.abs(scaled_dp))) + np.maximum(scaled_dp, 0.0)
+        delta_pos = softplus * tau_p
+
+        raw_score = (w[:-1] * delta_pos).mean(axis=0).astype(np.float32)
 
         scores = quantile_minmax_by_class(
             raw_score, labels, q_low=self.q_low, q_high=self.q_high, eps=self.eps
@@ -119,16 +108,17 @@ class InformativenessScore:
         if not np.array_equal(indices, np.arange(len(indices))):
             order = np.argsort(indices)
             scores = scores[order]
-            hardness = hardness[order]
-            delta_gap = delta_gap[order]
+            gL = gL[order]
+            delta_pos = delta_pos[:, order]
             raw_score = raw_score[order]
             indices = indices[order]
             labels = labels[order]
 
         return InformativenessResult(
             scores=scores.astype(np.float32),
-            hardness=hardness,
-            delta_gap=delta_gap,
+            hardness=gL.astype(np.float32),
+            # hardness stores gL: late-window mean gap (boundary location proxy).
+            delta_gap=delta_pos.mean(axis=0).astype(np.float32),
             raw_score=raw_score,
             labels=labels,
             indices=indices,

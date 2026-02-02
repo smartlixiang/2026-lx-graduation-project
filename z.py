@@ -51,7 +51,9 @@ def _to_full(scores: np.ndarray, indices: np.ndarray, n: int) -> np.ndarray:
     return full
 
 
-def _compute_components(proxy_log: Path) -> tuple[dict[str, np.ndarray], np.ndarray]:
+def _compute_components(
+    proxy_log: Path,
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     absorption_res = AbsorptionEfficiencyScore(proxy_log).compute()
     informativeness_res = InformativenessScore(proxy_log).compute()
     coverage_res = CoverageGainScore(proxy_log).compute()
@@ -69,15 +71,21 @@ def _compute_components(proxy_log: Path) -> tuple[dict[str, np.ndarray], np.ndar
 
     n = absorption_res.labels.shape[0]
     a_full = _to_full(absorption_res.scores, absorption_res.indices, n)
+    a_raw_full = _to_full(absorption_res.raw_score, absorption_res.indices, n)
     b_full = _to_full(informativeness_res.scores, informativeness_res.indices, n)
+    b_raw_full = _to_full(informativeness_res.raw_score, informativeness_res.indices, n)
     c_full = _to_full(coverage_res.scores, coverage_res.indices, n)
     r_full = _to_full(risk_res.scores, risk_res.indices, n)
+    r_raw_full = _to_full(risk_res.raw_score, risk_res.indices, n)
 
     if (
         np.any(np.isnan(a_full))
+        or np.any(np.isnan(a_raw_full))
         or np.any(np.isnan(b_full))
+        or np.any(np.isnan(b_raw_full))
         or np.any(np.isnan(c_full))
         or np.any(np.isnan(r_full))
+        or np.any(np.isnan(r_raw_full))
     ):
         raise RuntimeError("Failed to align some dynamic scores to full index space (NaNs found).")
 
@@ -90,7 +98,28 @@ def _compute_components(proxy_log: Path) -> tuple[dict[str, np.ndarray], np.ndar
         "R": r_full.astype(np.float32),
         "u": u_norm.astype(np.float32),
     }
-    return components, absorption_res.labels.astype(np.int64)
+    return (
+        components,
+        a_raw_full.astype(np.float32),
+        b_raw_full.astype(np.float32),
+        r_raw_full.astype(np.float32),
+        absorption_res.labels.astype(np.int64),
+    )
+
+
+def _print_quantiles(values: np.ndarray, name: str) -> None:
+    quantiles = [0, 1, 5, 25, 50, 75, 95, 99, 100]
+    percentiles = np.percentile(values, quantiles)
+    print(f"\n{name} quantiles:")
+    for q, v in zip(quantiles, percentiles, strict=True):
+        print(f"  p{q:02d}: {v: .6f}")
+
+
+def _print_zero_one_counts(values: np.ndarray, name: str) -> None:
+    zero_count = int(np.sum(values == 0.0))
+    one_count = int(np.sum(values == 1.0))
+    print(f"{name} exact 0 count: {zero_count}")
+    print(f"{name} exact 1 count: {one_count}")
 
 
 def _rankdata(values: np.ndarray) -> np.ndarray:
@@ -132,7 +161,7 @@ def main() -> None:
     if not proxy_log.exists():
         raise FileNotFoundError(f"Proxy log not found: {proxy_log}")
 
-    arrays, labels = _compute_components(proxy_log)
+    arrays, a_raw, b_raw, r_raw, labels = _compute_components(proxy_log)
     num_samples = labels.shape[0]
     for key, values in arrays.items():
         if values.shape[0] != num_samples:
@@ -147,6 +176,15 @@ def main() -> None:
         fig.tight_layout()
         fig.savefig(out_dir / f"hist_{name}.png", dpi=150)
         plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(b_raw, bins=args.bins, color="#55A868", alpha=0.85)
+    ax.set_title("B_raw Histogram")
+    ax.set_xlabel("Value")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(out_dir / "hist_B_raw.png", dpi=150)
+    plt.close(fig)
 
     fig, axes = plt.subplots(2, 3, figsize=(12, 7))
     axes = axes.ravel()
@@ -166,6 +204,13 @@ def main() -> None:
 
     print(f"Loaded proxy log: {proxy_log}")
     print(f"Saved histogram plots to: {out_dir}")
+    _print_quantiles(arrays["A"], "A_score")
+    _print_quantiles(a_raw, "A_raw")
+    _print_quantiles(b_raw, "B_raw")
+    _print_quantiles(arrays["R"], "R_score")
+    _print_quantiles(r_raw, "R_raw")
+    _print_zero_one_counts(arrays["A"], "A_score")
+    _print_zero_one_counts(arrays["R"], "R_score")
     _print_corr_table(names, pearson, "Pearson Correlation")
     _print_corr_table(names, spearman, "Spearman Correlation")
 

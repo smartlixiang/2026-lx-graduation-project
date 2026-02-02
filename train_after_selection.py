@@ -62,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="跳过已经保存的结果文件",
     )
+    parser.add_argument(
+        "--load_checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="训练开始前是否加载已有 checkpoint",
+    )
     return parser.parse_args()
 
 
@@ -234,6 +240,14 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             / str(seed)
         )
         result_path = result_dir / f"result_{cut_ratio}.json"
+        checkpoint_dir = (
+            Path("checkpoint")
+            / args.mode
+            / args.dataset
+            / model_name
+            / str(seed)
+        )
+        checkpoint_path = checkpoint_dir / f"checkpoint_{cut_ratio}.pt"
         if args.skip_saved and result_path.exists():
             continue
 
@@ -271,7 +285,18 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
         accuracy_samples: list[float] = []
         start_eval_epoch = max(1, args.epochs - 9)
-        for epoch in range(1, args.epochs + 1):
+        start_epoch = 1
+        if args.load_checkpoint and checkpoint_path.exists():
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state"])
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+            scheduler.load_state_dict(checkpoint["scheduler_state"])
+            accuracy_samples = list(checkpoint.get("accuracy_samples", []))
+            start_epoch = int(checkpoint["epoch"]) + 1
+            elapsed_time = float(checkpoint.get("elapsed_time", 0.0))
+            start_time = time.time() - elapsed_time
+
+        for epoch in range(start_epoch, args.epochs + 1):
             train_loss = train_one_epoch(
                 model,
                 subset_loader,
@@ -289,6 +314,19 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 )
                 accuracy_samples.append(eval_accuracy)
                 print(f"Test accuracy at epoch {epoch}: {eval_accuracy:.4f}")
+            if epoch % 20 == 0:
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "scheduler_state": scheduler.state_dict(),
+                        "accuracy_samples": accuracy_samples,
+                        "elapsed_time": time.time() - start_time,
+                    },
+                    checkpoint_path,
+                )
 
         total_time = time.time() - start_time
         accuracy = float(np.mean(accuracy_samples)) if accuracy_samples else 0.0
@@ -326,6 +364,8 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         with result_path.open("w", encoding="utf-8") as f:
             json.dump(result_payload, f, ensure_ascii=False, indent=2)
 
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
         if multi_seed:
             print(f"Saved result to {result_path}")
 

@@ -1,11 +1,15 @@
 """End-to-end debug script for CIFAR-10 selection + training using proxy dynamics.
 
 This version implements the user's intended baseline:
-- Compute utility score u = mean(CoverageGainScore, StabilityScore, EarlyLearnabilityScore)
-- Normalize u within each true class (quantile-based min-max)
+- Compute utility score u = A + B + C - R (AbsorptionEfficiency, Informativeness,
+  CoverageGain, RiskScore)
+- Normalize u with a global quantile-based min-max
 - Select top-k within each true class proportional to cut_ratio
 - Train downstream model on the selected subset (true labels)
 """
+
+# Key interfaces:
+# - _compute_u_scores_from_proxy_log(): builds A/B/C/R/u from proxy logs for selection.
 from __future__ import annotations
 
 import json
@@ -25,9 +29,11 @@ from utils.global_config import CONFIG
 from utils.seed import set_seed
 
 # NEW: import dynamic scoring terms (must exist in your repo)
+from utils.score_utils import quantile_minmax
+from weights.AbsorptionEfficiencyScore import AbsorptionEfficiencyScore
 from weights.CoverageGainScore import CoverageGainScore
-from weights.EarlyLearnabilityScore import EarlyLearnabilityScore
-from weights.StabilityScore import StabilityScore
+from weights.InformativenessScore import InformativenessScore
+from weights.RiskScore import RiskScore
 
 # =========================
 # User config
@@ -35,7 +41,7 @@ from weights.StabilityScore import StabilityScore
 DATASET = "cifar10"
 MODEL_NAME = "resnet50"
 SEED = 22
-CUT_RATIOS = [30, 50, 70]
+CUT_RATIOS = [30, 40, 50]
 PROXY_LOG_DIR = Path("weights") / "proxy_logs" / str(SEED)
 OUT_DIR = Path("debug")
 
@@ -62,12 +68,6 @@ def _find_latest_npz(log_dir: Path) -> Path:
     if not candidates:
         raise FileNotFoundError(f"No proxy log .npz files found in: {log_dir}")
     return candidates[-1]
-
-
-def _softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
-    max_logits = np.max(logits, axis=axis, keepdims=True)
-    exp_logits = np.exp(logits - max_logits)
-    return exp_logits / np.sum(exp_logits, axis=axis, keepdims=True)
 
 
 def _load_proxy_logits_and_labels(npz_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -101,37 +101,8 @@ def _load_proxy_logits_and_labels(npz_path: Path) -> tuple[np.ndarray, np.ndarra
     return logits, labels, indices
 
 
-def _normalize_scores_with_quantiles(
-    scores: np.ndarray,
-    labels: np.ndarray,
-    *,
-    q_low: float = 0.01,
-    q_high: float = 0.99,
-    eps: float = 1e-8,
-) -> np.ndarray:
-    """Class-wise quantile min-max normalization to [0, 1]."""
-    if scores.ndim != 1 or labels.ndim != 1 or scores.shape[0] != labels.shape[0]:
-        raise ValueError("scores and labels must be 1D arrays with same length")
-    if not (0.0 <= q_low < q_high <= 1.0):
-        raise ValueError("q_low and q_high must satisfy 0<=q_low<q_high<=1")
-
-    out = np.zeros_like(scores, dtype=np.float32)
-    classes = np.unique(labels)
-    for c in classes:
-        idx = np.flatnonzero(labels == c)
-        if idx.size == 0:
-            continue
-        s = scores[idx].astype(np.float32, copy=False)
-        lo = float(np.quantile(s, q_low))
-        hi = float(np.quantile(s, q_high))
-        denom = (hi - lo) + eps
-        normed = (s - lo) / denom
-        out[idx] = np.clip(normed, 0.0, 1.0)
-    return out
-
-
-def _compute_u_scores_from_proxy_log(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Compute u = mean(CoverageGain, Stability, EarlyLearnability), then class-wise normalize.
+def _compute_u_scores_from_proxy_log(npz_path: Path) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """Compute u = A + B + C - R, then global quantile normalize.
 
     Returns:
         u_norm: shape (N,) float32 in [0,1], aligned to dataset index order
@@ -141,9 +112,10 @@ def _compute_u_scores_from_proxy_log(npz_path: Path) -> tuple[np.ndarray, np.nda
     _, labels_proxy, indices_proxy = _load_proxy_logits_and_labels(npz_path)
 
     # Compute three dynamic scores (each should return per-sample scores + indices)
-    stab_res = StabilityScore(npz_path).compute()
-    early_res = EarlyLearnabilityScore(npz_path).compute()
+    absorption_res = AbsorptionEfficiencyScore(npz_path).compute()
+    informativeness_res = InformativenessScore(npz_path).compute()
     cov_res = CoverageGainScore(npz_path).compute()
+    risk_res = RiskScore(npz_path).compute()
 
     # Build map from index -> position for each result to align robustly
     def _to_full(scores: np.ndarray, indices: np.ndarray, n: int) -> np.ndarray:
@@ -156,14 +128,20 @@ def _compute_u_scores_from_proxy_log(npz_path: Path) -> tuple[np.ndarray, np.nda
         return full
 
     n = labels_proxy.shape[0]
-    s_full = _to_full(stab_res.scores, stab_res.indices, n)
-    e_full = _to_full(early_res.scores, early_res.indices, n)
+    a_full = _to_full(absorption_res.scores, absorption_res.indices, n)
+    b_full = _to_full(informativeness_res.scores, informativeness_res.indices, n)
     c_full = _to_full(cov_res.scores, cov_res.indices, n)
+    r_full = _to_full(risk_res.scores, risk_res.indices, n)
 
-    if np.any(np.isnan(s_full)) or np.any(np.isnan(e_full)) or np.any(np.isnan(c_full)):
+    if (
+        np.any(np.isnan(a_full))
+        or np.any(np.isnan(b_full))
+        or np.any(np.isnan(c_full))
+        or np.any(np.isnan(r_full))
+    ):
         raise RuntimeError("Failed to align some dynamic scores to full index space (NaNs found).")
 
-    u = (s_full + e_full + c_full) / 3.0
+    u_raw = a_full + b_full + c_full - r_full
 
     # Ensure labels are aligned to dataset index order 0..N-1
     labels_full = np.full((n,), -1, dtype=np.int64)
@@ -171,9 +149,15 @@ def _compute_u_scores_from_proxy_log(npz_path: Path) -> tuple[np.ndarray, np.nda
     if np.any(labels_full < 0):
         raise RuntimeError("Failed to align proxy labels to full index space.")
 
-    # Class-wise normalization to [0,1] (matches your weight-learning normalization style)
-    u_norm = _normalize_scores_with_quantiles(u.astype(np.float32), labels_full, q_low=0.01, q_high=0.99)
-    return u_norm, labels_full
+    u_norm = quantile_minmax(u_raw.astype(np.float32), q_low=0.1, q_high=0.99)
+    components = {
+        "A": a_full.astype(np.float32),
+        "B": b_full.astype(np.float32),
+        "C": c_full.astype(np.float32),
+        "R": r_full.astype(np.float32),
+        "u": u_norm.astype(np.float32),
+    }
+    return u_norm, labels_full, components
 
 
 def _select_topk_indices(
@@ -285,7 +269,7 @@ def main() -> None:
     print(f"Using proxy log: {proxy_npz}")
 
     # Compute the intended utility score u (aligned to dataset order)
-    u_scores, labels_full = _compute_u_scores_from_proxy_log(proxy_npz)
+    u_scores, labels_full, components = _compute_u_scores_from_proxy_log(proxy_npz)
 
     # Data
     data_loader = BaseDataLoader(
@@ -315,6 +299,17 @@ def main() -> None:
         "epochs": EPOCHS,
         "metrics": {},
     }
+
+    np.savez(
+        OUT_DIR / "pseudolabel_components.npz",
+        A=components["A"],
+        B=components["B"],
+        C=components["C"],
+        R=components["R"],
+        u=components["u"],
+        labels=labels_full,
+        indices=np.arange(labels_full.shape[0], dtype=np.int64),
+    )
 
     num_classes = data_loader.num_classes
 

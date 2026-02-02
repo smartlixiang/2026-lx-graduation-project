@@ -1,4 +1,7 @@
 """Learn scoring weights from proxy training dynamics."""
+
+# Key interfaces:
+# - run_for_seed(...): computes A/B/C/R, builds u, saves pseudolabel components, trains ridge weights.
 from __future__ import annotations
 
 import argparse
@@ -16,7 +19,13 @@ from model.adapter import AdapterMLP
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.global_config import CONFIG
 from utils.seed import parse_seed_list, set_seed
-from weights import CoverageGainScore, EarlyLearnabilityScore, StabilityScore
+from utils.score_utils import quantile_minmax
+from weights import (
+    AbsorptionEfficiencyScore,
+    CoverageGainScore,
+    InformativenessScore,
+    RiskScore,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,13 +49,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--div-k", type=int, default=10)
     parser.add_argument("--dds-k", type=float, default=10)
-    parser.add_argument("--early-epochs", type=int, default=None)
     parser.add_argument("--coverage-tau-g", type=float, default=0.15)
     parser.add_argument("--coverage-s-g", type=float, default=0.07)
     parser.add_argument("--coverage-k", type=int, default=10)
-    parser.add_argument("--coverage-gamma", type=float, default=1.0)
     parser.add_argument("--coverage-q-low", type=float, default=0.1)
     parser.add_argument("--coverage-q-high", type=float, default=0.99)
+    parser.add_argument(
+        "--pseudolabel-output",
+        type=str,
+        default="weights/pseudolabels",
+        help="Path (directory or .npz) to save A/B/C/R/u components.",
+    )
     parser.add_argument("--ridge-lambda", type=float, default=1e-2)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=1000)
@@ -179,30 +192,6 @@ def project_to_simplex(vector: np.ndarray) -> np.ndarray:
     return (projected / projected_sum).astype(np.float64)
 
 
-def normalize_scores_with_quantiles(
-    scores: np.ndarray,
-    labels: np.ndarray,
-    lower_q: float = 0.001,
-    upper_q: float = 0.999,
-) -> np.ndarray:
-    if labels.shape[0] != scores.shape[0]:
-        raise ValueError("labels length must match scores length.")
-    normalized = np.zeros_like(scores, dtype=np.float64)
-    for cls in np.unique(labels):
-        mask = labels == cls
-        if not np.any(mask):
-            continue
-        class_scores = scores[mask]
-        lower = float(np.quantile(class_scores, lower_q))
-        upper = float(np.quantile(class_scores, upper_q))
-        if upper <= lower:
-            normalized[mask] = 0.5
-            continue
-        clipped = np.clip(class_scores, lower, upper)
-        normalized[mask] = (clipped - lower) / (upper - lower)
-    return normalized.astype(np.float64)
-
-
 def build_output_path(base_path: str) -> Path:
     return Path(base_path)
 
@@ -238,37 +227,62 @@ def resolve_proxy_log_path(proxy_log_arg: str, dataset: str, seed: int) -> Path:
     return matches[0]
 
 
+def resolve_pseudolabel_output(base_path: str, dataset: str, seed: int) -> Path:
+    path = Path(base_path)
+    if path.suffix == ".npz":
+        return path
+    path.mkdir(parents=True, exist_ok=True)
+    return path / f"pseudolabel_{dataset}_seed{seed}.npz"
+
+
 def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     set_seed(seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
     proxy_log = resolve_proxy_log_path(args.proxy_log, args.dataset, seed)
 
-    early_result = EarlyLearnabilityScore(
-        proxy_log, early_epochs=args.early_epochs
-    ).compute()
-    stability_result = StabilityScore(proxy_log).compute()
+    absorption_result = AbsorptionEfficiencyScore(proxy_log).compute()
+    informativeness_result = InformativenessScore(proxy_log).compute()
     coverage_result = CoverageGainScore(
         proxy_log,
         tau_g=args.coverage_tau_g,
         s_g=args.coverage_s_g,
         k=args.coverage_k,
-        gamma=args.coverage_gamma,
         q_low=args.coverage_q_low,
         q_high=args.coverage_q_high,
     ).compute()
+    risk_result = RiskScore(proxy_log).compute()
 
+    indices = absorption_result.indices
     if (
-        not np.array_equal(early_result.indices, stability_result.indices)
-        or not np.array_equal(early_result.indices, coverage_result.indices)
+        not np.array_equal(indices, informativeness_result.indices)
+        or not np.array_equal(indices, coverage_result.indices)
+        or not np.array_equal(indices, risk_result.indices)
     ):
         raise ValueError("动态指标的 indices 不一致，无法对齐样本。")
+    if absorption_result.labels is None:
+        raise ValueError("代理训练日志缺少 labels，无法对齐动态分数。")
 
-    dynamic_scores = (
-        stability_result.scores + early_result.scores + coverage_result.scores
-    ) / 3.0
-    if early_result.labels is None:
-        raise ValueError("代理训练日志缺少 labels，无法按类别归一化动态分数。")
-    dynamic_scores = normalize_scores_with_quantiles(dynamic_scores, early_result.labels)
+    a_scores = absorption_result.scores
+    b_scores = informativeness_result.scores
+    c_scores = coverage_result.scores
+    r_scores = risk_result.scores
+    u_raw = a_scores + b_scores + c_scores - r_scores
+    u_scores = quantile_minmax(u_raw.astype(np.float32), q_low=0.01, q_high=0.99)
+
+    pseudo_path = resolve_pseudolabel_output(args.pseudolabel_output, args.dataset, seed)
+    pseudo_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        pseudo_path,
+        A=a_scores.astype(np.float32),
+        B=b_scores.astype(np.float32),
+        C=c_scores.astype(np.float32),
+        R=r_scores.astype(np.float32),
+        u=u_scores.astype(np.float32),
+        labels=absorption_result.labels.astype(np.int64),
+        indices=indices.astype(np.int64),
+        proxy_log=str(proxy_log),
+    )
+    print("Saved pseudolabel components to", pseudo_path)
 
     class_names = load_class_names(args.dataset, args.data_root)
     dds_metric = DifficultyDirection(
@@ -315,8 +329,8 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     div_scores = div_metric.score_dataset(div_loader, adapter=adapter)
     sa_scores = sa_metric.score_dataset(sa_loader, adapter=adapter)
 
-    if early_result.labels is not None:
-        if not np.array_equal(early_result.labels, sa_scores.labels.numpy()):
+    if absorption_result.labels is not None:
+        if not np.array_equal(absorption_result.labels, sa_scores.labels.numpy()):
             raise ValueError("代理训练日志的标签与评分数据集标签不一致。")
 
     static_features = np.stack(
@@ -327,7 +341,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         ],
         axis=1,
     ).astype(np.float64)
-    dynamic_scores = dynamic_scores.astype(np.float64)
+    dynamic_scores = u_scores.astype(np.float64)
 
     weights, bias = fit_ridge_regression_nonnegative(
         static_features,

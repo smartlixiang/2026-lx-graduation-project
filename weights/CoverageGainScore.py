@@ -1,4 +1,7 @@
 """CoverageGainScore implementation based on proxy training dynamics."""
+
+# Key interfaces:
+# - CoverageGainScore.compute() -> CoverageGainResult with scores in [0, 1].
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,6 +9,8 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+from utils.score_utils import quantile_minmax_by_class, stable_sigmoid
 
 
 @dataclass
@@ -16,7 +21,6 @@ class CoverageGainResult:
     knn_distance: np.ndarray
     q_confusion: np.ndarray
     alpha_sum: np.ndarray
-    g_learn: np.ndarray
     labels: Optional[np.ndarray]
     indices: np.ndarray
 
@@ -28,35 +32,22 @@ class CoverageGainScore:
         self,
         npz_path: str | Path,
         *,
-        beta: float = 0.9,
-        theta: float = 0.7,
-        t_learn: float = 0.2,
         tau_g: float = 0.15,
         s_g: float = 0.07,
         k: int = 10,
-        gamma: float = 1.0,
         q_low: float = 0.01,
         q_high: float = 0.99,
         eps: float = 1e-8,
         verbose: bool = False,
     ) -> None:
         self.npz_path = Path(npz_path)
-        self.beta = float(beta)
-        self.theta = float(theta)
-        self.t_learn = float(t_learn)
         self.tau_g = float(tau_g)
         self.s_g = float(s_g)
         self.k = int(k)
-        self.gamma = float(gamma)
         self.q_low = float(q_low)
         self.q_high = float(q_high)
         self.eps = float(eps)
         self.verbose = bool(verbose)
-
-    @staticmethod
-    def _sigmoid(values: np.ndarray) -> np.ndarray:
-        values = np.clip(values, -50.0, 50.0)
-        return 1.0 / (1.0 + np.exp(-values))
 
     @staticmethod
     def _validate_logits(logits: np.ndarray, labels: np.ndarray) -> None:
@@ -118,18 +109,10 @@ class CoverageGainScore:
         return distances.astype(np.float32)
 
     def compute(self) -> CoverageGainResult:
-        if not 0.0 < self.beta < 1.0:
-            raise ValueError("beta must be in (0, 1).")
-        if not 0.0 <= self.theta <= 1.0:
-            raise ValueError("theta must be in [0, 1].")
-        if self.t_learn <= 0.0:
-            raise ValueError("t_learn must be positive.")
         if self.s_g <= 0.0:
             raise ValueError("s_g must be positive.")
         if self.k <= 0:
             raise ValueError("k must be positive.")
-        if self.gamma <= 0.0:
-            raise ValueError("gamma must be positive.")
         if not 0.0 <= self.q_low < self.q_high <= 1.0:
             raise ValueError("q_low/q_high must satisfy 0 <= q_low < q_high <= 1.")
         if self.eps <= 0.0:
@@ -149,7 +132,7 @@ class CoverageGainScore:
         probs_other[:, np.arange(num_samples), labels] = -np.inf
         p_other_max = probs_other.max(axis=2)
         gap = p_true - p_other_max
-        alpha = self._sigmoid((self.tau_g - gap) / self.s_g).astype(np.float32)
+        alpha = stable_sigmoid((self.tau_g - gap) / self.s_g).astype(np.float32)
         alpha_sum = alpha.sum(axis=0).astype(np.float32)
 
         q_sum = np.zeros((num_samples, num_classes), dtype=np.float64)
@@ -163,15 +146,7 @@ class CoverageGainScore:
             np.float32
         )
 
-        ema = np.zeros_like(p_true, dtype=np.float32)
-        ema[0] = p_true[0]
-        for t in range(1, num_epochs):
-            ema[t] = self.beta * ema[t - 1] + (1.0 - self.beta) * p_true[t]
-        a_max = ema.max(axis=0)
-        g_learn = self._sigmoid((a_max - self.theta) / self.t_learn).astype(np.float32)
-
         knn_distance = np.zeros(num_samples, dtype=np.float32)
-        score_raw = np.zeros(num_samples, dtype=np.float32)
         class_k: dict[int, int] = {}
         for cls in np.unique(labels):
             mask = labels == cls
@@ -185,16 +160,10 @@ class CoverageGainScore:
             q_class = q_confusion[idx]
             distances = self._compute_knn_mean_distance(q_class, k_eff)
             knn_distance[idx] = distances
-            lo = float(np.quantile(distances, self.q_low))
-            hi = float(np.quantile(distances, self.q_high))
-            if hi <= lo:
-                score_raw[idx] = 0.0
-            else:
-                score_raw[idx] = np.clip(
-                    (distances - lo) / (hi - lo + self.eps), 0.0, 1.0
-                ).astype(np.float32)
-
-        scores = np.clip((g_learn**self.gamma) * score_raw, 0.0, 1.0).astype(np.float32)
+        score_raw = quantile_minmax_by_class(
+            knn_distance, labels, q_low=self.q_low, q_high=self.q_high, eps=self.eps
+        )
+        scores = np.clip(score_raw, 0.0, 1.0).astype(np.float32)
 
         if self.verbose:
             print(
@@ -210,7 +179,6 @@ class CoverageGainScore:
             knn_distance = knn_distance[order]
             q_confusion = q_confusion[order]
             alpha_sum = alpha_sum[order]
-            g_learn = g_learn[order]
             indices = indices[order]
             labels = labels[order]
 
@@ -219,7 +187,6 @@ class CoverageGainScore:
             knn_distance=knn_distance,
             q_confusion=q_confusion,
             alpha_sum=alpha_sum,
-            g_learn=g_learn,
             labels=labels,
             indices=indices,
         )

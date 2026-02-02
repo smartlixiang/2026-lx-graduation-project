@@ -2,5 +2,6 @@ data/
 adapter_weights/
 pretrained_clip/
 weights/proxy_logs/
+checkpoint
 
 __pycache__/

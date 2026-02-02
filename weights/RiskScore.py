@@ -10,12 +10,7 @@ from typing import Optional
 
 import numpy as np
 
-from utils.score_utils import (
-    quantile_minmax_by_class,
-    resolve_window_length,
-    robust_z_by_class,
-    stable_sigmoid,
-)
+from utils.score_utils import resolve_window_length, robust_z_by_class
 
 
 @dataclass
@@ -41,17 +36,15 @@ class RiskScore:
         self,
         npz_path: str | Path,
         *,
-        q_low: float = 0.01,
-        q_high: float = 0.99,
         lambda_improve: float = 0.7,
-        temp: float = 2.5,
+        tail_q0: float = 0.95,
+        tail_q1: float = 0.995,
         eps: float = 1e-6,
     ) -> None:
         self.npz_path = Path(npz_path)
-        self.q_low = float(q_low)
-        self.q_high = float(q_high)
         self.lambda_improve = float(lambda_improve)
-        self.temp = float(temp)
+        self.tail_q0 = float(tail_q0)
+        self.tail_q1 = float(tail_q1)
         self.eps = float(eps)
 
     def _load_loss(self, data: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -88,11 +81,20 @@ class RiskScore:
         late_z = robust_z_by_class(late_value, labels, eps=self.eps)
         improve_z = robust_z_by_class(improve_value, labels, eps=self.eps)
         risk_core = late_z - self.lambda_improve * improve_z
-        raw_score = stable_sigmoid(risk_core / self.temp)
+        raw_score = np.zeros_like(risk_core, dtype=np.float32)
+        for cls in np.unique(labels):
+            cls_mask = labels == cls
+            cls_vals = risk_core[cls_mask]
+            if cls_vals.size == 0:
+                continue
+            t0 = np.quantile(cls_vals, self.tail_q0)
+            t1 = np.quantile(cls_vals, self.tail_q1)
+            if t1 <= t0 + self.eps:
+                t1 = t0 + 1.0
+            denom = t1 - t0 + self.eps
+            raw_score[cls_mask] = np.clip((cls_vals - t0) / denom, 0.0, 1.0)
 
-        scores = quantile_minmax_by_class(
-            raw_score, labels, q_low=self.q_low, q_high=self.q_high, eps=self.eps
-        )
+        scores = raw_score
 
         if not np.array_equal(indices, np.arange(len(indices))):
             order = np.argsort(indices)

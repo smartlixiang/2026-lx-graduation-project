@@ -229,6 +229,12 @@ def main() -> None:
     _print_quantiles(raw_arrays["R_raw"], "R_raw")
     _print_zero_one_counts(arrays["A"], "A_score")
     _print_zero_one_counts(arrays["R"], "R_score")
+    neg_ratio = float(np.mean(raw_arrays["u_raw"] < 0))
+    zero_ratio_r = float(np.mean(arrays["R"] == 0))
+    nonzero_ratio_r = float(np.mean(arrays["R"] > 0))
+    print(f"u_raw neg_ratio: {neg_ratio:.6f}")
+    print(f"R zero_ratio: {zero_ratio_r:.6f}")
+    print(f"R nonzero_ratio: {nonzero_ratio_r:.6f}")
     _print_corr_table(names, pearson, "Pearson Correlation")
     _print_corr_table(names, spearman, "Spearman Correlation")
 

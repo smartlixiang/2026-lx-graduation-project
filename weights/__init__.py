@@ -2,8 +2,8 @@
 
 from .AbsorptionEfficiencyScore import AbsorptionEfficiencyResult, AbsorptionEfficiencyScore
 from .CoverageGainScore import CoverageGainResult, CoverageGainScore
-from .EarlyLearnabilityScore import EarlyLearnabilityResult, EarlyLearnabilityScore
 from .InformativenessScore import InformativenessResult, InformativenessScore
+from .PersistentDifficultyScore import PersistentDifficultyScore
 from .RiskScore import RiskResult, RiskScore
 from .TransferGainScore import TransferGainScore
 
@@ -12,10 +12,9 @@ __all__ = [
     "AbsorptionEfficiencyScore",
     "CoverageGainResult",
     "CoverageGainScore",
-    "EarlyLearnabilityResult",
-    "EarlyLearnabilityScore",
     "InformativenessResult",
     "InformativenessScore",
+    "PersistentDifficultyScore",
     "RiskResult",
     "RiskScore",
     "TransferGainScore",

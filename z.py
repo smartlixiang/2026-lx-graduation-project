@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 # Example:
-# python z.py --cv_log_dir weights/proxy_logs/cifar10/resnet18/0/100 --dataset cifar10 --seed 0 --k_folds 5 --wT_list 1.0,0.25
+# python z.py --cv_log_dir weights/proxy_logs/cifar10/resnet18/0/100 --dataset cifar10 --seed 0 --keep_ratio 0.60 --w_list 1.0,0.25
 
 import argparse
+import csv
+import json
 import sys
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from utils.score_utils import quantile_minmax  # noqa: E402
 from weights.AbsorptionEfficiencyScore import AbsorptionEfficiencyScore  # noqa: E402
 from weights.CoverageGainScore import CoverageGainScore  # noqa: E402
 from weights.InformativenessScore import InformativenessScore  # noqa: E402
+from weights.PersistentDifficultyScore import PersistentDifficultyScore  # noqa: E402
 from weights.RiskScore import RiskScore  # noqa: E402
 from weights.TransferGainScore import TransferGainScore  # noqa: E402
 
@@ -58,6 +61,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="1.0,0.25",
         help="Comma-separated list of weights for TransferGainScore.",
+    )
+    parser.add_argument(
+        "--w_list",
+        type=str,
+        default="1.0,0.25",
+        help="Comma-separated list of weights for TransferGainScore and PersistentDifficultyScore.",
+    )
+    parser.add_argument(
+        "--keep_ratio",
+        type=float,
+        default=0.60,
+        help="Top-k keep ratio for overlap analysis.",
     )
     parser.add_argument("--no_pause", action="store_true", default=True, help="Disable input() pause.")
     return parser.parse_args()
@@ -178,6 +193,25 @@ def _plot_compare_hist(
     plt.close(fig)
 
 
+def _plot_risk_hist(
+    out_path: Path,
+    values: np.ndarray,
+    bins: int,
+    title_prefix: str,
+) -> None:
+    zeros = int(np.sum(values == 0.0))
+    nonzero_values = values[values > 0.0]
+    nonzero_count = int(nonzero_values.size)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(nonzero_values, bins=bins, color="#C44E52", alpha=0.85)
+    ax.set_title(f"{title_prefix} (nonzero only) | zeros={zeros} | nonzero={nonzero_count}")
+    ax.set_xlabel("Value")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def _print_quantiles(values: np.ndarray, name: str) -> None:
     quantiles = [0, 1, 5, 25, 50, 75, 95, 99, 100]
     percentiles = np.percentile(values, quantiles)
@@ -223,6 +257,38 @@ def _print_corr_table(names: list[str], corr: np.ndarray, title: str) -> None:
         print(f"{name}\t{values}")
 
 
+def _format_tag(value: float) -> str:
+    return f"{value:.2f}".replace(".", "p")
+
+
+def _parse_weight_list(raw: str) -> list[float]:
+    weights = [float(v.strip()) for v in raw.split(",") if v.strip()]
+    if not weights:
+        raise ValueError("weight list is empty.")
+    return weights
+
+
+def _topk_indices(values: np.ndarray, keep_ratio: float) -> np.ndarray:
+    if not 0 < keep_ratio <= 1.0:
+        raise ValueError("keep_ratio must be within (0,1].")
+    k = int(np.ceil(values.size * keep_ratio))
+    order = np.argsort(values)[::-1]
+    return order[:k]
+
+
+def _overlap_ratio(set_a: set[int], set_b: set[int]) -> float:
+    if not set_a:
+        return 0.0
+    return len(set_a & set_b) / float(len(set_a))
+
+
+def _jaccard_ratio(set_a: set[int], set_b: set[int]) -> float:
+    union = set_a | set_b
+    if not union:
+        return 0.0
+    return len(set_a & set_b) / float(len(union))
+
+
 def main() -> None:
     args = parse_args()
     out_dir = Path(args.out_dir)
@@ -250,22 +316,40 @@ def main() -> None:
     t_scores = t_result["score"].astype(np.float32)
     if t_scores.shape[0] != num_samples:
         raise ValueError("TransferGainScore length does not match labels length.")
+    v_result = PersistentDifficultyScore().compute(cv_log_dir, dataset)
+    v_scores = v_result["score"].astype(np.float32)
+    if v_scores.shape[0] != num_samples:
+        raise ValueError("PersistentDifficultyScore length does not match labels length.")
 
     u_raw_base = raw_arrays["u_raw"].astype(np.float32)
     u_norm_base = normalize_u_raw(u_raw_base)
 
-    wT_list = [float(v.strip()) for v in args.wT_list.split(",") if v.strip()]
-    if not wT_list:
-        raise ValueError("wT_list is empty.")
+    if args.w_list == "1.0,0.25" and args.wT_list != "1.0,0.25":
+        weight_list = _parse_weight_list(args.wT_list)
+    else:
+        weight_list = _parse_weight_list(args.w_list)
+
+    keep_tag = _format_tag(args.keep_ratio)
 
     for name, values in arrays.items():
+        if name == "R":
+            _plot_risk_hist(
+                out_dir / f"hist_{name}_seed{args.seed}_wT0p00_wV0p00_keep{keep_tag}.png",
+                values,
+                args.bins,
+                f"{name} Histogram",
+            )
+            continue
         fig, ax = plt.subplots(figsize=(7, 5))
         ax.hist(values, bins=args.bins, color="#4C72B0", alpha=0.85)
         ax.set_title(f"{name} Histogram")
         ax.set_xlabel("Value")
         ax.set_ylabel("Count")
         fig.tight_layout()
-        fig.savefig(out_dir / f"hist_{name}.png", dpi=150)
+        fig.savefig(
+            out_dir / f"hist_{name}_seed{args.seed}_wT0p00_wV0p00_keep{keep_tag}.png",
+            dpi=150,
+        )
         plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(7, 5))
@@ -274,7 +358,10 @@ def main() -> None:
     ax.set_xlabel("Value")
     ax.set_ylabel("Count")
     fig.tight_layout()
-    fig.savefig(out_dir / "hist_B_raw.png", dpi=150)
+    fig.savefig(
+        out_dir / f"hist_B_raw_seed{args.seed}_wT0p00_wV0p00_keep{keep_tag}.png",
+        dpi=150,
+    )
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(7, 5))
@@ -283,14 +370,30 @@ def main() -> None:
     ax.set_xlabel("Value")
     ax.set_ylabel("Count")
     fig.tight_layout()
-    fig.savefig(out_dir / f"hist_T_seed{args.seed}.png", dpi=150)
+    fig.savefig(
+        out_dir / f"hist_T_seed{args.seed}_wT0p00_wV0p00_keep{keep_tag}.png",
+        dpi=150,
+    )
     plt.close(fig)
 
-    for w_t in wT_list:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(v_scores, bins=args.bins, color="#CCB974", alpha=0.85)
+    ax.set_title("V (PersistentDifficultyScore) Histogram")
+    ax.set_xlabel("Value")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(
+        out_dir / f"hist_V_seed{args.seed}_wT0p00_wV0p00_keep{keep_tag}.png",
+        dpi=150,
+    )
+    plt.close(fig)
+
+    for w_t in weight_list:
+        tag_wt = _format_tag(w_t)
         u_raw_with_t = u_raw_base + w_t * t_scores
         u_norm_with_t = normalize_u_raw(u_raw_with_t)
         _plot_compare_hist(
-            out_dir / f"hist_u_raw_withT_w{w_t}_seed{args.seed}.png",
+            out_dir / f"hist_u_raw_base_vs_T_seed{args.seed}_wT{tag_wt}_wV0p00_keep{keep_tag}.png",
             u_raw_base,
             u_raw_with_t,
             args.bins,
@@ -299,7 +402,7 @@ def main() -> None:
             f"u_raw_withT (w_T={w_t})",
         )
         _plot_compare_hist(
-            out_dir / f"hist_u_norm_withT_w{w_t}_seed{args.seed}.png",
+            out_dir / f"hist_u_norm_base_vs_T_seed{args.seed}_wT{tag_wt}_wV0p00_keep{keep_tag}.png",
             u_norm_base,
             u_norm_with_t,
             args.bins,
@@ -308,32 +411,133 @@ def main() -> None:
             f"u_norm_withT (w_T={w_t})",
         )
 
+    for w_v in weight_list:
+        tag_wv = _format_tag(w_v)
+        u_raw_with_v = u_raw_base + w_v * v_scores
+        u_norm_with_v = normalize_u_raw(u_raw_with_v)
+        _plot_compare_hist(
+            out_dir / f"hist_u_raw_base_vs_V_seed{args.seed}_wT0p00_wV{tag_wv}_keep{keep_tag}.png",
+            u_raw_base,
+            u_raw_with_v,
+            args.bins,
+            f"u_raw_base vs u_raw_withV (w_V={w_v})",
+            "u_raw_base",
+            f"u_raw_withV (w_V={w_v})",
+        )
+        _plot_compare_hist(
+            out_dir / f"hist_u_norm_base_vs_V_seed{args.seed}_wT0p00_wV{tag_wv}_keep{keep_tag}.png",
+            u_norm_base,
+            u_norm_with_v,
+            args.bins,
+            f"u_norm_base vs u_norm_withV (w_V={w_v})",
+            "u_norm_base",
+            f"u_norm_withV (w_V={w_v})",
+        )
+
+    for w_t in weight_list:
+        for w_v in weight_list:
+            tag_wt = _format_tag(w_t)
+            tag_wv = _format_tag(w_v)
+            u_raw_with_tv = u_raw_base + w_t * t_scores + w_v * v_scores
+            u_norm_with_tv = normalize_u_raw(u_raw_with_tv)
+            _plot_compare_hist(
+                out_dir
+                / f"hist_u_raw_base_vs_TV_seed{args.seed}_wT{tag_wt}_wV{tag_wv}_keep{keep_tag}.png",
+                u_raw_base,
+                u_raw_with_tv,
+                args.bins,
+                f"u_raw_base vs u_raw_withT+V (w_T={w_t}, w_V={w_v})",
+                "u_raw_base",
+                f"u_raw_withT+V (w_T={w_t}, w_V={w_v})",
+            )
+            _plot_compare_hist(
+                out_dir
+                / f"hist_u_norm_base_vs_TV_seed{args.seed}_wT{tag_wt}_wV{tag_wv}_keep{keep_tag}.png",
+                u_norm_base,
+                u_norm_with_tv,
+                args.bins,
+                f"u_norm_base vs u_norm_withT+V (w_T={w_t}, w_V={w_v})",
+                "u_norm_base",
+                f"u_norm_withT+V (w_T={w_t}, w_V={w_v})",
+            )
+
     fig, axes = plt.subplots(2, 3, figsize=(12, 7))
     axes = axes.ravel()
     for idx, name in enumerate(["A", "B", "C", "R", "u"]):
         ax = axes[idx]
-        ax.hist(arrays[name], bins=args.bins, color="#4C72B0", alpha=0.85)
-        ax.set_title(name)
+        if name == "R":
+            values = arrays[name]
+            nonzero_values = values[values > 0.0]
+            zeros = int(np.sum(values == 0.0))
+            ax.hist(nonzero_values, bins=args.bins, color="#4C72B0", alpha=0.85)
+            ax.set_title(f"{name} (zeros={zeros})")
+        else:
+            ax.hist(arrays[name], bins=args.bins, color="#4C72B0", alpha=0.85)
+            ax.set_title(name)
     axes[-1].axis("off")
     fig.tight_layout()
-    fig.savefig(out_dir / "hist_overview.png", dpi=150)
+    fig.savefig(out_dir / f"hist_overview_seed{args.seed}_wT0p00_wV0p00_keep{keep_tag}.png", dpi=150)
     plt.close(fig)
 
     fig, axes = plt.subplots(2, 3, figsize=(12, 7))
     axes = axes.ravel()
     for idx, name in enumerate(["A_raw", "B_raw", "C_raw", "R_raw", "u_raw"]):
         ax = axes[idx]
-        ax.hist(raw_arrays[name], bins=args.bins, color="#C44E52", alpha=0.85)
-        ax.set_title(name)
+        if name == "R_raw":
+            values = raw_arrays[name]
+            nonzero_values = values[values > 0.0]
+            zeros = int(np.sum(values == 0.0))
+            ax.hist(nonzero_values, bins=args.bins, color="#C44E52", alpha=0.85)
+            ax.set_title(f"{name} (zeros={zeros})")
+        else:
+            ax.hist(raw_arrays[name], bins=args.bins, color="#C44E52", alpha=0.85)
+            ax.set_title(name)
     axes[-1].axis("off")
     fig.tight_layout()
-    fig.savefig(out_dir / "hist_overview_raw.png", dpi=150)
+    fig.savefig(out_dir / f"hist_overview_raw_seed{args.seed}_wT0p00_wV0p00_keep{keep_tag}.png", dpi=150)
     plt.close(fig)
 
-    names = ["A", "B", "C", "R", "u"]
-    matrix = np.vstack([arrays[name] for name in names])
-    pearson = np.corrcoef(matrix)
-    spearman = _spearman_corrcoef(matrix)
+    corr_weight = 1.0 if 1.0 in weight_list else weight_list[0]
+    u_raw_with_tv = u_raw_base + corr_weight * t_scores + corr_weight * v_scores
+    u_norm_with_tv = normalize_u_raw(u_raw_with_tv)
+
+    corr_names = [
+        "A",
+        "B",
+        "C",
+        "R",
+        "T",
+        "V",
+        "u_raw_base",
+        "u_raw_TV",
+        "u_norm_base",
+        "u_norm_TV",
+    ]
+    corr_matrix = np.vstack(
+        [
+            arrays["A"],
+            arrays["B"],
+            arrays["C"],
+            arrays["R"],
+            t_scores,
+            v_scores,
+            u_raw_base,
+            u_raw_with_tv,
+            u_norm_base,
+            u_norm_with_tv,
+        ]
+    )
+    pearson = np.corrcoef(corr_matrix)
+    spearman = _spearman_corrcoef(corr_matrix)
+
+    corr_csv_path = out_dir / (
+        f"corr_seed{args.seed}_wT{_format_tag(corr_weight)}_wV{_format_tag(corr_weight)}_keep{keep_tag}.csv"
+    )
+    with corr_csv_path.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow([""] + corr_names)
+        for name, row in zip(corr_names, spearman, strict=True):
+            writer.writerow([name] + [f"{val:.6f}" for val in row])
 
     print(f"Loaded proxy log: {proxy_log}")
     print(f"Saved histogram plots to: {out_dir}")
@@ -350,8 +554,62 @@ def main() -> None:
     print(f"u_raw neg_ratio: {neg_ratio:.6f}")
     print(f"R zero_ratio: {zero_ratio_r:.6f}")
     print(f"R nonzero_ratio: {nonzero_ratio_r:.6f}")
-    _print_corr_table(names, pearson, "Pearson Correlation")
-    _print_corr_table(names, spearman, "Spearman Correlation")
+    _print_corr_table(corr_names, pearson, "Pearson Correlation")
+    _print_corr_table(corr_names, spearman, "Spearman Correlation")
+
+    base_set = set(_topk_indices(u_raw_base, args.keep_ratio).tolist())
+    w11 = 1.0 if 1.0 in weight_list else weight_list[0]
+    w025 = 0.25 if 0.25 in weight_list else weight_list[0]
+    u_raw_11 = u_raw_base + w11 * t_scores + w11 * v_scores
+    u_raw_025 = u_raw_base + w025 * t_scores + w025 * v_scores
+    set_11 = set(_topk_indices(u_raw_11, args.keep_ratio).tolist())
+    set_025 = set(_topk_indices(u_raw_025, args.keep_ratio).tolist())
+
+    comparisons = [
+        ("base", "w11", base_set, set_11),
+        ("base", "w025", base_set, set_025),
+        ("w11", "w025", set_11, set_025),
+    ]
+    overlap_records = []
+    print("\nTop-k overlap analysis:")
+    for name_a, name_b, set_a, set_b in comparisons:
+        overlap = _overlap_ratio(set_a, set_b)
+        jaccard = _jaccard_ratio(set_a, set_b)
+        print(f"  {name_a} vs {name_b}: overlap={overlap:.4f}, jaccard={jaccard:.4f}")
+        overlap_records.append(
+            {
+                "a": name_a,
+                "b": name_b,
+                "overlap": overlap,
+                "jaccard": jaccard,
+                "keep_ratio": args.keep_ratio,
+                "w11": w11,
+                "w025": w025,
+            }
+        )
+
+    overlap_json = out_dir / (
+        f"overlap_seed{args.seed}_keep{keep_tag}_w11{_format_tag(w11)}_w025{_format_tag(w025)}.json"
+    )
+    overlap_csv = out_dir / (
+        f"overlap_seed{args.seed}_keep{keep_tag}_w11{_format_tag(w11)}_w025{_format_tag(w025)}.csv"
+    )
+    overlap_json.write_text(json.dumps(overlap_records, indent=2), encoding="utf-8")
+    with overlap_csv.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["a", "b", "overlap", "jaccard", "keep_ratio", "w11", "w025"])
+        for record in overlap_records:
+            writer.writerow(
+                [
+                    record["a"],
+                    record["b"],
+                    f"{record['overlap']:.6f}",
+                    f"{record['jaccard']:.6f}",
+                    f"{record['keep_ratio']:.2f}",
+                    f"{record['w11']:.2f}",
+                    f"{record['w025']:.2f}",
+                ]
+            )
 
     if not args.no_pause:
         input("Press Enter to exit...")

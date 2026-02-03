@@ -1,7 +1,5 @@
 """Learn scoring weights from proxy training dynamics."""
 
-# Key interfaces:
-# - run_for_seed(...): computes A/B/C/R, builds u, saves pseudolabel components, trains ridge weights.
 from __future__ import annotations
 
 import argparse
@@ -55,12 +53,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coverage-k", type=int, default=10)
     parser.add_argument("--coverage-q-low", type=float, default=0.1)
     parser.add_argument("--coverage-q-high", type=float, default=0.99)
-    parser.add_argument(
-        "--pseudolabel-output",
-        type=str,
-        default="weights/pseudolabels",
-        help="Path (directory or .npz) to save A/B/C/R/u components.",
-    )
     parser.add_argument("--ridge-lambda", type=float, default=1e-2)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=1000)
@@ -216,14 +208,6 @@ def resolve_proxy_log_path(proxy_log_arg: str, dataset: str, seed: int) -> Path:
             return matches[-1]
 
     raise FileNotFoundError(f"未找到代理训练日志路径: {proxy_log_arg}")
-
-
-def resolve_pseudolabel_output(base_path: str, dataset: str, seed: int) -> Path:
-    path = Path(base_path)
-    if path.suffix == ".npz":
-        return path
-    path.mkdir(parents=True, exist_ok=True)
-    return path / f"pseudolabel_{dataset}_seed{seed}.npz"
 
 
 def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:

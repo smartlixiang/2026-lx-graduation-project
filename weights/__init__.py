@@ -5,6 +5,7 @@ from .CoverageGainScore import CoverageGainResult, CoverageGainScore
 from .EarlyLearnabilityScore import EarlyLearnabilityResult, EarlyLearnabilityScore
 from .InformativenessScore import InformativenessResult, InformativenessScore
 from .RiskScore import RiskResult, RiskScore
+from .TransferGainScore import TransferGainScore
 
 __all__ = [
     "AbsorptionEfficiencyResult",
@@ -17,4 +18,5 @@ __all__ = [
     "InformativenessScore",
     "RiskResult",
     "RiskScore",
+    "TransferGainScore",
 ]

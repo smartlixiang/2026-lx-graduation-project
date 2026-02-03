@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Example:
+# python z.py --cv_log_dir weights/proxy_logs/cifar10/resnet18/0/100 --dataset cifar10 --seed 0 --k_folds 5 --wT_list 1.0,0.25
+
 import argparse
 import sys
 from pathlib import Path
@@ -11,12 +14,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from dataset.dataset import BaseDataLoader  # noqa: E402
 from utils.proxy_log_utils import load_proxy_log  # noqa: E402
 from utils.score_utils import quantile_minmax  # noqa: E402
 from weights.AbsorptionEfficiencyScore import AbsorptionEfficiencyScore  # noqa: E402
 from weights.CoverageGainScore import CoverageGainScore  # noqa: E402
 from weights.InformativenessScore import InformativenessScore  # noqa: E402
 from weights.RiskScore import RiskScore  # noqa: E402
+from weights.TransferGainScore import TransferGainScore  # noqa: E402
 
 
 # Key interfaces:
@@ -31,8 +36,16 @@ def parse_args() -> argparse.Namespace:
         default="weights/proxy_logs/cifar10/resnet18/22/100",
         help="Path to proxy training log (.npz) or k-fold log directory.",
     )
+    parser.add_argument(
+        "--cv_log_dir",
+        type=str,
+        default=None,
+        help="Path to k-fold proxy log directory (for TransferGainScore).",
+    )
     parser.add_argument("--dataset", type=str, default="cifar10", help="Dataset name.")
     parser.add_argument("--data_root", type=str, default="./data", help="Dataset root path.")
+    parser.add_argument("--seed", type=int, default=0, help="Dataset seed for loader.")
+    parser.add_argument("--k_folds", type=int, default=5, help="Number of folds (for metadata).")
     parser.add_argument(
         "--out_dir",
         type=str,
@@ -40,6 +53,12 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for histogram plots.",
     )
     parser.add_argument("--bins", type=int, default=50, help="Histogram bins.")
+    parser.add_argument(
+        "--wT_list",
+        type=str,
+        default="1.0,0.25",
+        help="Comma-separated list of weights for TransferGainScore.",
+    )
     parser.add_argument("--no_pause", action="store_true", default=True, help="Disable input() pause.")
     return parser.parse_args()
 
@@ -99,7 +118,7 @@ def _compute_components(
         raise RuntimeError("Failed to align some dynamic scores to full index space (NaNs found).")
 
     u_raw = a_full + b_full + c_full - r_full
-    u_norm = quantile_minmax(u_raw.astype(np.float32), q_low=0.01, q_high=0.99)
+    u_norm = normalize_u_raw(u_raw.astype(np.float32))
     components = {
         "A": a_full.astype(np.float32),
         "B": b_full.astype(np.float32),
@@ -115,6 +134,48 @@ def _compute_components(
         "u_raw": u_raw.astype(np.float32),
     }
     return components, raw_components, absorption_res.labels.astype(np.int64)
+
+
+def normalize_u_raw(u_raw: np.ndarray) -> np.ndarray:
+    return quantile_minmax(u_raw.astype(np.float32), q_low=0.01, q_high=0.99)
+
+
+def _load_train_dataset(dataset_name: str, data_root: str, seed: int):
+    loader = BaseDataLoader(
+        dataset_name,
+        data_path=Path(data_root),
+        batch_size=1,
+        num_workers=0,
+        val_split=0.0,
+        seed=seed,
+        augment=False,
+        normalize=False,
+    )
+    train_loader, _, _ = loader.load()
+    return train_loader.dataset
+
+
+def _plot_compare_hist(
+    out_path: Path,
+    base_values: np.ndarray,
+    with_t_values: np.ndarray,
+    bins: int,
+    title: str,
+    label_base: str,
+    label_with_t: str,
+    color_base: str = "#4C72B0",
+    color_with: str = "#55A868",
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(base_values, bins=bins, color=color_base, alpha=0.6, label=label_base)
+    ax.hist(with_t_values, bins=bins, color=color_with, alpha=0.6, label=label_with_t)
+    ax.set_title(title)
+    ax.set_xlabel("Value")
+    ax.set_ylabel("Count")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def _print_quantiles(values: np.ndarray, name: str) -> None:
@@ -180,6 +241,23 @@ def main() -> None:
         if values.shape[0] != num_samples:
             raise ValueError(f"{key} length does not match labels length.")
 
+    cv_log_dir = Path(args.cv_log_dir) if args.cv_log_dir is not None else proxy_log
+    if not cv_log_dir.exists():
+        raise FileNotFoundError(f"cv_log_dir not found: {cv_log_dir}")
+
+    dataset = _load_train_dataset(args.dataset, args.data_root, args.seed)
+    t_result = TransferGainScore().compute(cv_log_dir, dataset)
+    t_scores = t_result["score"].astype(np.float32)
+    if t_scores.shape[0] != num_samples:
+        raise ValueError("TransferGainScore length does not match labels length.")
+
+    u_raw_base = raw_arrays["u_raw"].astype(np.float32)
+    u_norm_base = normalize_u_raw(u_raw_base)
+
+    wT_list = [float(v.strip()) for v in args.wT_list.split(",") if v.strip()]
+    if not wT_list:
+        raise ValueError("wT_list is empty.")
+
     for name, values in arrays.items():
         fig, ax = plt.subplots(figsize=(7, 5))
         ax.hist(values, bins=args.bins, color="#4C72B0", alpha=0.85)
@@ -198,6 +276,37 @@ def main() -> None:
     fig.tight_layout()
     fig.savefig(out_dir / "hist_B_raw.png", dpi=150)
     plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(t_scores, bins=args.bins, color="#8172B2", alpha=0.85)
+    ax.set_title("T (TransferGainScore) Histogram")
+    ax.set_xlabel("Value")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(out_dir / f"hist_T_seed{args.seed}.png", dpi=150)
+    plt.close(fig)
+
+    for w_t in wT_list:
+        u_raw_with_t = u_raw_base + w_t * t_scores
+        u_norm_with_t = normalize_u_raw(u_raw_with_t)
+        _plot_compare_hist(
+            out_dir / f"hist_u_raw_withT_w{w_t}_seed{args.seed}.png",
+            u_raw_base,
+            u_raw_with_t,
+            args.bins,
+            f"u_raw_base vs u_raw_withT (w_T={w_t})",
+            "u_raw_base",
+            f"u_raw_withT (w_T={w_t})",
+        )
+        _plot_compare_hist(
+            out_dir / f"hist_u_norm_withT_w{w_t}_seed{args.seed}.png",
+            u_norm_base,
+            u_norm_with_t,
+            args.bins,
+            f"u_norm_base vs u_norm_withT (w_T={w_t})",
+            "u_norm_base",
+            f"u_norm_withT (w_T={w_t})",
+        )
 
     fig, axes = plt.subplots(2, 3, figsize=(12, 7))
     axes = axes.ravel()

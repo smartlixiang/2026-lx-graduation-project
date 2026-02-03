@@ -26,7 +26,12 @@ from utils.seed import parse_seed_list, set_seed  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Calculate selection masks (CIFAR-10)")
     parser.add_argument("--data-root", type=str, default="./data", help="数据根目录")
-    parser.add_argument("--cr", type=int, default=80, help="cut_ratio (百分比)")
+    parser.add_argument(
+        "--cr",
+        type=str,
+        default="80",
+        help="cut_ratio 列表（百分比），支持逗号分隔或单值",
+    )
     parser.add_argument("--clip-model", type=str, default="ViT-B/32", help="CLIP 模型规格")
     parser.add_argument(
         "--adapter-path",
@@ -60,6 +65,17 @@ def parse_args() -> argparse.Namespace:
         help="mask 保存路径中的模型名称",
     )
     return parser.parse_args()
+
+
+def parse_ratio_list(ratio_text: str) -> list[int]:
+    cleaned = ratio_text.strip()
+    if not cleaned:
+        return []
+    if "," in cleaned:
+        items = [item.strip() for item in cleaned.split(",") if item.strip()]
+    else:
+        items = [cleaned]
+    return [int(item) for item in items]
 
 
 def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str, object]]:
@@ -241,61 +257,64 @@ def main() -> None:
     )
     labels = np.asarray(dataset_for_names.targets)
     total_scores_np = np.asarray(total_scores)
-    mask, selected_by_class = select_topk_mask(
-        total_scores_np, labels, num_classes=len(class_names), cut_ratio=args.cr
-    )
-    total_time = time.perf_counter() - total_start
-
     if args.method.strip():
         method_name = args.method.strip()
     elif args.weight_group == "naive":
         method_name = "my_naive"
     else:
         method_name = "my_learned"
+    cut_ratios = parse_ratio_list(args.cr)
+    if not cut_ratios:
+        raise ValueError("cr 参数不能为空。")
     seeds = parse_seed_list(args.seeds)
     if method_name == "my_naive":
         save_seeds = [CONFIG.global_seed]
     else:
         save_seeds = seeds
-    for seed in save_seeds:
-        set_seed(seed)
-        mask_dir = (
-            PROJECT_ROOT
-            / "mask"
-            / method_name
-            / "cifar10"
-            / args.model_name
-            / str(seed)
+    for cut_ratio in cut_ratios:
+        mask, selected_by_class = select_topk_mask(
+            total_scores_np, labels, num_classes=len(class_names), cut_ratio=cut_ratio
         )
-        mask_dir.mkdir(parents=True, exist_ok=True)
-        mask_path = mask_dir / f"mask_{args.cr}.npz"
-        np.savez_compressed(mask_path, mask=mask.astype(np.uint8))
+        total_time = time.perf_counter() - total_start
+        for seed in save_seeds:
+            set_seed(seed)
+            mask_dir = (
+                PROJECT_ROOT
+                / "mask"
+                / method_name
+                / "cifar10"
+                / args.model_name
+                / str(seed)
+            )
+            mask_dir.mkdir(parents=True, exist_ok=True)
+            mask_path = mask_dir / f"mask_{cut_ratio}.npz"
+            np.savez_compressed(mask_path, mask=mask.astype(np.uint8))
 
-        meta_info = {
-            "dataset": "cifar10",
-            "model_name": args.model_name,
-            "method": method_name,
-            "weight_group": args.weight_group,
-            "clip_model": args.clip_model,
-            "adapter_path": str(Path(args.adapter_path)),
-            "cr": args.cr,
-            "num_samples": int(mask.shape[0]),
-            "selected_count": int(mask.sum()),
-            "selected_by_class": selected_by_class,
-            "selection_strategy": "topk_per_class",
-            "seeds": save_seeds,
-            "timing": {
-                "dds_seconds": dds_time,
-                "div_seconds": div_time,
-                "sa_seconds": sa_time,
-                "total_seconds": total_time,
-            },
-        }
-        with open(mask_dir / "meta_info.json", "w", encoding="utf-8") as f:
-            json.dump(meta_info, f, ensure_ascii=False, indent=2)
+            meta_info = {
+                "dataset": "cifar10",
+                "model_name": args.model_name,
+                "method": method_name,
+                "weight_group": args.weight_group,
+                "clip_model": args.clip_model,
+                "adapter_path": str(Path(args.adapter_path)),
+                "cr": cut_ratio,
+                "num_samples": int(mask.shape[0]),
+                "selected_count": int(mask.sum()),
+                "selected_by_class": selected_by_class,
+                "selection_strategy": "topk_per_class",
+                "seeds": save_seeds,
+                "timing": {
+                    "dds_seconds": dds_time,
+                    "div_seconds": div_time,
+                    "sa_seconds": sa_time,
+                    "total_seconds": total_time,
+                },
+            }
+            with open(mask_dir / "meta_info.json", "w", encoding="utf-8") as f:
+                json.dump(meta_info, f, ensure_ascii=False, indent=2)
 
-        print(f"seed={seed} | cr={args.cr} | selected={int(mask.sum())}")
-        print(f"mask saved to: {mask_path}")
+            print(f"seed={seed} | cr={cut_ratio} | selected={int(mask.sum())}")
+            print(f"mask saved to: {mask_path}")
 
 
 if __name__ == "__main__":

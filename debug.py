@@ -300,17 +300,6 @@ def main() -> None:
         "metrics": {},
     }
 
-    np.savez(
-        OUT_DIR / "pseudolabel_components.npz",
-        A=components["A"],
-        B=components["B"],
-        C=components["C"],
-        R=components["R"],
-        u=components["u"],
-        labels=labels_full,
-        indices=np.arange(labels_full.shape[0], dtype=np.int64),
-    )
-
     num_classes = data_loader.num_classes
 
     for cut_ratio in CUT_RATIOS:

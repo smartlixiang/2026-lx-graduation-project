@@ -269,21 +269,6 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     u_raw = a_scores + b_scores + c_scores - r_scores
     u_scores = quantile_minmax(u_raw.astype(np.float32), q_low=0.01, q_high=0.99)
 
-    pseudo_path = resolve_pseudolabel_output(args.pseudolabel_output, args.dataset, seed)
-    pseudo_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        pseudo_path,
-        A=a_scores.astype(np.float32),
-        B=b_scores.astype(np.float32),
-        C=c_scores.astype(np.float32),
-        R=r_scores.astype(np.float32),
-        u=u_scores.astype(np.float32),
-        labels=absorption_result.labels.astype(np.int64),
-        indices=indices.astype(np.int64),
-        proxy_log=str(proxy_log),
-    )
-    print("Saved pseudolabel components to", pseudo_path)
-
     class_names = load_class_names(args.dataset, args.data_root)
     dds_metric = DifficultyDirection(
         class_names=class_names, clip_model=args.clip_model, device=device, k=args.dds_k

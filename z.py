@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from utils.proxy_log_utils import load_proxy_log  # noqa: E402
 from utils.score_utils import quantile_minmax  # noqa: E402
 from weights.AbsorptionEfficiencyScore import AbsorptionEfficiencyScore  # noqa: E402
 from weights.CoverageGainScore import CoverageGainScore  # noqa: E402
@@ -27,9 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--proxy_log",
         type=str,
-        default="weights/proxy_logs/22/cifar10_resnet18_2026_01_20_11_42.npz",
-        help="Path to proxy training log (.npz).",
+        default="weights/proxy_logs/cifar10/resnet18/22/100",
+        help="Path to proxy training log (.npz) or k-fold log directory.",
     )
+    parser.add_argument("--dataset", type=str, default="cifar10", help="Dataset name.")
+    parser.add_argument("--data_root", type=str, default="./data", help="Dataset root path.")
     parser.add_argument(
         "--out_dir",
         type=str,
@@ -53,11 +56,14 @@ def _to_full(scores: np.ndarray, indices: np.ndarray, n: int) -> np.ndarray:
 
 def _compute_components(
     proxy_log: Path,
+    dataset_name: str,
+    data_root: str,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray]:
-    absorption_res = AbsorptionEfficiencyScore(proxy_log).compute()
-    informativeness_res = InformativenessScore(proxy_log).compute()
-    coverage_res = CoverageGainScore(proxy_log).compute()
-    risk_res = RiskScore(proxy_log).compute()
+    proxy_data = load_proxy_log(proxy_log, dataset_name, data_root)
+    absorption_res = AbsorptionEfficiencyScore(proxy_log).compute(proxy_logs=proxy_data)
+    informativeness_res = InformativenessScore(proxy_log).compute(proxy_logs=proxy_data)
+    coverage_res = CoverageGainScore(proxy_log).compute(proxy_logs=proxy_data)
+    risk_res = RiskScore(proxy_log).compute(proxy_logs=proxy_data)
 
     indices = absorption_res.indices
     if (
@@ -165,7 +171,7 @@ def main() -> None:
     if not proxy_log.exists():
         raise FileNotFoundError(f"Proxy log not found: {proxy_log}")
 
-    arrays, raw_arrays, labels = _compute_components(proxy_log)
+    arrays, raw_arrays, labels = _compute_components(proxy_log, args.dataset, args.data_root)
     num_samples = labels.shape[0]
     for key, values in arrays.items():
         if values.shape[0] != num_samples:

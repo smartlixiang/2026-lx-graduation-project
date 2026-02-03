@@ -29,6 +29,7 @@ from utils.global_config import CONFIG
 from utils.seed import set_seed
 
 # NEW: import dynamic scoring terms (must exist in your repo)
+from utils.proxy_log_utils import load_proxy_log
 from utils.score_utils import quantile_minmax
 from weights.AbsorptionEfficiencyScore import AbsorptionEfficiencyScore
 from weights.CoverageGainScore import CoverageGainScore
@@ -42,7 +43,10 @@ DATASET = "cifar10"
 MODEL_NAME = "resnet50"
 SEED = 22
 CUT_RATIOS = [30, 40, 50]
-PROXY_LOG_DIR = Path("weights") / "proxy_logs" / str(SEED)
+PROXY_EPOCHS = 50
+PROXY_LOG_DIR = (
+    Path("weights") / "proxy_logs" / DATASET / "resnet18" / str(SEED) / str(PROXY_EPOCHS)
+)
 OUT_DIR = Path("debug")
 
 EPOCHS = 200
@@ -61,61 +65,22 @@ def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _find_latest_npz(log_dir: Path) -> Path:
-    if not log_dir.exists():
-        raise FileNotFoundError(f"Proxy log directory not found: {log_dir}")
-    candidates = sorted(log_dir.glob("*.npz"), key=lambda p: p.stat().st_mtime)
-    if not candidates:
-        raise FileNotFoundError(f"No proxy log .npz files found in: {log_dir}")
-    return candidates[-1]
-
-
-def _load_proxy_logits_and_labels(npz_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load proxy logits/labels/indices, and reorder them by ascending indices if needed."""
-    data = np.load(npz_path)
-    if "logits" not in data:
-        raise ValueError(f"Proxy log missing logits: {npz_path}")
-    if "labels" not in data:
-        raise ValueError(f"Proxy log missing labels: {npz_path}")
-
-    logits = data["logits"].astype(np.float32)
-    labels = data["labels"].astype(np.int64)
-    if logits.ndim != 3:
-        raise ValueError("Proxy logits should have shape (epochs, num_samples, num_classes)")
-    if labels.ndim != 1:
-        raise ValueError("Proxy labels should have shape (num_samples,)")
-
-    indices = data["indices"] if "indices" in data else np.arange(logits.shape[1])
-    if indices.shape[0] != logits.shape[1]:
-        raise ValueError("Proxy log indices length mismatch")
-    if labels.shape[0] != logits.shape[1]:
-        raise ValueError("Proxy log labels length mismatch")
-
-    # Ensure logits/labels are aligned to dataset order (ascending indices)
-    if not np.array_equal(indices, np.arange(len(indices))):
-        order = np.argsort(indices)
-        logits = logits[:, order, :]
-        labels = labels[order]
-        indices = indices[order]
-
-    return logits, labels, indices
-
-
-def _compute_u_scores_from_proxy_log(npz_path: Path) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+def _compute_u_scores_from_proxy_log(log_path: Path) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     """Compute u = A + B + C - R, then global quantile normalize.
 
     Returns:
         u_norm: shape (N,) float32 in [0,1], aligned to dataset index order
         labels: shape (N,) int64 true labels, aligned to dataset index order
     """
-    # Load labels/indices for alignment sanity
-    _, labels_proxy, indices_proxy = _load_proxy_logits_and_labels(npz_path)
+    proxy_data = load_proxy_log(log_path, DATASET, str(CONFIG.data_root))
+    labels_proxy = proxy_data["labels"]
+    indices_proxy = proxy_data["indices"]
 
     # Compute three dynamic scores (each should return per-sample scores + indices)
-    absorption_res = AbsorptionEfficiencyScore(npz_path).compute()
-    informativeness_res = InformativenessScore(npz_path).compute()
-    cov_res = CoverageGainScore(npz_path).compute()
-    risk_res = RiskScore(npz_path).compute()
+    absorption_res = AbsorptionEfficiencyScore(log_path).compute(proxy_logs=proxy_data)
+    informativeness_res = InformativenessScore(log_path).compute(proxy_logs=proxy_data)
+    cov_res = CoverageGainScore(log_path).compute(proxy_logs=proxy_data)
+    risk_res = RiskScore(log_path).compute(proxy_logs=proxy_data)
 
     # Build map from index -> position for each result to align robustly
     def _to_full(scores: np.ndarray, indices: np.ndarray, n: int) -> np.ndarray:
@@ -265,11 +230,13 @@ def main() -> None:
 
     _ensure_dir(OUT_DIR)
 
-    proxy_npz = _find_latest_npz(PROXY_LOG_DIR)
-    print(f"Using proxy log: {proxy_npz}")
+    proxy_log_path = PROXY_LOG_DIR
+    if not proxy_log_path.exists():
+        raise FileNotFoundError(f"Proxy log not found: {proxy_log_path}")
+    print(f"Using proxy log: {proxy_log_path}")
 
     # Compute the intended utility score u (aligned to dataset order)
-    u_scores, labels_full, components = _compute_u_scores_from_proxy_log(proxy_npz)
+    u_scores, labels_full, components = _compute_u_scores_from_proxy_log(proxy_log_path)
 
     # Data
     data_loader = BaseDataLoader(
@@ -294,7 +261,7 @@ def main() -> None:
         "dataset": DATASET,
         "model": MODEL_NAME,
         "seed": SEED,
-        "proxy_log": str(proxy_npz),
+        "proxy_log": str(proxy_log_path),
         "cut_ratios": CUT_RATIOS,
         "epochs": EPOCHS,
         "metrics": {},

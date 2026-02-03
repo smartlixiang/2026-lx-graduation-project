@@ -108,7 +108,7 @@ class CoverageGainScore:
             distances[start:end] = np.sqrt(nearest).mean(axis=1)
         return distances.astype(np.float32)
 
-    def compute(self) -> CoverageGainResult:
+    def compute(self, proxy_logs: Optional[dict[str, np.ndarray]] = None) -> CoverageGainResult:
         if self.s_g <= 0.0:
             raise ValueError("s_g must be positive.")
         if self.k <= 0:
@@ -118,7 +118,7 @@ class CoverageGainScore:
         if self.eps <= 0.0:
             raise ValueError("eps must be positive.")
 
-        data = np.load(self.npz_path)
+        data = proxy_logs if proxy_logs is not None else np.load(self.npz_path)
         logits, labels, indices = self._load_logits(data)
 
         num_epochs, num_samples, num_classes = logits.shape

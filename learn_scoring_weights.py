@@ -18,6 +18,7 @@ from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100
 from model.adapter import AdapterMLP
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.global_config import CONFIG
+from utils.proxy_log_utils import load_proxy_log
 from utils.seed import parse_seed_list, set_seed
 from utils.score_utils import quantile_minmax
 from weights import (
@@ -40,8 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--proxy-log",
         type=str,
-        default="weights/proxy_logs/cifar10_resnet18_2026_01_12_14_31.npz",
-        help="Path to proxy training log (.npz).",
+        default="weights/proxy_logs",
+        help="Path to proxy training log (.npz) or k-fold log directory.",
     )
     parser.add_argument("--adapter-path", type=str, default="adapter_weights/cifar10/adapter_cifar10_ViT-B-32.pt", help="Optional adapter path.")
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
@@ -198,33 +199,23 @@ def build_output_path(base_path: str) -> Path:
 
 def resolve_proxy_log_path(proxy_log_arg: str, dataset: str, seed: int) -> Path:
     candidate = Path(proxy_log_arg)
-    if candidate.suffix == ".npz" and candidate.exists():
+    if candidate.exists():
         return candidate
 
-    if candidate.is_dir():
-        base_dir = candidate
-    else:
-        base_dir = candidate.parent
+    base_dir = Path("weights") / "proxy_logs" / dataset / "resnet18" / str(seed)
+    if base_dir.exists() and base_dir.is_dir():
+        epoch_dirs = [p for p in base_dir.iterdir() if p.is_dir() and p.name.isdigit()]
+        if epoch_dirs:
+            epoch_dirs.sort(key=lambda p: int(p.name))
+            return epoch_dirs[-1]
 
-    if not base_dir.exists():
-        base_dir = Path("weights") / "proxy_logs" / str(seed)
+    legacy_dir = Path("weights") / "proxy_logs" / str(seed)
+    if legacy_dir.exists() and legacy_dir.is_dir():
+        matches = sorted(legacy_dir.glob("*.npz"))
+        if matches:
+            return matches[-1]
 
-    if not base_dir.exists() or not base_dir.is_dir():
-        raise FileNotFoundError(f"未找到代理训练日志目录: {base_dir}")
-
-    matches = sorted(base_dir.glob(f"{dataset}_resnet18_*.npz"))
-    if not matches:
-        matches = sorted(base_dir.glob("*.npz"))
-    if not matches:
-        seed_dir = base_dir / str(seed)
-        if seed_dir.exists() and seed_dir.is_dir():
-            matches = sorted(seed_dir.glob(f"{dataset}_resnet18_*.npz"))
-            if not matches:
-                matches = sorted(seed_dir.glob("*.npz"))
-            if matches:
-                return matches[0]
-        raise FileNotFoundError(f"未找到代理训练日志文件: {base_dir}")
-    return matches[0]
+    raise FileNotFoundError(f"未找到代理训练日志路径: {proxy_log_arg}")
 
 
 def resolve_pseudolabel_output(base_path: str, dataset: str, seed: int) -> Path:
@@ -239,9 +230,10 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     set_seed(seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
     proxy_log = resolve_proxy_log_path(args.proxy_log, args.dataset, seed)
+    proxy_data = load_proxy_log(proxy_log, args.dataset, args.data_root)
 
-    absorption_result = AbsorptionEfficiencyScore(proxy_log).compute()
-    informativeness_result = InformativenessScore(proxy_log).compute()
+    absorption_result = AbsorptionEfficiencyScore(proxy_log).compute(proxy_logs=proxy_data)
+    informativeness_result = InformativenessScore(proxy_log).compute(proxy_logs=proxy_data)
     coverage_result = CoverageGainScore(
         proxy_log,
         tau_g=args.coverage_tau_g,
@@ -249,8 +241,8 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         k=args.coverage_k,
         q_low=args.coverage_q_low,
         q_high=args.coverage_q_high,
-    ).compute()
-    risk_result = RiskScore(proxy_log).compute()
+    ).compute(proxy_logs=proxy_data)
+    risk_result = RiskScore(proxy_log).compute(proxy_logs=proxy_data)
 
     indices = absorption_result.indices
     if (

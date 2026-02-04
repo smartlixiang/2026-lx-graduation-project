@@ -38,7 +38,7 @@ class RiskScore:
         *,
         lambda_improve: float = 0.7,
         tail_q0: float = 0.95,
-        tail_q1: float = 0.995,
+        tail_q1: float = 0.999,
         early_late_ratio: float = 0.5,
         eps: float = 1e-6,
     ) -> None:

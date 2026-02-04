@@ -41,7 +41,7 @@ class AbsorptionEfficiencyScore:
         q_low: float = 0.002,
         q_high: float = 0.998,
         temp_progress: float = 2.0,
-        sigma_level: float = 2.0,
+        sigma_level: float = 3.0,
         early_late_ratio: float = 0.5,
         eps: float = 1e-6,
     ) -> None:

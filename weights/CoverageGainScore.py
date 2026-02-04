@@ -34,7 +34,7 @@ class CoverageGainScore:
         *,
         tau_g_mode: str = "percentile",
         tau_g: float = 0.15,
-        tau_g_percentile: float = 30.0,
+        tau_g_percentile: float = 25.0,
         tau_g_by_class: bool = True,
         s_g: float = 0.07,
         k_pct: float = 0.005,

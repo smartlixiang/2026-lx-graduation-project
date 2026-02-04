@@ -10,7 +10,7 @@ from typing import Optional
 
 import numpy as np
 
-from utils.score_utils import quantile_minmax_by_class, resolve_window_length, stable_sigmoid
+from utils.score_utils import quantile_minmax_by_class, resolve_early_late_slices, stable_sigmoid
 
 
 @dataclass
@@ -38,6 +38,7 @@ class CoverageGainScore:
         tau_g_by_class: bool = True,
         s_g: float = 0.07,
         k_pct: float = 0.005,
+        early_late_ratio: float = 0.5,
         q_low: float = 0.002,
         q_high: float = 0.998,
         eps: float = 1e-8,
@@ -50,6 +51,7 @@ class CoverageGainScore:
         self.tau_g_by_class = bool(tau_g_by_class)
         self.s_g = float(s_g)
         self.k_pct = float(k_pct)
+        self.early_late_ratio = float(early_late_ratio)
         self.q_low = float(q_low)
         self.q_high = float(q_high)
         self.eps = float(eps)
@@ -139,8 +141,9 @@ class CoverageGainScore:
         p_other_max = probs_other.max(axis=2)
         gap = p_true - p_other_max
 
-        late_epochs = resolve_window_length(num_epochs, ratio=0.2, min_epochs=5)
-        late_slice = slice(num_epochs - late_epochs, num_epochs)
+        _, late_slice, _ = resolve_early_late_slices(
+            num_epochs, ratio=self.early_late_ratio, min_epochs=5, skip_first=True
+        )
         gL = gap[late_slice].mean(axis=0)
 
         tau_g_arr = None

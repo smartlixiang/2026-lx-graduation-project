@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dataset.dataset import BaseDataLoader  # noqa: E402
 from utils.proxy_log_utils import load_proxy_log  # noqa: E402
+from utils.score_utils import quantile_minmax  # noqa: E402
 from weights.AbsorptionEfficiencyScore import AbsorptionEfficiencyScore  # noqa: E402
 from weights.CoverageGainScore import CoverageGainScore  # noqa: E402
 from weights.InformativenessScore import InformativenessScore  # noqa: E402
@@ -23,7 +24,7 @@ from weights.RiskScore import RiskScore  # noqa: E402
 from weights.TransferGainScore import TransferGainScore  # noqa: E402
 
 
-OUTPUT_ROOT = PROJECT_ROOT / "debug_z"
+OUTPUT_ROOT = PROJECT_ROOT / "debug_para"
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,6 +104,32 @@ def _plot_hist_pair(
     plt.close(fig)
 
 
+def _plot_multi_hist_pair(
+    out_path: Path,
+    raw_list: list[np.ndarray],
+    norm_list: list[np.ndarray],
+    labels: list[str],
+    bins: int,
+    title_raw: str,
+    title_norm: str,
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    colors = plt.cm.tab10.colors
+    for idx, (raw_vals, norm_vals, label) in enumerate(zip(raw_list, norm_list, labels, strict=True)):
+        color = colors[idx % len(colors)]
+        axes[0].hist(raw_vals, bins=bins, alpha=0.5, label=label, color=color)
+        axes[1].hist(norm_vals, bins=bins, alpha=0.5, label=label, color=color)
+    axes[0].set_title(title_raw)
+    axes[1].set_title(title_norm)
+    for ax in axes:
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Count")
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def _load_train_dataset(dataset_name: str, data_root: str, seed: int):
     loader = BaseDataLoader(
         dataset_name,
@@ -127,13 +154,14 @@ def _limit_cases(cases: list[dict[str, Any]], max_cases: int | None) -> list[dic
 def _sweep_absorption() -> list[dict[str, Any]]:
     cases = []
     for temp_progress, sigma_level in itertools.product(
-        [0.5, 1.0, 2.0, 4.0, 8.0],
-        [0.5, 1.0, 2.0, 4.0, 8.0],
+        [1.0, 2.0, 3.0, 4.0],
+        [1.0, 2.0, 3.0, 4.0],
     ):
         cases.append(
             {
                 "temp_progress": temp_progress,
                 "sigma_level": sigma_level,
+                "early_late_ratio": 0.5,
             }
         )
     return cases
@@ -141,29 +169,21 @@ def _sweep_absorption() -> list[dict[str, Any]]:
 
 def _sweep_informativeness() -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
-    for mu_percentile, stats_by_class, tau_p_mode in itertools.product(
-        [10.0, 20.0, 30.0, 40.0, 50.0],
-        [True, False],
-        ["fixed", "percentile"],
+    for mu_pct, stats_by_class, tau_p_mode in itertools.product(
+        [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5],
+        [True],
+        ["percentile"],
     ):
         if tau_p_mode == "percentile":
-            for tau_p_percentile in [50.0, 70.0, 90.0, 97.0]:
+            for tau_p_percentile in [40.0, 60.0, 80.0, 85.0, 90.0, 95.0]:
                 cases.append(
                     {
-                        "mu_percentile": mu_percentile,
+                        "mu_percentile": mu_pct * 100.0,
+                        "mu_pct": mu_pct,
                         "stats_by_class": stats_by_class,
                         "tau_p_mode": tau_p_mode,
                         "tau_p_percentile": tau_p_percentile,
-                    }
-                )
-        else:
-            for tau_p in [0.005, 0.02, 0.05, 0.1]:
-                cases.append(
-                    {
-                        "mu_percentile": mu_percentile,
-                        "stats_by_class": stats_by_class,
-                        "tau_p_mode": tau_p_mode,
-                        "tau_p": tau_p,
+                        "early_late_ratio": 0.5,
                     }
                 )
     return cases
@@ -172,13 +192,13 @@ def _sweep_informativeness() -> list[dict[str, Any]]:
 def _sweep_coverage() -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
     for tau_g_mode, tau_g_by_class, k_pct, s_g in itertools.product(
-        ["fixed", "percentile"],
-        [True, False],
-        [0.001, 0.0025, 0.005, 0.01, 0.02],
-        [0.03, 0.07, 0.15],
+        ["percentile"],
+        [True],
+        [0.001, 0.003, 0.005, 0.01],
+        [0.025, 0.05, 0.075, 0.1, 0.125, 0.15],
     ):
         if tau_g_mode == "percentile":
-            for tau_g_percentile in [10.0, 20.0, 30.0, 40.0, 50.0]:
+            for tau_g_percentile in [10.0, 15.0, 20.0, 25.0, 30.0]:
                 cases.append(
                     {
                         "tau_g_mode": tau_g_mode,
@@ -186,17 +206,7 @@ def _sweep_coverage() -> list[dict[str, Any]]:
                         "tau_g_by_class": tau_g_by_class,
                         "k_pct": k_pct,
                         "s_g": s_g,
-                    }
-                )
-        else:
-            for tau_g in [0.05, 0.1, 0.15, 0.25, 0.4]:
-                cases.append(
-                    {
-                        "tau_g_mode": tau_g_mode,
-                        "tau_g": tau_g,
-                        "tau_g_by_class": tau_g_by_class,
-                        "k_pct": k_pct,
-                        "s_g": s_g,
+                        "early_late_ratio": 0.5,
                     }
                 )
     return cases
@@ -204,7 +214,7 @@ def _sweep_coverage() -> list[dict[str, Any]]:
 
 def _sweep_transfer() -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
-    for tau_p_mode in ["fixed", "percentile"]:
+    for tau_p_mode in ["percentile"]:
         if tau_p_mode == "percentile":
             for tau_p_percentile in [50.0, 70.0, 90.0, 97.0]:
                 cases.append(
@@ -213,24 +223,16 @@ def _sweep_transfer() -> list[dict[str, Any]]:
                         "tau_p_percentile": tau_p_percentile,
                     }
                 )
-        else:
-            for tau_p in [0.02, 0.05, 0.1, 0.2, 0.4]:
-                cases.append(
-                    {
-                        "tau_p_mode": tau_p_mode,
-                        "tau_p": tau_p,
-                    }
-                )
     return cases
 
 
 def _sweep_persistent() -> list[dict[str, Any]]:
     cases = []
-    for late_ratio, tau_m in itertools.product(
-        [0.3, 0.5, 0.7],
+    for early_late_ratio, tau_m in itertools.product(
+        [0.2, 0.3, 0.4, 0.5],
         [0.05, 0.1, 0.15, 0.25],
     ):
-        cases.append({"late_ratio": late_ratio, "tau_m": tau_m})
+        cases.append({"early_late_ratio": early_late_ratio, "tau_m": tau_m})
     return cases
 
 
@@ -289,12 +291,48 @@ def main() -> None:
             "AbsorptionEfficiencyScore norm",
         )
 
+    compare_ratios = [0.2, 0.3, 0.4, 0.5]
+    compare_pairs = [(2.0, 2.0), (2.0, 3.0)]
+    for temp_progress, sigma_level in compare_pairs:
+        raw_list: list[np.ndarray] = []
+        norm_list: list[np.ndarray] = []
+        labels: list[str] = []
+        for ratio in compare_ratios:
+            scorer = AbsorptionEfficiencyScore(
+                npz_path,
+                temp_progress=temp_progress,
+                sigma_level=sigma_level,
+                early_late_ratio=ratio,
+            )
+            result = scorer.compute(proxy_logs=proxy_data)
+            raw_list.append(result.raw_score)
+            norm_list.append(result.scores)
+            labels.append(f"early_late_ratio={ratio:.2f}")
+        tag = _params_to_tag(
+            [
+                ("temp_progress", temp_progress),
+                ("sigma_level", sigma_level),
+                ("early_late_ratio", "compare"),
+            ]
+        )
+        out_path = OUTPUT_ROOT / "A" / f"{tag}.png"
+        _plot_multi_hist_pair(
+            out_path,
+            raw_list,
+            norm_list,
+            labels,
+            args.bins,
+            "AbsorptionEfficiencyScore raw (ratio compare)",
+            "AbsorptionEfficiencyScore norm (ratio compare)",
+        )
+
     for params in _limit_cases(_sweep_informativeness(), args.max_cases):
-        scorer = InformativenessScore(npz_path, **params)
+        scorer_params = {key: val for key, val in params.items() if key != "mu_pct"}
+        scorer = InformativenessScore(npz_path, **scorer_params)
         result = scorer.compute(proxy_logs=proxy_data)
         tag_parts = [
             ("tau_p_mode", params["tau_p_mode"]),
-            ("mu_pct", params["mu_percentile"]),
+            ("mu_pct", params["mu_pct"]),
             ("stats_by_class", params["stats_by_class"]),
         ]
         if params["tau_p_mode"] == "percentile":
@@ -362,6 +400,7 @@ def main() -> None:
             scorer = TransferGainScore(**params)
             result = scorer.compute(cv_log_dir, dataset)
             scores = result["score"].astype(np.float32)
+            scores_norm = quantile_minmax(scores, q_low=0.002, q_high=0.998)
             tag_parts = [("tau_p_mode", params["tau_p_mode"])]
             if params["tau_p_mode"] == "percentile":
                 tag_parts.append(("tau_p_pct", params["tau_p_percentile"]))
@@ -372,7 +411,7 @@ def main() -> None:
             _plot_hist_pair(
                 out_path,
                 scores,
-                scores,
+                scores_norm,
                 args.bins,
                 "TransferGainScore raw",
                 "TransferGainScore norm",
@@ -384,7 +423,7 @@ def main() -> None:
             scores = result["score"].astype(np.float32)
             tag = _params_to_tag(
                 [
-                    ("late_ratio", params["late_ratio"]),
+                    ("early_late_ratio", params["early_late_ratio"]),
                     ("tau_m", params["tau_m"]),
                 ]
             )

@@ -12,7 +12,7 @@ import numpy as np
 
 from utils.score_utils import (
     quantile_minmax_by_class,
-    resolve_window_length,
+    resolve_early_late_slices,
     robust_z_by_class,
     stable_sigmoid,
 )
@@ -42,6 +42,7 @@ class AbsorptionEfficiencyScore:
         q_high: float = 0.998,
         temp_progress: float = 2.0,
         sigma_level: float = 2.0,
+        early_late_ratio: float = 0.5,
         eps: float = 1e-6,
     ) -> None:
         self.npz_path = Path(npz_path)
@@ -49,6 +50,7 @@ class AbsorptionEfficiencyScore:
         self.q_high = float(q_high)
         self.temp_progress = float(temp_progress)
         self.sigma_level = float(sigma_level)
+        self.early_late_ratio = float(early_late_ratio)
         self.eps = float(eps)
 
     def _load_loss(self, data: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -74,9 +76,11 @@ class AbsorptionEfficiencyScore:
         loss, labels, indices = self._load_loss(data)
 
         num_epochs = loss.shape[0]
-        early_epochs = resolve_window_length(num_epochs, ratio=0.5, min_epochs=5)
+        early_slice, _, early_epochs = resolve_early_late_slices(
+            num_epochs, ratio=self.early_late_ratio, min_epochs=5, skip_first=True
+        )
 
-        early_log = np.log1p(loss[:early_epochs])
+        early_log = np.log1p(loss[early_slice])
         level = early_log.mean(axis=0)
         if early_epochs == 1:
             progress = np.zeros_like(level)

@@ -302,7 +302,8 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
     dataset = _build_dataset(args.dataset, args.data_root, transform=None)
     t_result = TransferGainScore().compute(cv_log_dir, dataset)
-    t_scores = t_result["score"].astype(np.float32)
+    t_scores_raw = t_result["score"].astype(np.float32)
+    t_scores = quantile_minmax(t_scores_raw, q_low=0.002, q_high=0.998)
     v_result = PersistentDifficultyScore().compute(cv_log_dir, dataset)
     v_scores = v_result["score"].astype(np.float32)
 

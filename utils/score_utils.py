@@ -36,6 +36,26 @@ def resolve_window_length(num_epochs: int, ratio: float = 0.2, min_epochs: int =
     return min(num_epochs, window)
 
 
+def resolve_early_late_slices(
+    num_epochs: int,
+    ratio: float = 0.5,
+    min_epochs: int = 5,
+    skip_first: bool = True,
+) -> tuple[slice, slice, int]:
+    """Resolve aligned early/late slices using a shared window length."""
+    window = resolve_window_length(num_epochs, ratio=ratio, min_epochs=min_epochs)
+    if skip_first and num_epochs > 1:
+        window = min(window, num_epochs - 1)
+        early_start = 1
+    else:
+        early_start = 0
+    early_end = min(num_epochs, early_start + window)
+    late_start = max(0, num_epochs - window)
+    early_slice = slice(early_start, early_end)
+    late_slice = slice(late_start, num_epochs)
+    return early_slice, late_slice, window
+
+
 def _iter_classes(labels: np.ndarray) -> Iterable[int]:
     for cls in np.unique(labels.astype(np.int64)):
         yield int(cls)

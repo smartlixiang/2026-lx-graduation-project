@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from utils.score_utils import quantile_minmax, stable_sigmoid
+from utils.score_utils import quantile_minmax, resolve_early_late_slices, stable_sigmoid
 from weights.TransferGainScore import get_labels_by_indices
 
 
@@ -16,7 +16,7 @@ class PersistentDifficultyScore:
     def __init__(
         self,
         *,
-        late_ratio: float = 0.5,
+        early_late_ratio: float = 0.5,
         tau_m: float = 0.10,
         eps: float = 1e-12,
         q_low: float = 0.002,
@@ -24,7 +24,7 @@ class PersistentDifficultyScore:
         min_class_count: int = 20,
         verbose: bool = False,
     ) -> None:
-        self.late_ratio = float(late_ratio)
+        self.early_late_ratio = float(early_late_ratio)
         self.tau_m = float(tau_m)
         self.eps = float(eps)
         self.q_low = float(q_low)
@@ -69,13 +69,15 @@ class PersistentDifficultyScore:
         num_epochs = val_logits.shape[0]
         if num_epochs == 0:
             raise ValueError("val_logits must include at least one epoch.")
-        if not 0.0 < self.late_ratio <= 1.0:
-            raise ValueError("late_ratio must be in (0, 1].")
+        if not 0.0 < self.early_late_ratio <= 1.0:
+            raise ValueError("early_late_ratio must be in (0, 1].")
         if self.tau_m <= 0:
             raise ValueError("tau_m must be positive.")
 
-        start_idx = int(np.floor(num_epochs * (1.0 - self.late_ratio)))
-        start_idx = max(0, min(start_idx, num_epochs - 1))
+        _, late_slice, _ = resolve_early_late_slices(
+            num_epochs, ratio=self.early_late_ratio, min_epochs=5, skip_first=True
+        )
+        start_idx = late_slice.start
 
         probs = self._softmax(val_logits.astype(np.float64), self.eps)
         label_idx = val_labels.reshape(1, -1, 1)
@@ -182,7 +184,7 @@ class PersistentDifficultyScore:
             "score": v_norm.astype(np.float32),
             "name": "PersistentDifficultyScore",
             "meta": {
-                "late_ratio": self.late_ratio,
+                "early_late_ratio": self.early_late_ratio,
                 "tau_m": self.tau_m,
                 "q_low": self.q_low,
                 "q_high": self.q_high,

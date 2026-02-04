@@ -10,7 +10,7 @@ from typing import Optional
 
 import numpy as np
 
-from utils.score_utils import quantile_minmax_by_class, resolve_window_length
+from utils.score_utils import quantile_minmax_by_class, resolve_early_late_slices
 
 
 @dataclass
@@ -45,6 +45,7 @@ class InformativenessScore:
         tau_p: float = 0.02,
         tau_p_percentile: float = 90.0,
         tau_p_min: float = 1e-3,
+        early_late_ratio: float = 0.5,
         eps: float = 1e-8,
     ) -> None:
         self.npz_path = Path(npz_path)
@@ -59,6 +60,7 @@ class InformativenessScore:
         self.tau_p = float(tau_p)
         self.tau_p_percentile = float(tau_p_percentile)
         self.tau_p_min = float(tau_p_min)
+        self.early_late_ratio = float(early_late_ratio)
         self.eps = float(eps)
 
     def _load_logits(self, data: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -131,8 +133,11 @@ class InformativenessScore:
         logits, labels, indices = self._load_logits(data)
 
         num_epochs = logits.shape[0]
-        early_epochs = resolve_window_length(num_epochs, ratio=0.2, min_epochs=5)
-        late_epochs = resolve_window_length(num_epochs, ratio=0.2, min_epochs=5)
+        _, late_slice, window = resolve_early_late_slices(
+            num_epochs, ratio=self.early_late_ratio, min_epochs=5, skip_first=True
+        )
+        early_epochs = window
+        late_epochs = window
 
         probs = self._softmax(logits)
         label_idx = labels.reshape(1, -1, 1)
@@ -142,8 +147,6 @@ class InformativenessScore:
         probs_other[:, np.arange(p_true.shape[1]), labels] = -np.inf
         p_other_max = probs_other.max(axis=2)
         gap = p_true - p_other_max
-
-        late_slice = slice(num_epochs - late_epochs, num_epochs)
 
         gL = gap[late_slice].mean(axis=0)
         mu_arr, sigma_arr = self._compute_mu_sigma(gL, labels)

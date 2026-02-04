@@ -10,7 +10,7 @@ from typing import Optional
 
 import numpy as np
 
-from utils.score_utils import resolve_window_length, robust_z_by_class
+from utils.score_utils import resolve_early_late_slices, robust_z_by_class
 
 
 @dataclass
@@ -39,12 +39,14 @@ class RiskScore:
         lambda_improve: float = 0.7,
         tail_q0: float = 0.95,
         tail_q1: float = 0.995,
+        early_late_ratio: float = 0.5,
         eps: float = 1e-6,
     ) -> None:
         self.npz_path = Path(npz_path)
         self.lambda_improve = float(lambda_improve)
         self.tail_q0 = float(tail_q0)
         self.tail_q1 = float(tail_q1)
+        self.early_late_ratio = float(early_late_ratio)
         self.eps = float(eps)
 
     def _load_loss(self, data: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -70,10 +72,13 @@ class RiskScore:
         loss, labels, indices = self._load_loss(data)
 
         num_epochs = loss.shape[0]
-        early_epochs = resolve_window_length(num_epochs, ratio=0.2, min_epochs=5)
-        late_epochs = resolve_window_length(num_epochs, ratio=0.2, min_epochs=5)
-        early_log = np.log1p(loss[:early_epochs])
-        late_log = np.log1p(loss[-late_epochs:])
+        early_slice, late_slice, window = resolve_early_late_slices(
+            num_epochs, ratio=self.early_late_ratio, min_epochs=5, skip_first=True
+        )
+        early_epochs = window
+        late_epochs = window
+        early_log = np.log1p(loss[early_slice])
+        late_log = np.log1p(loss[late_slice])
         early_value = early_log.mean(axis=0)
         late_value = late_log.mean(axis=0)
         improve_value = early_value - late_value

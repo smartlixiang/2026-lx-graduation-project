@@ -16,7 +16,7 @@ from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100
 from model.adapter import AdapterMLP
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.global_config import CONFIG
-from utils.proxy_log_utils import load_proxy_log
+from utils.proxy_log_utils import load_proxy_log, resolve_proxy_log_path
 from utils.seed import parse_seed_list, set_seed
 from utils.score_utils import quantile_minmax
 from utils.static_score_cache import get_or_compute_static_scores
@@ -45,7 +45,13 @@ def parse_args() -> argparse.Namespace:
         "--proxy-log",
         type=str,
         default="weights/proxy_logs",
-        help="Path to proxy training log (.npz) or k-fold log directory.",
+        help="Proxy log root path (or a specific log file/dir).",
+    )
+    parser.add_argument(
+        "--proxy-epochs",
+        type=int,
+        default=None,
+        help="Max epochs for proxy log directory name. Defaults to latest epoch folder.",
     )
     parser.add_argument("--adapter-path", type=str, default="adapter_weights/cifar10/adapter_cifar10_ViT-B-32.pt", help="Optional adapter path.")
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
@@ -55,15 +61,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dds-k", type=float, default=10)
     parser.add_argument("--coverage-tau-g", type=float, default=0.15)
     parser.add_argument("--coverage-s-g", type=float, default=0.07)
-    parser.add_argument("--coverage-k", type=int, default=10)
+    parser.add_argument(
+        "--coverage-k-pct",
+        type=float,
+        default=0.005,
+        help="Class-wise k ratio for CoverageGainScore (fraction of class size).",
+    )
     parser.add_argument("--coverage-q-low", type=float, default=0.002)
     parser.add_argument("--coverage-q-high", type=float, default=0.998)
-    parser.add_argument(
-        "--cv-log-dir",
-        type=str,
-        default=None,
-        help="Path to k-fold proxy log directory (for TransferGainScore/PersistentDifficultyScore).",
-    )
     parser.add_argument(
         "--sanity-keep-ratio",
         type=float,
@@ -233,31 +238,15 @@ def _topk_overlap(base: np.ndarray, other: np.ndarray, keep_ratio: float) -> flo
     return len(base_idx & other_idx) / float(len(base_idx))
 
 
-def resolve_proxy_log_path(proxy_log_arg: str, dataset: str, seed: int) -> Path:
-    candidate = Path(proxy_log_arg)
-    if candidate.exists():
-        return candidate
-
-    base_dir = Path("weights") / "proxy_logs" / dataset / "resnet18" / str(seed)
-    if base_dir.exists() and base_dir.is_dir():
-        epoch_dirs = [p for p in base_dir.iterdir() if p.is_dir() and p.name.isdigit()]
-        if epoch_dirs:
-            epoch_dirs.sort(key=lambda p: int(p.name))
-            return epoch_dirs[-1]
-
-    legacy_dir = Path("weights") / "proxy_logs" / str(seed)
-    if legacy_dir.exists() and legacy_dir.is_dir():
-        matches = sorted(legacy_dir.glob("*.npz"))
-        if matches:
-            return matches[-1]
-
-    raise FileNotFoundError(f"未找到代理训练日志路径: {proxy_log_arg}")
-
-
 def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     set_seed(seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
-    proxy_log = resolve_proxy_log_path(args.proxy_log, args.dataset, seed)
+    proxy_log = resolve_proxy_log_path(
+        args.proxy_log,
+        args.dataset,
+        seed,
+        max_epoch=args.proxy_epochs,
+    )
     proxy_data = load_proxy_log(proxy_log, args.dataset, args.data_root)
 
     absorption_result = AbsorptionEfficiencyScore(proxy_log).compute(proxy_logs=proxy_data)
@@ -266,7 +255,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         proxy_log,
         tau_g=args.coverage_tau_g,
         s_g=args.coverage_s_g,
-        k=args.coverage_k,
+        k_pct=args.coverage_k_pct,
         q_low=args.coverage_q_low,
         q_high=args.coverage_q_high,
     ).compute(proxy_logs=proxy_data)
@@ -294,7 +283,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         c_scores = _align_scores(coverage_result.scores, coverage_result.indices, num_samples)
         r_scores = _align_scores(risk_result.scores, risk_result.indices, num_samples)
 
-    cv_log_dir = Path(args.cv_log_dir) if args.cv_log_dir is not None else proxy_log
+    cv_log_dir = Path(proxy_log)
     if not cv_log_dir.exists():
         raise FileNotFoundError(f"cv_log_dir not found: {cv_log_dir}")
     if cv_log_dir.is_file():

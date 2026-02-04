@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataset.dataset import BaseDataLoader  # noqa: E402
-from utils.proxy_log_utils import load_proxy_log  # noqa: E402
+from utils.proxy_log_utils import load_proxy_log, resolve_proxy_log_path  # noqa: E402
 from utils.score_utils import quantile_minmax  # noqa: E402
 from weights.AbsorptionEfficiencyScore import AbsorptionEfficiencyScore  # noqa: E402
 from weights.CoverageGainScore import CoverageGainScore  # noqa: E402
@@ -30,16 +30,16 @@ OUTPUT_ROOT = PROJECT_ROOT / "debug_para"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sweep score hyperparameters and plot histograms.")
     parser.add_argument(
-        "--npz_path",
+        "--proxy-log",
         type=str,
-        default="weights/proxy_logs/cifar10/resnet18/22/100",
-        help="Path to proxy training log (.npz) for A/B/C/R.",
+        default="weights/proxy_logs",
+        help="Proxy log root path (or a specific log file/dir).",
     )
     parser.add_argument(
-        "--cv_log_dir",
-        type=str,
-        default="weights/proxy_logs/cifar10/resnet18/22/100",
-        help="Path to k-fold proxy log directory for T/V.",
+        "--proxy-epochs",
+        type=int,
+        default=None,
+        help="Max epochs for proxy log directory name. Defaults to latest epoch folder.",
     )
     parser.add_argument("--dataset", type=str, default="cifar10", help="Dataset name.")
     parser.add_argument("--data_root", type=str, default="./data", help="Dataset root path.")
@@ -255,25 +255,26 @@ def _sweep_risk() -> list[dict[str, Any]]:
 
 def main() -> None:
     args = parse_args()
-    npz_path = Path(args.npz_path)
-    if not npz_path.exists():
-        raise FileNotFoundError(f"npz_path not found: {npz_path}")
+    log_path = resolve_proxy_log_path(
+        args.proxy_log,
+        args.dataset,
+        args.seed,
+        max_epoch=args.proxy_epochs,
+    )
 
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     for name in ["A", "B", "C", "T", "V", "R"]:
         (OUTPUT_ROOT / name).mkdir(parents=True, exist_ok=True)
 
-    proxy_data = load_proxy_log(npz_path, args.dataset, args.data_root)
+    proxy_data = load_proxy_log(log_path, args.dataset, args.data_root)
 
-    cv_log_dir = Path(args.cv_log_dir) if args.cv_log_dir else None
-    dataset = None
-    if cv_log_dir is not None:
-        if not cv_log_dir.exists():
-            raise FileNotFoundError(f"cv_log_dir not found: {cv_log_dir}")
-        dataset = _load_train_dataset(args.dataset, args.data_root, args.seed)
+    cv_log_dir = Path(log_path)
+    if not cv_log_dir.exists():
+        raise FileNotFoundError(f"cv_log_dir not found: {cv_log_dir}")
+    dataset = _load_train_dataset(args.dataset, args.data_root, args.seed)
 
     for params in _limit_cases(_sweep_absorption(), args.max_cases):
-        scorer = AbsorptionEfficiencyScore(npz_path, **params)
+        scorer = AbsorptionEfficiencyScore(log_path, **params)
         result = scorer.compute(proxy_logs=proxy_data)
         tag = _params_to_tag(
             [
@@ -299,7 +300,7 @@ def main() -> None:
         labels: list[str] = []
         for ratio in compare_ratios:
             scorer = AbsorptionEfficiencyScore(
-                npz_path,
+                log_path,
                 temp_progress=temp_progress,
                 sigma_level=sigma_level,
                 early_late_ratio=ratio,
@@ -328,7 +329,7 @@ def main() -> None:
 
     for params in _limit_cases(_sweep_informativeness(), args.max_cases):
         scorer_params = {key: val for key, val in params.items() if key != "mu_pct"}
-        scorer = InformativenessScore(npz_path, **scorer_params)
+        scorer = InformativenessScore(log_path, **scorer_params)
         result = scorer.compute(proxy_logs=proxy_data)
         tag_parts = [
             ("tau_p_mode", params["tau_p_mode"]),
@@ -351,7 +352,7 @@ def main() -> None:
         )
 
     for params in _limit_cases(_sweep_coverage(), args.max_cases):
-        scorer = CoverageGainScore(npz_path, **params)
+        scorer = CoverageGainScore(log_path, **params)
         result = scorer.compute(proxy_logs=proxy_data)
         tag_parts = [
             ("tau_g_mode", params["tau_g_mode"]),
@@ -375,7 +376,7 @@ def main() -> None:
         )
 
     for params in _limit_cases(_sweep_risk(), args.max_cases):
-        scorer = RiskScore(npz_path, **params)
+        scorer = RiskScore(log_path, **params)
         result = scorer.compute(proxy_logs=proxy_data)
         tag = _params_to_tag(
             [
@@ -395,47 +396,46 @@ def main() -> None:
             risk_nonzero=True,
         )
 
-    if cv_log_dir is not None and dataset is not None:
-        for params in _limit_cases(_sweep_transfer(), args.max_cases):
-            scorer = TransferGainScore(**params)
-            result = scorer.compute(cv_log_dir, dataset)
-            scores = result["score"].astype(np.float32)
-            scores_norm = quantile_minmax(scores, q_low=0.002, q_high=0.998)
-            tag_parts = [("tau_p_mode", params["tau_p_mode"])]
-            if params["tau_p_mode"] == "percentile":
-                tag_parts.append(("tau_p_pct", params["tau_p_percentile"]))
-            else:
-                tag_parts.append(("tau_p", params["tau_p"]))
-            tag = _params_to_tag(tag_parts)
-            out_path = OUTPUT_ROOT / "T" / f"{tag}.png"
-            _plot_hist_pair(
-                out_path,
-                scores,
-                scores_norm,
-                args.bins,
-                "TransferGainScore raw",
-                "TransferGainScore norm",
-            )
+    for params in _limit_cases(_sweep_transfer(), args.max_cases):
+        scorer = TransferGainScore(**params)
+        result = scorer.compute(cv_log_dir, dataset)
+        scores = result["score"].astype(np.float32)
+        scores_norm = quantile_minmax(scores, q_low=0.002, q_high=0.998)
+        tag_parts = [("tau_p_mode", params["tau_p_mode"])]
+        if params["tau_p_mode"] == "percentile":
+            tag_parts.append(("tau_p_pct", params["tau_p_percentile"]))
+        else:
+            tag_parts.append(("tau_p", params["tau_p"]))
+        tag = _params_to_tag(tag_parts)
+        out_path = OUTPUT_ROOT / "T" / f"{tag}.png"
+        _plot_hist_pair(
+            out_path,
+            scores,
+            scores_norm,
+            args.bins,
+            "TransferGainScore raw",
+            "TransferGainScore norm",
+        )
 
-        for params in _limit_cases(_sweep_persistent(), args.max_cases):
-            scorer = PersistentDifficultyScore(**params)
-            result = scorer.compute(cv_log_dir, dataset)
-            scores = result["score"].astype(np.float32)
-            tag = _params_to_tag(
-                [
-                    ("early_late_ratio", params["early_late_ratio"]),
-                    ("tau_m", params["tau_m"]),
-                ]
-            )
-            out_path = OUTPUT_ROOT / "V" / f"{tag}.png"
-            _plot_hist_pair(
-                out_path,
-                scores,
-                scores,
-                args.bins,
-                "PersistentDifficultyScore raw",
-                "PersistentDifficultyScore norm",
-            )
+    for params in _limit_cases(_sweep_persistent(), args.max_cases):
+        scorer = PersistentDifficultyScore(**params)
+        result = scorer.compute(cv_log_dir, dataset)
+        scores = result["score"].astype(np.float32)
+        tag = _params_to_tag(
+            [
+                ("early_late_ratio", params["early_late_ratio"]),
+                ("tau_m", params["tau_m"]),
+            ]
+        )
+        out_path = OUTPUT_ROOT / "V" / f"{tag}.png"
+        _plot_hist_pair(
+            out_path,
+            scores,
+            scores,
+            args.bins,
+            "PersistentDifficultyScore raw",
+            "PersistentDifficultyScore norm",
+        )
 
 
 if __name__ == "__main__":

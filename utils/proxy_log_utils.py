@@ -94,6 +94,42 @@ def _assemble_logits_from_folds(log_dir: Path, labels_all: np.ndarray) -> tuple[
     return logits_full, indices
 
 
+def resolve_proxy_log_path(
+    proxy_log_root: str | Path,
+    dataset_name: str,
+    seed: int,
+    proxy_model: str = "resnet18",
+    max_epoch: int | None = None,
+) -> Path:
+    candidate = Path(proxy_log_root)
+    if candidate.exists():
+        if candidate.is_file():
+            return candidate
+        if candidate.is_dir() and any(candidate.glob("fold_*.npz")):
+            return candidate
+
+    base_dir = candidate / dataset_name / proxy_model / str(seed)
+    if max_epoch is not None:
+        epoch_dir = base_dir / str(max_epoch)
+        if epoch_dir.exists():
+            return epoch_dir
+        raise FileNotFoundError(f"未找到代理训练日志路径: {epoch_dir}")
+
+    if base_dir.exists() and base_dir.is_dir():
+        epoch_dirs = [p for p in base_dir.iterdir() if p.is_dir() and p.name.isdigit()]
+        if epoch_dirs:
+            epoch_dirs.sort(key=lambda p: int(p.name))
+            return epoch_dirs[-1]
+
+    legacy_dir = candidate / str(seed)
+    if legacy_dir.exists() and legacy_dir.is_dir():
+        matches = sorted(legacy_dir.glob("*.npz"))
+        if matches:
+            return matches[-1]
+
+    raise FileNotFoundError(f"未找到代理训练日志路径: {proxy_log_root}")
+
+
 def load_proxy_log(proxy_log_path: str | Path, dataset_name: str, data_root: str) -> dict[str, np.ndarray]:
     path = Path(proxy_log_path)
     labels_all = load_dataset_labels(dataset_name, data_root)
@@ -132,4 +168,4 @@ def load_proxy_log(proxy_log_path: str | Path, dataset_name: str, data_root: str
     return {"logits": logits, "labels": labels, "indices": indices, "loss": loss}
 
 
-__all__ = ["load_proxy_log"]
+__all__ = ["load_proxy_log", "resolve_proxy_log_path"]

@@ -35,8 +35,8 @@ class CoverageGainScore:
         tau_g: float = 0.15,
         s_g: float = 0.07,
         k: int = 10,
-        q_low: float = 0.01,
-        q_high: float = 0.99,
+        q_low: float = 0.002,
+        q_high: float = 0.998,
         eps: float = 1e-8,
         verbose: bool = False,
     ) -> None:

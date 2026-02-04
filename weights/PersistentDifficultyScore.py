@@ -19,8 +19,8 @@ class PersistentDifficultyScore:
         late_ratio: float = 0.5,
         tau_m: float = 0.10,
         eps: float = 1e-12,
-        q_low: float = 0.01,
-        q_high: float = 0.99,
+        q_low: float = 0.002,
+        q_high: float = 0.998,
         min_class_count: int = 20,
         verbose: bool = False,
     ) -> None:

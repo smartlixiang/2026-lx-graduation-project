@@ -70,23 +70,23 @@ plan
 
 SA：语义对齐度（Semantic Alignment）；
 
-Div：类内多样性覆盖度（基于 kNN 距离排序的 rank-based 稀疏度）；
+Div：类内多样性覆盖度（基于同类 kNN 距离均值的稀疏度）；
 
 DDS：类内难度方向得分（基于 PCA 的低方差方向投影）。
 
 (2) 从训练动态学习权重（Weight Learning via Dynamics）：
 
-在原始图像上训练一个代理分类模型（如 ResNet-18），记录每个样本的训练动态：early loss 轨迹、logit/margin 轨迹、stability 情况；
+在原始图像上以 K 折交叉验证训练一个代理分类模型（如 ResNet-18），按折记录训练子集与验证子集（OOF）的 logits 轨迹；
 
-从这些动态构造两个 0–1 区间的动态指标：EarlyLearnabilityScore、StabilityScore；
+基于训练轨迹构造训练视角分量 A/B/C/R，刻画“吸收效率、边界推进信息、覆盖互补增益、极端噪声风险”；
 
-二者平均得到基础“样本效用标签” u_base(i)；
+基于 OOF 验证轨迹构造验证视角分量 T/V，分别刻画“可迁移增益”和“后期持久难度”；
 
-进一步引入 CoverageGainScore（基于特征空间的类内互补/去冗余增益）对 u_base 做条件性修正，得到最终用于教学的效用标签 u_i；
+将 A/B/C/T/V/R 融合并归一化得到动态效用标签 u_i；
 
-用带 L2 正则的线性回归，将 u_i 回归到 (SA, Div, DDS)，学习出各静态指标的权重 w。
+用带 L2 正则的线性回归（Ridge），将 u_i 回归到 (SA, Div, DDS)，学习出静态指标的权重 w。
 
-(3) 基于最终得分进行数据选择与 Selection Optimization：
+(3)  基于最终得分进行数据选择与 Selection Optimization：
 
 最终评分定义为 Score(x) = Σ_k ẇ_k · feature_k，其中 ẇ 由 w 归一化而来；
 
@@ -515,15 +515,28 @@ SA / Div / DDS 三个静态指标“谁更重要”，不同数据集与任务�
 
 5.2 代理模型与记录
 
-代理模型：如 ResNet-18，在完整训练集上训练 E 个 epoch；
+代理模型：如 ResNet-18，以 K 折交叉验证方式训练（默认 K=5），每折训练 E 个 epoch。
 
-训练在原始图像空间进行，与 CLIP/Adapter 模块分离；
+交叉验证的目标不是为了“更高的代理模型精度”，而是为了在不使用测试集的前提下，引入 OOF（out-of-fold）预测轨迹，使后续动态分量能够显式利用“验证/预测视角”的信息。
 
-在训练过程中，对每个样本 x_i 记录：
+设训练集全局索引为 i ∈ {0,...,N-1}。第 f 折包含训练子集 I_train^f 与验证子集 I_val^f，且 I_train^f ∪ I_val^f 为全体样本，I_train^f ∩ I_val^f = ∅。
 
-(1) 每轮 loss：ℓ_t(i)
-(2) 每轮是否预测正确：c_t(i) ∈ {0,1}
-(3) 每轮 logits：z_t(i) ∈ ℝ^C，用于计算 margin。
+【按折保存的关键日志（最小必要信息）】
+对每一折 f 保存 fold_f.npz（或等价格式），至少包含：
+
+(1) train_indices：I_train^f（全局索引）
+(2) val_indices：I_val^f（全局索引）
+(3) train_logits：z_train^f[t, j, :] ∈ ℝ^C（训练子集的 logits 轨迹）
+(4) val_logits：z_val^f[t, k, :] ∈ ℝ^C（验证子集的 logits 轨迹）
+
+说明：
+- 不额外保存 label：可通过 train_indices / val_indices 从原始数据集读取 y_i。
+- 不额外保存 correct / loss：可由 logits 与 label 快速计算得到。
+
+【跨折对齐与聚合规则】
+- “训练视角”分量（A/B/C/R）：样本 i 会在 K−1 个折中出现在训练子集，对应 K−1 条训练轨迹；先在每折内计算该折对 i 的分量得分，再在折间做聚合（默认 median，可选 mean），得到全局的 A(i)/B(i)/C(i)/R(i)。
+- “验证/预测视角”分量（如 T、V）：样本 i 恰好在 1 个折中作为验证子集出现，对应一条 OOF 预测轨迹，可直接计算并写回到全局索引位置，无需折间聚合。
+
 
 5.3 AbsorptionEfficiencyScore：吸收效率得分（A）
 
@@ -689,7 +702,7 @@ k：类内 kNN 的邻居数（控制“冗余/互补”的尺度）
 
 q_low, q_high：鲁棒归一化分位点
 
-5.6 RiskScore：极端噪声风险得分（R）与综合动态效用标签 u_i
+5.6 RiskScore：极端噪声风险得分（R）
 
 【定位与目标】
 RiskScore 的角色是“极端噪声约束项”，只针对极少数明显异常样本施加惩罚，避免在简单数据集（如 CIFAR-10）上出现“伤及无辜”的大范围扣分。
@@ -728,59 +741,80 @@ R_raw(i) = σ( ( z_R(i) − thr_{y_i} ) / τ_r )
 （4）输出
 R(i) = clip( R_raw(i), 0, 1 )
 
-5.7 综合动态效用标签 u_i
-本阶段的动态监督信号采用“加性融合 + 统一归一化”：
-u_raw(i) = A(i) + B(i) + C(i) − R(i)
 
-随后对 {u_raw(i)} 做全局分位点 min-max 归一化到 [0,1]（与调试脚本一致）：
+5.7 TransferGainScore：可迁移增益得分（T）
+
+【定位与目标】
+TransferGainScore（记为 T）用于显式引入验证集信息：它衡量训练样本在“被学习”过程中，是否伴随带来了验证集上的整体预测改善，从而刻画样本的可迁移价值。
+
+【输入】
+来自 K 折交叉验证日志（每折一个 fold_f.npz）：
+
+训练子集 logits 轨迹：z_train^f[t, j, :]
+验证子集 logits 轨迹（OOF）：z_val^f[t, k, :]
+
+以及通过 indices 回到原数据集得到的标签 y_i。
+
+【核心计算思想（语义层）】
+在每一折 f 上，训练端的学习过程会推进某些类别区分能力；如果这些能力能在同分布的验证集上同步体现为更低的预测不确定性/更高的正确类 margin/更低的验证损失，则说明训练端吸收的知识具有迁移性。
+
+因此，T 的本质是“训练→验证”的迁移推进量：用训练动态与验证端改善之间的耦合来给训练样本分配增益。
+
+【实现建议（与代码一致即可）】
+可以在每一折上先构造一个随 epoch 变化的验证端整体指标序列，例如：
+G_val^f(t) = mean_{j∈I_val^f} g( z_val^f[t,j,:], y_j )
+
+其中 g 可选：
+- 负对数似然（NLL）
+- 正确类概率 p(y|x)
+- margin：z(y) − max_{c≠y} z(c)
+- 或 margin 的 softplus 形式以平滑尺度
+
+再把训练样本 i 的训练端学习推进序列与 G_val^f(t) 的变化做关联（差分相似度、相关性、或分段贡献度），得到该折对样本 i 的迁移增益 T_f(i)。最后对 i 在多个折中作为训练样本出现时的 {T_f(i)} 做聚合（median/mean），得到 T(i) ∈ [0,1]。
+
+5.8 PersistentDifficultyScore：持久难度得分（V）
+
+【定位与目标】
+PersistentDifficultyScore（记为 V）用于在“验证/预测”语境下鼓励难样本：它直接利用 OOF 验证轨迹刻画样本在训练后期仍然难以被正确预测（或缺乏足够 margin/置信度）的程度，并将这种“后期仍难”视为潜在价值，而不是噪声。
+
+【输入】
+对每个样本 i，仅使用其所在折的验证 logits 轨迹 z_val[t,i,:]（OOF）与标签 y_i。
+
+【计算步骤与数学形式（对应你当前实现的要点）】
+（1）后期窗口
+取后 50% epoch 作为后期窗口：
+T_l = { ⌈0.5E⌉, ..., E−1 }.
+
+（2）后期难度刻画（以 margin → softplus 难度为例）
+m_t(i) = z_val[t,i,y_i] − max_{c≠y_i} z_val[t,i,c]
+d_t(i) = softplus( −m_t(i) )
+
+（3）后期统计与类内归一化
+V_raw(i) = mean_{t∈T_l} d_t(i)
+V(i) = QuantileMinMax_{class}( V_raw(i) )
+
+其中 QuantileMinMax_{class} 表示在训练集内对每个类别 c 统计 V_raw 的类内分位点标尺，再把任意样本映射到 [0,1] 并截断。
+
+解释：V 越大表示“在验证语境下后期仍持续难”，从而被鼓励进入选择子集。
+
+5.9 综合动态效用标签 u_i（更新：加入 T 与 V）
+
+本阶段的动态监督信号采用“加性融合 + 统一归一化”：
+
+u_raw(i) = A(i) + B(i) + C(i) + w_T·T(i) + w_V·V(i) − R(i)
+
+其中 w_T 与 w_V 为融合权重（默认取 1.0；调试时可取 0.25 作敏感性分析）。
+
+随后对 {u_raw(i)} 做全局分位点 min-max 归一化到 [0,1]（与实现脚本一致）：
+
 u(i) = clip( (u_raw(i) − q_low) / (q_high − q_low), 0, 1 )
 
-其中 q_low/q_high 取 u_raw 的全局 1%/99% 分位点。
+其中 q_low/q_high 取 u_raw 的全局 0.2%/99.8% 分位点。
 
-【说明】
+5.10 用 Ridge 回归学习静态评分权重
 
-A/B/C 均为正向鼓励项，分别覆盖“吸收效率、边界推进信息、组合互补覆盖”；
+（本节保持原方案：以静态特征 f_i = [SA_i, Div_i, DDS_i]^T 回归 u_i，学习静态权重，使最终评分函数与训练动态解耦，能够泛化到未见样本。）
 
-R 为极端噪声约束项，仅对上尾异常样本产生显著惩罚；
-
-u(i) 作为连续软标签，用于后续 Ridge 回归学习静态权重（见 5.7），训练动态仅承担“教学信号”，最终评分函数仍由静态指标构成。
-
-【超参数含义】
-
-p_r：上尾阈值分位点（越大越“只惩罚极少数”）
-
-τ_r：风险门控温度（越大越平滑，越小越接近硬阈值）
-
-E_l：后期窗口长度（与代理训练轮数匹配）
-
-q_low/q_high：u_raw 的全局分位点归一化鲁棒性
-
-
-5.8 用 Ridge 回归学习静态评分权重
-
-现在对每个样本 i，有：
-
-静态特征：f_i = [ SA_i, Div_i, DDS_i ]^T；
-
-动态目标：u_i ∈ [0,1]。
-
-采用带 L2 正则的线性回归（Ridge Regression）学习 w ∈ ℝ^3, b：
-
-\hat u_i = w^T f_i + b
-
-损失：
-
-L(w,b) = (1/N) Σ_i (w^T f_i + b − u_i)^2 + λ ||w||_2^2
-
-约束：
-
-所有待学习权重为正
-
-训练完成后归一化：
-
-ẇ_k = w'_k / Σ_j w'_j
-
-得到归一化权重向量 ẇ = (ẇ_1, ẇ_2, ẇ_3)，代表 SA / Div / DDS 的相对重要性，由训练动态数据驱动确定。
 
 六、最终评分函数与未见样本评估
 
@@ -932,9 +966,9 @@ CIFAR-10 / CIFAR-100 作为起点；
 
 基于 g_i 计算静态指标：SA_i / Div_i / DDS_i；
 
-在原始图像上训练代理模型（ResNet-18），记录训练动态（loss / c_t / logits）；
+在原始图像上以 K 折交叉验证训练代理模型（ResNet-18），按折记录训练子集与验证子集（OOF）的 logits 轨迹；
 
-计算 EarlyLearnabilityScore_i / StabilityScore_i，得到 u_base(i)；再计算 CoverageGainScore 修正项并构造最终 u_i；
+基于训练轨迹计算 A/B/C/R，基于 OOF 验证轨迹计算 T（TransferGainScore）与 V（PersistentDifficultyScore），融合并归一化得到 u_i；
 
 使用 Ridge 回归将 u_i 回归到 (SA_i, Div_i, DDS_i)，学习权重 w，得到 ẇ；
 

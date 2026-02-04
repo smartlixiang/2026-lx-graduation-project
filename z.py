@@ -152,7 +152,7 @@ def _compute_components(
 
 
 def normalize_u_raw(u_raw: np.ndarray) -> np.ndarray:
-    return quantile_minmax(u_raw.astype(np.float32), q_low=0.01, q_high=0.99)
+    return quantile_minmax(u_raw.astype(np.float32), q_low=0.002, q_high=0.998)
 
 
 def _load_train_dataset(dataset_name: str, data_root: str, seed: int):

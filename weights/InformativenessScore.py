@@ -34,8 +34,8 @@ class InformativenessScore:
         self,
         npz_path: str | Path,
         *,
-        q_low: float = 0.01,
-        q_high: float = 0.99,
+        q_low: float = 0.002,
+        q_high: float = 0.998,
         eps: float = 1e-8,
     ) -> None:
         self.npz_path = Path(npz_path)

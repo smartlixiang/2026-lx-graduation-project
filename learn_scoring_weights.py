@@ -24,6 +24,8 @@ from weights import (
     CoverageGainScore,
     InformativenessScore,
     RiskScore,
+    PersistentDifficultyScore,
+    TransferGainScore,
 )
 
 
@@ -51,8 +53,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coverage-tau-g", type=float, default=0.15)
     parser.add_argument("--coverage-s-g", type=float, default=0.07)
     parser.add_argument("--coverage-k", type=int, default=10)
-    parser.add_argument("--coverage-q-low", type=float, default=0.1)
-    parser.add_argument("--coverage-q-high", type=float, default=0.99)
+    parser.add_argument("--coverage-q-low", type=float, default=0.002)
+    parser.add_argument("--coverage-q-high", type=float, default=0.998)
+    parser.add_argument(
+        "--cv-log-dir",
+        type=str,
+        default=None,
+        help="Path to k-fold proxy log directory (for TransferGainScore/PersistentDifficultyScore).",
+    )
+    parser.add_argument(
+        "--sanity-keep-ratio",
+        type=float,
+        default=0.6,
+        help="Keep ratio for top-k overlap sanity check between u_raw_base and u_raw.",
+    )
     parser.add_argument("--ridge-lambda", type=float, default=1e-2)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=1000)
@@ -189,6 +203,33 @@ def build_output_path(base_path: str) -> Path:
     return Path(base_path)
 
 
+def _align_scores(scores: np.ndarray, indices: np.ndarray, num_samples: int) -> np.ndarray:
+    if scores.shape[0] != indices.shape[0]:
+        raise ValueError("scores and indices length mismatch.")
+    full = np.full((num_samples,), np.nan, dtype=np.float32)
+    if np.min(indices) < 0 or np.max(indices) >= num_samples:
+        raise ValueError("indices out of range when aligning scores.")
+    full[indices.astype(np.int64)] = scores.astype(np.float32)
+    if np.any(~np.isfinite(full)):
+        raise ValueError("aligned scores contain NaN/inf values.")
+    return full
+
+
+def _topk_indices(values: np.ndarray, keep_ratio: float) -> np.ndarray:
+    if not 0 < keep_ratio <= 1:
+        raise ValueError("keep_ratio must be in (0, 1].")
+    k = max(1, int(np.ceil(values.size * keep_ratio)))
+    return np.argpartition(values, -k)[-k:]
+
+
+def _topk_overlap(base: np.ndarray, other: np.ndarray, keep_ratio: float) -> float:
+    base_idx = set(_topk_indices(base, keep_ratio).tolist())
+    other_idx = set(_topk_indices(other, keep_ratio).tolist())
+    if not base_idx:
+        return 0.0
+    return len(base_idx & other_idx) / float(len(base_idx))
+
+
 def resolve_proxy_log_path(proxy_log_arg: str, dataset: str, seed: int) -> Path:
     candidate = Path(proxy_log_arg)
     if candidate.exists():
@@ -238,12 +279,62 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     if absorption_result.labels is None:
         raise ValueError("代理训练日志缺少 labels，无法对齐动态分数。")
 
-    a_scores = absorption_result.scores
-    b_scores = informativeness_result.scores
-    c_scores = coverage_result.scores
-    r_scores = risk_result.scores
-    u_raw = a_scores + b_scores + c_scores - r_scores
-    u_scores = quantile_minmax(u_raw.astype(np.float32), q_low=0.01, q_high=0.99)
+    num_samples = absorption_result.labels.shape[0]
+    if np.array_equal(indices, np.arange(num_samples)):
+        a_scores = absorption_result.scores.astype(np.float32)
+        b_scores = informativeness_result.scores.astype(np.float32)
+        c_scores = coverage_result.scores.astype(np.float32)
+        r_scores = risk_result.scores.astype(np.float32)
+    else:
+        a_scores = _align_scores(absorption_result.scores, absorption_result.indices, num_samples)
+        b_scores = _align_scores(informativeness_result.scores, informativeness_result.indices, num_samples)
+        c_scores = _align_scores(coverage_result.scores, coverage_result.indices, num_samples)
+        r_scores = _align_scores(risk_result.scores, risk_result.indices, num_samples)
+
+    cv_log_dir = Path(args.cv_log_dir) if args.cv_log_dir is not None else proxy_log
+    if not cv_log_dir.exists():
+        raise FileNotFoundError(f"cv_log_dir not found: {cv_log_dir}")
+    if cv_log_dir.is_file():
+        raise ValueError("cv_log_dir must be a directory containing fold_*.npz files.")
+
+    dataset = _build_dataset(args.dataset, args.data_root, transform=None)
+    t_result = TransferGainScore().compute(cv_log_dir, dataset)
+    t_scores = t_result["score"].astype(np.float32)
+    v_result = PersistentDifficultyScore().compute(cv_log_dir, dataset)
+    v_scores = v_result["score"].astype(np.float32)
+
+    for name, arr in {
+        "A": a_scores,
+        "B": b_scores,
+        "C": c_scores,
+        "R": r_scores,
+        "T": t_scores,
+        "V": v_scores,
+    }.items():
+        if arr.shape != (num_samples,):
+            raise ValueError(f"{name} score shape mismatch: {arr.shape}, expected ({num_samples},).")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"{name} scores contain NaN/inf values.")
+
+    u_raw_base = a_scores + b_scores + c_scores - r_scores
+    u_raw = u_raw_base + t_scores + v_scores
+    if not np.all(np.isfinite(u_raw)):
+        raise ValueError("u_raw contains NaN/inf values.")
+    u_scores = quantile_minmax(u_raw.astype(np.float32), q_low=0.002, q_high=0.998)
+    if not np.all(np.isfinite(u_scores)):
+        raise ValueError("u_norm contains NaN/inf values.")
+
+    base_mean = float(np.mean(u_raw_base))
+    base_var = float(np.var(u_raw_base))
+    tv_mean = float(np.mean(u_raw))
+    tv_var = float(np.var(u_raw))
+    overlap = _topk_overlap(u_raw_base, u_raw, args.sanity_keep_ratio)
+    print(
+        "Sanity check u_raw: "
+        f"base_mean={base_mean:.6f}, base_var={base_var:.6f}, "
+        f"tv_mean={tv_mean:.6f}, tv_var={tv_var:.6f}, "
+        f"topk_overlap={overlap:.6f} (keep_ratio={args.sanity_keep_ratio})"
+    )
 
     class_names = load_class_names(args.dataset, args.data_root)
     dds_metric = DifficultyDirection(

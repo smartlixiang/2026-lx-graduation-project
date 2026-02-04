@@ -32,13 +32,19 @@ class TransferGainScore:
     def __init__(
         self,
         *,
+        tau_p_mode: str = "percentile",
         tau_p: float = 0.10,
+        tau_p_percentile: float = 90.0,
+        tau_p_min: float = 1e-3,
         eps: float = 1e-12,
         agg: str = "median",
         cache_dir: str | Path = "weights/cache",
         verbose: bool = False,
     ) -> None:
+        self.tau_p_mode = str(tau_p_mode)
         self.tau_p = float(tau_p)
+        self.tau_p_percentile = float(tau_p_percentile)
+        self.tau_p_min = float(tau_p_min)
         self.eps = float(eps)
         self.agg = agg
         self.cache_dir = Path(cache_dir)
@@ -66,6 +72,18 @@ class TransferGainScore:
     @staticmethod
     def _softplus(values: np.ndarray) -> np.ndarray:
         return np.log1p(np.exp(-np.abs(values))) + np.maximum(values, 0)
+
+    def _resolve_tau_p(self, dp: np.ndarray) -> float:
+        if self.tau_p_mode == "fixed":
+            return max(self.tau_p_min, self.tau_p)
+        if self.tau_p_mode == "percentile":
+            values = np.abs(dp).reshape(-1)
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                return self.tau_p_min
+            tau = float(np.percentile(values, self.tau_p_percentile))
+            return max(self.tau_p_min, tau)
+        raise ValueError(f"Unsupported tau_p_mode: {self.tau_p_mode}")
 
     @staticmethod
     def _iter_classes(num_classes: int) -> Iterable[int]:
@@ -118,10 +136,13 @@ class TransferGainScore:
         gap = train_p_true - p_other_max
 
         delta_gap = np.zeros_like(gap)
+        dp = np.empty((0, gap.shape[1]), dtype=gap.dtype)
         if num_epochs > 1:
-            delta_gap[1:] = gap[1:] - gap[:-1]
-        scaled = delta_gap / self.tau_p
-        delta_gap_pos = self._softplus(scaled) * self.tau_p
+            dp = gap[1:] - gap[:-1]
+            delta_gap[1:] = dp
+        tau_p = self._resolve_tau_p(dp)
+        scaled = delta_gap / tau_p
+        delta_gap_pos = self._softplus(scaled) * tau_p
         delta_gap_pos[0] = 0.0
 
         fold_scores = np.zeros(train_labels.shape[0], dtype=np.float32)
@@ -159,6 +180,8 @@ class TransferGainScore:
     ) -> dict:
         if self.tau_p <= 0:
             raise ValueError("tau_p must be positive.")
+        if self.tau_p_min <= 0:
+            raise ValueError("tau_p_min must be positive.")
         if self.eps <= 0:
             raise ValueError("eps must be positive.")
 
@@ -225,7 +248,10 @@ class TransferGainScore:
             "score": scores.astype(np.float32),
             "name": "TransferGainScore",
             "meta": {
+                "tau_p_mode": self.tau_p_mode,
                 "tau_p": self.tau_p,
+                "tau_p_percentile": self.tau_p_percentile,
+                "tau_p_min": self.tau_p_min,
                 "agg": self.agg,
                 "seed": seed,
                 "k_folds": k_folds,

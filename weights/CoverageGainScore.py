@@ -10,7 +10,7 @@ from typing import Optional
 
 import numpy as np
 
-from utils.score_utils import quantile_minmax_by_class, stable_sigmoid
+from utils.score_utils import quantile_minmax_by_class, resolve_window_length, stable_sigmoid
 
 
 @dataclass
@@ -32,18 +32,24 @@ class CoverageGainScore:
         self,
         npz_path: str | Path,
         *,
+        tau_g_mode: str = "percentile",
         tau_g: float = 0.15,
+        tau_g_percentile: float = 30.0,
+        tau_g_by_class: bool = True,
         s_g: float = 0.07,
-        k: int = 10,
+        k_pct: float = 0.005,
         q_low: float = 0.002,
         q_high: float = 0.998,
         eps: float = 1e-8,
         verbose: bool = False,
     ) -> None:
         self.npz_path = Path(npz_path)
+        self.tau_g_mode = str(tau_g_mode)
         self.tau_g = float(tau_g)
+        self.tau_g_percentile = float(tau_g_percentile)
+        self.tau_g_by_class = bool(tau_g_by_class)
         self.s_g = float(s_g)
-        self.k = int(k)
+        self.k_pct = float(k_pct)
         self.q_low = float(q_low)
         self.q_high = float(q_high)
         self.eps = float(eps)
@@ -111,8 +117,8 @@ class CoverageGainScore:
     def compute(self, proxy_logs: Optional[dict[str, np.ndarray]] = None) -> CoverageGainResult:
         if self.s_g <= 0.0:
             raise ValueError("s_g must be positive.")
-        if self.k <= 0:
-            raise ValueError("k must be positive.")
+        if self.k_pct <= 0:
+            raise ValueError("k_pct must be positive.")
         if not 0.0 <= self.q_low < self.q_high <= 1.0:
             raise ValueError("q_low/q_high must satisfy 0 <= q_low < q_high <= 1.")
         if self.eps <= 0.0:
@@ -132,7 +138,32 @@ class CoverageGainScore:
         probs_other[:, np.arange(num_samples), labels] = -np.inf
         p_other_max = probs_other.max(axis=2)
         gap = p_true - p_other_max
-        alpha = stable_sigmoid((self.tau_g - gap) / self.s_g).astype(np.float32)
+
+        late_epochs = resolve_window_length(num_epochs, ratio=0.2, min_epochs=5)
+        late_slice = slice(num_epochs - late_epochs, num_epochs)
+        gL = gap[late_slice].mean(axis=0)
+
+        tau_g_arr = None
+        if self.tau_g_mode == "fixed":
+            tau_g = self.tau_g
+        elif self.tau_g_mode == "percentile":
+            if self.tau_g_by_class:
+                tau_g_arr = np.empty(num_samples, dtype=np.float64)
+                for cls in np.unique(labels):
+                    mask = labels == cls
+                    gLc = gL[mask]
+                    if gLc.size == 0:
+                        continue
+                    tau_g_arr[mask] = np.percentile(gLc, self.tau_g_percentile)
+            else:
+                tau_g = np.percentile(gL, self.tau_g_percentile)
+        else:
+            raise ValueError(f"Unsupported tau_g_mode: {self.tau_g_mode}")
+
+        if tau_g_arr is not None:
+            alpha = stable_sigmoid((tau_g_arr[None, :] - gap) / self.s_g).astype(np.float32)
+        else:
+            alpha = stable_sigmoid((tau_g - gap) / self.s_g).astype(np.float32)
         alpha_sum = alpha.sum(axis=0).astype(np.float32)
 
         q_sum = np.zeros((num_samples, num_classes), dtype=np.float64)
@@ -146,6 +177,11 @@ class CoverageGainScore:
             np.float32
         )
 
+        k_global = 0
+        if num_samples > 1:
+            k_global = int(round(num_samples * self.k_pct))
+            k_global = max(1, min(k_global, num_samples - 1))
+
         knn_distance = np.zeros(num_samples, dtype=np.float32)
         class_k: dict[int, int] = {}
         for cls in np.unique(labels):
@@ -155,7 +191,10 @@ class CoverageGainScore:
             if count <= 1:
                 class_k[int(cls)] = 0
                 continue
-            k_eff = self.k if count > self.k else min(5, count - 1)
+            if k_global <= 0:
+                class_k[int(cls)] = 0
+                continue
+            k_eff = k_global if count > k_global else min(5, count - 1)
             class_k[int(cls)] = k_eff
             q_class = q_confusion[idx]
             distances = self._compute_knn_mean_distance(q_class, k_eff)
@@ -166,6 +205,13 @@ class CoverageGainScore:
         scores = np.clip(score_raw, 0.0, 1.0).astype(np.float32)
 
         if self.verbose:
+            class_counts = [int(np.sum(labels == cls)) for cls in np.unique(labels)]
+            mean_count = float(np.mean(class_counts)) if class_counts else 0.0
+            print(
+                "CoverageGainScore kNN config: "
+                f"N={num_samples}, k_pct={self.k_pct:.4f}, k_global={k_global}, "
+                f"mean(n_c)={mean_count:.2f}"
+            )
             print(
                 "CoverageGainScore scores min/mean/max: "
                 f"{scores.min():.6f}, {scores.mean():.6f}, {scores.max():.6f}"

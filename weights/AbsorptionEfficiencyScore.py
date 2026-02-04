@@ -74,7 +74,7 @@ class AbsorptionEfficiencyScore:
         loss, labels, indices = self._load_loss(data)
 
         num_epochs = loss.shape[0]
-        early_epochs = resolve_window_length(num_epochs, ratio=0.2, min_epochs=5)
+        early_epochs = resolve_window_length(num_epochs, ratio=0.5, min_epochs=5)
 
         early_log = np.log1p(loss[:early_epochs])
         level = early_log.mean(axis=0)

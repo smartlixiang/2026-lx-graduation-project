@@ -19,6 +19,7 @@ from utils.global_config import CONFIG
 from utils.proxy_log_utils import load_proxy_log
 from utils.seed import parse_seed_list, set_seed
 from utils.score_utils import quantile_minmax
+from utils.static_score_cache import get_or_compute_static_scores
 from weights import (
     AbsorptionEfficiencyScore,
     CoverageGainScore,
@@ -27,6 +28,8 @@ from weights import (
     PersistentDifficultyScore,
     TransferGainScore,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def parse_args() -> argparse.Namespace:
@@ -377,19 +380,41 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         args.num_workers,
     )
 
-    dds_scores = dds_metric.score_dataset(dds_loader, adapter=adapter)
-    div_scores = div_metric.score_dataset(div_loader, adapter=adapter)
-    sa_scores = sa_metric.score_dataset(sa_loader, adapter=adapter)
+    dataset_for_labels = _build_dataset(args.dataset, args.data_root, transform=None)
+    num_samples = len(dataset_for_labels)
+
+    def _compute_scores() -> dict[str, np.ndarray]:
+        dds_scores_local = dds_metric.score_dataset(dds_loader, adapter=adapter)
+        div_scores_local = div_metric.score_dataset(div_loader, adapter=adapter)
+        sa_scores_local = sa_metric.score_dataset(sa_loader, adapter=adapter)
+        return {
+            "sa": sa_scores_local.scores.numpy(),
+            "div": div_scores_local.scores.numpy(),
+            "dds": dds_scores_local.scores.numpy(),
+            "labels": np.asarray(dataset_for_labels.targets),
+        }
+
+    static_scores = get_or_compute_static_scores(
+        cache_root=PROJECT_ROOT / "static_scores",
+        dataset=args.dataset,
+        clip_model=args.clip_model,
+        adapter_path=args.adapter_path,
+        div_k=div_metric.k,
+        dds_k=dds_metric.k,
+        prompt_template=sa_metric.prompt_template,
+        num_samples=num_samples,
+        compute_fn=_compute_scores,
+    )
 
     if absorption_result.labels is not None:
-        if not np.array_equal(absorption_result.labels, sa_scores.labels.numpy()):
+        if not np.array_equal(absorption_result.labels, static_scores["labels"]):
             raise ValueError("代理训练日志的标签与评分数据集标签不一致。")
 
     static_features = np.stack(
         [
-            sa_scores.scores.numpy(),
-            div_scores.scores.numpy(),
-            dds_scores.scores.numpy(),
+            static_scores["sa"],
+            static_scores["div"],
+            static_scores["dds"],
         ],
         axis=1,
     ).astype(np.float64)

@@ -20,6 +20,7 @@ from model.adapter import AdapterMLP  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.seed import set_seed  # noqa: E402
+from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -178,9 +179,34 @@ def main() -> None:
         sa_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers
     )
 
-    dds_scores = dds_metric.score_dataset(dds_loader, adapter=adapter).scores
-    div_scores = div_metric.score_dataset(div_loader, adapter=adapter).scores
-    sa_scores = sa_metric.score_dataset(sa_loader, adapter=adapter).scores
+    num_samples = len(dataset_for_names)
+
+    def _compute_scores() -> dict[str, np.ndarray]:
+        dds_scores_local = dds_metric.score_dataset(dds_loader, adapter=adapter).scores
+        div_scores_local = div_metric.score_dataset(div_loader, adapter=adapter).scores
+        sa_scores_local = sa_metric.score_dataset(sa_loader, adapter=adapter).scores
+        return {
+            "sa": np.asarray(sa_scores_local),
+            "div": np.asarray(div_scores_local),
+            "dds": np.asarray(dds_scores_local),
+            "labels": np.asarray(dataset_for_names.targets),
+        }
+
+    static_scores = get_or_compute_static_scores(
+        cache_root=PROJECT_ROOT / "static_scores",
+        dataset=CIFAR10,
+        clip_model=args.clip_model,
+        adapter_path=str(adapter_path),
+        div_k=div_metric.k,
+        dds_k=dds_metric.k,
+        prompt_template=sa_metric.prompt_template,
+        num_samples=num_samples,
+        compute_fn=_compute_scores,
+    )
+
+    dds_scores = torch.from_numpy(static_scores["dds"])
+    div_scores = torch.from_numpy(static_scores["div"])
+    sa_scores = torch.from_numpy(static_scores["sa"])
 
     if not (len(dds_scores) == len(div_scores) == len(sa_scores)):
         raise RuntimeError("三个指标的样本数不一致，无法合并。")

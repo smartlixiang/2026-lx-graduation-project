@@ -5,5 +5,4 @@ weights/proxy_logs/
 checkpoint/
 debug/
 mask/
-
 __pycache__/

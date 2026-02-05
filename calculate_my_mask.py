@@ -108,10 +108,30 @@ def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str,
     if not isinstance(naive, dict):
         naive = {}
         updated = True
+    default_weight = 1.0 / 3.0
     for key in ("dds", "div", "sa"):
         if key not in naive:
-            naive[key] = 1.0
+            naive[key] = default_weight
             updated = True
+
+    naive_total = 0.0
+    for key in ("dds", "div", "sa"):
+        try:
+            naive[key] = float(naive[key])
+        except (TypeError, ValueError):
+            naive[key] = default_weight
+            updated = True
+        naive_total += naive[key]
+
+    if naive_total <= 0:
+        for key in ("dds", "div", "sa"):
+            naive[key] = default_weight
+        updated = True
+    elif abs(naive_total - 1.0) > 1e-12:
+        for key in ("dds", "div", "sa"):
+            naive[key] /= naive_total
+        updated = True
+
     dataset_entry["naive"] = naive
     data[dataset_name] = dataset_entry
     if updated or not path.exists():

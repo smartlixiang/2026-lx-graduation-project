@@ -442,15 +442,11 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
     dataset_entry = data.get(args.dataset, {})
     seed_key = str(seed)
+    dataset_entry.pop(f"{seed_key}_meta", None)
     dataset_entry[seed_key] = {
         "sa": float(weights[0]),
         "div": float(weights[1]),
         "dds": float(weights[2]),
-    }
-    dataset_entry[f"{seed_key}_meta"] = {
-        "raw_sa": float(weights[0]),
-        "raw_div": float(weights[1]),
-        "raw_dds": float(weights[2]),
         "bias": float(bias),
         "ridge_lambda": float(args.ridge_lambda),
         "proxy_log": str(proxy_log),

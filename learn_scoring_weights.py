@@ -69,12 +69,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--coverage-q-low", type=float, default=0.002)
     parser.add_argument("--coverage-q-high", type=float, default=0.998)
-    parser.add_argument(
-        "--sanity-keep-ratio",
-        type=float,
-        default=0.6,
-        help="Keep ratio for top-k overlap sanity check between u_raw_base and u_raw.",
-    )
     parser.add_argument("--ridge-lambda", type=float, default=1e-2)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=1000)
@@ -223,21 +217,6 @@ def _align_scores(scores: np.ndarray, indices: np.ndarray, num_samples: int) -> 
     return full
 
 
-def _topk_indices(values: np.ndarray, keep_ratio: float) -> np.ndarray:
-    if not 0 < keep_ratio <= 1:
-        raise ValueError("keep_ratio must be in (0, 1].")
-    k = max(1, int(np.ceil(values.size * keep_ratio)))
-    return np.argpartition(values, -k)[-k:]
-
-
-def _topk_overlap(base: np.ndarray, other: np.ndarray, keep_ratio: float) -> float:
-    base_idx = set(_topk_indices(base, keep_ratio).tolist())
-    other_idx = set(_topk_indices(other, keep_ratio).tolist())
-    if not base_idx:
-        return 0.0
-    return len(base_idx & other_idx) / float(len(base_idx))
-
-
 def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     set_seed(seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
@@ -321,12 +300,10 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     base_var = float(np.var(u_raw_base))
     tv_mean = float(np.mean(u_raw))
     tv_var = float(np.var(u_raw))
-    overlap = _topk_overlap(u_raw_base, u_raw, args.sanity_keep_ratio)
     print(
         "Sanity check u_raw: "
         f"base_mean={base_mean:.6f}, base_var={base_var:.6f}, "
-        f"tv_mean={tv_mean:.6f}, tv_var={tv_var:.6f}, "
-        f"topk_overlap={overlap:.6f} (keep_ratio={args.sanity_keep_ratio})"
+        f"tv_mean={tv_mean:.6f}, tv_var={tv_var:.6f}"
     )
 
     class_names = load_class_names(args.dataset, args.data_root)

@@ -38,7 +38,6 @@ class TransferGainScore:
         tau_p_min: float = 1e-3,
         eps: float = 1e-12,
         agg: str = "median",
-        cache_dir: str | Path = "weights/cache",
         verbose: bool = False,
     ) -> None:
         self.tau_p_mode = str(tau_p_mode)
@@ -47,7 +46,6 @@ class TransferGainScore:
         self.tau_p_min = float(tau_p_min)
         self.eps = float(eps)
         self.agg = agg
-        self.cache_dir = Path(cache_dir)
         self.verbose = bool(verbose)
 
     @staticmethod
@@ -176,7 +174,6 @@ class TransferGainScore:
         cv_log_dir: str | Path,
         dataset,
         num_classes: int | None = None,
-        save_cache: bool = True,
     ) -> dict:
         if self.tau_p <= 0:
             raise ValueError("tau_p must be positive.")
@@ -238,11 +235,6 @@ class TransferGainScore:
 
         seed = meta.get("seed")
         k_folds = meta.get("k_folds")
-        if save_cache:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            seed_tag = f"seed{seed}" if seed is not None else "seedunknown"
-            cache_path = self.cache_dir / f"transfer_gain_{seed_tag}.npy"
-            np.save(cache_path, scores)
 
         result = {
             "score": scores.astype(np.float32),

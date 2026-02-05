@@ -161,3 +161,38 @@
 - 静态指标缓存：
   - static_scores/<dataset>/<seed>/<重要参数目录>/ 下分别保存 SA_cache、Div_cache、DDS_cache（三者含 labels 与 indices，确保索引对齐）。
   - 适用于 top-k 数据选择；未来组合优化若改变静态指标分值，需要绕开缓存。
+
+
+# 6. 关键目录路径命名规则（由实验参数唯一确定）
+以下规则用于保证“同一组实验参数 <=> 唯一路径”。
+
+- adapter_weights
+  - 命名规则：adapter_weights/<dataset>/<seed>/
+  - 文件名：adapter_image.pt、adapter_context.pt、meta.json
+  - 参数来源：dataset、seed（可选 clip_model 会在 meta.json 中校验一致性）。
+
+- checkpoint
+  - 命名规则：checkpoint/<mode>/<dataset>/<model>/<seed>/checkpoint_<cut_ratio>.pt
+  - 参数来源：mode、dataset、model、seed、cut_ratio。
+
+- mask
+  - 命名规则：mask/<method>/<dataset>/<model>/<seed>/mask_<cut_ratio>.npz
+  - 参数来源：method、dataset、model、seed、cut_ratio。
+  - 伴随文件：meta_info.json。
+
+- result
+  - 命名规则：result/<mode>/<dataset>/<model>/<seed>/result_<cut_ratio>.json
+  - 参数来源：mode、dataset、model、seed、cut_ratio。
+
+- static_scores
+  - 命名规则：static_scores/<dataset>/<seed>/<param_dir>/
+  - 其中 param_dir = Div_<div_k>_DDS_[<lower>-<upper>]，例如 Div_5%_DDS_[2%-20%]。
+  - 文件名：SA_cache.npz、Div_cache.npz、DDS_cache.npz。
+  - 参数来源：dataset、seed、div_k、dds_eigval_lower_bound、dds_eigval_upper_bound。
+
+- weights/proxy_logs
+  - 命名规则：weights/proxy_logs/<dataset>/<proxy_model>/<seed>/<epochs>/
+  - 文件名：fold_<id>.npz 与 meta.json。
+  - 参数来源：dataset、proxy_model、seed、epochs。
+
+说明：上述 6 个目录在代码中均能找到明确命名规则；本次未发现“无法定位命名规则”的目录，因此未跳过相关改动。

@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -194,7 +195,7 @@ def _sweep_coverage() -> list[dict[str, Any]]:
     for tau_g_mode, tau_g_by_class, k_pct, s_g in itertools.product(
         ["percentile"],
         [True],
-        [0.001, 0.003, 0.005, 0.01],
+        [0.01, 0.03, 0.05, 0.1],
         [0.025, 0.05, 0.075, 0.1, 0.125, 0.15],
     ):
         if tau_g_mode == "percentile":
@@ -273,7 +274,8 @@ def main() -> None:
         raise FileNotFoundError(f"cv_log_dir not found: {cv_log_dir}")
     dataset = _load_train_dataset(args.dataset, args.data_root, args.seed)
 
-    for params in _limit_cases(_sweep_absorption(), args.max_cases):
+    abs_cases = list(_limit_cases(_sweep_absorption(), args.max_cases))
+    for params in tqdm(abs_cases, desc="Sweep A", unit="case"):
         scorer = AbsorptionEfficiencyScore(log_path, **params)
         result = scorer.compute(proxy_logs=proxy_data)
         tag = _params_to_tag(
@@ -327,7 +329,8 @@ def main() -> None:
             "AbsorptionEfficiencyScore norm (ratio compare)",
         )
 
-    for params in _limit_cases(_sweep_informativeness(), args.max_cases):
+    b_cases = list(_limit_cases(_sweep_informativeness(), args.max_cases))
+    for params in tqdm(b_cases, desc="Sweep B", unit="case"):
         scorer_params = {key: val for key, val in params.items() if key != "mu_pct"}
         scorer = InformativenessScore(log_path, **scorer_params)
         result = scorer.compute(proxy_logs=proxy_data)
@@ -351,7 +354,8 @@ def main() -> None:
             "InformativenessScore norm",
         )
 
-    for params in _limit_cases(_sweep_coverage(), args.max_cases):
+    c_cases = list(_limit_cases(_sweep_coverage(), args.max_cases))
+    for params in tqdm(c_cases, desc="Sweep C", unit="case"):
         scorer = CoverageGainScore(log_path, **params)
         result = scorer.compute(proxy_logs=proxy_data)
         tag_parts = [
@@ -375,7 +379,8 @@ def main() -> None:
             "CoverageGainScore norm",
         )
 
-    for params in _limit_cases(_sweep_risk(), args.max_cases):
+    r_cases = list(_limit_cases(_sweep_risk(), args.max_cases))
+    for params in tqdm(r_cases, desc="Sweep R", unit="case"):
         scorer = RiskScore(log_path, **params)
         result = scorer.compute(proxy_logs=proxy_data)
         tag = _params_to_tag(
@@ -396,7 +401,8 @@ def main() -> None:
             risk_nonzero=True,
         )
 
-    for params in _limit_cases(_sweep_transfer(), args.max_cases):
+    t_cases = list(_limit_cases(_sweep_transfer(), args.max_cases))
+    for params in tqdm(t_cases, desc="Sweep T", unit="case"):
         scorer = TransferGainScore(**params)
         result = scorer.compute(cv_log_dir, dataset)
         scores = result["score"].astype(np.float32)
@@ -417,7 +423,8 @@ def main() -> None:
             "TransferGainScore norm",
         )
 
-    for params in _limit_cases(_sweep_persistent(), args.max_cases):
+    v_cases = list(_limit_cases(_sweep_persistent(), args.max_cases))
+    for params in tqdm(v_cases, desc="Sweep V", unit="case"):
         scorer = PersistentDifficultyScore(**params)
         result = scorer.compute(cv_log_dir, dataset)
         scores = result["score"].astype(np.float32)

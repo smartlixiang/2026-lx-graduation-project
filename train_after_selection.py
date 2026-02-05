@@ -18,6 +18,7 @@ from dataset.dataset import BaseDataLoader
 from dataset.dataset_config import AVAILABLE_DATASETS
 from model.model_config import get_model
 from utils.global_config import CONFIG
+from utils.path_rules import resolve_checkpoint_path, resolve_mask_path, resolve_result_path
 from utils.seed import parse_seed_list, set_seed
 
 
@@ -128,16 +129,13 @@ def load_selection_mask(
     The mask should have shape (N,) and values in {0, 1}, where 1 indicates
     the sample is selected.
     """
-    project_root = Path(__file__).resolve().parent
     mask_seed = CONFIG.global_seed if mode == "my_naive" else seed
-    mask_path = (
-        project_root
-        / "mask"
-        / mode
-        / dataset_name
-        / model_name
-        / str(mask_seed)
-        / f"mask_{cut_ratio}.npz"
+    mask_path = resolve_mask_path(
+        mode=mode,
+        dataset=dataset_name,
+        model=model_name,
+        seed=mask_seed,
+        cut_ratio=cut_ratio,
     )
     if not mask_path.exists():
         raise FileNotFoundError(f"未找到 mask 文件: {mask_path}")
@@ -232,22 +230,23 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     model_factory = get_model(model_name)
 
     for cut_ratio in cut_ratios:
-        result_dir = (
-            Path(args.result_root)
-            / args.mode
-            / args.dataset
-            / model_name
-            / str(seed)
+        result_path = resolve_result_path(
+            mode=args.mode,
+            dataset=args.dataset,
+            model=model_name,
+            seed=seed,
+            cut_ratio=cut_ratio,
+            root=Path(args.result_root),
         )
-        result_path = result_dir / f"result_{cut_ratio}.json"
-        checkpoint_dir = (
-            Path("checkpoint")
-            / args.mode
-            / args.dataset
-            / model_name
-            / str(seed)
+        result_dir = result_path.parent
+        checkpoint_path = resolve_checkpoint_path(
+            mode=args.mode,
+            dataset=args.dataset,
+            model=model_name,
+            seed=seed,
+            cut_ratio=cut_ratio,
         )
-        checkpoint_path = checkpoint_dir / f"checkpoint_{cut_ratio}.pt"
+        checkpoint_dir = checkpoint_path.parent
         if args.skip_saved and result_path.exists():
             continue
 

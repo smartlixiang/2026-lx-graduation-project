@@ -16,6 +16,7 @@ from tqdm import tqdm
 from dataset.dataset import BaseDataLoader
 from model.resnet import resnet18
 from utils.global_config import CONFIG
+from utils.path_rules import resolve_proxy_log_dir
 from utils.seed import parse_seed_list, set_seed
 
 
@@ -111,13 +112,11 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
     folds = build_stratified_folds(labels, args.k_folds, seed)
 
     proxy_model_name = "resnet18"
-    log_dir = (
-        Path("weights")
-        / "proxy_logs"
-        / args.dataset
-        / proxy_model_name
-        / str(seed)
-        / str(args.epochs)
+    log_dir = resolve_proxy_log_dir(
+        args.dataset,
+        seed,
+        proxy_model=proxy_model_name,
+        epochs=args.epochs,
     )
     log_dir.mkdir(parents=True, exist_ok=True)
 

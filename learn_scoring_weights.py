@@ -9,6 +9,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torchvision import datasets
 
@@ -75,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--coverage-k-pct",
         type=float,
-        default=0.005,
+        default=0.05,
         help="Class-wise k ratio for CoverageGainScore (fraction of class size).",
     )
     parser.add_argument("--coverage-q-low", type=float, default=0.002)
@@ -179,7 +180,7 @@ def fit_ridge_regression_nonnegative(
     features = features.astype(np.float64)
     targets = targets.astype(np.float64)
 
-    for _ in range(max_iter):
+    for _ in tqdm(range(max_iter), desc="Fitting ridge weights", unit="iter", leave=False):
         preds = features @ weights + bias
         errors = preds - targets
         grad_w = (features.T @ errors) / num_samples + l2_lambda * weights
@@ -371,10 +372,18 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     num_samples = len(dataset_for_labels)
 
     def _compute_scores() -> dict[str, np.ndarray]:
-        dds_scores_local = dds_metric.score_dataset(dds_loader, adapter=image_adapter)
-        div_scores_local = div_metric.score_dataset(div_loader, adapter=image_adapter)
+        dds_scores_local = dds_metric.score_dataset(
+            tqdm(dds_loader, desc="Scoring DDS", unit="batch"),
+            adapter=image_adapter,
+        )
+        div_scores_local = div_metric.score_dataset(
+            tqdm(div_loader, desc="Scoring Div", unit="batch"),
+            adapter=image_adapter,
+        )
         sa_scores_local = sa_metric.score_dataset(
-            sa_loader, adapter_image=image_adapter, adapter_text=text_adapter
+            tqdm(sa_loader, desc="Scoring SA", unit="batch"),
+            adapter_image=image_adapter,
+            adapter_text=text_adapter,
         )
         return {
             "sa": sa_scores_local.scores.numpy(),

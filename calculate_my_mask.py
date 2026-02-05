@@ -20,6 +20,7 @@ from model.adapter import load_trained_adapters  # noqa: E402
 from dataset.dataset_config import CIFAR10  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
+from utils.path_rules import resolve_mask_path  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 
@@ -321,16 +322,15 @@ def main() -> None:
                 total_scores_np, labels, num_classes=len(class_names), cut_ratio=cut_ratio
             )
             total_time = time.perf_counter() - total_start
-            mask_dir = (
-                PROJECT_ROOT
-                / "mask"
-                / method_name
-                / "cifar10"
-                / args.model_name
-                / str(seed)
+            mask_path = resolve_mask_path(
+                mode=method_name,
+                dataset="cifar10",
+                model=args.model_name,
+                seed=seed,
+                cut_ratio=cut_ratio,
             )
+            mask_dir = mask_path.parent
             mask_dir.mkdir(parents=True, exist_ok=True)
-            mask_path = mask_dir / f"mask_{cut_ratio}.npz"
             np.savez_compressed(mask_path, mask=mask.astype(np.uint8))
 
             meta_info = {

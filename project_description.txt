@@ -85,7 +85,7 @@
 
 ### utils/static_score_cache.py
 - 静态指标缓存工具，统一保存/读取 SA、Div、DDS 与标签。
-- 缓存路径结构：static_scores/<dataset>/static_<clip>_div<k>_dds<k>_<prompt>_img<hash>_txt<hash>.npz。
+- 缓存路径结构改为：static_scores/<dataset>/<seed>/<重要参数目录>/，其中重要参数目录遵循 Div_5%_DDS_[2%-20%] 形式（Div 小数用百分数，Div 为整数时直接写整数）；并分文件保存 SA_cache.npz、Div_cache.npz、DDS_cache.npz。
 - 缓存键包含 dataset、clip_model、图像/文本 adapter 权重哈希、Div/DDS 超参、prompt_template 和样本数，避免误读旧缓存。
 - 适用于所有“静态指标计算结果不会随运行变化”的脚本，以减少重复计算成本。
 
@@ -112,13 +112,13 @@
   - 权重 JSON 以 seed 作为 key（例如 "22"），元信息使用 "{seed}_meta" 保存。
   - 代理日志路径由 dataset + seed + proxy_epochs 组成，不再单独传入 cv_log_dir/npz_path。
   - 若 proxy_epochs 未设置，会在 weights/proxy_logs/<dataset>/resnet18/<seed>/ 下选取最新 epoch 目录。
-  - 静态指标（SA/Div/DDS）会优先从 static_scores/<dataset> 缓存读取；缓存缺失时才计算并保存。
+  - 静态指标（SA/Div/DDS）会优先从 static_scores/<dataset>/<seed>/<重要参数目录>/ 缓存读取；读取时会解析目录参数并校验 Div/DDS 参数、样本数、adapter 哈希及索引一致性，缓存缺失或校验失败时才重算。
 - scripts/diagnose_div_correlation.py（正式脚本）：
   - 用于分析静态指标与动态目标的相关性，输出分布图；多 seed 时输出到 seed 子目录。
 - scripts/test_* / calculate_my_mask.py（测试脚本）：
   - 默认种子为 CONFIG.global_seed=42。
   - calculate_my_mask.py 负责计算数据选择 0/1 mask，并保存到 mask/ 路径供 train_after_selection.py 加载。
-  - 计算 mask 时静态指标先查 static_scores/<dataset> 缓存；top-k 方式下缓存命中后无需重复计算。
+  - 计算 mask 时静态指标先查 static_scores/<dataset>/<seed>/<重要参数目录>/ 缓存；top-k 方式下缓存命中后无需重复计算。
   - 部分无用的测试脚本与历史测试结果已清理，不再随仓库保留。
 
 # 5. CIFAR-10 数据选择实验配置（写入实验汇报用）
@@ -159,5 +159,5 @@
   - 同目录下保存 meta_info.json，记录权重组、CLIP 规格、adapter 路径、裁剪比例与统计信息等。
   - my_naive 默认使用 CONFIG.global_seed 作为 mask 路径中的随机种子。
 - 静态指标缓存：
-  - static_scores/<dataset> 下保存 SA/Div/DDS 缓存（按 clip/adapter/超参区分）。
+  - static_scores/<dataset>/<seed>/<重要参数目录>/ 下分别保存 SA_cache、Div_cache、DDS_cache（三者含 labels 与 indices，确保索引对齐）。
   - 适用于 top-k 数据选择；未来组合优化若改变静态指标分值，需要绕开缓存。

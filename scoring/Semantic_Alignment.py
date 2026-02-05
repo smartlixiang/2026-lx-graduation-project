@@ -53,9 +53,14 @@ class SemanticAlignment:
         self.device = torch.device(device) if device is not None else CONFIG.global_device
         self.extractor = CLIPFeatureExtractor(model_name=clip_model, device=self.device)
 
-    def _build_text_features(self) -> torch.Tensor:
+    def _build_text_features(self, adapter_text: AdapterMLP | None = None) -> torch.Tensor:
         prompts = [self.prompt_template.format(name) for name in self.class_names]
-        return self.extractor.encode_text(prompts)
+        text_features = self.extractor.encode_text(prompts)
+        if adapter_text is not None:
+            adapter_text.eval()
+            adapter_device = next(adapter_text.parameters()).device
+            text_features = adapter_text(text_features.to(adapter_device))
+        return text_features
 
     def _encode_images(
         self, dataloader: DataLoader, adapter: AdapterMLP | None = None
@@ -114,14 +119,17 @@ class SemanticAlignment:
         return scores
 
     def score_dataset(
-        self, dataloader: DataLoader, adapter: AdapterMLP | None = None
+        self,
+        dataloader: DataLoader,
+        adapter_image: AdapterMLP | None = None,
+        adapter_text: AdapterMLP | None = None,
     ) -> SAResult:
-        text_features = self._build_text_features().to(self.device)
+        text_features = self._build_text_features(adapter_text=adapter_text)
 
-        if adapter is not None:
-            adapter.eval()
+        if adapter_image is not None:
+            adapter_image.eval()
 
-        image_features, labels = self._encode_images(dataloader, adapter)
+        image_features, labels = self._encode_images(dataloader, adapter_image)
         text_features = text_features.to(image_features.device)
         scores = self._margin_similarity(image_features, text_features, labels)
         scores = self._quantile_normalize(scores, labels, len(self.class_names))

@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets
 
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100
-from model.adapter import AdapterMLP
+from model.adapter import AdapterMLP, load_trained_adapters
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.global_config import CONFIG
 from utils.proxy_log_utils import load_proxy_log, resolve_proxy_log_path
@@ -53,7 +53,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Max epochs for proxy log directory name. Defaults to latest epoch folder.",
     )
-    parser.add_argument("--adapter-path", type=str, default="adapter_weights/cifar10/adapter_cifar10_ViT-B-32.pt", help="Optional adapter path.")
+    parser.add_argument(
+        "--adapter-image-path",
+        type=str,
+        default=None,
+        help="图像 adapter 权重路径（默认按 dataset/seed 规则）",
+    )
+    parser.add_argument(
+        "--adapter-text-path",
+        type=str,
+        default=None,
+        help="文本 adapter 权重路径（默认按 dataset/seed 规则）",
+    )
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -117,18 +128,25 @@ def load_class_names(dataset_name: str, data_root: str) -> Iterable[str]:
     return dataset.classes  # type: ignore[attr-defined]
 
 
-def load_adapter(adapter_path: str | None, input_dim: int, device: torch.device) -> AdapterMLP | None:
-    if not adapter_path:
-        return None
-    path = Path(adapter_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Adapter 权重不存在: {path}")
-    adapter = AdapterMLP(input_dim=input_dim)
-    state_dict = torch.load(path, map_location=device)
-    adapter.load_state_dict(state_dict)
-    adapter.to(device)
-    adapter.eval()
-    return adapter
+def load_adapters_for_seed(
+    args: argparse.Namespace,
+    dataset_name: str,
+    input_dim: int,
+    seed: int,
+    device: torch.device,
+) -> tuple[AdapterMLP, AdapterMLP, dict[str, Path]]:
+    image_adapter, text_adapter, adapter_paths = load_trained_adapters(
+        dataset_name=dataset_name,
+        clip_model=args.clip_model,
+        input_dim=input_dim,
+        seed=seed,
+        map_location=device,
+        adapter_image_path=args.adapter_image_path,
+        adapter_text_path=args.adapter_text_path,
+    )
+    image_adapter.to(device).eval()
+    text_adapter.to(device).eval()
+    return image_adapter, text_adapter, adapter_paths
 
 
 def fit_ridge_regression_nonnegative(
@@ -320,7 +338,9 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         class_names=class_names, clip_model=args.clip_model, device=device
     )
 
-    adapter = load_adapter(args.adapter_path, dds_metric.extractor.embed_dim, device)
+    image_adapter, text_adapter, adapter_paths = load_adapters_for_seed(
+        args, args.dataset, dds_metric.extractor.embed_dim, seed, device
+    )
 
     dds_loader = build_score_loader(
         dds_metric.extractor.preprocess,
@@ -351,9 +371,11 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     num_samples = len(dataset_for_labels)
 
     def _compute_scores() -> dict[str, np.ndarray]:
-        dds_scores_local = dds_metric.score_dataset(dds_loader, adapter=adapter)
-        div_scores_local = div_metric.score_dataset(div_loader, adapter=adapter)
-        sa_scores_local = sa_metric.score_dataset(sa_loader, adapter=adapter)
+        dds_scores_local = dds_metric.score_dataset(dds_loader, adapter=image_adapter)
+        div_scores_local = div_metric.score_dataset(div_loader, adapter=image_adapter)
+        sa_scores_local = sa_metric.score_dataset(
+            sa_loader, adapter_image=image_adapter, adapter_text=text_adapter
+        )
         return {
             "sa": sa_scores_local.scores.numpy(),
             "div": div_scores_local.scores.numpy(),
@@ -365,7 +387,8 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         cache_root=PROJECT_ROOT / "static_scores",
         dataset=args.dataset,
         clip_model=args.clip_model,
-        adapter_path=args.adapter_path,
+        adapter_image_path=str(adapter_paths["image_path"]),
+        adapter_text_path=str(adapter_paths["text_path"]),
         div_k=div_metric.k,
         dds_k=dds_metric.k,
         prompt_template=sa_metric.prompt_template,

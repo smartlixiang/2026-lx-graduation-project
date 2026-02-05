@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from model.adapter import AdapterMLP  # noqa: E402
+from model.adapter import load_trained_adapters  # noqa: E402
 from dataset.dataset_config import CIFAR10  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
@@ -35,10 +35,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--clip-model", type=str, default="ViT-B/32", help="CLIP 模型规格")
     parser.add_argument(
-        "--adapter-path",
+        "--adapter-image-path",
         type=str,
-        default="adapter_weights/cifar10/adapter_cifar10_ViT-B-32.pt",
-        help="adapter 权重路径",
+        default=None,
+        help="图像 adapter 权重路径（默认按 dataset/seed 规则）",
+    )
+    parser.add_argument(
+        "--adapter-text-path",
+        type=str,
+        default=None,
+        help="文本 adapter 权重路径（默认按 dataset/seed 规则）",
+    )
+    parser.add_argument(
+        "--adapter-seed",
+        type=int,
+        default=None,
+        help="adapter 的随机种子（默认使用当前实验 seed）",
     )
     parser.add_argument("--device", type=str, default=None, help="设备，例如 cuda 或 cpu")
     parser.add_argument(
@@ -204,16 +216,6 @@ def main() -> None:
         class_names=class_names, clip_model=args.clip_model, device=device
     )
 
-    adapter = None
-    adapter_path = Path(args.adapter_path)
-    if not adapter_path.exists():
-        raise FileNotFoundError(f"未找到 adapter 权重: {adapter_path}")
-    adapter = AdapterMLP(input_dim=dds_metric.extractor.embed_dim)
-    state_dict = torch.load(adapter_path, map_location=device)
-    adapter.load_state_dict(state_dict)
-    adapter.to(device)
-    adapter.eval()
-
     batch_size = 128
     num_workers = 8
 
@@ -227,58 +229,6 @@ def main() -> None:
         sa_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers
     )
 
-    dds_start = time.perf_counter()
-    num_samples = len(dataset_for_names)
-
-    def _compute_scores() -> dict[str, np.ndarray]:
-        dds_scores_local = dds_metric.score_dataset(
-            tqdm(dds_loader, desc="Scoring DDS", unit="batch"),
-            adapter=adapter,
-        ).scores
-        div_scores_local = div_metric.score_dataset(
-            tqdm(div_loader, desc="Scoring Div", unit="batch"),
-            adapter=adapter,
-        ).scores
-        sa_scores_local = sa_metric.score_dataset(
-            tqdm(sa_loader, desc="Scoring SA", unit="batch"),
-            adapter=adapter,
-        ).scores
-        return {
-            "sa": np.asarray(sa_scores_local),
-            "div": np.asarray(div_scores_local),
-            "dds": np.asarray(dds_scores_local),
-            "labels": np.asarray(dataset_for_names.targets),
-        }
-
-    static_scores = get_or_compute_static_scores(
-        cache_root=PROJECT_ROOT / "static_scores",
-        dataset=CIFAR10,
-        clip_model=args.clip_model,
-        adapter_path=str(adapter_path),
-        div_k=div_metric.k,
-        dds_k=dds_metric.k,
-        prompt_template=sa_metric.prompt_template,
-        num_samples=num_samples,
-        compute_fn=_compute_scores,
-    )
-
-    dds_scores = torch.from_numpy(static_scores["dds"])
-    div_scores = torch.from_numpy(static_scores["div"])
-    sa_scores = torch.from_numpy(static_scores["sa"])
-    dds_time = time.perf_counter() - dds_start
-    div_time = dds_time
-    sa_time = dds_time
-
-    if not (len(dds_scores) == len(div_scores) == len(sa_scores)):
-        raise RuntimeError("三个指标的样本数不一致，无法合并。")
-
-    total_scores = (
-        weights["dds"] * dds_scores
-        + weights["div"] * div_scores
-        + weights["sa"] * sa_scores
-    )
-    labels = np.asarray(dataset_for_names.targets)
-    total_scores_np = np.asarray(total_scores)
     if args.method.strip():
         method_name = args.method.strip()
     elif args.weight_group == "naive":
@@ -293,13 +243,81 @@ def main() -> None:
         save_seeds = [CONFIG.global_seed]
     else:
         save_seeds = seeds
-    for cut_ratio in cut_ratios:
-        mask, selected_by_class = select_topk_mask(
-            total_scores_np, labels, num_classes=len(class_names), cut_ratio=cut_ratio
+    for seed in save_seeds:
+        set_seed(seed)
+        adapter_seed = args.adapter_seed if args.adapter_seed is not None else seed
+        image_adapter, text_adapter, adapter_paths = load_trained_adapters(
+            dataset_name=CIFAR10,
+            clip_model=args.clip_model,
+            input_dim=dds_metric.extractor.embed_dim,
+            seed=adapter_seed,
+            map_location=device,
+            adapter_image_path=args.adapter_image_path,
+            adapter_text_path=args.adapter_text_path,
         )
-        total_time = time.perf_counter() - total_start
-        for seed in save_seeds:
-            set_seed(seed)
+        image_adapter.to(device).eval()
+        text_adapter.to(device).eval()
+
+        dds_start = time.perf_counter()
+        num_samples = len(dataset_for_names)
+
+        def _compute_scores() -> dict[str, np.ndarray]:
+            dds_scores_local = dds_metric.score_dataset(
+                tqdm(dds_loader, desc="Scoring DDS", unit="batch"),
+                adapter=image_adapter,
+            ).scores
+            div_scores_local = div_metric.score_dataset(
+                tqdm(div_loader, desc="Scoring Div", unit="batch"),
+                adapter=image_adapter,
+            ).scores
+            sa_scores_local = sa_metric.score_dataset(
+                tqdm(sa_loader, desc="Scoring SA", unit="batch"),
+                adapter_image=image_adapter,
+                adapter_text=text_adapter,
+            ).scores
+            return {
+                "sa": np.asarray(sa_scores_local),
+                "div": np.asarray(div_scores_local),
+                "dds": np.asarray(dds_scores_local),
+                "labels": np.asarray(dataset_for_names.targets),
+            }
+
+        static_scores = get_or_compute_static_scores(
+            cache_root=PROJECT_ROOT / "static_scores",
+            dataset=CIFAR10,
+            clip_model=args.clip_model,
+            adapter_image_path=str(adapter_paths["image_path"]),
+            adapter_text_path=str(adapter_paths["text_path"]),
+            div_k=div_metric.k,
+            dds_k=dds_metric.k,
+            prompt_template=sa_metric.prompt_template,
+            num_samples=num_samples,
+            compute_fn=_compute_scores,
+        )
+
+        dds_scores = torch.from_numpy(static_scores["dds"])
+        div_scores = torch.from_numpy(static_scores["div"])
+        sa_scores = torch.from_numpy(static_scores["sa"])
+        dds_time = time.perf_counter() - dds_start
+        div_time = dds_time
+        sa_time = dds_time
+
+        if not (len(dds_scores) == len(div_scores) == len(sa_scores)):
+            raise RuntimeError("三个指标的样本数不一致，无法合并。")
+
+        total_scores = (
+            weights["dds"] * dds_scores
+            + weights["div"] * div_scores
+            + weights["sa"] * sa_scores
+        )
+        labels = np.asarray(dataset_for_names.targets)
+        total_scores_np = np.asarray(total_scores)
+
+        for cut_ratio in cut_ratios:
+            mask, selected_by_class = select_topk_mask(
+                total_scores_np, labels, num_classes=len(class_names), cut_ratio=cut_ratio
+            )
+            total_time = time.perf_counter() - total_start
             mask_dir = (
                 PROJECT_ROOT
                 / "mask"
@@ -318,7 +336,9 @@ def main() -> None:
                 "method": method_name,
                 "weight_group": args.weight_group,
                 "clip_model": args.clip_model,
-                "adapter_path": str(Path(args.adapter_path)),
+                "adapter_seed": adapter_seed,
+                "adapter_image_path": str(adapter_paths["image_path"]),
+                "adapter_text_path": str(adapter_paths["text_path"]),
                 "cr": cut_ratio,
                 "num_samples": int(mask.shape[0]),
                 "selected_count": int(mask.sum()),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 import torch
@@ -16,7 +17,7 @@ from utils.global_config import CONFIG
 class AdapterMLP(nn.Module):
     """Two-layer MLP adapter with output L2 normalization."""
 
-    def __init__(self, input_dim: int, hidden_dim: int = 1024):
+    def __init__(self, input_dim: int, hidden_dim: int = 256):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, input_dim)
@@ -88,26 +89,107 @@ class CLIPFeatureExtractor:
         self.tokenizer = clip.tokenize
 
 
-def load_trained_adapter(
-    dataset_name: str,
-    clip_model: str,
-    input_dim: int,
-    hidden_dim: int = 1024,
-    map_location: torch.device | str | None = None,
-) -> AdapterMLP:
-    """根据数据集名称和 CLIP 规格加载本地训练好的 Adapter 参数。"""
+def resolve_adapter_dir(dataset_name: str, seed: int) -> Path:
+    """Resolve adapter directory for a dataset/seed pair."""
 
     dataset_dir = CONFIG.ensure_adapter_dir(dataset_name)
-    weight_path = dataset_dir / f"adapter_{dataset_name.lower()}_{clip_model.replace('/', '-')}.pt"
-    if not weight_path.exists():
-        raise FileNotFoundError(
-            f"未找到 {dataset_name} 的适配器权重: {weight_path}. 请先训练或检查路径。"
-        )
+    seed_dir = dataset_dir / str(seed)
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    return seed_dir
+
+
+def resolve_adapter_paths(
+    dataset_name: str,
+    seed: int,
+    adapter_image_path: str | Path | None = None,
+    adapter_text_path: str | Path | None = None,
+) -> tuple[Path, Path]:
+    """Resolve adapter image/text weight paths with dataset/seed defaults."""
+
+    base_dir = resolve_adapter_dir(dataset_name, seed)
+    image_path = Path(adapter_image_path) if adapter_image_path else base_dir / "adapter_image.pt"
+    text_path = Path(adapter_text_path) if adapter_text_path else base_dir / "adapter_context.pt"
+    return image_path, text_path
+
+
+def _load_adapter_from_path(
+    path: Path,
+    input_dim: int,
+    hidden_dim: int | None = None,
+    map_location: torch.device | str | None = None,
+) -> AdapterMLP:
+    if hidden_dim is None:
+        meta_path = path.parent / "meta.json"
+        if meta_path.exists():
+            try:
+                import json
+
+                with meta_path.open("r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                hidden_dim = int(meta.get("hidden_dim", 256))
+            except (ValueError, TypeError, json.JSONDecodeError):  # pragma: no cover - best effort
+                hidden_dim = 256
+        else:
+            hidden_dim = 256
 
     adapter = AdapterMLP(input_dim=input_dim, hidden_dim=hidden_dim)
-    state_dict = torch.load(weight_path, map_location=map_location)
+    state_dict = torch.load(path, map_location=map_location)
     adapter.load_state_dict(state_dict)
     return adapter
 
 
-__all__ = ["AdapterMLP", "CLIPFeatureExtractor", "load_trained_adapter"]
+def load_trained_adapters(
+    dataset_name: str,
+    clip_model: str,
+    input_dim: int,
+    seed: int,
+    hidden_dim: int | None = None,
+    map_location: torch.device | str | None = None,
+    adapter_image_path: str | Path | None = None,
+    adapter_text_path: str | Path | None = None,
+) -> tuple[AdapterMLP, AdapterMLP, dict[str, Path]]:
+    """根据数据集名称/随机种子加载图像与文本 Adapter。"""
+
+    image_path, text_path = resolve_adapter_paths(
+        dataset_name, seed, adapter_image_path, adapter_text_path
+    )
+    if not image_path.exists():
+        raise FileNotFoundError(f"未找到图像 adapter 权重: {image_path}")
+    if not text_path.exists():
+        raise FileNotFoundError(f"未找到文本 adapter 权重: {text_path}")
+
+    meta_path = image_path.parent / "meta.json"
+    if meta_path.exists():
+        try:
+            import json
+
+            with meta_path.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+            meta_clip = meta.get("clip_model")
+            if meta_clip and meta_clip != clip_model:
+                raise ValueError(
+                    f"Adapter clip_model={meta_clip} 与当前 clip_model={clip_model} 不一致。"
+                )
+        except json.JSONDecodeError:  # pragma: no cover - meta optional
+            pass
+
+    image_adapter = _load_adapter_from_path(
+        image_path, input_dim=input_dim, hidden_dim=hidden_dim, map_location=map_location
+    )
+    text_adapter = _load_adapter_from_path(
+        text_path, input_dim=input_dim, hidden_dim=hidden_dim, map_location=map_location
+    )
+    return image_adapter, text_adapter, {
+        "image_path": image_path,
+        "text_path": text_path,
+        "meta_path": meta_path,
+    }
+
+
+__all__ = [
+    "AdapterMLP",
+    "CLIPFeatureExtractor",
+    "load_trained_adapters",
+    "resolve_adapter_dir",
+    "resolve_adapter_paths",
+]

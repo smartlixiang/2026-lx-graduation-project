@@ -25,7 +25,8 @@ def _build_cache_path(
     cache_root: Path,
     dataset: str,
     clip_model: str,
-    adapter_path: str | None,
+    adapter_image_path: str | None,
+    adapter_text_path: str | None,
     div_k: int,
     dds_k: float,
     prompt_template: str,
@@ -34,9 +35,13 @@ def _build_cache_path(
     dataset_dir.mkdir(parents=True, exist_ok=True)
     clip_tag = _sanitize(clip_model)
     prompt_tag = hashlib.sha1(prompt_template.encode("utf-8")).hexdigest()[:8]
-    adapter_hash = "no-adapter"
-    if adapter_path:
-        adapter_hash = _hash_file(Path(adapter_path))[:12]
+    image_hash = "no-adapter"
+    text_hash = "no-adapter"
+    if adapter_image_path:
+        image_hash = _hash_file(Path(adapter_image_path))[:12]
+    if adapter_text_path:
+        text_hash = _hash_file(Path(adapter_text_path))[:12]
+    adapter_hash = f"img{image_hash}_txt{text_hash}"
     filename = f"static_{clip_tag}_div{div_k}_dds{dds_k}_{prompt_tag}_{adapter_hash}.npz"
     return dataset_dir / filename
 
@@ -76,7 +81,8 @@ def get_or_compute_static_scores(
     cache_root: str | Path,
     dataset: str,
     clip_model: str,
-    adapter_path: str | None,
+    adapter_image_path: str | None,
+    adapter_text_path: str | None,
     div_k: int,
     dds_k: float,
     prompt_template: str,
@@ -85,13 +91,22 @@ def get_or_compute_static_scores(
 ) -> dict[str, np.ndarray]:
     cache_root = Path(cache_root)
     cache_path = _build_cache_path(
-        cache_root, dataset, clip_model, adapter_path, div_k, dds_k, prompt_template
+        cache_root,
+        dataset,
+        clip_model,
+        adapter_image_path,
+        adapter_text_path,
+        div_k,
+        dds_k,
+        prompt_template,
     )
     meta = {
         "dataset": dataset,
         "clip_model": clip_model,
-        "adapter_path": adapter_path or "",
-        "adapter_sha1": _hash_file(Path(adapter_path)) if adapter_path else "",
+        "adapter_image_path": adapter_image_path or "",
+        "adapter_text_path": adapter_text_path or "",
+        "adapter_image_sha1": _hash_file(Path(adapter_image_path)) if adapter_image_path else "",
+        "adapter_text_sha1": _hash_file(Path(adapter_text_path)) if adapter_text_path else "",
         "div_k": div_k,
         "dds_k": dds_k,
         "prompt_template": prompt_template,

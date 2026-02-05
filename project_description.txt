@@ -39,8 +39,10 @@
 - CLIPFeatureExtractor：封装 openai/clip 的模型加载与特征提取。
   - __post_init__ 会自动加载模型并设置 eval。
   - encode_image/encode_text 会返回 L2-normalized 特征，避免后续指标使用不同尺度。
-- load_trained_adapter：根据 dataset_name + clip_model 拼接权重路径并加载。
-  - 注意 weight_path 的命名规则依赖训练脚本，若种子后缀存在，需要显式指定。
+- resolve_adapter_dir/resolve_adapter_paths：根据 dataset + seed 解析 adapter_weights/<dataset>/<seed>/ 下的权重路径。
+- load_trained_adapters：按 dataset + seed 加载图像/文本双端 Adapter，并在 meta.json 存在时校验 clip_model 一致性。
+  - 默认权重文件名为 adapter_image.pt 与 adapter_context.pt。
+  - hidden_dim 若未显式指定，会尝试从 meta.json 读取（默认 256）。
 
 ### model/resnet.py
 - CIFAR 版本的 ResNet-18：
@@ -54,7 +56,7 @@
 ### scoring/Semantic_Alignment.py
 - 语义对齐度 SA：图像特征与其类别文本特征的“正类相似度 - 最大负类相似度”。
 - 关键函数：
-  - _build_text_features：生成 prompt 并编码文本。
+  - _build_text_features：生成 prompt 并编码文本，支持文本端 adapter。
   - _margin_similarity：核心公式，注意先排除目标类别，再取最大负类相似度。
   - _quantile_normalize：按类别做分位点归一化，避免不同类的数值尺度不一致。
 - 易错点：
@@ -82,8 +84,8 @@
 
 ### utils/static_score_cache.py
 - 静态指标缓存工具，统一保存/读取 SA、Div、DDS 与标签。
-- 缓存路径结构：static_scores/<dataset>/static_<clip>_div<k>_dds<k>_<prompt>_<adapter>.npz。
-- 缓存键包含 dataset、clip_model、adapter 权重哈希、Div/DDS 超参、prompt_template 和样本数，避免误读旧缓存。
+- 缓存路径结构：static_scores/<dataset>/static_<clip>_div<k>_dds<k>_<prompt>_img<hash>_txt<hash>.npz。
+- 缓存键包含 dataset、clip_model、图像/文本 adapter 权重哈希、Div/DDS 超参、prompt_template 和样本数，避免误读旧缓存。
 - 适用于所有“静态指标计算结果不会随运行变化”的脚本，以减少重复计算成本。
 
 ### utils/normalizer.py
@@ -98,9 +100,9 @@
   - set_seed 统一设置 Python/NumPy/PyTorch 以及 CUDA 随机种子。
 
 # 4. 重要脚本与调用方式补充
-- scripts/train_adapter.py（正式脚本）：
+- train_adapter.py（正式脚本，位于仓库根目录）：
   - --seed 支持单个或列表；默认 CONFIG.exp_seeds。
-  - 训练 Adapter，输出权重与可视化图；多 seed 情况下文件名会追加 _seed{seed}。
+  - 训练图像/文本双端 Adapter，输出权重与 meta.json 到 adapter_weights/<dataset>/<seed>/。
 - train_proxy.py（正式脚本）：
   - 训练 ResNet-18 代理模型并记录训练动态，日志保存到 weights/proxy_logs/[dataset]/[proxy_model_name]/[seed]/[max_epoch]/ 目录。
   - 代理训练日志体积较大，weights/proxy_logs 不会随仓库上传，需要本地生成。

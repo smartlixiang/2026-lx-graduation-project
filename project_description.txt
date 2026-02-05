@@ -58,7 +58,7 @@
 - 关键函数：
   - _build_text_features：生成 prompt 并编码文本，支持文本端 adapter。
   - _margin_similarity：核心公式，注意先排除目标类别，再取最大负类相似度。
-  - _quantile_normalize：按类别做分位点归一化，避免不同类的数值尺度不一致。
+  - _quantile_normalize：按类别做分位点归一化（默认 0.2%/99.8%），避免不同类的数值尺度不一致。
 - 易错点：
   - adapter 的设备与 CLIP 设备可能不一致，_encode_images 内会在 adapter_device 和 extractor.device 之间对齐。
 
@@ -67,15 +67,16 @@
 - 关键函数：
   - _knn_mean_distance：手动分块计算全量相似度矩阵，chunk_size 决定内存占用。
   - _quantile_normalize：同样按类别归一化。
-- 易错点：k 必须为正整数；实际使用时 k 会被限制为不超过类内样本数-1。
+- 易错点：k 支持“正整数=邻居个数”或“0~1 小数=类内样本比例（默认 0.05 即 5%）”；实际使用时会按类别样本数解析并限制到 [1, 类内样本数-1]。
 
 ### scoring/Difficulty_Direction.py
 - 类内难度方向 DDS：
-  - 对类内特征做 PCA，选择“低方差方向”投影，投影绝对值越大表示样本更偏离主流分布。
+  - 对类内特征做 PCA：按特征值从小到大排序后，选择“特征值和占总和处于 [eigval_lower_bound, eigval_upper_bound]”的方向集合作为难度方向，投影绝对值越大表示样本更偏离主流分布。
 - 关键函数：
-  - _resolve_k：k 允许为整数（方向数量）或 0~1 小数（按比例）；超出范围会报错。
-  - _dds_from_pca：对类内特征求协方差、特征分解，并计算低方差方向投影。
-  - _quantile_normalize：按类别归一化，保证不同类可比。
+  - _select_difficulty_dirs：按累计特征值占比边界 [eigval_lower_bound, eigval_upper_bound] 选方向，并保证所选方向特征值和不超过上界。
+  - k：不再用于 Div 式比例含义；在 DDS 中用于“最少选择方向数”的下限约束（默认 5），用于避免上界筛选后方向数过少（在不突破上界时尽量满足）。
+  - _dds_from_pca：对类内特征协方差加正则后做特征分解，并使用上述规则选取难度方向。
+  - _quantile_normalize：按类别做 0.2%/99.8% 分位点归一化，保证不同类可比。
 
 ## 3.4 utils 目录
 ### utils/global_config.py

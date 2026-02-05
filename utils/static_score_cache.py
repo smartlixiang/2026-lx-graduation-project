@@ -27,8 +27,8 @@ def _build_cache_path(
     clip_model: str,
     adapter_image_path: str | None,
     adapter_text_path: str | None,
-    div_k: int,
-    dds_k: float,
+    div_k: float,
+    dds_k: int,
     prompt_template: str,
 ) -> Path:
     dataset_dir = cache_root / _sanitize(dataset)
@@ -83,8 +83,8 @@ def get_or_compute_static_scores(
     clip_model: str,
     adapter_image_path: str | None,
     adapter_text_path: str | None,
-    div_k: int,
-    dds_k: float,
+    div_k: float,
+    dds_k: int,
     prompt_template: str,
     num_samples: int,
     compute_fn: Callable[[], dict[str, np.ndarray]],

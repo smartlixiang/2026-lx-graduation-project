@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import List, Sequence
 
 import torch
@@ -20,8 +19,10 @@ class DDSResult:
     labels: torch.Tensor
     image_features: torch.Tensor
     class_names: List[str]
-    k: float
-    resolved_k: int
+    k: int
+    eigval_lower_bound: float
+    eigval_upper_bound: float
+    pca_cov_reg: float
 
     def classwise_mean(self) -> List[float]:
         """按类别返回平均 DDS 分值。"""
@@ -42,16 +43,27 @@ class DifficultyDirection:
     def __init__(
         self,
         class_names: Sequence[str],
-        k: float = 10,
+        k: int = 5,
         clip_model: str = "ViT-B/32",
         device: torch.device | None = None,
+        eigval_lower_bound: float = 0.02,
+        eigval_upper_bound: float = 0.2,
+        pca_cov_reg: float = 1e-6,
     ) -> None:
-        if k <= 0:
-            raise ValueError("k 必须为正数。")
+        if k < 1:
+            raise ValueError("k 必须为正整数，用于控制最少选择方向数。")
+        if not (0 <= eigval_lower_bound < eigval_upper_bound <= 1):
+            raise ValueError("需满足 0 <= eigval_lower_bound < eigval_upper_bound <= 1。")
+        if pca_cov_reg < 0:
+            raise ValueError("pca_cov_reg 需为非负数。")
+
         self.class_names = [str(name) for name in class_names]
-        self.k = float(k)
+        self.k = int(k)
         self.device = torch.device(device) if device is not None else CONFIG.global_device
         self.extractor = CLIPFeatureExtractor(model_name=clip_model, device=self.device)
+        self.eigval_lower_bound = float(eigval_lower_bound)
+        self.eigval_upper_bound = float(eigval_upper_bound)
+        self.pca_cov_reg = float(pca_cov_reg)
 
     def _encode_images(
         self, dataloader: DataLoader, adapter: AdapterMLP | None = None
@@ -74,17 +86,60 @@ class DifficultyDirection:
 
         return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
 
-    def _resolve_k(self, feature_dim: int) -> int:
-        if float(self.k).is_integer():
-            return max(1, min(int(self.k), feature_dim))
-        if 0 < self.k < 1:
-            return max(1, min(int(math.ceil(self.k * feature_dim)), feature_dim))
-        raise ValueError("当 k 为小数时，需满足 0 < k < 1，用于表示方向比例。")
+    def _select_difficulty_dirs(
+        self, eigenvalues: torch.Tensor, eigenvectors: torch.Tensor
+    ) -> torch.Tensor:
+        feat_dim = eigenvalues.shape[0]
+        if feat_dim == 0:
+            return eigenvectors[:, :0]
 
-    @staticmethod
-    def _dds_from_pca(
-        class_features: torch.Tensor, low_k: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        eigvals = torch.clamp(eigenvalues, min=0.0)
+        total = eigvals.sum()
+        if total.item() <= 0:
+            return eigenvectors[:, : min(self.k, feat_dim)]
+
+        cumulative = torch.cumsum(eigvals, dim=0) / total
+
+        if self.eigval_lower_bound > 0:
+            below_lower = torch.nonzero(cumulative < self.eigval_lower_bound, as_tuple=False).flatten()
+            if below_lower.numel() == 0:
+                start = 1 if feat_dim > 1 else 0
+            else:
+                start = int(below_lower[-1].item()) + 1
+        else:
+            start = 0
+
+        start = min(start, feat_dim - 1)
+        upper_budget = self.eigval_upper_bound * total
+
+        chosen_indices: list[int] = []
+        chosen_sum = torch.zeros((), dtype=eigvals.dtype, device=eigvals.device)
+
+        for idx in range(start, feat_dim):
+            next_sum = chosen_sum + eigvals[idx]
+            if next_sum <= upper_budget:
+                chosen_indices.append(idx)
+                chosen_sum = next_sum
+            else:
+                break
+
+        idx = start + len(chosen_indices)
+        while len(chosen_indices) < self.k and idx < feat_dim:
+            next_sum = chosen_sum + eigvals[idx]
+            if next_sum <= upper_budget:
+                chosen_indices.append(idx)
+                chosen_sum = next_sum
+                idx += 1
+                continue
+            break
+
+        if not chosen_indices:
+            return eigenvectors[:, :0]
+
+        index_tensor = torch.tensor(chosen_indices, device=eigenvectors.device)
+        return eigenvectors.index_select(dim=1, index=index_tensor)
+
+    def _dds_from_pca(self, class_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_samples, feat_dim = class_features.shape
         if num_samples <= 1:
             return torch.zeros(num_samples, device=class_features.device), torch.zeros(
@@ -94,10 +149,16 @@ class DifficultyDirection:
         mean = class_features.mean(dim=0)
         centered = class_features - mean
         cov = centered.T @ centered / (num_samples - 1)
+        cov = cov + self.pca_cov_reg * torch.eye(
+            feat_dim, device=class_features.device, dtype=class_features.dtype
+        )
         eigenvalues, eigenvectors = torch.linalg.eigh(cov)
-        low_k = max(1, min(low_k, eigenvectors.shape[1]))
-        low_dirs = eigenvectors[:, :low_k]
-        projections = centered @ low_dirs
+
+        selected_dirs = self._select_difficulty_dirs(eigenvalues, eigenvectors)
+        if selected_dirs.shape[1] == 0:
+            return torch.zeros(num_samples, device=class_features.device), mean
+
+        projections = centered @ selected_dirs
         scores = projections.abs().sum(dim=1)
         return scores, mean
 
@@ -106,8 +167,8 @@ class DifficultyDirection:
         values: torch.Tensor,
         labels: torch.Tensor,
         num_classes: int,
-        low_q: float = 0.01,
-        high_q: float = 0.99,
+        low_q: float = 0.002,
+        high_q: float = 0.998,
     ) -> torch.Tensor:
         scores = torch.zeros_like(values)
         for class_idx in range(num_classes):
@@ -132,14 +193,13 @@ class DifficultyDirection:
 
         image_features, labels = self._encode_images(dataloader, adapter)
         scores = torch.zeros(labels.shape[0], device=image_features.device)
-        resolved_k = self._resolve_k(image_features.shape[1])
 
         for class_idx in range(len(self.class_names)):
             mask = labels == class_idx
             if not mask.any():
                 continue
             class_features = image_features[mask]
-            class_scores, _ = self._dds_from_pca(class_features, resolved_k)
+            class_scores, _ = self._dds_from_pca(class_features)
             scores[mask] = class_scores
 
         scores = self._quantile_normalize(scores, labels, len(self.class_names))
@@ -150,7 +210,9 @@ class DifficultyDirection:
             image_features=image_features.detach().cpu(),
             class_names=self.class_names,
             k=self.k,
-            resolved_k=resolved_k,
+            eigval_lower_bound=self.eigval_lower_bound,
+            eigval_upper_bound=self.eigval_upper_bound,
+            pca_cov_reg=self.pca_cov_reg,
         )
 
 

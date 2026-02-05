@@ -100,8 +100,8 @@ class SemanticAlignment:
         values: torch.Tensor,
         labels: torch.Tensor,
         num_classes: int,
-        low_q: float = 0.01,
-        high_q: float = 0.99,
+        low_q: float = 0.002,
+        high_q: float = 0.998,
     ) -> torch.Tensor:
         scores = torch.zeros_like(values)
         for class_idx in range(num_classes):

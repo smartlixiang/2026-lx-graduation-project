@@ -68,8 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--div-k", type=int, default=10)
-    parser.add_argument("--dds-k", type=float, default=10)
+    parser.add_argument("--div-k", type=float, default=0.05)
+    parser.add_argument("--dds-k", type=int, default=5)
     parser.add_argument("--coverage-tau-g", type=float, default=0.15)
     parser.add_argument("--coverage-s-g", type=float, default=0.07)
     parser.add_argument(

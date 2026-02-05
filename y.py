@@ -129,6 +129,102 @@ def _save_dual_hist(
     print(f"Saved comparison histogram to: {output_path}")
 
 
+def _minmax_normalize(scores: np.ndarray) -> np.ndarray:
+    min_val = float(np.min(scores))
+    max_val = float(np.max(scores))
+    if np.isclose(max_val, min_val):
+        return np.zeros_like(scores, dtype=np.float64)
+    return (scores - min_val) / (max_val - min_val)
+
+
+def _save_div_dds_grid_hist(
+    div_scores: np.ndarray,
+    dds_scores_by_combo: list[tuple[tuple[int, int], np.ndarray]],
+    bins: int,
+    output_path: Path,
+) -> None:
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True, sharey=True)
+    flat_axes = axes.flatten()
+
+    for idx, ((k, upper_pct), dds_scores) in enumerate(dds_scores_by_combo):
+        ax = flat_axes[idx]
+        ax.hist(div_scores, bins=bins, range=(0.0, 1.0), color="#4C72B0", alpha=0.55, label="Div (default)")
+        ax.hist(dds_scores, bins=bins, range=(0.0, 1.0), color="#DD8452", alpha=0.55, label="DDS")
+        ax.set_title(f"DDS(k={k}, upper={upper_pct}%) vs Div")
+        ax.set_xlim(0.0, 1.0)
+        ax.set_xlabel("Score")
+        ax.set_ylabel("Count")
+
+    handles, labels = flat_axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved Div-vs-DDS grid histogram to: {output_path}")
+
+
+def _save_divk_dds_grid_hist(
+    dds_scores: np.ndarray,
+    div_scores_by_k: list[tuple[float, np.ndarray]],
+    bins: int,
+    output_path: Path,
+) -> None:
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True, sharey=True)
+    flat_axes = axes.flatten()
+
+    for idx, (div_k, div_scores_variant) in enumerate(div_scores_by_k):
+        ax = flat_axes[idx]
+        ax.hist(dds_scores, bins=bins, range=(0.0, 1.0), color="#DD8452", alpha=0.55, label="DDS (default)")
+        ax.hist(div_scores_variant, bins=bins, range=(0.0, 1.0), color="#4C72B0", alpha=0.55, label="Div")
+        ax.set_title(f"Div(k={div_k * 100:.1f}%) vs DDS")
+        ax.set_xlim(0.0, 1.0)
+        ax.set_xlabel("Score")
+        ax.set_ylabel("Count")
+
+    handles, labels = flat_axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved Div(k)-vs-DDS grid histogram to: {output_path}")
+
+
+def _compute_div_dds_overlap_rows(
+    div_scores: np.ndarray,
+    dds_scores_by_combo: list[tuple[tuple[int, int], np.ndarray]],
+    cut_ratios: list[int],
+) -> tuple[list[str], list[list[str]]]:
+    header = ["DDS Params"] + [f"Top {ratio}%" for ratio in cut_ratios]
+    rows: list[list[str]] = []
+
+    for (k, upper_pct), dds_scores in dds_scores_by_combo:
+        row = [f"k={k}, upper={upper_pct}%"]
+        for ratio in cut_ratios:
+            div_idx = _select_topk_indices(div_scores, ratio)
+            dds_idx = _select_topk_indices(dds_scores, ratio)
+            row.append(f"{_overlap_rate(div_idx, dds_idx):.4f}")
+        rows.append(row)
+    return header, rows
+
+
+def _compute_divk_dds_overlap_rows(
+    dds_scores: np.ndarray,
+    div_scores_by_k: list[tuple[float, np.ndarray]],
+    cut_ratios: list[int],
+) -> tuple[list[str], list[list[str]]]:
+    header = ["Div k"] + [f"Top {ratio}%" for ratio in cut_ratios]
+    rows: list[list[str]] = []
+
+    for div_k, div_scores_variant in div_scores_by_k:
+        row = [f"k={div_k * 100:.1f}%"]
+        for ratio in cut_ratios:
+            dds_idx = _select_topk_indices(dds_scores, ratio)
+            div_idx = _select_topk_indices(div_scores_variant, ratio)
+            row.append(f"{_overlap_rate(dds_idx, div_idx):.4f}")
+        rows.append(row)
+    return header, rows
+
+
 def _select_topk_indices(scores: np.ndarray, cut_ratio: int) -> np.ndarray:
     if scores.ndim != 1:
         raise ValueError("scores 必须为一维数组。")
@@ -146,6 +242,26 @@ def _overlap_rate(indices_a: np.ndarray, indices_b: np.ndarray) -> float:
     return inter_size / base
 
 
+def _print_aligned_table(title: str, header: list[str], rows: list[list[str]]) -> None:
+    all_rows = [header] + rows
+    col_widths = [max(len(r[col_idx]) for r in all_rows) for col_idx in range(len(header))]
+
+    def _format_row(items: list[str]) -> str:
+        return "│ " + " │ ".join(item.ljust(col_widths[i]) for i, item in enumerate(items)) + " │"
+
+    top_border = "┌─" + "─┬─".join("─" * w for w in col_widths) + "─┐"
+    mid_border = "├─" + "─┼─".join("─" * w for w in col_widths) + "─┤"
+    bottom_border = "└─" + "─┴─".join("─" * w for w in col_widths) + "─┘"
+
+    print(f"\n{title}")
+    print(top_border)
+    print(_format_row(header))
+    print(mid_border)
+    for row in rows:
+        print(_format_row(row))
+    print(bottom_border)
+
+
 def _print_overlap_table(score_map: dict[str, np.ndarray], cut_ratios: list[int]) -> None:
     pairs = [
         ("SA", "Div", "SA vs Div"),
@@ -154,10 +270,8 @@ def _print_overlap_table(score_map: dict[str, np.ndarray], cut_ratios: list[int]
         ("Total Learned", "Total Naive", "Total Learned vs Naive"),
     ]
 
-    header = ["Pair"] + [f"{ratio}%" for ratio in cut_ratios]
-    print("\nSubset overlap rate table (intersection / selected_size):")
-    print(" | ".join(header))
-    print("-|-".join(["---"] * len(header)))
+    header = ["Pair"] + [f"Top {ratio}%" for ratio in cut_ratios]
+    rows: list[list[str]] = []
 
     for left_key, right_key, row_name in pairs:
         row = [row_name]
@@ -165,7 +279,25 @@ def _print_overlap_table(score_map: dict[str, np.ndarray], cut_ratios: list[int]
             left_idx = _select_topk_indices(score_map[left_key], ratio)
             right_idx = _select_topk_indices(score_map[right_key], ratio)
             row.append(f"{_overlap_rate(left_idx, right_idx):.4f}")
-        print(" | ".join(row))
+        rows.append(row)
+
+    all_rows = [header] + rows
+    col_widths = [max(len(r[col_idx]) for r in all_rows) for col_idx in range(len(header))]
+
+    def _format_row(items: list[str]) -> str:
+        return "│ " + " │ ".join(item.ljust(col_widths[i]) for i, item in enumerate(items)) + " │"
+
+    top_border = "┌─" + "─┬─".join("─" * w for w in col_widths) + "─┐"
+    mid_border = "├─" + "─┼─".join("─" * w for w in col_widths) + "─┤"
+    bottom_border = "└─" + "─┴─".join("─" * w for w in col_widths) + "─┘"
+
+    print("\nSubset overlap rate table (intersection / selected_size):")
+    print(top_border)
+    print(_format_row(header))
+    print(mid_border)
+    for row in rows:
+        print(_format_row(row))
+    print(bottom_border)
 
 
 def main() -> None:
@@ -206,7 +338,7 @@ def main() -> None:
     print(f"Resolved adapter text path: {adapter_paths['text_path']}")
 
     batch_size = 128
-    num_workers = 8
+    num_workers = 4
     dds_loader = build_score_loader(dds_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers)
     div_loader = build_score_loader(div_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers)
     sa_loader = build_score_loader(sa_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers)
@@ -286,6 +418,74 @@ def main() -> None:
         "Total Naive (uniform 1/3)",
         args.bins,
         output_dir / f"cifar10_total_hist_compare_learned_vs_naive_{args.weight_seed}.png",
+    )
+
+    total_scores_learned_norm = _minmax_normalize(np.asarray(total_scores_learned, dtype=np.float64))
+    total_scores_naive_norm = _minmax_normalize(np.asarray(total_scores_naive, dtype=np.float64))
+    _save_dual_hist(
+        total_scores_learned_norm,
+        total_scores_naive_norm,
+        f"Total Learned Min-Max Norm (seed {args.weight_seed})",
+        "Total Naive Min-Max Norm",
+        args.bins,
+        output_dir / f"cifar10_total_hist_compare_learned_vs_naive_minmax_{args.weight_seed}.png",
+    )
+
+    dds_param_combos = [(2, 20), (2, 30), (1, 10), (1, 20), (5, 30), (5, 50)]
+    dds_scores_by_combo: list[tuple[tuple[int, int], np.ndarray]] = []
+    for k, upper_pct in dds_param_combos:
+        dds_metric.k = k
+        dds_metric.eigval_upper_bound = upper_pct / 100.0
+        dds_scores_variant = dds_metric.score_dataset(
+            tqdm(dds_loader, desc=f"Scoring DDS (k={k}, upper={upper_pct}%)", unit="batch"),
+            adapter=image_adapter,
+        ).scores
+        dds_scores_by_combo.append(((k, upper_pct), np.asarray(dds_scores_variant)))
+
+    div_dds_header, div_dds_rows = _compute_div_dds_overlap_rows(
+        np.asarray(div_scores),
+        dds_scores_by_combo,
+        cut_ratios=list(range(20, 100, 10)),
+    )
+    _print_aligned_table(
+        "Div(default) vs DDS(parameter combos) overlap rate table:",
+        div_dds_header,
+        div_dds_rows,
+    )
+
+    _save_div_dds_grid_hist(
+        np.asarray(div_scores),
+        dds_scores_by_combo,
+        args.bins,
+        output_dir / "cifar10_div_vs_dds_param_grid_hist.png",
+    )
+
+    div_k_values = [0.002, 0.005, 0.01, 0.03, 0.05, 0.10]
+    div_scores_by_k: list[tuple[float, np.ndarray]] = []
+    for div_k in div_k_values:
+        div_metric.k = div_k
+        div_scores_variant = div_metric.score_dataset(
+            tqdm(div_loader, desc=f"Scoring Div (k={div_k * 100:.1f}%)", unit="batch"),
+            adapter=image_adapter,
+        ).scores
+        div_scores_by_k.append((div_k, np.asarray(div_scores_variant)))
+
+    divk_dds_header, divk_dds_rows = _compute_divk_dds_overlap_rows(
+        np.asarray(dds_scores),
+        div_scores_by_k,
+        cut_ratios=list(range(20, 100, 10)),
+    )
+    _print_aligned_table(
+        "DDS(default) vs Div(k sweep) overlap rate table:",
+        divk_dds_header,
+        divk_dds_rows,
+    )
+
+    _save_divk_dds_grid_hist(
+        np.asarray(dds_scores),
+        div_scores_by_k,
+        args.bins,
+        output_dir / "cifar10_div_k_sweep_vs_dds_grid_hist.png",
     )
 
     overlap_scores = {

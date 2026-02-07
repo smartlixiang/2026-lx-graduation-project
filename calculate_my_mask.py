@@ -238,7 +238,7 @@ def main() -> None:
     )
 
     batch_size = 128
-    num_workers = 8
+    num_workers = 4
 
     dds_loader = build_score_loader(
         dds_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers

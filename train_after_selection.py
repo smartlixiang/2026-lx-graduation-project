@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cr",  # cut ratios
         type=str,
-        default="20,30,40,60,70,80,90,100",
+        default="20,30,40,60,70,80,90",
         help="裁剪比例列表（百分比），支持逗号分隔或单值",
     )
     parser.add_argument(

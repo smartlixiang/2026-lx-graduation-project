@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--result-dir",
         default="result",
-        help="Root directory that stores result/<dataset>/<model>/<seed>/*.json",
+        help="Root directory that stores result/<method>/<dataset>/<model>/<seed>/result_*.json",
     )
     parser.add_argument("--dataset", default="cifar10", help="Dataset name")
     parser.add_argument("--model", default="resnet50", help="Model name")
@@ -27,13 +27,6 @@ def parse_args() -> argparse.Namespace:
         help="Selection methods to compare",
     )
     parser.add_argument(
-        "--seeds",
-        nargs="+",
-        type=int,
-        default=[22, 42, 96],
-        help="Seeds to average",
-    )
-    parser.add_argument(
         "--output",
         default="acc_curve_cifar10_resnet50_methods.png",
         help="Output image path",
@@ -41,13 +34,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_seed_results(seed_dir: Path, method: str) -> dict[int, float]:
+def load_seed_results(seed_dir: Path) -> dict[int, float]:
     results: dict[int, float] = {}
-    for path in seed_dir.glob(f"result_*_{method}.json"):
+    for path in seed_dir.glob("result_*.json"):
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         metadata = payload.get("metadata", {})
-        cut_ratio = int(metadata.get("cut_ratio", path.stem.split("_")[1]))
+        cut_ratio = int(metadata.get("cut_ratio", path.stem.split("_")[-1]))
         acc_samples = payload.get("accuracy_samples")
         if acc_samples:
             acc_value = mean(acc_samples[-10:])
@@ -59,7 +52,7 @@ def load_seed_results(seed_dir: Path, method: str) -> dict[int, float]:
 
 def main() -> None:
     args = parse_args()
-    result_root = Path(args.result_dir) / args.dataset / args.model
+    result_root = Path(args.result_dir)
     methods = args.methods
     color_map = {
         "random": "black",
@@ -70,12 +63,15 @@ def main() -> None:
     plt.figure(figsize=(8, 5))
     all_cut_ratios: set[int] = set()
     for method in methods:
+        method_root = result_root / method / args.dataset / args.model
+        if not method_root.exists():
+            raise FileNotFoundError(f"Missing method directory: {method_root}")
+        seed_dirs = sorted(path for path in method_root.iterdir() if path.is_dir())
+        if not seed_dirs:
+            raise FileNotFoundError(f"No seed directories under: {method_root}")
         seed_results = []
-        for seed in args.seeds:
-            seed_dir = result_root / str(seed)
-            if not seed_dir.exists():
-                raise FileNotFoundError(f"Missing seed directory: {seed_dir}")
-            seed_results.append(load_seed_results(seed_dir, method))
+        for seed_dir in seed_dirs:
+            seed_results.append(load_seed_results(seed_dir))
 
         common_cut_ratios = sorted(
             set.intersection(*(set(r.keys()) for r in seed_results))

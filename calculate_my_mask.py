@@ -217,6 +217,7 @@ def select_group_mask(
     num_classes: int,
     cut_ratio: int,
     device: torch.device,
+    progress_desc: str | None = None,
 ) -> tuple[np.ndarray, dict[int, int]]:
     """
     使用 YangCLIP 风格的 selection optimization 对连续选择变量 d 做 SGD 优化，
@@ -243,7 +244,13 @@ def select_group_mask(
     theta = 5e-4
     num_steps = 100000
 
-    for _ in range(num_steps):
+    step_iterator = tqdm(
+        range(num_steps),
+        desc=progress_desc or "Optimizing group mask",
+        unit="step",
+        leave=False,
+    )
+    for step in step_iterator:
         optimizer.zero_grad()
         sigma = torch.sigmoid(d)
         l_qual = -(sigma * scores_t).mean()
@@ -255,7 +262,20 @@ def select_group_mask(
         loss.backward()
         optimizer.step()
 
+        if step % 200 == 0:
+            step_iterator.set_postfix(
+                loss=f"{loss.item():.4f}",
+                ratio=f"{hard_mean.item():.4f}",
+                target=f"{ratio_target:.4f}",
+            )
+
         if l_s.item() < theta:
+            step_iterator.set_postfix(
+                loss=f"{loss.item():.4f}",
+                ratio=f"{hard_mean.item():.4f}",
+                target=f"{ratio_target:.4f}",
+                converged="yes",
+            )
             break
 
     sigma_np = torch.sigmoid(d.detach()).cpu().numpy()
@@ -334,6 +354,8 @@ def main() -> None:
         save_seeds = [CONFIG.global_seed]
     else:
         save_seeds = seeds
+    total_tasks = len(save_seeds) * len(cut_ratios)
+    task_idx = 0
     for seed in save_seeds:
         set_seed(seed)
         adapter_seed = args.adapter_seed if args.adapter_seed is not None else seed
@@ -407,7 +429,11 @@ def main() -> None:
         labels = np.asarray(dataset_for_names.targets)
         total_scores_np = np.asarray(total_scores)
 
-        for cut_ratio in tqdm(cut_ratios, desc=f"Generating mask (seed={seed})", unit="cr"):
+        for cut_ratio in cut_ratios:
+            task_idx += 1
+            print(
+                f"[Mask {task_idx}/{total_tasks}] seed={seed} | cr={cut_ratio} | method={method}"
+            )
             if method == "topk":
                 mask, selected_by_class = select_topk_mask(
                     total_scores_np,
@@ -423,6 +449,9 @@ def main() -> None:
                     num_classes=len(class_names),
                     cut_ratio=cut_ratio,
                     device=device,
+                    progress_desc=(
+                        f"Group mask optimization (seed={seed}, cr={cut_ratio})"
+                    ),
                 )
                 selection_strategy = "group_selection"
             total_time = time.perf_counter() - total_start

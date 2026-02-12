@@ -212,12 +212,20 @@ def select_topk_mask(
 
 
 def select_group_mask(
-    scores: np.ndarray,
+    sa_scores: np.ndarray,
+    dds_metric: DifficultyDirection,
+    div_metric: Div,
+    dds_loader: DataLoader,
+    div_loader: DataLoader,
+    image_adapter,
     labels: np.ndarray,
+    weights: dict[str, float],
     num_classes: int,
     cut_ratio: int,
     device: torch.device,
     progress_desc: str | None = None,
+    outer_iters: int = 8,
+    inner_steps: int = 300,
 ) -> tuple[np.ndarray, dict[int, int]]:
     """
     使用 YangCLIP 风格的 selection optimization 对连续选择变量 d 做 SGD 优化，
@@ -230,11 +238,12 @@ def select_group_mask(
     if cut_ratio <= 0 or cut_ratio > 100:
         raise ValueError("cr 必须在 1-100 之间。")
 
-    num_samples = scores.shape[0]
+    num_samples = sa_scores.shape[0]
     if labels.shape[0] != num_samples:
-        raise ValueError("scores 与 labels 的样本数不一致。")
+        raise ValueError("sa_scores 与 labels 的样本数不一致。")
 
-    scores_t = torch.as_tensor(scores, dtype=torch.float32, device=device)
+    sa_scores_t = torch.as_tensor(sa_scores, dtype=torch.float32, device=device)
+    labels_t = torch.as_tensor(labels, dtype=torch.long, device=device)
     ratio_target = cut_ratio / 100.0
 
     d = torch.nn.Parameter(torch.zeros(num_samples, device=device, dtype=torch.float32))
@@ -242,47 +251,77 @@ def select_group_mask(
 
     gamma = 1.0 / 3.0
     theta = 5e-4
-    num_steps = 100000
+    selected_mask = np.ones(num_samples, dtype=np.uint8)
 
-    step_iterator = tqdm(
-        range(num_steps),
-        desc=progress_desc or "Optimizing group mask",
-        unit="step",
-        leave=False,
+    div_features, _ = div_metric._encode_images(div_loader, image_adapter)
+    dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
+
+    outer_iterator = tqdm(
+        range(outer_iters),
+        desc=progress_desc or "Set-level group optimization",
+        unit="outer",
+        leave=True,
     )
-    for step in step_iterator:
-        optimizer.zero_grad()
-        sigma = torch.sigmoid(d)
-        l_qual = -(sigma * scores_t).mean()
-        hard = (sigma > 0.5).float()
-        hard_mean = hard.mean()
-        diff = hard_mean - ratio_target
-        l_s = diff.abs().sqrt()
-        loss = l_qual + gamma * l_s
-        loss.backward()
-        optimizer.step()
+    for outer_idx in outer_iterator:
+        div_scores = div_metric.score_dataset_dynamic(
+            div_loader,
+            adapter=image_adapter,
+            selected_mask=selected_mask,
+            image_features=div_features,
+            labels=labels_t,
+        ).scores.to(device)
+        dds_scores = dds_metric.score_dataset_dynamic(
+            dds_loader,
+            adapter=image_adapter,
+            selected_mask=selected_mask,
+            image_features=dds_features,
+            labels=labels_t,
+        ).scores.to(device)
+        score_s = (
+            weights["sa"] * sa_scores_t
+            + weights["div"] * div_scores
+            + weights["dds"] * dds_scores
+        )
 
-        if step % 200 == 0:
-            step_iterator.set_postfix(
-                loss=f"{loss.item():.4f}",
-                ratio=f"{hard_mean.item():.4f}",
-                target=f"{ratio_target:.4f}",
-            )
+        for inner_idx in range(inner_steps):
+            optimizer.zero_grad()
+            sigma = torch.sigmoid(d)
+            l_qual = -(sigma * score_s).mean()
+            hard = (sigma > 0.5).float()
+            hard_mean = hard.mean()
+            diff = hard_mean - ratio_target
+            l_s = diff.abs().sqrt()
+            loss = l_qual + gamma * l_s
+            loss.backward()
+            optimizer.step()
 
-        if l_s.item() < theta:
-            step_iterator.set_postfix(
-                loss=f"{loss.item():.4f}",
-                ratio=f"{hard_mean.item():.4f}",
-                target=f"{ratio_target:.4f}",
-                converged="yes",
-            )
-            break
+            if l_s.item() < theta:
+                break
+
+        sigma_np = torch.sigmoid(d.detach()).cpu().numpy()
+        selected_mask = (sigma_np > 0.5).astype(np.uint8)
+        outer_iterator.set_postfix(
+            outer=f"{outer_idx + 1}/{outer_iters}",
+            inner_steps=str(inner_idx + 1),
+            ratio=f"{selected_mask.mean():.4f}",
+            target=f"{ratio_target:.4f}",
+            loss=f"{loss.item():.4f}",
+        )
 
     sigma_np = torch.sigmoid(d.detach()).cpu().numpy()
     global_mask = (sigma_np > 0.5).astype(np.uint8)
+    target_selected = int(round(ratio_target * num_samples))
+    target_selected = min(max(target_selected, 1), num_samples)
+    current_selected = int(global_mask.sum())
+    if current_selected != target_selected:
+        sorted_idx = np.argsort(-sigma_np)
+        hard_fixed = np.zeros(num_samples, dtype=np.uint8)
+        hard_fixed[sorted_idx[:target_selected]] = 1
+        global_mask = hard_fixed
 
     selected_by_class: dict[int, int] = {}
     final_mask = np.zeros_like(global_mask, dtype=np.uint8)
+    final_score_np = score_s.detach().cpu().numpy()
     for class_id in range(num_classes):
         class_indices = np.flatnonzero(labels == class_id)
         if class_indices.size == 0:
@@ -292,8 +331,7 @@ def select_group_mask(
         class_mask = global_mask[class_indices]
         num_selected = int(class_mask.sum())
         if num_selected == 0:
-            scores_in_class = scores[class_indices]
-            best_idx = class_indices[np.argmax(scores_in_class)]
+            best_idx = class_indices[np.argmax(final_score_np[class_indices])]
             final_mask[best_idx] = 1
             selected_by_class[class_id] = 1
         else:
@@ -444,8 +482,14 @@ def main() -> None:
                 selection_strategy = "topk_per_class"
             elif method == "group":
                 mask, selected_by_class = select_group_mask(
-                    total_scores_np,
-                    labels,
+                    np.asarray(sa_scores),
+                    dds_metric=dds_metric,
+                    div_metric=div_metric,
+                    dds_loader=dds_loader,
+                    div_loader=div_loader,
+                    image_adapter=image_adapter,
+                    labels=labels,
+                    weights=weights,
                     num_classes=len(class_names),
                     cut_ratio=cut_ratio,
                     device=device,

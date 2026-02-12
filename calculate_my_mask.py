@@ -69,8 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--method",
         type=str,
-        default="",
-        help="mask 保存时使用的方法名（默认按 weight-group 映射为 my_naive 或 my_learned）",
+        default="topk",
+        help="数据选择方式，可选 {topk, group}",
     )
     parser.add_argument(
         "--model-name",
@@ -211,6 +211,78 @@ def select_topk_mask(
     return mask, selected_by_class
 
 
+def select_group_mask(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    num_classes: int,
+    cut_ratio: int,
+    device: torch.device,
+) -> tuple[np.ndarray, dict[int, int]]:
+    """
+    使用 YangCLIP 风格的 selection optimization 对连续选择变量 d 做 SGD 优化，
+    在给定 selection ratio (cut_ratio) 下优化整体被选子集的总分数。
+
+    返回:
+        mask: shape (N,), uint8 {0,1}
+        selected_by_class: dict[int, int]，记录每个类别被选中的样本数
+    """
+    if cut_ratio <= 0 or cut_ratio > 100:
+        raise ValueError("cr 必须在 1-100 之间。")
+
+    num_samples = scores.shape[0]
+    if labels.shape[0] != num_samples:
+        raise ValueError("scores 与 labels 的样本数不一致。")
+
+    scores_t = torch.as_tensor(scores, dtype=torch.float32, device=device)
+    ratio_target = cut_ratio / 100.0
+
+    d = torch.nn.Parameter(torch.zeros(num_samples, device=device, dtype=torch.float32))
+    optimizer = torch.optim.SGD([d], lr=1e-3, momentum=0.9)
+
+    gamma = 1.0 / 3.0
+    theta = 5e-4
+    num_steps = 100000
+
+    for _ in range(num_steps):
+        optimizer.zero_grad()
+        sigma = torch.sigmoid(d)
+        l_qual = -(sigma * scores_t).mean()
+        hard = (sigma > 0.5).float()
+        hard_mean = hard.mean()
+        diff = hard_mean - ratio_target
+        l_s = diff.abs().sqrt()
+        loss = l_qual + gamma * l_s
+        loss.backward()
+        optimizer.step()
+
+        if l_s.item() < theta:
+            break
+
+    sigma_np = torch.sigmoid(d.detach()).cpu().numpy()
+    global_mask = (sigma_np > 0.5).astype(np.uint8)
+
+    selected_by_class: dict[int, int] = {}
+    final_mask = np.zeros_like(global_mask, dtype=np.uint8)
+    for class_id in range(num_classes):
+        class_indices = np.flatnonzero(labels == class_id)
+        if class_indices.size == 0:
+            selected_by_class[class_id] = 0
+            continue
+
+        class_mask = global_mask[class_indices]
+        num_selected = int(class_mask.sum())
+        if num_selected == 0:
+            scores_in_class = scores[class_indices]
+            best_idx = class_indices[np.argmax(scores_in_class)]
+            final_mask[best_idx] = 1
+            selected_by_class[class_id] = 1
+        else:
+            final_mask[class_indices[class_mask.astype(bool)]] = 1
+            selected_by_class[class_id] = num_selected
+
+    return final_mask, selected_by_class
+
+
 def main() -> None:
     total_start = time.perf_counter()
     args = parse_args()
@@ -250,17 +322,15 @@ def main() -> None:
         sa_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers
     )
 
-    if args.method.strip():
-        method_name = args.method.strip()
-    elif args.weight_group == "naive":
-        method_name = "my_naive"
-    else:
-        method_name = "my_learned"
+    method = args.method.strip().lower()
+    if method not in {"topk", "group"}:
+        raise ValueError(f"未知 method={method}，应为 {{'topk','group'}}")
+    method_name = f"{args.weight_group}_{method}"
     cut_ratios = parse_ratio_list(args.cr)
     if not cut_ratios:
         raise ValueError("cr 参数不能为空。")
     seeds = parse_seed_list(args.seeds)
-    if method_name == "my_naive":
+    if args.weight_group == "naive":
         save_seeds = [CONFIG.global_seed]
     else:
         save_seeds = seeds
@@ -337,10 +407,24 @@ def main() -> None:
         labels = np.asarray(dataset_for_names.targets)
         total_scores_np = np.asarray(total_scores)
 
-        for cut_ratio in cut_ratios:
-            mask, selected_by_class = select_topk_mask(
-                total_scores_np, labels, num_classes=len(class_names), cut_ratio=cut_ratio
-            )
+        for cut_ratio in tqdm(cut_ratios, desc=f"Generating mask (seed={seed})", unit="cr"):
+            if method == "topk":
+                mask, selected_by_class = select_topk_mask(
+                    total_scores_np,
+                    labels,
+                    num_classes=len(class_names),
+                    cut_ratio=cut_ratio,
+                )
+                selection_strategy = "topk_per_class"
+            elif method == "group":
+                mask, selected_by_class = select_group_mask(
+                    total_scores_np,
+                    labels,
+                    num_classes=len(class_names),
+                    cut_ratio=cut_ratio,
+                    device=device,
+                )
+                selection_strategy = "group_selection"
             total_time = time.perf_counter() - total_start
             mask_path = resolve_mask_path(
                 mode=method_name,
@@ -366,7 +450,7 @@ def main() -> None:
                 "num_samples": int(mask.shape[0]),
                 "selected_count": int(mask.sum()),
                 "selected_by_class": selected_by_class,
-                "selection_strategy": "topk_per_class",
+                "selection_strategy": selection_strategy,
                 "seeds": save_seeds,
                 "timing": {
                     "dds_seconds": dds_time,

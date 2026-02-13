@@ -224,17 +224,11 @@ def select_group_mask(
     cut_ratio: int,
     device: torch.device,
     progress_desc: str | None = None,
-    outer_iters: int = 8,
-    inner_steps: int = 300,
-) -> tuple[np.ndarray, dict[int, int]]:
-    """
-    使用 YangCLIP 风格的 selection optimization 对连续选择变量 d 做 SGD 优化，
-    在给定 selection ratio (cut_ratio) 下优化整体被选子集的总分数。
-
-    返回:
-        mask: shape (N,), uint8 {0,1}
-        selected_by_class: dict[int, int]，记录每个类别被选中的样本数
-    """
+    outer_iters: int = 4,
+    inner_steps: int = 400,
+    candidate_topk: int = 1500,
+    remove_topk: int = 600,
+) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if cut_ratio <= 0 or cut_ratio > 100:
         raise ValueError("cr 必须在 1-100 之间。")
 
@@ -242,19 +236,61 @@ def select_group_mask(
     if labels.shape[0] != num_samples:
         raise ValueError("sa_scores 与 labels 的样本数不一致。")
 
-    sa_scores_t = torch.as_tensor(sa_scores, dtype=torch.float32, device=device)
-    labels_t = torch.as_tensor(labels, dtype=torch.long, device=device)
+    sa_scores_np = np.asarray(sa_scores, dtype=np.float32)
+    labels_np = np.asarray(labels, dtype=np.int64)
+    labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
     ratio_target = cut_ratio / 100.0
+    m = int(np.floor(ratio_target * num_samples))
+    m = min(max(m, 1), num_samples)
 
-    d = torch.nn.Parameter(torch.zeros(num_samples, device=device, dtype=torch.float32))
-    optimizer = torch.optim.SGD([d], lr=1e-3, momentum=0.9)
-
-    gamma = 1.0 / 3.0
-    theta = 5e-4
-    selected_mask = np.ones(num_samples, dtype=np.uint8)
+    class_counts_total = np.bincount(labels_np, minlength=num_classes)
+    p_c = class_counts_total.astype(np.float64) / float(num_samples)
+    lambda_cls = 0.1 * (m / float(num_classes))
 
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
     dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
+
+    static_div = np.asarray(
+        div_metric.score_dataset_dynamic(
+            div_loader,
+            adapter=image_adapter,
+            selected_mask=np.ones(num_samples, dtype=np.uint8),
+            image_features=div_features,
+            labels=labels_t,
+        ).scores,
+        dtype=np.float32,
+    )
+    static_dds = np.asarray(
+        dds_metric.score_dataset_dynamic(
+            dds_loader,
+            adapter=image_adapter,
+            selected_mask=np.ones(num_samples, dtype=np.uint8),
+            image_features=dds_features,
+            labels=labels_t,
+        ).scores,
+        dtype=np.float32,
+    )
+    warm_scores = (
+        weights["sa"] * sa_scores_np
+        + weights["div"] * static_div
+        + weights["dds"] * static_dds
+    )
+    warm_top = np.argpartition(-warm_scores, m - 1)[:m]
+    selected_mask = np.zeros(num_samples, dtype=np.uint8)
+    selected_mask[warm_top] = 1
+
+    m_c = np.bincount(labels_np[selected_mask.astype(bool)], minlength=num_classes).astype(np.int64)
+
+    def _omega(cur_counts: np.ndarray) -> float:
+        q = cur_counts.astype(np.float64) / float(m)
+        return float(np.sum((q - p_c) ** 2))
+
+    def _metrics(cur_mask: np.ndarray, s_ref: np.ndarray) -> tuple[float, float, float]:
+        selected = cur_mask.astype(bool)
+        s_val = float(np.sum(s_ref[selected]))
+        omega_val = _omega(np.bincount(labels_np[selected], minlength=num_classes))
+        j_val = s_val - lambda_cls * omega_val
+        return s_val, omega_val, j_val
 
     outer_iterator = tqdm(
         range(outer_iters),
@@ -262,83 +298,143 @@ def select_group_mask(
         unit="outer",
         leave=True,
     )
+    total_swaps = 0
+    accepted_any_outer = False
     for outer_idx in outer_iterator:
-        div_scores = div_metric.score_dataset_dynamic(
+        div_result = div_metric.score_dataset_dynamic(
             div_loader,
             adapter=image_adapter,
             selected_mask=selected_mask,
             image_features=div_features,
             labels=labels_t,
-        ).scores.to(device)
-        dds_scores = dds_metric.score_dataset_dynamic(
+        )
+        dds_result = dds_metric.score_dataset_dynamic(
             dds_loader,
             adapter=image_adapter,
             selected_mask=selected_mask,
             image_features=dds_features,
             labels=labels_t,
-        ).scores.to(device)
-        score_s = (
-            weights["sa"] * sa_scores_t
+        )
+        div_scores = np.asarray(div_result.scores, dtype=np.float32)
+        dds_scores = np.asarray(dds_result.scores, dtype=np.float32)
+        knn_dists = np.asarray(div_result.k_distances, dtype=np.float32)
+        s_ref = (
+            weights["sa"] * sa_scores_np
             + weights["div"] * div_scores
             + weights["dds"] * dds_scores
         )
-
+        outer_swaps = 0
         for inner_idx in range(inner_steps):
-            optimizer.zero_grad()
-            sigma = torch.sigmoid(d)
-            l_qual = -(sigma * score_s).mean()
-            hard = (sigma > 0.5).float()
-            hard_mean = hard.mean()
-            diff = hard_mean - ratio_target
-            l_s = diff.abs().sqrt()
-            loss = l_qual + gamma * l_s
-            loss.backward()
-            optimizer.step()
-
-            if l_s.item() < theta:
+            selected_idx = np.flatnonzero(selected_mask == 1)
+            unselected_idx = np.flatnonzero(selected_mask == 0)
+            if selected_idx.size == 0 or unselected_idx.size == 0:
                 break
 
-        sigma_np = torch.sigmoid(d.detach()).cpu().numpy()
-        selected_mask = (sigma_np > 0.5).astype(np.uint8)
+            k_a = min(candidate_topk, unselected_idx.size)
+            k_r = min(remove_topk, selected_idx.size)
+
+            top_ref = unselected_idx[np.argpartition(-s_ref[unselected_idx], k_a - 1)[:k_a]]
+            top_sa = unselected_idx[np.argpartition(-sa_scores_np[unselected_idx], k_a - 1)[:k_a]]
+            top_far = unselected_idx[np.argpartition(-knn_dists[unselected_idx], k_a - 1)[:k_a]]
+            A = np.unique(np.concatenate([top_ref, top_sa, top_far]))
+            A = A[np.argsort(-s_ref[A])]
+
+            low_ref = selected_idx[np.argpartition(s_ref[selected_idx], k_r - 1)[:k_r]]
+            low_sa = selected_idx[np.argpartition(sa_scores_np[selected_idx], k_r - 1)[:k_r]]
+            R = np.unique(np.concatenate([low_ref, low_sa]))
+
+            improved = False
+            for j in A:
+                cj = labels_np[j]
+                delta_s = s_ref[j] - s_ref[R]
+                ci_arr = labels_np[R]
+                delta_omega = np.zeros_like(delta_s, dtype=np.float64)
+                neq_mask = ci_arr != cj
+                if np.any(neq_mask):
+                    ci_sub = ci_arr[neq_mask]
+                    before_ci = (m_c[ci_sub] / m - p_c[ci_sub]) ** 2
+                    before_cj = (m_c[cj] / m - p_c[cj]) ** 2
+                    after_ci = ((m_c[ci_sub] - 1) / m - p_c[ci_sub]) ** 2
+                    after_cj = ((m_c[cj] + 1) / m - p_c[cj]) ** 2
+                    delta_omega[neq_mask] = (after_ci + after_cj) - (before_ci + before_cj)
+
+                delta_j = delta_s - lambda_cls * delta_omega
+                best_pos = int(np.argmax(delta_j))
+                if delta_j[best_pos] > 1e-12:
+                    i = int(R[best_pos])
+                    ci = labels_np[i]
+                    selected_mask[i] = 0
+                    selected_mask[j] = 1
+                    if ci != cj:
+                        m_c[ci] -= 1
+                        m_c[cj] += 1
+                    outer_swaps += 1
+                    total_swaps += 1
+                    improved = True
+                    break
+
+            if not improved:
+                break
+
+        accepted_any_outer = accepted_any_outer or (outer_swaps > 0)
+        s_val, omega_val, j_val = _metrics(selected_mask, s_ref)
         outer_iterator.set_postfix(
             outer=f"{outer_idx + 1}/{outer_iters}",
-            inner_steps=str(inner_idx + 1),
+            swaps=str(outer_swaps),
             ratio=f"{selected_mask.mean():.4f}",
             target=f"{ratio_target:.4f}",
-            loss=f"{loss.item():.4f}",
+            omega=f"{omega_val:.6f}",
+            J=f"{j_val:.2f}",
         )
+        if outer_swaps == 0:
+            break
 
-    sigma_np = torch.sigmoid(d.detach()).cpu().numpy()
-    global_mask = (sigma_np > 0.5).astype(np.uint8)
-    target_selected = int(round(ratio_target * num_samples))
-    target_selected = min(max(target_selected, 1), num_samples)
-    current_selected = int(global_mask.sum())
-    if current_selected != target_selected:
-        sorted_idx = np.argsort(-sigma_np)
-        hard_fixed = np.zeros(num_samples, dtype=np.uint8)
-        hard_fixed[sorted_idx[:target_selected]] = 1
-        global_mask = hard_fixed
+    global_mask = selected_mask.astype(np.uint8)
 
     selected_by_class: dict[int, int] = {}
     final_mask = np.zeros_like(global_mask, dtype=np.uint8)
-    final_score_np = score_s.detach().cpu().numpy()
     for class_id in range(num_classes):
         class_indices = np.flatnonzero(labels == class_id)
         if class_indices.size == 0:
             selected_by_class[class_id] = 0
             continue
 
-        class_mask = global_mask[class_indices]
-        num_selected = int(class_mask.sum())
-        if num_selected == 0:
-            best_idx = class_indices[np.argmax(final_score_np[class_indices])]
-            final_mask[best_idx] = 1
-            selected_by_class[class_id] = 1
-        else:
-            final_mask[class_indices[class_mask.astype(bool)]] = 1
-            selected_by_class[class_id] = num_selected
+        class_mask = global_mask[class_indices].astype(bool)
+        final_mask[class_indices[class_mask]] = 1
+        selected_by_class[class_id] = int(class_mask.sum())
 
-    return final_mask, selected_by_class
+    final_div = np.asarray(div_metric.score_dataset_dynamic(
+        div_loader,
+        adapter=image_adapter,
+        selected_mask=final_mask,
+        image_features=div_features,
+        labels=labels_t,
+    ).scores, dtype=np.float32)
+    final_dds = np.asarray(dds_metric.score_dataset_dynamic(
+        dds_loader,
+        adapter=image_adapter,
+        selected_mask=final_mask,
+        image_features=dds_features,
+        labels=labels_t,
+    ).scores, dtype=np.float32)
+    final_s_ref = weights["sa"] * sa_scores_np + weights["div"] * final_div + weights["dds"] * final_dds
+    final_counts = np.bincount(labels_np[final_mask.astype(bool)], minlength=num_classes)
+    final_omega = _omega(final_counts)
+    final_s = float(np.sum(final_s_ref[final_mask.astype(bool)]))
+    final_j = final_s - lambda_cls * final_omega
+
+    stats: dict[str, object] = {
+        "m": int(m),
+        "lambda_cls": float(lambda_cls),
+        "m_c": {int(c): int(v) for c, v in enumerate(final_counts.tolist())},
+        "Omega": float(final_omega),
+        "S": float(final_s),
+        "J": float(final_j),
+        "total_swaps": int(total_swaps),
+        "improved": bool(accepted_any_outer),
+    }
+
+    return final_mask, selected_by_class, stats
 
 
 def main() -> None:
@@ -472,6 +568,7 @@ def main() -> None:
             print(
                 f"[Mask {task_idx}/{total_tasks}] seed={seed} | cr={cut_ratio} | method={method}"
             )
+            group_stats: dict[str, object] | None = None
             if method == "topk":
                 mask, selected_by_class = select_topk_mask(
                     total_scores_np,
@@ -481,7 +578,7 @@ def main() -> None:
                 )
                 selection_strategy = "topk_per_class"
             elif method == "group":
-                mask, selected_by_class = select_group_mask(
+                mask, selected_by_class, group_stats = select_group_mask(
                     np.asarray(sa_scores),
                     dds_metric=dds_metric,
                     div_metric=div_metric,
@@ -525,6 +622,7 @@ def main() -> None:
                 "selected_by_class": selected_by_class,
                 "selection_strategy": selection_strategy,
                 "seeds": save_seeds,
+                "group_stats": group_stats,
                 "timing": {
                     "dds_seconds": dds_time,
                     "div_seconds": div_time,
@@ -536,6 +634,13 @@ def main() -> None:
                 json.dump(meta_info, f, ensure_ascii=False, indent=2)
 
             print(f"seed={seed} | cr={cut_ratio} | selected={int(mask.sum())}")
+            if group_stats is not None:
+                print(
+                    "group_stats: "
+                    f"m={group_stats['m']} | lambda_cls={group_stats['lambda_cls']:.6f} | "
+                    f"m_c={group_stats['m_c']} | Omega(D)={group_stats['Omega']:.6f} | "
+                    f"S(D)={group_stats['S']:.6f} | J(D)={group_stats['J']:.6f}"
+                )
             print(f"mask saved to: {mask_path}")
 
 

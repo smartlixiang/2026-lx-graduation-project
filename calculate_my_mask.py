@@ -224,8 +224,8 @@ def select_group_mask(
     cut_ratio: int,
     device: torch.device,
     progress_desc: str | None = None,
-    outer_iters: int = 4,
-    inner_steps: int = 400,
+    outer_iters: int = 200,
+    inner_steps: int = 10,
     candidate_topk: int = 1500,
     remove_topk: int = 600,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
@@ -300,6 +300,10 @@ def select_group_mask(
     )
     total_swaps = 0
     accepted_any_outer = False
+    prev_s_ref: np.ndarray | None = None
+    prev_s_val: float | None = None
+    prev_omega_val: float | None = None
+    prev_j_val: float | None = None
     for outer_idx in outer_iterator:
         div_result = div_metric.score_dataset_dynamic(
             div_loader,
@@ -324,6 +328,7 @@ def select_group_mask(
             + weights["dds"] * dds_scores
         )
         outer_swaps = 0
+        accepted_delta_js: list[float] = []
         for inner_idx in range(inner_steps):
             selected_idx = np.flatnonzero(selected_mask == 1)
             unselected_idx = np.flatnonzero(selected_mask == 0)
@@ -370,6 +375,7 @@ def select_group_mask(
                         m_c[cj] += 1
                     outer_swaps += 1
                     total_swaps += 1
+                    accepted_delta_js.append(float(delta_j[best_pos]))
                     improved = True
                     break
 
@@ -378,6 +384,20 @@ def select_group_mask(
 
         accepted_any_outer = accepted_any_outer or (outer_swaps > 0)
         s_val, omega_val, j_val = _metrics(selected_mask, s_ref)
+        delta_j_outer = 0.0 if prev_j_val is None else (j_val - prev_j_val)
+        delta_s_outer = 0.0 if prev_s_val is None else (s_val - prev_s_val)
+        delta_omega_outer = 0.0 if prev_omega_val is None else (omega_val - prev_omega_val)
+        median_delta_j = (
+            float(np.median(np.asarray(accepted_delta_js, dtype=np.float64)))
+            if accepted_delta_js
+            else 0.0
+        )
+        s_ref_mse = (
+            float(np.mean(np.square((s_ref - prev_s_ref).astype(np.float64))))
+            if prev_s_ref is not None
+            else 0.0
+        )
+        improvement_rate = float(outer_swaps / max(inner_steps, 1))
         outer_iterator.set_postfix(
             outer=f"{outer_idx + 1}/{outer_iters}",
             swaps=str(outer_swaps),
@@ -386,6 +406,19 @@ def select_group_mask(
             omega=f"{omega_val:.6f}",
             J=f"{j_val:.2f}",
         )
+        outer_iterator.write(
+            (
+                f"[outer {outer_idx + 1}/{outer_iters}] "
+                f"ΔJ={delta_j_outer:+.6f} | ΔS={delta_s_outer:+.6f} | "
+                f"ΔΩ={delta_omega_outer:+.6f} | outer_swaps/inner_steps={outer_swaps}/{inner_steps} "
+                f"(rate={improvement_rate:.4f}) | median ΔJ={median_delta_j:+.6f} | "
+                f"MSE(s_ref, prev)={s_ref_mse:.6e}"
+            )
+        )
+        prev_s_ref = s_ref.copy()
+        prev_s_val = s_val
+        prev_omega_val = omega_val
+        prev_j_val = j_val
         if outer_swaps == 0:
             break
 
@@ -446,11 +479,16 @@ def main() -> None:
     all_weights = ensure_scoring_weights(weights_path, CIFAR10)
     weights = load_scoring_weights(all_weights, args.weight_group)
 
+    data_load_start = time.perf_counter()
     dataset_for_names = datasets.CIFAR10(
         root=args.data_root, train=True, download=True, transform=None
     )
     class_names = dataset_for_names.classes  # type: ignore[attr-defined]
+    print(
+        f"[Init] CIFAR-10 data ready | samples={len(dataset_for_names)} | elapsed={time.perf_counter() - data_load_start:.2f}s"
+    )
 
+    metric_init_start = time.perf_counter()
     dds_metric = DifficultyDirection(
         class_names=class_names, clip_model=args.clip_model, device=device
     )
@@ -462,10 +500,14 @@ def main() -> None:
     sa_metric = SemanticAlignment(
         class_names=class_names, clip_model=args.clip_model, device=device
     )
+    print(
+        f"[Init] Metrics ready (DDS/Div/SA) | elapsed={time.perf_counter() - metric_init_start:.2f}s"
+    )
 
     batch_size = 128
     num_workers = 4
 
+    loader_build_start = time.perf_counter()
     dds_loader = build_score_loader(
         dds_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers
     )
@@ -474,6 +516,9 @@ def main() -> None:
     )
     sa_loader = build_score_loader(
         sa_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers
+    )
+    print(
+        f"[Init] DataLoaders ready (DDS/Div/SA) | elapsed={time.perf_counter() - loader_build_start:.2f}s"
     )
 
     method = args.method.strip().lower()
@@ -529,6 +574,7 @@ def main() -> None:
                 "labels": np.asarray(dataset_for_names.targets),
             }
 
+        static_compute_start = time.perf_counter()
         static_scores = get_or_compute_static_scores(
             cache_root=PROJECT_ROOT / "static_scores",
             dataset=CIFAR10,
@@ -543,6 +589,9 @@ def main() -> None:
             prompt_template=sa_metric.prompt_template,
             num_samples=num_samples,
             compute_fn=_compute_scores,
+        )
+        print(
+            f"[Seed {seed}] Static scores ready (cache/compute) | elapsed={time.perf_counter() - static_compute_start:.2f}s"
         )
 
         dds_scores = torch.from_numpy(static_scores["dds"])

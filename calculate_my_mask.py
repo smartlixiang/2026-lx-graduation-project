@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -265,10 +267,13 @@ def select_group_mask(
     cut_ratio: int,
     device: torch.device,
     progress_desc: str | None = None,
-    outer_iters: int = 200,
-    inner_steps: int = 5,
+    outer_iters: int = 150,
+    inner_steps: int = 10,
     candidate_topk: int = 1500,
     remove_topk: int = 600,
+    tabu_L: int = 5,
+    replace_rate: float = 0.3,
+    use_soft_accept: bool = True,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if cut_ratio <= 0 or cut_ratio > 100:
         raise ValueError("cr 必须在 1-100 之间。")
@@ -321,6 +326,8 @@ def select_group_mask(
     selected_mask[warm_top] = 1
 
     m_c = np.bincount(labels_np[selected_mask.astype(bool)], minlength=num_classes).astype(np.int64)
+    recently_removed: deque[int] = deque(maxlen=max(0, int(tabu_L)))
+    recently_added: deque[int] = deque(maxlen=max(0, int(tabu_L)))
 
     def _omega(cur_counts: np.ndarray) -> float:
         q = cur_counts.astype(np.float64) / float(m)
@@ -342,7 +349,37 @@ def select_group_mask(
     total_swaps = 0
     accepted_any_outer = False
     outer_j_history: list[float] = []
+    no_improve_steps = 0
+
+    def _apply_random_replacement(
+        candidates: np.ndarray,
+        full_pool: np.ndarray,
+        blocked: np.ndarray,
+    ) -> np.ndarray:
+        if replace_rate <= 0 or candidates.size == 0:
+            return candidates
+        replace_cnt = int(replace_rate * candidates.size)
+        if replace_cnt <= 0:
+            return candidates
+        pool = full_pool[~np.isin(full_pool, candidates)]
+        if blocked.size > 0:
+            pool = pool[~np.isin(pool, blocked)]
+        if pool.size == 0:
+            return candidates
+        replace_cnt = min(replace_cnt, pool.size, candidates.size)
+        if replace_cnt <= 0:
+            return candidates
+
+        replace_positions = np.random.choice(candidates.size, size=replace_cnt, replace=False)
+        replace_values = np.random.choice(pool, size=replace_cnt, replace=False)
+        mixed = candidates.copy()
+        mixed[replace_positions] = replace_values
+        return mixed
+
     for outer_idx in outer_iterator:
+        prev_mask = selected_mask.copy()
+        prev_counts = m_c.copy()
+
         div_result = div_metric.score_dataset_dynamic(
             div_loader,
             adapter=image_adapter,
@@ -365,7 +402,9 @@ def select_group_mask(
             + weights["div"] * div_scores
             + weights["dds"] * dds_scores
         )
+        prev_j = float(np.sum(s_ref[prev_mask.astype(bool)])) - lambda_cls * _omega(prev_counts)
         outer_swaps = 0
+        outer_j_sum = 0.0
         for inner_idx in range(inner_steps):
             selected_idx = np.flatnonzero(selected_mask == 1)
             unselected_idx = np.flatnonzero(selected_mask == 0)
@@ -385,42 +424,135 @@ def select_group_mask(
             low_sa = selected_idx[np.argpartition(sa_scores_np[selected_idx], k_r - 1)[:k_r]]
             R = np.unique(np.concatenate([low_ref, low_sa]))
 
-            improved = False
-            for j in A:
-                cj = labels_np[j]
-                delta_s = s_ref[j] - s_ref[R]
-                ci_arr = labels_np[R]
-                delta_omega = np.zeros_like(delta_s, dtype=np.float64)
-                neq_mask = ci_arr != cj
-                if np.any(neq_mask):
-                    ci_sub = ci_arr[neq_mask]
-                    before_ci = (m_c[ci_sub] / m - p_c[ci_sub]) ** 2
-                    before_cj = (m_c[cj] / m - p_c[cj]) ** 2
-                    after_ci = ((m_c[ci_sub] - 1) / m - p_c[ci_sub]) ** 2
-                    after_cj = ((m_c[cj] + 1) / m - p_c[cj]) ** 2
-                    delta_omega[neq_mask] = (after_ci + after_cj) - (before_ci + before_cj)
+            raw_A = A.copy()
+            raw_R = R.copy()
+            removed_arr = np.fromiter(recently_removed, dtype=np.int64)
+            added_arr = np.fromiter(recently_added, dtype=np.int64)
+            if removed_arr.size > 0:
+                A = A[~np.isin(A, removed_arr)]
+            if added_arr.size > 0:
+                R = R[~np.isin(R, added_arr)]
+            if A.size == 0:
+                A = raw_A
+            if R.size == 0:
+                R = raw_R
 
-                delta_j = delta_s - lambda_cls * delta_omega
-                best_pos = int(np.argmax(delta_j))
-                if delta_j[best_pos] > 1e-12:
-                    i = int(R[best_pos])
-                    ci = labels_np[i]
-                    selected_mask[i] = 0
-                    selected_mask[j] = 1
-                    if ci != cj:
-                        m_c[ci] -= 1
-                        m_c[cj] += 1
-                    outer_swaps += 1
-                    total_swaps += 1
-                    improved = True
+            retried_with_replace = False
+            blocked_for_A = removed_arr
+
+            while True:
+                scan_A = A
+                if retried_with_replace:
+                    scan_A = _apply_random_replacement(A, unselected_idx, blocked_for_A)
+                    scan_A = scan_A[np.argsort(-s_ref[scan_A])]
+
+                improved = False
+                for j in scan_A:
+                    cj = labels_np[j]
+                    delta_s = s_ref[j] - s_ref[R]
+                    ci_arr = labels_np[R]
+                    delta_omega = np.zeros_like(delta_s, dtype=np.float64)
+                    neq_mask = ci_arr != cj
+                    if np.any(neq_mask):
+                        ci_sub = ci_arr[neq_mask]
+                        before_ci = (m_c[ci_sub] / m - p_c[ci_sub]) ** 2
+                        before_cj = (m_c[cj] / m - p_c[cj]) ** 2
+                        after_ci = ((m_c[ci_sub] - 1) / m - p_c[ci_sub]) ** 2
+                        after_cj = ((m_c[cj] + 1) / m - p_c[cj]) ** 2
+                        delta_omega[neq_mask] = (after_ci + after_cj) - (before_ci + before_cj)
+
+                    delta_j = delta_s - lambda_cls * delta_omega
+                    best_pos = int(np.argmax(delta_j))
+                    if delta_j[best_pos] > 1e-12:
+                        i = int(R[best_pos])
+                        ci = labels_np[i]
+                        selected_mask[i] = 0
+                        selected_mask[j] = 1
+                        if ci != cj:
+                            m_c[ci] -= 1
+                            m_c[cj] += 1
+                        outer_swaps += 1
+                        total_swaps += 1
+                        outer_j_sum += float(delta_j[best_pos])
+                        recently_removed.append(i)
+                        recently_added.append(int(j))
+                        improved = True
+                        break
+
+                if improved:
+                    no_improve_steps = 0
                     break
+                if (not retried_with_replace) and replace_rate > 0.0:
+                    retried_with_replace = True
+                    continue
+                no_improve_steps += 1
+                break
 
             if not improved:
                 break
 
-        accepted_any_outer = accepted_any_outer or (outer_swaps > 0)
-        s_val, omega_val, j_val = _metrics(selected_mask, s_ref)
+        new_div_result = div_metric.score_dataset_dynamic(
+            div_loader,
+            adapter=image_adapter,
+            selected_mask=selected_mask,
+            image_features=div_features,
+            labels=labels_t,
+        )
+        new_dds_result = dds_metric.score_dataset_dynamic(
+            dds_loader,
+            adapter=image_adapter,
+            selected_mask=selected_mask,
+            image_features=dds_features,
+            labels=labels_t,
+        )
+        new_div_scores = np.asarray(new_div_result.scores, dtype=np.float32)
+        new_dds_scores = np.asarray(new_dds_result.scores, dtype=np.float32)
+        new_s_ref = (
+            weights["sa"] * sa_scores_np
+            + weights["div"] * new_div_scores
+            + weights["dds"] * new_dds_scores
+        )
+        s_val, omega_val, j_val = _metrics(selected_mask, new_s_ref)
+        delta_j_outer = float(j_val - prev_j)
+        accepted_outer = True
+        accept_prob: float | None = None
+        if delta_j_outer < 0.0 and use_soft_accept:
+            t = outer_idx + 1
+            x = outer_j_sum / float(t * t) + delta_j_outer
+            if x >= 50.0:
+                accept_prob = 1.0
+            elif x <= -50.0:
+                accept_prob = 0.0
+            else:
+                accept_prob = float(np.exp(x))
+            accept_prob = min(1.0, max(0.0, accept_prob))
+            accepted_outer = random.random() < accept_prob
+            if not accepted_outer:
+                selected_mask = prev_mask
+                m_c = prev_counts
+                s_val = float(np.sum(new_s_ref[prev_mask.astype(bool)]))
+                omega_val = _omega(prev_counts)
+                j_val = prev_j
+                recently_removed.clear()
+                recently_added.clear()
+
+        accepted_any_outer = accepted_any_outer or (outer_swaps > 0 and accepted_outer)
         outer_j_history.append(float(j_val))
+        tqdm.write(
+            "[Group] outer={}/{} deltaJ={:.6f} J_sum={:.6f} accept_prob={} accepted={} "
+            "tabu_sizes=({},{}) replace_rate={:.2f} no_improve_steps={}".format(
+                outer_idx + 1,
+                outer_iters,
+                delta_j_outer,
+                outer_j_sum,
+                "-" if accept_prob is None else f"{accept_prob:.6f}",
+                accepted_outer,
+                len(recently_removed),
+                len(recently_added),
+                replace_rate,
+                no_improve_steps,
+            )
+        )
         outer_iterator.set_postfix(
             outer=f"{outer_idx + 1}/{outer_iters}",
             swaps=str(outer_swaps),
@@ -428,6 +560,8 @@ def select_group_mask(
             target=f"{ratio_target:.4f}",
             omega=f"{omega_val:.6f}",
             J=f"{j_val:.2f}",
+            tabu_L=str(tabu_L),
+            rr=f"{replace_rate:.2f}",
         )
         if outer_swaps == 0:
             break
@@ -476,6 +610,9 @@ def select_group_mask(
         "total_swaps": int(total_swaps),
         "improved": bool(accepted_any_outer),
         "outer_j_history": outer_j_history,
+        "tabu_L": int(tabu_L),
+        "replace_rate": float(replace_rate),
+        "use_soft_accept": bool(use_soft_accept),
     }
 
     return final_mask, selected_by_class, stats

@@ -211,6 +211,47 @@ def select_topk_mask(
     return mask, selected_by_class
 
 
+def save_j_curve(
+    j_history: list[float],
+    dataset: str,
+    cut_ratio: int,
+    seed: int,
+    weight_group: str,
+    method: str,
+    model_name: str,
+    clip_model: str,
+) -> Path | None:
+    if not j_history:
+        return None
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[Warn] 无法绘制 J 曲线（matplotlib 不可用）: {exc}")
+        return None
+
+    debug_dir = PROJECT_ROOT / "mask_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    clip_tag = clip_model.replace("/", "-")
+    file_name = (
+        f"dataset_{dataset}_method_{method}_weight_{weight_group}_"
+        f"model_{model_name}_seed_{seed}_cr_{cut_ratio}_clip_{clip_tag}_J_curve.png"
+    )
+    save_path = debug_dir / file_name
+
+    xs = np.arange(1, len(j_history) + 1)
+    ys = np.asarray(j_history, dtype=np.float64)
+    plt.figure(figsize=(8, 4.5))
+    plt.plot(xs, ys, marker="o", linewidth=1.8)
+    plt.title(f"J vs Outer Iteration ({dataset}, cr={cut_ratio}, seed={seed})")
+    plt.xlabel("Outer iteration")
+    plt.ylabel("J(D)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=180)
+    plt.close()
+    return save_path
+
+
 def select_group_mask(
     sa_scores: np.ndarray,
     dds_metric: DifficultyDirection,
@@ -225,7 +266,7 @@ def select_group_mask(
     device: torch.device,
     progress_desc: str | None = None,
     outer_iters: int = 200,
-    inner_steps: int = 10,
+    inner_steps: int = 5,
     candidate_topk: int = 1500,
     remove_topk: int = 600,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
@@ -300,10 +341,7 @@ def select_group_mask(
     )
     total_swaps = 0
     accepted_any_outer = False
-    prev_s_ref: np.ndarray | None = None
-    prev_s_val: float | None = None
-    prev_omega_val: float | None = None
-    prev_j_val: float | None = None
+    outer_j_history: list[float] = []
     for outer_idx in outer_iterator:
         div_result = div_metric.score_dataset_dynamic(
             div_loader,
@@ -328,7 +366,6 @@ def select_group_mask(
             + weights["dds"] * dds_scores
         )
         outer_swaps = 0
-        accepted_delta_js: list[float] = []
         for inner_idx in range(inner_steps):
             selected_idx = np.flatnonzero(selected_mask == 1)
             unselected_idx = np.flatnonzero(selected_mask == 0)
@@ -375,7 +412,6 @@ def select_group_mask(
                         m_c[cj] += 1
                     outer_swaps += 1
                     total_swaps += 1
-                    accepted_delta_js.append(float(delta_j[best_pos]))
                     improved = True
                     break
 
@@ -384,20 +420,7 @@ def select_group_mask(
 
         accepted_any_outer = accepted_any_outer or (outer_swaps > 0)
         s_val, omega_val, j_val = _metrics(selected_mask, s_ref)
-        delta_j_outer = 0.0 if prev_j_val is None else (j_val - prev_j_val)
-        delta_s_outer = 0.0 if prev_s_val is None else (s_val - prev_s_val)
-        delta_omega_outer = 0.0 if prev_omega_val is None else (omega_val - prev_omega_val)
-        median_delta_j = (
-            float(np.median(np.asarray(accepted_delta_js, dtype=np.float64)))
-            if accepted_delta_js
-            else 0.0
-        )
-        s_ref_mse = (
-            float(np.mean(np.square((s_ref - prev_s_ref).astype(np.float64))))
-            if prev_s_ref is not None
-            else 0.0
-        )
-        improvement_rate = float(outer_swaps / max(inner_steps, 1))
+        outer_j_history.append(float(j_val))
         outer_iterator.set_postfix(
             outer=f"{outer_idx + 1}/{outer_iters}",
             swaps=str(outer_swaps),
@@ -406,19 +429,6 @@ def select_group_mask(
             omega=f"{omega_val:.6f}",
             J=f"{j_val:.2f}",
         )
-        outer_iterator.write(
-            (
-                f"[outer {outer_idx + 1}/{outer_iters}] "
-                f"ΔJ={delta_j_outer:+.6f} | ΔS={delta_s_outer:+.6f} | "
-                f"ΔΩ={delta_omega_outer:+.6f} | outer_swaps/inner_steps={outer_swaps}/{inner_steps} "
-                f"(rate={improvement_rate:.4f}) | median ΔJ={median_delta_j:+.6f} | "
-                f"MSE(s_ref, prev)={s_ref_mse:.6e}"
-            )
-        )
-        prev_s_ref = s_ref.copy()
-        prev_s_val = s_val
-        prev_omega_val = omega_val
-        prev_j_val = j_val
         if outer_swaps == 0:
             break
 
@@ -465,6 +475,7 @@ def select_group_mask(
         "J": float(final_j),
         "total_swaps": int(total_swaps),
         "improved": bool(accepted_any_outer),
+        "outer_j_history": outer_j_history,
     }
 
     return final_mask, selected_by_class, stats
@@ -690,6 +701,18 @@ def main() -> None:
                     f"m_c={group_stats['m_c']} | Omega(D)={group_stats['Omega']:.6f} | "
                     f"S(D)={group_stats['S']:.6f} | J(D)={group_stats['J']:.6f}"
                 )
+                j_curve_path = save_j_curve(
+                    j_history=list(group_stats.get("outer_j_history", [])),
+                    dataset="cifar10",
+                    cut_ratio=cut_ratio,
+                    seed=seed,
+                    weight_group=args.weight_group,
+                    method=method,
+                    model_name=args.model_name,
+                    clip_model=args.clip_model,
+                )
+                if j_curve_path is not None:
+                    print(f"J-curve saved to: {j_curve_path}")
             print(f"mask saved to: {mask_path}")
 
 

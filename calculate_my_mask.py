@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import deque
 import json
-import random
 import sys
 import time
 from pathlib import Path
@@ -80,6 +78,17 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
+    parser.add_argument("--max-outer-iters", type=int, default=150)
+    parser.add_argument("--rho", type=float, default=0.05)
+    parser.add_argument("--topm", type=int, default=5000)
+    parser.add_argument("--use-prob-select", action="store_true", default=True)
+    parser.add_argument("--no-use-prob-select", dest="use_prob_select", action="store_false")
+    parser.add_argument("--alpha0", type=float, default=1.0)
+    parser.add_argument("--alpha-max", type=float, default=8.0)
+    parser.add_argument("--alpha-mul", type=float, default=1.10)
+    parser.add_argument("--lambda-cls", type=float, default=None)
+    parser.add_argument("--gamma-cls", type=float, default=0.2)
+    parser.add_argument("--candidate-pool-topm", type=int, default=5000, help="兼容旧参数，优先使用 --topm")
     return parser.parse_args()
 
 
@@ -267,13 +276,15 @@ def select_group_mask(
     cut_ratio: int,
     device: torch.device,
     progress_desc: str | None = None,
-    outer_iters: int = 150,
-    inner_steps: int = 10,
-    candidate_topk: int = 1500,
-    remove_topk: int = 600,
-    tabu_L: int = 5,
-    replace_rate: float = 0.3,
-    use_soft_accept: bool = True,
+    max_outer_iters: int = 80,
+    rho: float = 0.10,
+    topM: int = 5000,
+    use_prob_select: bool = True,
+    alpha0: float = 1.0,
+    alpha_max: float = 8.0,
+    alpha_mul: float = 1.10,
+    lambda_cls: float | None = None,
+    gamma_cls: float = 0.2,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if cut_ratio <= 0 or cut_ratio > 100:
         raise ValueError("cr 必须在 1-100 之间。")
@@ -285,334 +296,229 @@ def select_group_mask(
     sa_scores_np = np.asarray(sa_scores, dtype=np.float32)
     labels_np = np.asarray(labels, dtype=np.int64)
     labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
-    ratio_target = cut_ratio / 100.0
-    m = int(np.floor(ratio_target * num_samples))
+    m = int(np.round((cut_ratio / 100.0) * num_samples))
     m = min(max(m, 1), num_samples)
 
     class_counts_total = np.bincount(labels_np, minlength=num_classes)
-    p_c = class_counts_total.astype(np.float64) / float(num_samples)
-    lambda_cls = 0.1 * (m / float(num_classes))
+    if class_counts_total.sum() == num_samples and num_samples > 0:
+        p_c = class_counts_total.astype(np.float64) / float(num_samples)
+    else:
+        p_c = np.full(num_classes, 1.0 / float(num_classes), dtype=np.float64)
+    lambda_cls_val = float(lambda_cls) if lambda_cls is not None else float(gamma_cls * (m / float(num_classes)))
 
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
     dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
-
-    static_div = np.asarray(
-        div_metric.score_dataset_dynamic(
-            div_loader,
-            adapter=image_adapter,
-            selected_mask=np.ones(num_samples, dtype=np.uint8),
-            image_features=div_features,
-            labels=labels_t,
-        ).scores,
-        dtype=np.float32,
-    )
-    static_dds = np.asarray(
-        dds_metric.score_dataset_dynamic(
-            dds_loader,
-            adapter=image_adapter,
-            selected_mask=np.ones(num_samples, dtype=np.uint8),
-            image_features=dds_features,
-            labels=labels_t,
-        ).scores,
-        dtype=np.float32,
-    )
-    warm_scores = (
-        weights["sa"] * sa_scores_np
-        + weights["div"] * static_div
-        + weights["dds"] * static_dds
-    )
-    warm_top = np.argpartition(-warm_scores, m - 1)[:m]
-    selected_mask = np.zeros(num_samples, dtype=np.uint8)
-    selected_mask[warm_top] = 1
-
-    m_c = np.bincount(labels_np[selected_mask.astype(bool)], minlength=num_classes).astype(np.int64)
-    recently_removed: deque[int] = deque(maxlen=max(0, int(tabu_L)))
-    recently_added: deque[int] = deque(maxlen=max(0, int(tabu_L)))
+    all_indices = np.arange(num_samples)
 
     def _omega(cur_counts: np.ndarray) -> float:
         q = cur_counts.astype(np.float64) / float(m)
         return float(np.sum((q - p_c) ** 2))
 
-    def _metrics(cur_mask: np.ndarray, s_ref: np.ndarray) -> tuple[float, float, float]:
-        selected = cur_mask.astype(bool)
-        s_val = float(np.sum(s_ref[selected]))
-        omega_val = _omega(np.bincount(labels_np[selected], minlength=num_classes))
-        j_val = s_val - lambda_cls * omega_val
-        return s_val, omega_val, j_val
+    def _real_j(cur_mask: np.ndarray) -> tuple[float, float, np.ndarray]:
+        div_scores = np.asarray(
+            div_metric.score_dataset_dynamic(
+                div_loader,
+                adapter=image_adapter,
+                selected_mask=cur_mask,
+                image_features=div_features,
+                labels=labels_t,
+            ).scores,
+            dtype=np.float32,
+        )
+        dds_scores = np.asarray(
+            dds_metric.score_dataset_dynamic(
+                dds_loader,
+                adapter=image_adapter,
+                selected_mask=cur_mask,
+                image_features=dds_features,
+                labels=labels_t,
+            ).scores,
+            dtype=np.float32,
+        )
+        s_ref = weights["sa"] * sa_scores_np + weights["div"] * div_scores + weights["dds"] * dds_scores
+        counts = np.bincount(labels_np[cur_mask.astype(bool)], minlength=num_classes).astype(np.int64)
+        omega_val = _omega(counts)
+        j_val = float(np.sum(s_ref[cur_mask.astype(bool)])) - lambda_cls_val * omega_val
+        return j_val, omega_val, counts
+
+    def _delta_remove_by_class(cur_counts: np.ndarray) -> np.ndarray:
+        before = (cur_counts.astype(np.float64) / float(m) - p_c) ** 2
+        after_counts = np.maximum(cur_counts - 1, 0)
+        after = (after_counts.astype(np.float64) / float(m) - p_c) ** 2
+        return after - before
+
+    def _delta_add_by_class(cur_counts: np.ndarray) -> np.ndarray:
+        before = (cur_counts.astype(np.float64) / float(m) - p_c) ** 2
+        after = ((cur_counts + 1).astype(np.float64) / float(m) - p_c) ** 2
+        return after - before
+
+    selected_mask = np.zeros(num_samples, dtype=np.uint8)
+    init_idx = np.random.choice(num_samples, size=m, replace=False)
+    selected_mask[init_idx] = 1
+
+    j_cur, omega_cur, m_c = _real_j(selected_mask)
+    best_mask = selected_mask.copy()
+    best_j = float(j_cur)
+    best_omega = float(omega_cur)
+    outer_j_history = [float(j_cur)]
 
     outer_iterator = tqdm(
-        range(outer_iters),
-        desc=progress_desc or "Set-level group optimization",
+        range(max_outer_iters),
+        desc=progress_desc or "IRGR optimization",
         unit="outer",
         leave=True,
     )
-    total_swaps = 0
-    accepted_any_outer = False
-    outer_j_history: list[float] = []
-    no_improve_steps = 0
 
-    def _apply_random_replacement(
-        candidates: np.ndarray,
-        full_pool: np.ndarray,
-        blocked: np.ndarray,
-    ) -> np.ndarray:
-        if replace_rate <= 0 or candidates.size == 0:
-            return candidates
-        replace_cnt = int(replace_rate * candidates.size)
-        if replace_cnt <= 0:
-            return candidates
-        pool = full_pool[~np.isin(full_pool, candidates)]
-        if blocked.size > 0:
-            pool = pool[~np.isin(pool, blocked)]
-        if pool.size == 0:
-            return candidates
-        replace_cnt = min(replace_cnt, pool.size, candidates.size)
-        if replace_cnt <= 0:
-            return candidates
+    for t in outer_iterator:
+        alpha_t = min(alpha_max, alpha0 * (alpha_mul ** t))
 
-        replace_positions = np.random.choice(candidates.size, size=replace_cnt, replace=False)
-        replace_values = np.random.choice(pool, size=replace_cnt, replace=False)
-        mixed = candidates.copy()
-        mixed[replace_positions] = replace_values
-        return mixed
-
-    for outer_idx in outer_iterator:
-        prev_mask = selected_mask.copy()
-        prev_counts = m_c.copy()
-
-        div_result = div_metric.score_dataset_dynamic(
-            div_loader,
-            adapter=image_adapter,
-            selected_mask=selected_mask,
-            image_features=div_features,
-            labels=labels_t,
+        div_scores = np.asarray(
+            div_metric.score_dataset_dynamic(
+                div_loader,
+                adapter=image_adapter,
+                selected_mask=selected_mask,
+                image_features=div_features,
+                labels=labels_t,
+            ).scores,
+            dtype=np.float32,
         )
-        dds_result = dds_metric.score_dataset_dynamic(
-            dds_loader,
-            adapter=image_adapter,
-            selected_mask=selected_mask,
-            image_features=dds_features,
-            labels=labels_t,
+        dds_scores = np.asarray(
+            dds_metric.score_dataset_dynamic(
+                dds_loader,
+                adapter=image_adapter,
+                selected_mask=selected_mask,
+                image_features=dds_features,
+                labels=labels_t,
+            ).scores,
+            dtype=np.float32,
         )
-        div_scores = np.asarray(div_result.scores, dtype=np.float32)
-        dds_scores = np.asarray(dds_result.scores, dtype=np.float32)
-        knn_dists = np.asarray(div_result.k_distances, dtype=np.float32)
-        s_ref = (
-            weights["sa"] * sa_scores_np
-            + weights["div"] * div_scores
-            + weights["dds"] * dds_scores
-        )
-        prev_j = float(np.sum(s_ref[prev_mask.astype(bool)])) - lambda_cls * _omega(prev_counts)
-        outer_swaps = 0
-        outer_j_sum = 0.0
-        for inner_idx in range(inner_steps):
-            selected_idx = np.flatnonzero(selected_mask == 1)
-            unselected_idx = np.flatnonzero(selected_mask == 0)
-            if selected_idx.size == 0 or unselected_idx.size == 0:
-                break
+        s_all = weights["sa"] * sa_scores_np + weights["div"] * div_scores + weights["dds"] * dds_scores
 
-            k_a = min(candidate_topk, unselected_idx.size)
-            k_r = min(remove_topk, selected_idx.size)
+        k = int(rho * m)
+        if rho > 0 and k == 0:
+            k = 1
+        k = min(max(0, k), m)
 
-            top_ref = unselected_idx[np.argpartition(-s_ref[unselected_idx], k_a - 1)[:k_a]]
-            top_sa = unselected_idx[np.argpartition(-sa_scores_np[unselected_idx], k_a - 1)[:k_a]]
-            top_far = unselected_idx[np.argpartition(-knn_dists[unselected_idx], k_a - 1)[:k_a]]
-            A = np.unique(np.concatenate([top_ref, top_sa, top_far]))
-            A = A[np.argsort(-s_ref[A])]
+        if k > 0:
+            selected_idx = all_indices[selected_mask == 1]
+            delta_remove = _delta_remove_by_class(m_c)
+            remove_gain = -s_all[selected_idx] - lambda_cls_val * delta_remove[labels_np[selected_idx]]
+            rem_pos = np.argpartition(-remove_gain, k - 1)[:k]
+            remove_idx = selected_idx[rem_pos]
 
-            low_ref = selected_idx[np.argpartition(s_ref[selected_idx], k_r - 1)[:k_r]]
-            low_sa = selected_idx[np.argpartition(sa_scores_np[selected_idx], k_r - 1)[:k_r]]
-            R = np.unique(np.concatenate([low_ref, low_sa]))
+            tmp_mask = selected_mask.copy()
+            tmp_mask[remove_idx] = 0
+            m_c_tmp = m_c.copy()
+            rem_counts = np.bincount(labels_np[remove_idx], minlength=num_classes)
+            m_c_tmp = m_c_tmp - rem_counts
 
-            raw_A = A.copy()
-            raw_R = R.copy()
-            removed_arr = np.fromiter(recently_removed, dtype=np.int64)
-            added_arr = np.fromiter(recently_added, dtype=np.int64)
-            if removed_arr.size > 0:
-                A = A[~np.isin(A, removed_arr)]
-            if added_arr.size > 0:
-                R = R[~np.isin(R, added_arr)]
-            if A.size == 0:
-                A = raw_A
-            if R.size == 0:
-                R = raw_R
+            candidate_idx = all_indices[tmp_mask == 0]
+            delta_add = _delta_add_by_class(m_c_tmp)
+            add_gain = s_all[candidate_idx] - lambda_cls_val * delta_add[labels_np[candidate_idx]]
 
-            retried_with_replace = False
-            blocked_for_A = removed_arr
-
-            while True:
-                scan_A = A
-                if retried_with_replace:
-                    scan_A = _apply_random_replacement(A, unselected_idx, blocked_for_A)
-                    scan_A = scan_A[np.argsort(-s_ref[scan_A])]
-
-                improved = False
-                for j in scan_A:
-                    cj = labels_np[j]
-                    delta_s = s_ref[j] - s_ref[R]
-                    ci_arr = labels_np[R]
-                    delta_omega = np.zeros_like(delta_s, dtype=np.float64)
-                    neq_mask = ci_arr != cj
-                    if np.any(neq_mask):
-                        ci_sub = ci_arr[neq_mask]
-                        before_ci = (m_c[ci_sub] / m - p_c[ci_sub]) ** 2
-                        before_cj = (m_c[cj] / m - p_c[cj]) ** 2
-                        after_ci = ((m_c[ci_sub] - 1) / m - p_c[ci_sub]) ** 2
-                        after_cj = ((m_c[cj] + 1) / m - p_c[cj]) ** 2
-                        delta_omega[neq_mask] = (after_ci + after_cj) - (before_ci + before_cj)
-
-                    delta_j = delta_s - lambda_cls * delta_omega
-                    best_pos = int(np.argmax(delta_j))
-                    if delta_j[best_pos] > 1e-12:
-                        i = int(R[best_pos])
-                        ci = labels_np[i]
-                        selected_mask[i] = 0
-                        selected_mask[j] = 1
-                        if ci != cj:
-                            m_c[ci] -= 1
-                            m_c[cj] += 1
-                        outer_swaps += 1
-                        total_swaps += 1
-                        outer_j_sum += float(delta_j[best_pos])
-                        recently_removed.append(i)
-                        recently_added.append(int(j))
-                        improved = True
-                        break
-
-                if improved:
-                    no_improve_steps = 0
-                    break
-                if (not retried_with_replace) and replace_rate > 0.0:
-                    retried_with_replace = True
-                    continue
-                no_improve_steps += 1
-                break
-
-            if not improved:
-                break
-
-        new_div_result = div_metric.score_dataset_dynamic(
-            div_loader,
-            adapter=image_adapter,
-            selected_mask=selected_mask,
-            image_features=div_features,
-            labels=labels_t,
-        )
-        new_dds_result = dds_metric.score_dataset_dynamic(
-            dds_loader,
-            adapter=image_adapter,
-            selected_mask=selected_mask,
-            image_features=dds_features,
-            labels=labels_t,
-        )
-        new_div_scores = np.asarray(new_div_result.scores, dtype=np.float32)
-        new_dds_scores = np.asarray(new_dds_result.scores, dtype=np.float32)
-        new_s_ref = (
-            weights["sa"] * sa_scores_np
-            + weights["div"] * new_div_scores
-            + weights["dds"] * new_dds_scores
-        )
-        s_val, omega_val, j_val = _metrics(selected_mask, new_s_ref)
-        delta_j_outer = float(j_val - prev_j)
-        accepted_outer = True
-        accept_prob: float | None = None
-        if delta_j_outer < 0.0 and use_soft_accept:
-            t = outer_idx + 1
-            x = outer_j_sum / float(t * t) + delta_j_outer
-            if x >= 50.0:
-                accept_prob = 1.0
-            elif x <= -50.0:
-                accept_prob = 0.0
+            pool_k = min(max(1, topM), candidate_idx.size)
+            if pool_k < candidate_idx.size:
+                top_pos = np.argpartition(-add_gain, pool_k - 1)[:pool_k]
             else:
-                accept_prob = float(np.exp(x))
-            accept_prob = min(1.0, max(0.0, accept_prob))
-            accepted_outer = random.random() < accept_prob
-            if not accepted_outer:
-                selected_mask = prev_mask
-                m_c = prev_counts
-                s_val = float(np.sum(new_s_ref[prev_mask.astype(bool)]))
-                omega_val = _omega(prev_counts)
-                j_val = prev_j
-                recently_removed.clear()
-                recently_added.clear()
+                top_pos = np.arange(candidate_idx.size)
+            pool_idx = candidate_idx[top_pos]
+            pool_gain = add_gain[top_pos]
 
-        accepted_any_outer = accepted_any_outer or (outer_swaps > 0 and accepted_outer)
-        outer_j_history.append(float(j_val))
+            add_cnt = min(k, pool_idx.size)
+            if add_cnt > 0:
+                if use_prob_select and pool_idx.size > 1:
+                    logits = np.clip(alpha_t * (pool_gain - np.max(pool_gain)), -50.0, 50.0)
+                    probs = np.exp(logits)
+                    probs = probs / probs.sum()
+                    chosen_add = np.random.choice(pool_idx, size=add_cnt, replace=False, p=probs)
+                else:
+                    choose_pos = np.argpartition(-pool_gain, add_cnt - 1)[:add_cnt]
+                    chosen_add = pool_idx[choose_pos]
+                tmp_mask[chosen_add] = 1
+
+            selected_mask_new = tmp_mask
+        else:
+            selected_mask_new = selected_mask.copy()
+
+        j_new, omega_new, m_c_new = _real_j(selected_mask_new)
+
+        j_old = j_cur
+        best_old = best_j
+        j_cur = float(j_new)
+        omega_cur = float(omega_new)
+        selected_mask = selected_mask_new
+        m_c = m_c_new
+        outer_j_history.append(j_cur)
+
+        if j_cur > best_j:
+            best_j = float(j_cur)
+            best_mask = selected_mask.copy()
+            best_omega = float(omega_cur)
+
+        max_dev = float(np.max(np.abs(m_c / float(m) - p_c)))
         tqdm.write(
-            "[Group] outer={}/{} deltaJ={:.6f} J_sum={:.6f} accept_prob={} accepted={} "
-            "tabu_sizes=({},{}) replace_rate={:.2f} no_improve_steps={}".format(
-                outer_idx + 1,
-                outer_iters,
-                delta_j_outer,
-                outer_j_sum,
-                "-" if accept_prob is None else f"{accept_prob:.6f}",
-                accepted_outer,
-                len(recently_removed),
-                len(recently_added),
-                replace_rate,
-                no_improve_steps,
-            )
+            f"[Group/IRGR] t={t + 1}/{max_outer_iters} ΔJ_cur={j_cur - j_old:.6f} Δbest={best_j - best_old:.6f} "
+            f"Omega={omega_cur:.6f} max_dev={max_dev:.6f}"
         )
         outer_iterator.set_postfix(
-            outer=f"{outer_idx + 1}/{outer_iters}",
-            swaps=str(outer_swaps),
-            ratio=f"{selected_mask.mean():.4f}",
-            target=f"{ratio_target:.4f}",
-            omega=f"{omega_val:.6f}",
-            J=f"{j_val:.2f}",
-            tabu_L=str(tabu_L),
-            rr=f"{replace_rate:.2f}",
+            t=f"{t + 1}/{max_outer_iters}",
+            J_cur=f"{j_cur:.3f}",
+            best_J=f"{best_j:.3f}",
+            Omega=f"{omega_cur:.6f}",
+            alpha=f"{alpha_t:.3f}",
+            rho=f"{rho:.3f}",
         )
-        if outer_swaps == 0:
-            break
 
-    global_mask = selected_mask.astype(np.uint8)
+    final_mask = best_mask.astype(np.uint8)
+    final_j, final_omega, final_counts = _real_j(final_mask)
 
     selected_by_class: dict[int, int] = {}
-    final_mask = np.zeros_like(global_mask, dtype=np.uint8)
     for class_id in range(num_classes):
         class_indices = np.flatnonzero(labels == class_id)
         if class_indices.size == 0:
             selected_by_class[class_id] = 0
             continue
+        selected_by_class[class_id] = int(final_mask[class_indices].sum())
 
-        class_mask = global_mask[class_indices].astype(bool)
-        final_mask[class_indices[class_mask]] = 1
-        selected_by_class[class_id] = int(class_mask.sum())
-
-    final_div = np.asarray(div_metric.score_dataset_dynamic(
-        div_loader,
-        adapter=image_adapter,
-        selected_mask=final_mask,
-        image_features=div_features,
-        labels=labels_t,
-    ).scores, dtype=np.float32)
-    final_dds = np.asarray(dds_metric.score_dataset_dynamic(
-        dds_loader,
-        adapter=image_adapter,
-        selected_mask=final_mask,
-        image_features=dds_features,
-        labels=labels_t,
-    ).scores, dtype=np.float32)
+    # recompute S via final real scores
+    final_div = np.asarray(
+        div_metric.score_dataset_dynamic(
+            div_loader,
+            adapter=image_adapter,
+            selected_mask=final_mask,
+            image_features=div_features,
+            labels=labels_t,
+        ).scores,
+        dtype=np.float32,
+    )
+    final_dds = np.asarray(
+        dds_metric.score_dataset_dynamic(
+            dds_loader,
+            adapter=image_adapter,
+            selected_mask=final_mask,
+            image_features=dds_features,
+            labels=labels_t,
+        ).scores,
+        dtype=np.float32,
+    )
     final_s_ref = weights["sa"] * sa_scores_np + weights["div"] * final_div + weights["dds"] * final_dds
-    final_counts = np.bincount(labels_np[final_mask.astype(bool)], minlength=num_classes)
-    final_omega = _omega(final_counts)
     final_s = float(np.sum(final_s_ref[final_mask.astype(bool)]))
-    final_j = final_s - lambda_cls * final_omega
 
     stats: dict[str, object] = {
         "m": int(m),
-        "lambda_cls": float(lambda_cls),
+        "lambda_cls": float(lambda_cls_val),
+        "gamma_cls": float(gamma_cls),
+        "rho": float(rho),
         "m_c": {int(c): int(v) for c, v in enumerate(final_counts.tolist())},
         "Omega": float(final_omega),
         "S": float(final_s),
         "J": float(final_j),
-        "total_swaps": int(total_swaps),
-        "improved": bool(accepted_any_outer),
+        "best_Omega": float(best_omega),
+        "best_J": float(best_j),
         "outer_j_history": outer_j_history,
-        "tabu_L": int(tabu_L),
-        "replace_rate": float(replace_rate),
-        "use_soft_accept": bool(use_soft_accept),
+        "max_outer_iters": int(max_outer_iters),
+        "use_prob_select": bool(use_prob_select),
+        "topM": int(topM),
     }
 
     return final_mask, selected_by_class, stats
@@ -790,6 +696,15 @@ def main() -> None:
                     progress_desc=(
                         f"Group mask optimization (seed={seed}, cr={cut_ratio})"
                     ),
+                    max_outer_iters=args.max_outer_iters,
+                    rho=args.rho,
+                    topM=args.topm if args.topm is not None else args.candidate_pool_topm,
+                    use_prob_select=args.use_prob_select,
+                    alpha0=args.alpha0,
+                    alpha_max=args.alpha_max,
+                    alpha_mul=args.alpha_mul,
+                    lambda_cls=args.lambda_cls,
+                    gamma_cls=args.gamma_cls,
                 )
                 selection_strategy = "group_selection"
             total_time = time.perf_counter() - total_start

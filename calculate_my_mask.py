@@ -78,11 +78,13 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--debug-outer", type=int, default=40)
-    parser.add_argument("--yangclip-steps", type=int, default=20000)
-    parser.add_argument("--yangclip-lr", type=float, default=0.1)
-    parser.add_argument("--yangclip-beta", type=float, default=1.0)
-    parser.add_argument("--yangclip-theta", type=float, default=1e-3)
+    parser.add_argument("--debug-outer", type=int, default=80)
+    parser.add_argument(
+        "--compare",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="group 模式下是否额外对比 topk",
+    )
     return parser.parse_args()
 
 
@@ -216,47 +218,6 @@ def select_topk_mask(
     return mask, selected_by_class
 
 
-def save_j_curve(
-    j_history: list[float],
-    dataset: str,
-    cut_ratio: int,
-    seed: int,
-    weight_group: str,
-    method: str,
-    model_name: str,
-    clip_model: str,
-) -> Path | None:
-    if not j_history:
-        return None
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as exc:
-        print(f"[Warn] 无法绘制 J 曲线（matplotlib 不可用）: {exc}")
-        return None
-
-    debug_dir = PROJECT_ROOT / "mask_debug"
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    clip_tag = clip_model.replace("/", "-")
-    file_name = (
-        f"dataset_{dataset}_method_{method}_weight_{weight_group}_"
-        f"model_{model_name}_seed_{seed}_cr_{cut_ratio}_clip_{clip_tag}_J_curve.png"
-    )
-    save_path = debug_dir / file_name
-
-    xs = np.arange(1, len(j_history) + 1)
-    ys = np.asarray(j_history, dtype=np.float64)
-    plt.figure(figsize=(8, 4.5))
-    plt.plot(xs, ys, marker="o", linewidth=1.8)
-    plt.title(f"J vs Outer Iteration ({dataset}, cr={cut_ratio}, seed={seed})")
-    plt.xlabel("Outer iteration")
-    plt.ylabel("J(D)")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=180)
-    plt.close()
-    return save_path
-
-
 def select_group_mask(
     sa_scores: np.ndarray,
     dds_metric: DifficultyDirection,
@@ -271,10 +232,6 @@ def select_group_mask(
     device: torch.device,
     progress_desc: str | None = None,
     debug_outer: int = 3,
-    yangclip_steps: int = 300,
-    yangclip_lr: float = 0.1,
-    yangclip_beta: float = 50.0,
-    yangclip_theta: float = 5e-4,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if cut_ratio <= 0 or cut_ratio > 100:
         raise ValueError("cr 必须在 1-100 之间。")
@@ -290,7 +247,10 @@ def select_group_mask(
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
     dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
 
-    def _real_stats(cur_mask: np.ndarray) -> tuple[float, float, np.ndarray]:
+    class_counts_all = np.bincount(labels_np, minlength=num_classes).astype(np.int64)
+    class_quotas = np.maximum(1, (class_counts_all * sr).astype(np.int64))
+
+    def _real_stats(cur_mask: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
         div_scores = np.asarray(
             div_metric.score_dataset_dynamic(
                 div_loader,
@@ -318,103 +278,14 @@ def select_group_mask(
         )
         counts = np.bincount(labels_np[cur_mask.astype(bool)], minlength=num_classes).astype(np.int64)
         s_val = float(np.sum(s_ref[cur_mask.astype(bool)]))
-        return s_val, s_val, counts
-
-    def _yangclip_sgd_select(s_all: np.ndarray, outer_idx: int) -> tuple[np.ndarray, dict[str, float]]:
-        s_all_t = torch.as_tensor(s_all, dtype=torch.float32, device=device)
-        d = torch.nn.Parameter(torch.ones(num_samples, dtype=torch.float32, device=device))
-        optimizer = torch.optim.Adam([d], lr=yangclip_lr)
-
-        final_loss = 0.0
-        final_lsa = 0.0
-        final_ls = 0.0
-        final_ls_eff = 0.0
-        final_rate_mean = 0.0
-        final_gap_mean = 0.0
-        final_gap_max = 0.0
-
-        for _ in range(yangclip_steps):
-            optimizer.zero_grad(set_to_none=True)
-            z = torch.sigmoid(d)
-            b = (z > 0.5).float()
-            b_ste = b + z - z.detach()
-            class_sums = torch.zeros(num_classes, dtype=torch.float32, device=device)
-            class_counts = torch.zeros(num_classes, dtype=torch.float32, device=device)
-            class_sums.index_add_(0, labels_t, b_ste)
-            class_counts.index_add_(0, labels_t, torch.ones_like(b_ste))
-            rate_c = class_sums / class_counts.clamp_min(1.0)
-
-            lsa = -torch.mean(z * s_all_t)
-            ls_c = torch.sqrt((rate_c - sr) ** 2 + 1e-12)
-            ls = torch.mean(ls_c)
-            ls_eff = torch.relu(ls - yangclip_theta)
-            loss = lsa + yangclip_beta * ls_eff
-            loss.backward()
-            optimizer.step()
-
-            final_loss = float(loss.item())
-            final_lsa = float(lsa.item())
-            final_ls = float(ls.item())
-            final_ls_eff = float(ls_eff.item())
-            gap_c = torch.abs(rate_c - sr)
-            final_rate_mean = float(rate_c.mean().item())
-            final_gap_mean = float(gap_c.mean().item())
-            final_gap_max = float(gap_c.max().item())
-
-        with torch.no_grad():
-            z_final = torch.sigmoid(d)
-            b_final = (z_final > 0.5).to(torch.uint8)
-            b_final_f = b_final.float()
-            hard_class_sums = torch.zeros(num_classes, dtype=torch.float32, device=device)
-            hard_class_counts = torch.zeros(num_classes, dtype=torch.float32, device=device)
-            hard_class_sums.index_add_(0, labels_t, b_final_f)
-            hard_class_counts.index_add_(0, labels_t, torch.ones_like(b_final_f))
-            hard_rate_c = hard_class_sums / hard_class_counts.clamp_min(1.0)
-            hard_gap_c = torch.abs(hard_rate_c - sr)
-            rate_hard = float(hard_rate_c.mean().item())
-            hard_gap = float(hard_gap_c.max().item())
-            d_mean = float(d.mean().item())
-            d_std = float(d.std().item())
-            d_max = float(torch.max(torch.abs(d)).item())
-            z_mean = float(z_final.mean().item())
-            z_std = float(z_final.std().item())
-
-        tqdm.write(
-            f"[SGD-final][outer {outer_idx + 1}] loss={final_loss:.6f} "
-            f"Lsa={final_lsa:.6f} Ls={final_ls:.6f} Ls_eff={final_ls_eff:.6f} "
-            f"beta={yangclip_beta:.3f} sr={sr:.6f} "
-            f"rate_mean={final_rate_mean:.6f} gap_mean={final_gap_mean:.6f} gap_max={final_gap_max:.6f} "
-            f"d_mean/d_std/max|d|={d_mean:.6f}/{d_std:.6f}/{d_max:.6f} "
-            f"sigmoid(d)_mean/std={z_mean:.6f}/{z_std:.6f}"
-        )
-
-        if hard_gap > 5e-4:
-            tqdm.write(
-                f"[Warn] hard ratio gap={hard_gap:.6f} > 0.0005 after binarization; "
-                "consider increasing --yangclip-beta or --yangclip-steps."
-            )
-
-        return b_final.detach().cpu().numpy().astype(np.uint8), {
-            "loss": final_loss,
-            "Lsa": final_lsa,
-            "Ls": final_ls,
-            "Ls_eff": final_ls_eff,
-            "rate": final_rate_mean,
-            "gap": final_gap_mean,
-            "hard_rate": rate_hard,
-            "hard_gap": hard_gap,
-        }
+        return s_val, s_ref, counts
 
     selected_mask = np.zeros(num_samples, dtype=np.uint8)
     init_count = max(1, int(round(sr * num_samples)))
     init_idx = np.random.choice(num_samples, size=init_count, replace=False)
     selected_mask[init_idx] = 1
 
-    j_cur, s_cur, _ = _real_stats(selected_mask)
-    outer_j_history = [float(j_cur)]
     outer_iters = max(1, int(debug_outer))
-    last_sgd_info: dict[str, float] = {}
-
     outer_iterator = tqdm(
         range(outer_iters),
         desc=progress_desc or "Group optimization",
@@ -422,8 +293,10 @@ def select_group_mask(
         leave=True,
     )
 
-    for t in outer_iterator:
-        j_old = float(j_cur)
+    for _ in outer_iterator:
+        num_d = int(selected_mask.sum())
+        remain_count = max(0, num_samples - num_d)
+        n_extra = max(1, int(0.1 * remain_count)) if remain_count > 0 else 0
 
         div_scores = np.asarray(
             div_metric.score_dataset_dynamic(
@@ -451,21 +324,54 @@ def select_group_mask(
             + weights["dds"] * dds_scores
         )
 
-        selected_mask, last_sgd_info = _yangclip_sgd_select(s_all, outer_idx=t)
-        j_cur, s_cur, _ = _real_stats(selected_mask)
-        outer_j_history.append(float(j_cur))
+        top_a = np.argpartition(-s_all, num_d - 1)[:num_d]
+        remaining_indices = np.flatnonzero(selected_mask == 0)
+        top_b = np.empty((0,), dtype=np.int64)
+        if n_extra > 0 and remaining_indices.size > 0:
+            n_extra_eff = min(n_extra, remaining_indices.size)
+            remain_scores = s_all[remaining_indices]
+            top_b_local = np.argpartition(-remain_scores, n_extra_eff - 1)[:n_extra_eff]
+            top_b = remaining_indices[top_b_local]
 
-        rate = float(selected_mask.mean())
-        gap = abs(rate - sr)
-        delta_j = j_cur - j_old
-        tqdm.write(
-            f"[outer {t + 1}] J_old={j_old:.6f} J_new={j_cur:.6f} ΔJ={delta_j:.6f} "
-            f"rate={rate:.6f} gap={gap:.6f}"
-        )
-        outer_iterator.set_postfix(J_cur=f"{j_cur:.3f}", gap=f"{gap:.6f}")
+        cand = np.unique(np.concatenate([top_a, top_b]))
+        cand_labels = labels_np[cand]
+        picked_chunks: list[np.ndarray] = []
+
+        for class_id in range(num_classes):
+            class_quota = int(class_quotas[class_id])
+            class_candidates = cand[cand_labels == class_id]
+            if class_candidates.size == 0:
+                continue
+            take = min(class_quota, class_candidates.size)
+            class_scores = s_all[class_candidates]
+            class_order = np.argsort(-class_scores)
+            picked_chunks.append(class_candidates[class_order[:take]])
+
+        if picked_chunks:
+            d_new = np.unique(np.concatenate(picked_chunks))
+        else:
+            d_new = np.empty((0,), dtype=np.int64)
+
+        if d_new.size < num_d:
+            in_d_new = np.zeros(num_samples, dtype=bool)
+            in_d_new[d_new] = True
+            cand_remain = cand[~in_d_new[cand]]
+            if cand_remain.size > 0:
+                fill = min(num_d - d_new.size, cand_remain.size)
+                fill_scores = s_all[cand_remain]
+                fill_order = np.argsort(-fill_scores)
+                d_new = np.concatenate([d_new, cand_remain[fill_order[:fill]]])
+
+        if d_new.size > num_d:
+            d_new_scores = s_all[d_new]
+            d_new_order = np.argsort(-d_new_scores)
+            d_new = d_new[d_new_order[:num_d]]
+
+        selected_mask = np.zeros(num_samples, dtype=np.uint8)
+        selected_mask[d_new] = 1
 
     final_mask = selected_mask.astype(np.uint8)
-    final_j, final_s, final_counts = _real_stats(final_mask)
+    _, final_s_all, final_counts = _real_stats(final_mask)
 
     selected_by_class: dict[int, int] = {}
     for class_id in range(num_classes):
@@ -475,21 +381,13 @@ def select_group_mask(
             continue
         selected_by_class[class_id] = int(final_mask[class_indices].sum())
 
+    final_rate = float(final_mask.mean())
     stats: dict[str, object] = {
-        "target_sr": float(sr),
-        "m_c": {int(c): int(v) for c, v in enumerate(final_counts.tolist())},
-        "S": float(final_s),
-        "J": float(final_j),
-        "final_rate": float(final_mask.mean()),
-        "final_gap": float(abs(float(final_mask.mean()) - sr)),
-        "outer_j_history": outer_j_history,
+        "sr": float(sr),
+        "final_rate": final_rate,
+        "selected_by_class": selected_by_class,
+        "S": float(np.sum(final_s_all[final_mask.astype(bool)])),
         "outer_iters": int(outer_iters),
-        "debug_outer": int(debug_outer),
-        "yangclip_steps": int(yangclip_steps),
-        "yangclip_lr": float(yangclip_lr),
-        "yangclip_beta": float(yangclip_beta),
-        "yangclip_theta": float(yangclip_theta),
-        "last_sgd": last_sgd_info,
     }
 
     return final_mask, selected_by_class, stats
@@ -668,11 +566,27 @@ def main() -> None:
                         f"Group mask optimization (seed={seed}, cr={cut_ratio})"
                     ),
                     debug_outer=args.debug_outer,
-                    yangclip_steps=args.yangclip_steps,
-                    yangclip_lr=args.yangclip_lr,
-                    yangclip_beta=args.yangclip_beta,
-                    yangclip_theta=args.yangclip_theta,
                 )
+                if args.compare:
+                    topk_mask, _ = select_topk_mask(
+                        total_scores_np,
+                        labels,
+                        num_classes=len(class_names),
+                        cut_ratio=cut_ratio,
+                    )
+                    inter = int(np.logical_and(mask == 1, topk_mask == 1).sum())
+                    sel = int(mask.sum())
+                    overlap = inter / max(1, sel)
+                    sum_group = float(total_scores_np[mask.astype(bool)].sum())
+                    sum_topk = float(total_scores_np[topk_mask.astype(bool)].sum())
+                    better = "group" if sum_group >= sum_topk else "topk"
+                    diff = abs(sum_group - sum_topk)
+                    print(
+                        "[Compare] "
+                        f"overlap={overlap:.4f} ({inter}/{sel}) | "
+                        f"sum_group={sum_group:.4f} | sum_topk={sum_topk:.4f} | "
+                        f"better={better} (Δ={diff:.4f})"
+                    )
                 selection_strategy = "group_selection"
             total_time = time.perf_counter() - total_start
             mask_path = resolve_mask_path(
@@ -716,22 +630,10 @@ def main() -> None:
             if group_stats is not None:
                 print(
                     "group_stats: "
-                    f"sr={group_stats['target_sr']:.6f} | rate={group_stats['final_rate']:.6f} | "
-                    f"gap={group_stats['final_gap']:.6f} | m_c={group_stats['m_c']} | "
-                    f"S(D)={group_stats['S']:.6f} | J(D)={group_stats['J']:.6f}"
+                    f"sr={group_stats['sr']:.6f} | rate={group_stats['final_rate']:.6f} | "
+                    f"m_c={group_stats['selected_by_class']} | "
+                    f"S(D)={group_stats['S']:.6f}"
                 )
-                j_curve_path = save_j_curve(
-                    j_history=list(group_stats.get("outer_j_history", [])),
-                    dataset="cifar10",
-                    cut_ratio=cut_ratio,
-                    seed=seed,
-                    weight_group=args.weight_group,
-                    method=method,
-                    model_name=args.model_name,
-                    clip_model=args.clip_model,
-                )
-                if j_curve_path is not None:
-                    print(f"J-curve saved to: {j_curve_path}")
             print(f"mask saved to: {mask_path}")
 
 

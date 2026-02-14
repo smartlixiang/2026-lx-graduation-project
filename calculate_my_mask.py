@@ -4,8 +4,10 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -35,24 +37,6 @@ def parse_args() -> argparse.Namespace:
         help="cut_ratio 列表（百分比），支持逗号分隔或单值",
     )
     parser.add_argument("--clip-model", type=str, default="ViT-B/32", help="CLIP 模型规格")
-    parser.add_argument(
-        "--adapter-image-path",
-        type=str,
-        default=None,
-        help="图像 adapter 权重路径（默认按 dataset/seed 规则）",
-    )
-    parser.add_argument(
-        "--adapter-text-path",
-        type=str,
-        default=None,
-        help="文本 adapter 权重路径（默认按 dataset/seed 规则）",
-    )
-    parser.add_argument(
-        "--adapter-seed",
-        type=int,
-        default=None,
-        help="adapter 的随机种子（默认使用当前实验 seed）",
-    )
     parser.add_argument("--device", type=str, default=None, help="设备，例如 cuda 或 cpu")
     parser.add_argument(
         "--seeds",
@@ -64,7 +48,7 @@ def parse_args() -> argparse.Namespace:
         "--weight-group",
         type=str,
         default="naive",
-        help="scoring_weights.json 中的权重组名",
+        help="权重组，仅支持 {naive, learned}",
     )
     parser.add_argument(
         "--method",
@@ -78,7 +62,13 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--debug-outer", type=int, default=80)
+    parser.add_argument("--debug-outer", type=int, default=40)
+    parser.add_argument(
+        "--branch",
+        type=int,
+        default=3,
+        help="group 模式随机初始化分支数，最终取最优分支",
+    )
     parser.add_argument(
         "--compare",
         action=argparse.BooleanOptionalAction,
@@ -152,28 +142,41 @@ def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str,
     }
 
 
-def load_scoring_weights(
-    all_weights: dict[str, dict[str, object]],
-    group: str,
-) -> dict[str, float]:
-    selected = all_weights.get(group)
-    if selected is None:
-        raise KeyError(f"未找到权重组: {group}")
-    if not isinstance(selected, dict):
-        raise ValueError(f"权重组 {group} 格式不正确。")
+def _to_weight_triplet(selected: dict[str, object], group_name: str) -> dict[str, float]:
     required = {"dds", "div", "sa"}
     missing = required - selected.keys()
     if missing:
         missing_str = ", ".join(sorted(missing))
-        raise ValueError(f"权重组 {group} 缺少必要键: {missing_str}")
+        raise ValueError(f"权重组 {group_name} 缺少必要键: {missing_str}")
     weights: dict[str, float] = {}
     for key in sorted(required):
         value = selected[key]
         try:
             weights[key] = float(value)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"权重组 {group} 的 {key} 无法转换为 float。") from exc
+            raise ValueError(f"权重组 {group_name} 的 {key} 无法转换为 float。") from exc
     return weights
+
+
+def load_scoring_weights(
+    all_weights: dict[str, dict[str, object]],
+    weight_group: str,
+    seed: int,
+) -> dict[str, float]:
+    mode = weight_group.strip().lower()
+    if mode not in {"naive", "learned"}:
+        raise ValueError("weight-group 仅支持 {'naive', 'learned'}")
+
+    if mode == "naive":
+        selected = all_weights.get("naive")
+        if selected is None or not isinstance(selected, dict):
+            raise KeyError("未找到 naive 权重组。")
+        return _to_weight_triplet(selected, "naive")
+
+    selected = all_weights.get(str(seed))
+    if selected is None or not isinstance(selected, dict):
+        raise KeyError(f"未找到 learned 权重组（seed={seed}）。")
+    return _to_weight_triplet(selected, str(seed))
 
 
 def build_score_loader(
@@ -232,6 +235,7 @@ def select_group_mask(
     device: torch.device,
     progress_desc: str | None = None,
     debug_outer: int = 3,
+    branch_count: int = 1,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if cut_ratio <= 0 or cut_ratio > 100:
         raise ValueError("cr 必须在 1-100 之间。")
@@ -280,98 +284,140 @@ def select_group_mask(
         s_val = float(np.sum(s_ref[cur_mask.astype(bool)]))
         return s_val, s_ref, counts
 
-    selected_mask = np.zeros(num_samples, dtype=np.uint8)
-    init_count = max(1, int(round(sr * num_samples)))
-    init_idx = np.random.choice(num_samples, size=init_count, replace=False)
-    selected_mask[init_idx] = 1
-
+    branch_total = max(1, int(branch_count))
     outer_iters = max(1, int(debug_outer))
-    outer_iterator = tqdm(
-        range(outer_iters),
-        desc=progress_desc or "Group optimization",
-        unit="outer",
-        leave=True,
-    )
+    branch_histories: list[list[float]] = []
+    branch_best_scores: list[float] = []
+    branch_best_iters: list[int] = []
 
-    for _ in outer_iterator:
-        num_d = int(selected_mask.sum())
-        remain_count = max(0, num_samples - num_d)
-        n_extra = max(1, int(0.1 * remain_count)) if remain_count > 0 else 0
+    global_best_s = float("-inf")
+    global_best_mask = np.zeros(num_samples, dtype=np.uint8)
+    global_best_branch = 0
+    global_best_iter = 0
 
-        div_scores = np.asarray(
-            div_metric.score_dataset_dynamic(
-                div_loader,
-                adapter=image_adapter,
-                selected_mask=selected_mask,
-                image_features=div_features,
-                labels=labels_t,
-            ).scores,
-            dtype=np.float32,
-        )
-        dds_scores = np.asarray(
-            dds_metric.score_dataset_dynamic(
-                dds_loader,
-                adapter=image_adapter,
-                selected_mask=selected_mask,
-                image_features=dds_features,
-                labels=labels_t,
-            ).scores,
-            dtype=np.float32,
-        )
-        s_all = (
-            weights["sa"] * sa_scores_np
-            + weights["div"] * div_scores
-            + weights["dds"] * dds_scores
-        )
-
-        top_a = np.argpartition(-s_all, num_d - 1)[:num_d]
-        remaining_indices = np.flatnonzero(selected_mask == 0)
-        top_b = np.empty((0,), dtype=np.int64)
-        if n_extra > 0 and remaining_indices.size > 0:
-            n_extra_eff = min(n_extra, remaining_indices.size)
-            remain_scores = s_all[remaining_indices]
-            top_b_local = np.argpartition(-remain_scores, n_extra_eff - 1)[:n_extra_eff]
-            top_b = remaining_indices[top_b_local]
-
-        cand = np.unique(np.concatenate([top_a, top_b]))
-        cand_labels = labels_np[cand]
-        picked_chunks: list[np.ndarray] = []
-
-        for class_id in range(num_classes):
-            class_quota = int(class_quotas[class_id])
-            class_candidates = cand[cand_labels == class_id]
-            if class_candidates.size == 0:
-                continue
-            take = min(class_quota, class_candidates.size)
-            class_scores = s_all[class_candidates]
-            class_order = np.argsort(-class_scores)
-            picked_chunks.append(class_candidates[class_order[:take]])
-
-        if picked_chunks:
-            d_new = np.unique(np.concatenate(picked_chunks))
-        else:
-            d_new = np.empty((0,), dtype=np.int64)
-
-        if d_new.size < num_d:
-            in_d_new = np.zeros(num_samples, dtype=bool)
-            in_d_new[d_new] = True
-            cand_remain = cand[~in_d_new[cand]]
-            if cand_remain.size > 0:
-                fill = min(num_d - d_new.size, cand_remain.size)
-                fill_scores = s_all[cand_remain]
-                fill_order = np.argsort(-fill_scores)
-                d_new = np.concatenate([d_new, cand_remain[fill_order[:fill]]])
-
-        if d_new.size > num_d:
-            d_new_scores = s_all[d_new]
-            d_new_order = np.argsort(-d_new_scores)
-            d_new = d_new[d_new_order[:num_d]]
-
+    for branch_idx in range(branch_total):
         selected_mask = np.zeros(num_samples, dtype=np.uint8)
-        selected_mask[d_new] = 1
+        init_count = max(1, int(round(sr * num_samples)))
+        init_idx = np.random.choice(num_samples, size=init_count, replace=False)
+        selected_mask[init_idx] = 1
 
-    final_mask = selected_mask.astype(np.uint8)
-    _, final_s_all, final_counts = _real_stats(final_mask)
+        branch_best_mask = selected_mask.copy()
+        branch_best_s, _, _ = _real_stats(branch_best_mask)
+        branch_best_iter = 0
+        branch_scores = [float(branch_best_s)]
+
+        outer_iterator = tqdm(
+            range(outer_iters),
+            desc=(progress_desc or "Group optimization") + f" [b{branch_idx + 1}/{branch_total}]",
+            unit="outer",
+            leave=True,
+        )
+
+        for outer_idx in outer_iterator:
+            num_d = int(selected_mask.sum())
+            remain_count = max(0, num_samples - num_d)
+            n_extra = max(1, int(0.3 * remain_count)) if remain_count > 0 else 0
+
+            div_scores = np.asarray(
+                div_metric.score_dataset_dynamic(
+                    div_loader,
+                    adapter=image_adapter,
+                    selected_mask=selected_mask,
+                    image_features=div_features,
+                    labels=labels_t,
+                ).scores,
+                dtype=np.float32,
+            )
+            dds_scores = np.asarray(
+                dds_metric.score_dataset_dynamic(
+                    dds_loader,
+                    adapter=image_adapter,
+                    selected_mask=selected_mask,
+                    image_features=dds_features,
+                    labels=labels_t,
+                ).scores,
+                dtype=np.float32,
+            )
+            s_all = (
+                weights["sa"] * sa_scores_np
+                + weights["div"] * div_scores
+                + weights["dds"] * dds_scores
+            )
+
+            top_a = np.argpartition(-s_all, num_d - 1)[:num_d]
+            remaining_indices = np.flatnonzero(selected_mask == 0)
+            top_b = np.empty((0,), dtype=np.int64)
+            if n_extra > 0 and remaining_indices.size > 0:
+                n_extra_eff = min(n_extra, remaining_indices.size)
+                remain_scores = s_all[remaining_indices]
+                top_b_local = np.argpartition(-remain_scores, n_extra_eff - 1)[:n_extra_eff]
+                top_b = remaining_indices[top_b_local]
+
+            cand = np.unique(np.concatenate([top_a, top_b]))
+            cand_labels = labels_np[cand]
+            picked_chunks: list[np.ndarray] = []
+
+            for class_id in range(num_classes):
+                class_quota = int(class_quotas[class_id])
+                class_candidates = cand[cand_labels == class_id]
+                if class_candidates.size == 0:
+                    continue
+                take = min(class_quota, class_candidates.size)
+                class_scores = s_all[class_candidates]
+                class_order = np.argsort(-class_scores)
+                picked_chunks.append(class_candidates[class_order[:take]])
+
+            if picked_chunks:
+                d_new = np.unique(np.concatenate(picked_chunks))
+            else:
+                d_new = np.empty((0,), dtype=np.int64)
+
+            if d_new.size < num_d:
+                in_d_new = np.zeros(num_samples, dtype=bool)
+                in_d_new[d_new] = True
+                cand_remain = cand[~in_d_new[cand]]
+                if cand_remain.size > 0:
+                    fill = min(num_d - d_new.size, cand_remain.size)
+                    fill_scores = s_all[cand_remain]
+                    fill_order = np.argsort(-fill_scores)
+                    d_new = np.concatenate([d_new, cand_remain[fill_order[:fill]]])
+
+            if d_new.size > num_d:
+                d_new_scores = s_all[d_new]
+                d_new_order = np.argsort(-d_new_scores)
+                d_new = d_new[d_new_order[:num_d]]
+
+            selected_mask = np.zeros(num_samples, dtype=np.uint8)
+            selected_mask[d_new] = 1
+
+            current_s, _, _ = _real_stats(selected_mask)
+            branch_scores.append(float(current_s))
+            if current_s > branch_best_s:
+                branch_best_s = float(current_s)
+                branch_best_mask = selected_mask.copy()
+                branch_best_iter = outer_idx + 1
+
+            if branch_best_s > global_best_s:
+                global_best_s = float(branch_best_s)
+                global_best_mask = branch_best_mask.copy()
+                global_best_branch = branch_idx
+                global_best_iter = branch_best_iter
+
+            outer_iterator.set_postfix(
+                {
+                    "branch_best_S": f"{branch_best_s:.4f}",
+                    "branch_best_iter": branch_best_iter,
+                    "global_best_S": f"{global_best_s:.4f}",
+                    "global_best_branch": global_best_branch + 1,
+                }
+            )
+
+        branch_histories.append(branch_scores)
+        branch_best_scores.append(float(branch_best_s))
+        branch_best_iters.append(int(branch_best_iter))
+
+    final_mask = global_best_mask.astype(np.uint8)
+    _, final_s_all, _ = _real_stats(final_mask)
 
     selected_by_class: dict[int, int] = {}
     for class_id in range(num_classes):
@@ -388,9 +434,57 @@ def select_group_mask(
         "selected_by_class": selected_by_class,
         "S": float(np.sum(final_s_all[final_mask.astype(bool)])),
         "outer_iters": int(outer_iters),
+        "branch_count": int(branch_total),
+        "best_branch": int(global_best_branch + 1),
+        "best_iter": int(global_best_iter),
+        "branch_best_scores": branch_best_scores,
+        "branch_best_iters": branch_best_iters,
+        "branch_score_histories": branch_histories,
     }
 
     return final_mask, selected_by_class, stats
+
+
+def _sanitize_for_filename(text: str) -> str:
+    return text.replace("/", "-").replace(" ", "_")
+
+
+def save_branch_score_plot(
+    branch_score_histories: Sequence[Sequence[float]],
+    *,
+    dataset: str,
+    method: str,
+    weight_group: str,
+    model_name: str,
+    seed: int,
+    cut_ratio: int,
+    clip_model: str,
+) -> Path:
+    out_dir = PROJECT_ROOT / "mask_debug"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    clip_tag = _sanitize_for_filename(clip_model)
+    out_path = (
+        out_dir
+        / (
+            f"dataset_{dataset}_method_{method}_weight_{weight_group}_"
+            f"model_{model_name}_seed_{seed}_cr_{cut_ratio}_clip_{clip_tag}_branch_curve.png"
+        )
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for history in branch_score_histories:
+        if len(history) == 0:
+            continue
+        x = np.arange(len(history), dtype=np.int32)
+        ax.plot(x, np.asarray(history, dtype=np.float64), linewidth=1.6)
+    ax.set_title("Score trajectory by branch")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("S(D)")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
 
 
 def main() -> None:
@@ -398,9 +492,16 @@ def main() -> None:
     args = parse_args()
 
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
+    method = args.method.strip().lower()
+    if method not in {"topk", "group"}:
+        raise ValueError(f"未知 method={method}，应为 {{'topk','group'}}")
+
+    weight_group = args.weight_group.strip().lower()
+    if weight_group not in {"naive", "learned"}:
+        raise ValueError("weight-group 仅支持 {'naive', 'learned'}")
+
     weights_path = PROJECT_ROOT / "weights" / "scoring_weights.json"
     all_weights = ensure_scoring_weights(weights_path, CIFAR10)
-    weights = load_scoring_weights(all_weights, args.weight_group)
 
     data_load_start = time.perf_counter()
     dataset_for_names = datasets.CIFAR10(
@@ -444,31 +545,26 @@ def main() -> None:
         f"[Init] DataLoaders ready (DDS/Div/SA) | elapsed={time.perf_counter() - loader_build_start:.2f}s"
     )
 
-    method = args.method.strip().lower()
-    if method not in {"topk", "group"}:
-        raise ValueError(f"未知 method={method}，应为 {{'topk','group'}}")
-    method_name = f"{args.weight_group}_{method}"
+    method_name = f"{weight_group}_{method}"
     cut_ratios = parse_ratio_list(args.cr)
     if not cut_ratios:
         raise ValueError("cr 参数不能为空。")
     seeds = parse_seed_list(args.seeds)
-    if args.weight_group == "naive":
-        save_seeds = [CONFIG.global_seed]
-    else:
-        save_seeds = seeds
-    total_tasks = len(save_seeds) * len(cut_ratios)
+    if not seeds:
+        raise ValueError("seeds 参数不能为空。")
+
+    total_tasks = len(seeds) * len(cut_ratios)
     task_idx = 0
-    for seed in save_seeds:
+
+    for seed in seeds:
         set_seed(seed)
-        adapter_seed = args.adapter_seed if args.adapter_seed is not None else seed
+        weights = load_scoring_weights(all_weights, weight_group, seed)
         image_adapter, text_adapter, adapter_paths = load_trained_adapters(
             dataset_name=CIFAR10,
             clip_model=args.clip_model,
             input_dim=dds_metric.extractor.embed_dim,
-            seed=adapter_seed,
+            seed=seed,
             map_location=device,
-            adapter_image_path=args.adapter_image_path,
-            adapter_text_path=args.adapter_text_path,
         )
         image_adapter.to(device).eval()
         text_adapter.to(device).eval()
@@ -501,7 +597,7 @@ def main() -> None:
         static_scores = get_or_compute_static_scores(
             cache_root=PROJECT_ROOT / "static_scores",
             dataset=CIFAR10,
-            seed=adapter_seed,
+            seed=seed,
             clip_model=args.clip_model,
             adapter_image_path=str(adapter_paths["image_path"]),
             adapter_text_path=str(adapter_paths["text_path"]),
@@ -534,13 +630,52 @@ def main() -> None:
         )
         labels = np.asarray(dataset_for_names.targets)
         total_scores_np = np.asarray(total_scores)
+        labels_t = torch.as_tensor(labels, dtype=torch.long, device=device)
+        sa_scores_np = np.asarray(sa_scores, dtype=np.float32)
+        div_features_for_compare = None
+        dds_features_for_compare = None
+
+        def compute_subset_dynamic_sum(selected_mask: np.ndarray) -> float:
+            nonlocal div_features_for_compare, dds_features_for_compare
+            if div_features_for_compare is None:
+                div_features_for_compare, _ = div_metric._encode_images(div_loader, image_adapter)
+            if dds_features_for_compare is None:
+                dds_features_for_compare, _ = dds_metric._encode_images(dds_loader, image_adapter)
+
+            div_scores_dyn = np.asarray(
+                div_metric.score_dataset_dynamic(
+                    div_loader,
+                    adapter=image_adapter,
+                    selected_mask=selected_mask,
+                    image_features=div_features_for_compare,
+                    labels=labels_t,
+                ).scores,
+                dtype=np.float32,
+            )
+            dds_scores_dyn = np.asarray(
+                dds_metric.score_dataset_dynamic(
+                    dds_loader,
+                    adapter=image_adapter,
+                    selected_mask=selected_mask,
+                    image_features=dds_features_for_compare,
+                    labels=labels_t,
+                ).scores,
+                dtype=np.float32,
+            )
+            subset_scores = (
+                weights["sa"] * sa_scores_np
+                + weights["div"] * div_scores_dyn
+                + weights["dds"] * dds_scores_dyn
+            )
+            return float(subset_scores[selected_mask.astype(bool)].sum())
 
         for cut_ratio in cut_ratios:
             task_idx += 1
             print(
-                f"[Mask {task_idx}/{total_tasks}] seed={seed} | cr={cut_ratio} | method={method}"
+                f"[Mask {task_idx}/{total_tasks}] seed={seed} | cr={cut_ratio} | method={method} | weight_group={weight_group}"
             )
             group_stats: dict[str, object] | None = None
+            debug_curve_path: str | None = None
             if method == "topk":
                 mask, selected_by_class = select_topk_mask(
                     total_scores_np,
@@ -549,7 +684,7 @@ def main() -> None:
                     cut_ratio=cut_ratio,
                 )
                 selection_strategy = "topk_per_class"
-            elif method == "group":
+            else:
                 mask, selected_by_class, group_stats = select_group_mask(
                     np.asarray(sa_scores),
                     dds_metric=dds_metric,
@@ -566,7 +701,21 @@ def main() -> None:
                         f"Group mask optimization (seed={seed}, cr={cut_ratio})"
                     ),
                     debug_outer=args.debug_outer,
+                    branch_count=args.branch,
                 )
+                debug_curve = save_branch_score_plot(
+                    group_stats.get("branch_score_histories", []),
+                    dataset="cifar10",
+                    method=method,
+                    weight_group=weight_group,
+                    model_name=args.model_name,
+                    seed=seed,
+                    cut_ratio=cut_ratio,
+                    clip_model=args.clip_model,
+                )
+                debug_curve_path = str(debug_curve)
+                print(f"[Debug] branch score curves saved to: {debug_curve}")
+
                 if args.compare:
                     topk_mask, _ = select_topk_mask(
                         total_scores_np,
@@ -577,8 +726,8 @@ def main() -> None:
                     inter = int(np.logical_and(mask == 1, topk_mask == 1).sum())
                     sel = int(mask.sum())
                     overlap = inter / max(1, sel)
-                    sum_group = float(total_scores_np[mask.astype(bool)].sum())
-                    sum_topk = float(total_scores_np[topk_mask.astype(bool)].sum())
+                    sum_group = compute_subset_dynamic_sum(mask)
+                    sum_topk = compute_subset_dynamic_sum(topk_mask)
                     better = "group" if sum_group >= sum_topk else "topk"
                     diff = abs(sum_group - sum_topk)
                     print(
@@ -588,6 +737,7 @@ def main() -> None:
                         f"better={better} (Δ={diff:.4f})"
                     )
                 selection_strategy = "group_selection"
+
             total_time = time.perf_counter() - total_start
             mask_path = resolve_mask_path(
                 mode=method_name,
@@ -604,9 +754,10 @@ def main() -> None:
                 "dataset": "cifar10",
                 "model_name": args.model_name,
                 "method": method_name,
-                "weight_group": args.weight_group,
+                "weight_group": weight_group,
+                "weight_seed": seed if weight_group == "learned" else None,
                 "clip_model": args.clip_model,
-                "adapter_seed": adapter_seed,
+                "adapter_seed": seed,
                 "adapter_image_path": str(adapter_paths["image_path"]),
                 "adapter_text_path": str(adapter_paths["text_path"]),
                 "cr": cut_ratio,
@@ -614,8 +765,9 @@ def main() -> None:
                 "selected_count": int(mask.sum()),
                 "selected_by_class": selected_by_class,
                 "selection_strategy": selection_strategy,
-                "seeds": save_seeds,
+                "seed": seed,
                 "group_stats": group_stats,
+                "mask_debug_curve": debug_curve_path,
                 "timing": {
                     "dds_seconds": dds_time,
                     "div_seconds": div_time,
@@ -632,6 +784,8 @@ def main() -> None:
                     "group_stats: "
                     f"sr={group_stats['sr']:.6f} | rate={group_stats['final_rate']:.6f} | "
                     f"m_c={group_stats['selected_by_class']} | "
+                    f"best_branch={group_stats['best_branch']} | "
+                    f"best_iter={group_stats['best_iter']} | "
                     f"S(D)={group_stats['S']:.6f}"
                 )
             print(f"mask saved to: {mask_path}")

@@ -78,11 +78,11 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--debug-outer", type=int, default=3)
-    parser.add_argument("--yangclip-steps", type=int, default=10000)
+    parser.add_argument("--debug-outer", type=int, default=40)
+    parser.add_argument("--yangclip-steps", type=int, default=20000)
     parser.add_argument("--yangclip-lr", type=float, default=0.1)
-    parser.add_argument("--yangclip-beta", type=float, default=50.0)
-    parser.add_argument("--yangclip-theta", type=float, default=5e-4)
+    parser.add_argument("--yangclip-beta", type=float, default=1.0)
+    parser.add_argument("--yangclip-theta", type=float, default=1e-3)
     return parser.parse_args()
 
 
@@ -329,17 +329,24 @@ def select_group_mask(
         final_lsa = 0.0
         final_ls = 0.0
         final_ls_eff = 0.0
-        final_rate = 0.0
+        final_rate_mean = 0.0
+        final_gap_mean = 0.0
+        final_gap_max = 0.0
 
         for _ in range(yangclip_steps):
             optimizer.zero_grad(set_to_none=True)
             z = torch.sigmoid(d)
             b = (z > 0.5).float()
             b_ste = b + z - z.detach()
-            rate = torch.mean(b_ste)
+            class_sums = torch.zeros(num_classes, dtype=torch.float32, device=device)
+            class_counts = torch.zeros(num_classes, dtype=torch.float32, device=device)
+            class_sums.index_add_(0, labels_t, b_ste)
+            class_counts.index_add_(0, labels_t, torch.ones_like(b_ste))
+            rate_c = class_sums / class_counts.clamp_min(1.0)
 
             lsa = -torch.mean(z * s_all_t)
-            ls = torch.sqrt((rate - sr) ** 2 + 1e-12)
+            ls_c = torch.sqrt((rate_c - sr) ** 2 + 1e-12)
+            ls = torch.mean(ls_c)
             ls_eff = torch.relu(ls - yangclip_theta)
             loss = lsa + yangclip_beta * ls_eff
             loss.backward()
@@ -349,13 +356,23 @@ def select_group_mask(
             final_lsa = float(lsa.item())
             final_ls = float(ls.item())
             final_ls_eff = float(ls_eff.item())
-            final_rate = float(rate.item())
+            gap_c = torch.abs(rate_c - sr)
+            final_rate_mean = float(rate_c.mean().item())
+            final_gap_mean = float(gap_c.mean().item())
+            final_gap_max = float(gap_c.max().item())
 
         with torch.no_grad():
             z_final = torch.sigmoid(d)
             b_final = (z_final > 0.5).to(torch.uint8)
-            rate_hard = float(b_final.float().mean().item())
-            hard_gap = abs(rate_hard - sr)
+            b_final_f = b_final.float()
+            hard_class_sums = torch.zeros(num_classes, dtype=torch.float32, device=device)
+            hard_class_counts = torch.zeros(num_classes, dtype=torch.float32, device=device)
+            hard_class_sums.index_add_(0, labels_t, b_final_f)
+            hard_class_counts.index_add_(0, labels_t, torch.ones_like(b_final_f))
+            hard_rate_c = hard_class_sums / hard_class_counts.clamp_min(1.0)
+            hard_gap_c = torch.abs(hard_rate_c - sr)
+            rate_hard = float(hard_rate_c.mean().item())
+            hard_gap = float(hard_gap_c.max().item())
             d_mean = float(d.mean().item())
             d_std = float(d.std().item())
             d_max = float(torch.max(torch.abs(d)).item())
@@ -365,7 +382,8 @@ def select_group_mask(
         tqdm.write(
             f"[SGD-final][outer {outer_idx + 1}] loss={final_loss:.6f} "
             f"Lsa={final_lsa:.6f} Ls={final_ls:.6f} Ls_eff={final_ls_eff:.6f} "
-            f"beta={yangclip_beta:.3f} sr={sr:.6f} rate={final_rate:.6f} gap={abs(final_rate - sr):.6f} "
+            f"beta={yangclip_beta:.3f} sr={sr:.6f} "
+            f"rate_mean={final_rate_mean:.6f} gap_mean={final_gap_mean:.6f} gap_max={final_gap_max:.6f} "
             f"d_mean/d_std/max|d|={d_mean:.6f}/{d_std:.6f}/{d_max:.6f} "
             f"sigmoid(d)_mean/std={z_mean:.6f}/{z_std:.6f}"
         )
@@ -381,8 +399,8 @@ def select_group_mask(
             "Lsa": final_lsa,
             "Ls": final_ls,
             "Ls_eff": final_ls_eff,
-            "rate": final_rate,
-            "gap": abs(final_rate - sr),
+            "rate": final_rate_mean,
+            "gap": final_gap_mean,
             "hard_rate": rate_hard,
             "hard_gap": hard_gap,
         }

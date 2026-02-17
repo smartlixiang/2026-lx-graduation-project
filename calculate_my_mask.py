@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--debug-outer", type=int, default=40)
+    parser.add_argument("--debug-outer", type=int, default=160)
     parser.add_argument(
         "--branch",
         type=int,

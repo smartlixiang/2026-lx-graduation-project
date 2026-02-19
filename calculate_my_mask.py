@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compare",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="group 模式下是否额外对比 topk",
     )
     return parser.parse_args()
@@ -276,8 +276,12 @@ def select_group_mask(
     else:
         target_size = 0
 
-    rho_min = 0.01
-    rho_max = 0.5
+    ga_population_size = 4
+    ga_generations = 200
+    ga_offspring = ga_population_size
+    crossover_sym_ratio = 0.7
+    mutation_ratio = 0.01
+    local_search_ratio = 0.02
 
     def _real_stats(cur_mask: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
         div_scores = np.asarray(
@@ -309,138 +313,145 @@ def select_group_mask(
         s_val = float(np.sum(s_ref[cur_mask.astype(bool)]))
         return s_val, s_ref, counts
 
-    branch_total = max(1, int(branch_count))
-    outer_iters = max(1, int(debug_outer))
-    branch_histories: list[list[float]] = []
-    branch_best_scores: list[float] = []
-    branch_best_iters: list[int] = []
+    def _indices_to_mask(indices: np.ndarray) -> np.ndarray:
+        mask = np.zeros(num_samples, dtype=np.uint8)
+        if indices.size > 0:
+            mask[indices] = 1
+        return mask
 
-    global_best_s = float("-inf")
-    global_best_mask = np.zeros(num_samples, dtype=np.uint8)
-    global_best_branch = 0
-    global_best_iter = 0
+    def _pick_top_static(candidate_idx: np.ndarray, k: int) -> np.ndarray:
+        if k <= 0 or candidate_idx.size == 0:
+            return np.empty(0, dtype=np.int64)
+        order = np.argsort(-sa_scores_np[candidate_idx])
+        return candidate_idx[order[: min(k, candidate_idx.size)]].astype(np.int64)
 
-    for branch_idx in range(branch_total):
-        selected_mask = np.zeros(num_samples, dtype=np.uint8)
-        init_count = target_size
-        init_idx = np.random.choice(num_samples, size=init_count, replace=False)
-        selected_mask[init_idx] = 1
-        rho = float(rho_max)
+    def _repair_size(indices: np.ndarray) -> np.ndarray:
+        unique_idx = np.unique(indices.astype(np.int64))
+        if target_size == 0:
+            return np.empty(0, dtype=np.int64)
+        if unique_idx.size > target_size:
+            return _pick_top_static(unique_idx, target_size)
+        if unique_idx.size < target_size:
+            comp = np.setdiff1d(np.arange(num_samples, dtype=np.int64), unique_idx, assume_unique=False)
+            fill = _pick_top_static(comp, target_size - unique_idx.size)
+            unique_idx = np.concatenate([unique_idx, fill])
+        if unique_idx.size > target_size:
+            unique_idx = _pick_top_static(unique_idx, target_size)
+        return unique_idx.astype(np.int64)
 
-        branch_best_mask = selected_mask.copy()
-        branch_best_s, _, _ = _real_stats(branch_best_mask)
-        branch_best_iter = 0
-        branch_scores = [float(branch_best_s)]
+    def _evaluate(indices: np.ndarray) -> dict[str, object]:
+        mask = _indices_to_mask(indices)
+        fitness, s_ref, counts = _real_stats(mask)
+        return {
+            "indices": np.sort(indices.astype(np.int64)),
+            "mask": mask,
+            "fitness": float(fitness),
+            "s_ref": s_ref,
+            "counts": counts,
+        }
 
-        outer_iterator = tqdm(
-            range(outer_iters),
-            desc=(progress_desc or "Group optimization") + f" [b{branch_idx + 1}/{branch_total}]",
-            unit="outer",
-            leave=True,
-        )
+    def _tournament_select(population: list[dict[str, object]]) -> dict[str, object]:
+        if len(population) == 1:
+            return population[0]
+        chosen = np.random.choice(len(population), size=2, replace=False)
+        a = population[int(chosen[0])]
+        b = population[int(chosen[1])]
+        return a if float(a["fitness"]) >= float(b["fitness"]) else b
 
-        for outer_idx in outer_iterator:
-            div_scores = np.asarray(
-                div_metric.score_dataset_dynamic(
-                    div_loader,
-                    adapter=image_adapter,
-                    selected_mask=selected_mask,
-                    image_features=div_features,
-                    labels=labels_t,
-                ).scores,
+    static_topk = _pick_top_static(np.arange(num_samples, dtype=np.int64), target_size)
+    initial_population_idx: list[np.ndarray] = [static_topk]
+    while len(initial_population_idx) < ga_population_size:
+        random_idx = np.random.choice(num_samples, size=target_size, replace=False).astype(np.int64)
+        initial_population_idx.append(np.sort(random_idx))
+
+    population = [_evaluate(_repair_size(idx)) for idx in initial_population_idx]
+    best_history = [max(float(item["fitness"]) for item in population)]
+
+    generation_iter = tqdm(
+        range(ga_generations),
+        desc=(progress_desc or "Group optimization") + " [Memetic-GA]",
+        unit="gen",
+        leave=True,
+    )
+
+    for _ in generation_iter:
+        offspring: list[dict[str, object]] = []
+        for _offspring_idx in range(ga_offspring):
+            parent_a = _tournament_select(population)
+            parent_b = _tournament_select(population)
+            parent_a_idx = np.asarray(parent_a["indices"], dtype=np.int64)
+            parent_b_idx = np.asarray(parent_b["indices"], dtype=np.int64)
+
+            inter = np.intersect1d(parent_a_idx, parent_b_idx, assume_unique=False)
+            sym = np.setdiff1d(np.union1d(parent_a_idx, parent_b_idx), inter, assume_unique=False)
+            child = inter.copy()
+
+            max_from_sym = min(target_size, inter.size + int(np.floor(crossover_sym_ratio * target_size)))
+            if child.size < target_size and sym.size > 0:
+                need_sym = max(0, max_from_sym - child.size)
+                if need_sym > 0:
+                    add_sym = _pick_top_static(sym, need_sym)
+                    child = np.concatenate([child, add_sym])
+
+            if child.size < target_size:
+                complement_union = np.setdiff1d(
+                    np.arange(num_samples, dtype=np.int64),
+                    np.union1d(parent_a_idx, parent_b_idx),
+                    assume_unique=False,
+                )
+                add_comp = _pick_top_static(complement_union, target_size - child.size)
+                child = np.concatenate([child, add_comp])
+
+            child = _repair_size(child)
+
+            k_mut = max(1, int(mutation_ratio * target_size))
+            k_mut = min(k_mut, child.size, num_samples - child.size)
+            if k_mut > 0:
+                drop_idx = np.random.choice(child, size=k_mut, replace=False).astype(np.int64)
+                comp_child = np.setdiff1d(np.arange(num_samples, dtype=np.int64), child, assume_unique=False)
+                add_idx = np.random.choice(comp_child, size=k_mut, replace=False).astype(np.int64)
+                child = np.setdiff1d(child, drop_idx, assume_unique=False)
+                child = np.concatenate([child, add_idx])
+                child = _repair_size(child)
+
+            proxy_scores = np.asarray(
+                parent_a["s_ref"] if float(parent_a["fitness"]) >= float(parent_b["fitness"]) else parent_b["s_ref"],
                 dtype=np.float32,
             )
-            dds_scores = np.asarray(
-                dds_metric.score_dataset_dynamic(
-                    dds_loader,
-                    adapter=image_adapter,
-                    selected_mask=selected_mask,
-                    image_features=dds_features,
-                    labels=labels_t,
-                ).scores,
-                dtype=np.float32,
-            )
-            s_all = (
-                weights["sa"] * sa_scores_np
-                + weights["div"] * div_scores
-                + weights["dds"] * dds_scores
-            )
+            k_ls = max(1, int(local_search_ratio * target_size))
+            k_ls = min(k_ls, child.size, num_samples - child.size)
+            if k_ls > 0:
+                child_order = np.argsort(proxy_scores[child])
+                ls_drop = child[child_order[:k_ls]]
+                child_comp = np.setdiff1d(np.arange(num_samples, dtype=np.int64), child, assume_unique=False)
+                ls_add_order = np.argsort(-proxy_scores[child_comp])
+                ls_add = child_comp[ls_add_order[:k_ls]]
+                child = np.setdiff1d(child, ls_drop, assume_unique=False)
+                child = np.concatenate([child, ls_add])
+                child = _repair_size(child)
 
-            selected_idx = np.flatnonzero(selected_mask == 1)
-            unselected_idx = np.flatnonzero(selected_mask == 0)
-            k_replace = max(1, int(round(rho * target_size)))
-            k_replace = min(k_replace, selected_idx.size, unselected_idx.size)
+            offspring.append(_evaluate(child))
 
-            if k_replace > 0:
-                drop_order = np.argsort(s_all[selected_idx])
-                idx_drop = selected_idx[drop_order[:k_replace]]
+        merged = population + offspring
+        merged_sorted = sorted(merged, key=lambda item: float(item["fitness"]), reverse=True)
+        dedup_population: list[dict[str, object]] = []
+        seen: set[tuple[int, ...]] = set()
+        for item in merged_sorted:
+            key = tuple(np.asarray(item["indices"], dtype=np.int64).tolist())
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup_population.append(item)
+            if len(dedup_population) >= ga_population_size:
+                break
+        population = dedup_population
 
-                add_order = np.argsort(-s_all[unselected_idx])
-                idx_add = unselected_idx[add_order[:k_replace]]
+        generation_best = max(float(item["fitness"]) for item in population)
+        best_history.append(generation_best)
+        generation_iter.set_postfix({"best_S": f"{generation_best:.4f}"})
 
-                candidate_mask = selected_mask.copy()
-                candidate_mask[idx_drop] = 0
-                candidate_mask[idx_add] = 1
-            else:
-                candidate_mask = selected_mask.copy()
-
-            candidate_idx = np.flatnonzero(candidate_mask == 1)
-            if candidate_idx.size < target_size:
-                candidate_unselected = np.flatnonzero(candidate_mask == 0)
-                if candidate_unselected.size > 0:
-                    need = min(target_size - candidate_idx.size, candidate_unselected.size)
-                    fill_order = np.argsort(-s_all[candidate_unselected])
-                    fill_idx = candidate_unselected[fill_order[:need]]
-                    candidate_mask[fill_idx] = 1
-                    candidate_idx = np.flatnonzero(candidate_mask == 1)
-            if candidate_idx.size > target_size:
-                keep_order = np.argsort(-s_all[candidate_idx])
-                keep_idx = candidate_idx[keep_order[:target_size]]
-                candidate_mask = np.zeros(num_samples, dtype=np.uint8)
-                candidate_mask[keep_idx] = 1
-
-            candidate_s, _, _ = _real_stats(candidate_mask)
-            current_s = branch_scores[-1]
-            if outer_idx < 2:
-                accept = candidate_s >= current_s
-            else:
-                base = min(branch_scores[-1], branch_scores[-2])
-                accept = candidate_s >= base
-
-            if accept:
-                selected_mask = candidate_mask
-                accepted_s = float(candidate_s)
-                rho = min(rho_max, rho * 1.1)
-            else:
-                accepted_s = float(current_s)
-                rho = max(rho_min, rho * 0.5)
-
-            branch_scores.append(accepted_s)
-            if accepted_s > branch_best_s:
-                branch_best_s = float(accepted_s)
-                branch_best_mask = selected_mask.copy()
-                branch_best_iter = outer_idx + 1
-
-            if branch_best_s > global_best_s:
-                global_best_s = float(branch_best_s)
-                global_best_mask = branch_best_mask.copy()
-                global_best_branch = branch_idx
-                global_best_iter = branch_best_iter
-
-            outer_iterator.set_postfix(
-                {
-                    "branch_best_S": f"{branch_best_s:.4f}",
-                    "branch_best_iter": branch_best_iter,
-                    "global_best_S": f"{global_best_s:.4f}",
-                    "global_best_branch": global_best_branch + 1,
-                }
-            )
-
-        branch_histories.append(branch_scores)
-        branch_best_scores.append(float(branch_best_s))
-        branch_best_iters.append(int(branch_best_iter))
-
-    final_mask = global_best_mask.astype(np.uint8)
+    best_individual = max(population, key=lambda item: float(item["fitness"]))
+    final_mask = np.asarray(best_individual["mask"], dtype=np.uint8)
     _, final_s_all, _ = _real_stats(final_mask)
 
     selected_by_class: dict[int, int] = {}
@@ -457,13 +468,16 @@ def select_group_mask(
         "final_rate": final_rate,
         "selected_by_class": selected_by_class,
         "S": float(np.sum(final_s_all[final_mask.astype(bool)])),
-        "outer_iters": int(outer_iters),
-        "branch_count": int(branch_total),
-        "best_branch": int(global_best_branch + 1),
-        "best_iter": int(global_best_iter),
-        "branch_best_scores": branch_best_scores,
-        "branch_best_iters": branch_best_iters,
-        "branch_score_histories": branch_histories,
+        "outer_iters": int(ga_generations),
+        "branch_count": int(ga_population_size),
+        "best_branch": 1,
+        "best_iter": int(np.argmax(np.asarray(best_history, dtype=np.float32))),
+        "branch_best_scores": [float(np.max(np.asarray(best_history, dtype=np.float32)))],
+        "branch_best_iters": [int(np.argmax(np.asarray(best_history, dtype=np.float32)))],
+        "branch_score_histories": [best_history],
+        "ga_population_size": int(ga_population_size),
+        "ga_generations": int(ga_generations),
+        "ga_offspring": int(ga_offspring),
     }
 
     return final_mask, selected_by_class, stats

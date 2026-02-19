@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.adapter import load_trained_adapters  # noqa: E402
-from dataset.dataset_config import CIFAR10  # noqa: E402
+from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
@@ -28,8 +28,14 @@ from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Calculate selection masks (CIFAR-10)")
-    parser.add_argument("--data-root", type=str, default="./data", help="数据根目录")
+    parser = argparse.ArgumentParser(description="Calculate selection masks")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=CIFAR10,
+        choices=AVAILABLE_DATASETS,
+        help="目标数据集名称",
+    )
     parser.add_argument(
         "--cr",
         type=str,
@@ -62,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--debug-outer", type=int, default=160)
+    parser.add_argument("--debug-outer", type=int, default=40)
     parser.add_argument(
         "--branch",
         type=int,
@@ -76,6 +82,15 @@ def parse_args() -> argparse.Namespace:
         help="group 模式下是否额外对比 topk",
     )
     return parser.parse_args()
+
+
+def _build_dataset(dataset_name: str, transform) -> datasets.VisionDataset:
+    data_root = PROJECT_ROOT / "data"
+    if dataset_name == CIFAR10:
+        return datasets.CIFAR10(root=str(data_root), train=True, download=True, transform=transform)
+    if dataset_name == CIFAR100:
+        return datasets.CIFAR100(root=str(data_root), train=True, download=True, transform=transform)
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
 def parse_ratio_list(ratio_text: str) -> list[int]:
@@ -180,9 +195,13 @@ def load_scoring_weights(
 
 
 def build_score_loader(
-    preprocess, data_root: str, device: torch.device, batch_size: int, num_workers: int
+    preprocess,
+    dataset_name: str,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
 ) -> DataLoader:
-    dataset = datasets.CIFAR10(root=data_root, train=True, download=True, transform=preprocess)
+    dataset = _build_dataset(dataset_name, preprocess)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -251,8 +270,14 @@ def select_group_mask(
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
     dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
 
-    class_counts_all = np.bincount(labels_np, minlength=num_classes).astype(np.int64)
-    class_quotas = np.maximum(1, (class_counts_all * sr).astype(np.int64))
+    target_size = int(round(sr * num_samples))
+    if num_samples > 0:
+        target_size = min(num_samples, max(1, target_size))
+    else:
+        target_size = 0
+
+    rho_min = 0.01
+    rho_max = 0.5
 
     def _real_stats(cur_mask: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
         div_scores = np.asarray(
@@ -297,9 +322,10 @@ def select_group_mask(
 
     for branch_idx in range(branch_total):
         selected_mask = np.zeros(num_samples, dtype=np.uint8)
-        init_count = max(1, int(round(sr * num_samples)))
+        init_count = target_size
         init_idx = np.random.choice(num_samples, size=init_count, replace=False)
         selected_mask[init_idx] = 1
+        rho = float(rho_max)
 
         branch_best_mask = selected_mask.copy()
         branch_best_s, _, _ = _real_stats(branch_best_mask)
@@ -314,10 +340,6 @@ def select_group_mask(
         )
 
         for outer_idx in outer_iterator:
-            num_d = int(selected_mask.sum())
-            remain_count = max(0, num_samples - num_d)
-            n_extra = max(1, int(0.3 * remain_count)) if remain_count > 0 else 0
-
             div_scores = np.asarray(
                 div_metric.score_dataset_dynamic(
                     div_loader,
@@ -344,56 +366,58 @@ def select_group_mask(
                 + weights["dds"] * dds_scores
             )
 
-            top_a = np.argpartition(-s_all, num_d - 1)[:num_d]
-            remaining_indices = np.flatnonzero(selected_mask == 0)
-            top_b = np.empty((0,), dtype=np.int64)
-            if n_extra > 0 and remaining_indices.size > 0:
-                n_extra_eff = min(n_extra, remaining_indices.size)
-                remain_scores = s_all[remaining_indices]
-                top_b_local = np.argpartition(-remain_scores, n_extra_eff - 1)[:n_extra_eff]
-                top_b = remaining_indices[top_b_local]
+            selected_idx = np.flatnonzero(selected_mask == 1)
+            unselected_idx = np.flatnonzero(selected_mask == 0)
+            k_replace = max(1, int(round(rho * target_size)))
+            k_replace = min(k_replace, selected_idx.size, unselected_idx.size)
 
-            cand = np.unique(np.concatenate([top_a, top_b]))
-            cand_labels = labels_np[cand]
-            picked_chunks: list[np.ndarray] = []
+            if k_replace > 0:
+                drop_order = np.argsort(s_all[selected_idx])
+                idx_drop = selected_idx[drop_order[:k_replace]]
 
-            for class_id in range(num_classes):
-                class_quota = int(class_quotas[class_id])
-                class_candidates = cand[cand_labels == class_id]
-                if class_candidates.size == 0:
-                    continue
-                take = min(class_quota, class_candidates.size)
-                class_scores = s_all[class_candidates]
-                class_order = np.argsort(-class_scores)
-                picked_chunks.append(class_candidates[class_order[:take]])
+                add_order = np.argsort(-s_all[unselected_idx])
+                idx_add = unselected_idx[add_order[:k_replace]]
 
-            if picked_chunks:
-                d_new = np.unique(np.concatenate(picked_chunks))
+                candidate_mask = selected_mask.copy()
+                candidate_mask[idx_drop] = 0
+                candidate_mask[idx_add] = 1
             else:
-                d_new = np.empty((0,), dtype=np.int64)
+                candidate_mask = selected_mask.copy()
 
-            if d_new.size < num_d:
-                in_d_new = np.zeros(num_samples, dtype=bool)
-                in_d_new[d_new] = True
-                cand_remain = cand[~in_d_new[cand]]
-                if cand_remain.size > 0:
-                    fill = min(num_d - d_new.size, cand_remain.size)
-                    fill_scores = s_all[cand_remain]
-                    fill_order = np.argsort(-fill_scores)
-                    d_new = np.concatenate([d_new, cand_remain[fill_order[:fill]]])
+            candidate_idx = np.flatnonzero(candidate_mask == 1)
+            if candidate_idx.size < target_size:
+                candidate_unselected = np.flatnonzero(candidate_mask == 0)
+                if candidate_unselected.size > 0:
+                    need = min(target_size - candidate_idx.size, candidate_unselected.size)
+                    fill_order = np.argsort(-s_all[candidate_unselected])
+                    fill_idx = candidate_unselected[fill_order[:need]]
+                    candidate_mask[fill_idx] = 1
+                    candidate_idx = np.flatnonzero(candidate_mask == 1)
+            if candidate_idx.size > target_size:
+                keep_order = np.argsort(-s_all[candidate_idx])
+                keep_idx = candidate_idx[keep_order[:target_size]]
+                candidate_mask = np.zeros(num_samples, dtype=np.uint8)
+                candidate_mask[keep_idx] = 1
 
-            if d_new.size > num_d:
-                d_new_scores = s_all[d_new]
-                d_new_order = np.argsort(-d_new_scores)
-                d_new = d_new[d_new_order[:num_d]]
+            candidate_s, _, _ = _real_stats(candidate_mask)
+            current_s = branch_scores[-1]
+            if outer_idx < 2:
+                accept = candidate_s >= current_s
+            else:
+                base = min(branch_scores[-1], branch_scores[-2])
+                accept = candidate_s >= base
 
-            selected_mask = np.zeros(num_samples, dtype=np.uint8)
-            selected_mask[d_new] = 1
+            if accept:
+                selected_mask = candidate_mask
+                accepted_s = float(candidate_s)
+                rho = min(rho_max, rho * 1.1)
+            else:
+                accepted_s = float(current_s)
+                rho = max(rho_min, rho * 0.5)
 
-            current_s, _, _ = _real_stats(selected_mask)
-            branch_scores.append(float(current_s))
-            if current_s > branch_best_s:
-                branch_best_s = float(current_s)
+            branch_scores.append(accepted_s)
+            if accepted_s > branch_best_s:
+                branch_best_s = float(accepted_s)
                 branch_best_mask = selected_mask.copy()
                 branch_best_iter = outer_idx + 1
 
@@ -490,6 +514,7 @@ def save_branch_score_plot(
 def main() -> None:
     total_start = time.perf_counter()
     args = parse_args()
+    dataset_name = args.dataset.strip().lower()
 
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
     method = args.method.strip().lower()
@@ -501,15 +526,13 @@ def main() -> None:
         raise ValueError("weight-group 仅支持 {'naive', 'learned'}")
 
     weights_path = PROJECT_ROOT / "weights" / "scoring_weights.json"
-    all_weights = ensure_scoring_weights(weights_path, CIFAR10)
+    all_weights = ensure_scoring_weights(weights_path, dataset_name)
 
     data_load_start = time.perf_counter()
-    dataset_for_names = datasets.CIFAR10(
-        root=args.data_root, train=True, download=True, transform=None
-    )
+    dataset_for_names = _build_dataset(dataset_name, transform=None)
     class_names = dataset_for_names.classes  # type: ignore[attr-defined]
     print(
-        f"[Init] CIFAR-10 data ready | samples={len(dataset_for_names)} | elapsed={time.perf_counter() - data_load_start:.2f}s"
+        f"[Init] {dataset_name} data ready | samples={len(dataset_for_names)} | elapsed={time.perf_counter() - data_load_start:.2f}s"
     )
 
     metric_init_start = time.perf_counter()
@@ -533,13 +556,25 @@ def main() -> None:
 
     loader_build_start = time.perf_counter()
     dds_loader = build_score_loader(
-        dds_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers
+        dds_metric.extractor.preprocess,
+        dataset_name,
+        device,
+        batch_size,
+        num_workers,
     )
     div_loader = build_score_loader(
-        div_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers
+        div_metric.extractor.preprocess,
+        dataset_name,
+        device,
+        batch_size,
+        num_workers,
     )
     sa_loader = build_score_loader(
-        sa_metric.extractor.preprocess, args.data_root, device, batch_size, num_workers
+        sa_metric.extractor.preprocess,
+        dataset_name,
+        device,
+        batch_size,
+        num_workers,
     )
     print(
         f"[Init] DataLoaders ready (DDS/Div/SA) | elapsed={time.perf_counter() - loader_build_start:.2f}s"
@@ -560,7 +595,7 @@ def main() -> None:
         set_seed(seed)
         weights = load_scoring_weights(all_weights, weight_group, seed)
         image_adapter, text_adapter, adapter_paths = load_trained_adapters(
-            dataset_name=CIFAR10,
+            dataset_name=dataset_name,
             clip_model=args.clip_model,
             input_dim=dds_metric.extractor.embed_dim,
             seed=seed,
@@ -596,7 +631,7 @@ def main() -> None:
         static_compute_start = time.perf_counter()
         static_scores = get_or_compute_static_scores(
             cache_root=PROJECT_ROOT / "static_scores",
-            dataset=CIFAR10,
+            dataset=dataset_name,
             seed=seed,
             clip_model=args.clip_model,
             adapter_image_path=str(adapter_paths["image_path"]),
@@ -705,7 +740,7 @@ def main() -> None:
                 )
                 debug_curve = save_branch_score_plot(
                     group_stats.get("branch_score_histories", []),
-                    dataset="cifar10",
+                    dataset=dataset_name,
                     method=method,
                     weight_group=weight_group,
                     model_name=args.model_name,
@@ -741,7 +776,7 @@ def main() -> None:
             total_time = time.perf_counter() - total_start
             mask_path = resolve_mask_path(
                 mode=method_name,
-                dataset="cifar10",
+                dataset=dataset_name,
                 model=args.model_name,
                 seed=seed,
                 cut_ratio=cut_ratio,
@@ -751,7 +786,7 @@ def main() -> None:
             np.savez_compressed(mask_path, mask=mask.astype(np.uint8))
 
             meta_info = {
-                "dataset": "cifar10",
+                "dataset": dataset_name,
                 "model_name": args.model_name,
                 "method": method_name,
                 "weight_group": weight_group,

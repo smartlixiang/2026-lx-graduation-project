@@ -29,5 +29,12 @@
       "ridge_lambda": 0.01,
       "proxy_log": "weights\\proxy_logs\\cifar10\\resnet18\\96\\100"
     }
+  },
+  "cifar100": {
+    "naive": {
+      "dds": 0.3333333333333333,
+      "div": 0.3333333333333333,
+      "sa": 0.3333333333333333
+    }
   }
 }

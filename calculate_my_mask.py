@@ -280,8 +280,8 @@ def select_group_mask(
     ga_generations = 200
     ga_offspring = ga_population_size
     crossover_sym_ratio = 0.7
-    mutation_ratio = 0.01
-    local_search_ratio = 0.02
+    mutation_ratio = 0.005
+    local_search_ratio = 0.01
 
     def _real_stats(cur_mask: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
         div_scores = np.asarray(

@@ -1,0 +1,417 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from torchvision import datasets
+from tqdm import tqdm
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from dataset.dataset_config import CIFAR10
+from model.adapter import load_trained_adapters
+from scoring import DifficultyDirection, Div, SemanticAlignment
+from utils.global_config import CONFIG
+from utils.seed import set_seed
+from utils.static_score_cache import get_or_compute_static_scores
+
+
+FIXED_SEED = 42
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="计算 CIFAR10 在 cr=20..90 下 topk 与 group_old 的子集评分（Div/DDS 在子集上动态计算）"
+    )
+    parser.add_argument("--dataset", type=str, default=CIFAR10, choices=[CIFAR10])
+    parser.add_argument("--clip-model", type=str, default="ViT-B/32")
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--model-name", type=str, default="resnet50")
+    parser.add_argument("--weight-group", type=str, default="naive", choices=["naive", "learned"])
+    parser.add_argument("--group-old-iters", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "result" / "subset_mask_scores_cifar10.csv")
+    return parser.parse_args()
+
+
+def _build_dataset(transform) -> datasets.CIFAR10:
+    data_root = PROJECT_ROOT / "data"
+    return datasets.CIFAR10(root=str(data_root), train=True, download=True, transform=transform)
+
+
+def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str, object]]:
+    data: dict[str, dict[str, dict[str, float]]] = {}
+    updated = False
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+
+    dataset_entry = data.get(dataset_name)
+    if not isinstance(dataset_entry, dict):
+        dataset_entry = {}
+        updated = True
+
+    naive = dataset_entry.get("naive")
+    if not isinstance(naive, dict):
+        naive = {}
+        updated = True
+
+    default_weight = 1.0 / 3.0
+    for key in ("dds", "div", "sa"):
+        if key not in naive:
+            naive[key] = default_weight
+            updated = True
+
+    naive_total = 0.0
+    for key in ("dds", "div", "sa"):
+        try:
+            naive[key] = float(naive[key])
+        except (TypeError, ValueError):
+            naive[key] = default_weight
+            updated = True
+        naive_total += naive[key]
+
+    if naive_total <= 0:
+        for key in ("dds", "div", "sa"):
+            naive[key] = default_weight
+        updated = True
+    elif abs(naive_total - 1.0) > 1e-12:
+        for key in ("dds", "div", "sa"):
+            naive[key] /= naive_total
+        updated = True
+
+    dataset_entry["naive"] = naive
+    data[dataset_name] = dataset_entry
+    if updated or not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    return {group_name: group for group_name, group in dataset_entry.items() if isinstance(group, dict)}
+
+
+def load_scoring_weights(all_weights: dict[str, dict[str, object]], weight_group: str, seed: int) -> dict[str, float]:
+    if weight_group == "naive":
+        selected = all_weights.get("naive")
+        if not isinstance(selected, dict):
+            raise KeyError("未找到 naive 权重组")
+    else:
+        selected = all_weights.get(str(seed))
+        if not isinstance(selected, dict):
+            raise KeyError(f"未找到 learned 权重组（seed={seed}）")
+
+    required = {"dds", "div", "sa"}
+    if not required.issubset(selected.keys()):
+        raise KeyError(f"权重缺少键: {required - set(selected.keys())}")
+    return {k: float(selected[k]) for k in required}
+
+
+def build_score_loader(preprocess, device: torch.device, batch_size: int, num_workers: int) -> DataLoader:
+    dataset = _build_dataset(preprocess)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+    )
+
+
+def select_global_topk(scores: np.ndarray, cut_ratio: int) -> np.ndarray:
+    n = scores.shape[0]
+    k = max(1, min(n, int(round(n * cut_ratio / 100.0))))
+    idx = np.argpartition(-scores, k - 1)[:k]
+    mask = np.zeros(n, dtype=np.uint8)
+    mask[idx] = 1
+    return mask
+
+
+def compute_subset_score(
+    selected_mask: np.ndarray,
+    *,
+    sa_scores: np.ndarray,
+    labels_t: torch.Tensor,
+    weights: dict[str, float],
+    div_metric: Div,
+    dds_metric: DifficultyDirection,
+    div_loader: DataLoader,
+    dds_loader: DataLoader,
+    image_adapter,
+    div_features,
+    dds_features,
+) -> tuple[float, float, float]:
+    div_dyn = np.asarray(
+        div_metric.score_dataset_dynamic(
+            div_loader,
+            adapter=image_adapter,
+            selected_mask=selected_mask,
+            image_features=div_features,
+            labels=labels_t,
+        ).scores,
+        dtype=np.float32,
+    )
+    dds_dyn = np.asarray(
+        dds_metric.score_dataset_dynamic(
+            dds_loader,
+            adapter=image_adapter,
+            selected_mask=selected_mask,
+            image_features=dds_features,
+            labels=labels_t,
+        ).scores,
+        dtype=np.float32,
+    )
+    chosen = selected_mask.astype(bool)
+    div_sum = float(div_dyn[chosen].sum())
+    dds_sum = float(dds_dyn[chosen].sum())
+    total = float((weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_dyn)[chosen].sum())
+    return div_sum, dds_sum, total
+
+
+def select_group_old_best(
+    *,
+    n_samples: int,
+    cut_ratio: int,
+    outer_iters: int,
+    sa_scores: np.ndarray,
+    labels_t: torch.Tensor,
+    weights: dict[str, float],
+    div_metric: Div,
+    dds_metric: DifficultyDirection,
+    div_loader: DataLoader,
+    dds_loader: DataLoader,
+    image_adapter,
+    div_features,
+    dds_features,
+) -> tuple[np.ndarray, float, float, float, int]:
+    k = max(1, min(n_samples, int(round(n_samples * cut_ratio / 100.0))))
+    cur_idx = np.random.choice(n_samples, size=k, replace=False)
+    cur_mask = np.zeros(n_samples, dtype=np.uint8)
+    cur_mask[cur_idx] = 1
+
+    best_mask = cur_mask.copy()
+    best_div, best_dds, best_total = compute_subset_score(
+        cur_mask,
+        sa_scores=sa_scores,
+        labels_t=labels_t,
+        weights=weights,
+        div_metric=div_metric,
+        dds_metric=dds_metric,
+        div_loader=div_loader,
+        dds_loader=dds_loader,
+        image_adapter=image_adapter,
+        div_features=div_features,
+        dds_features=dds_features,
+    )
+    best_iter = 0
+
+    for t in range(1, outer_iters + 1):
+        div_dyn = np.asarray(
+            div_metric.score_dataset_dynamic(
+                div_loader,
+                adapter=image_adapter,
+                selected_mask=cur_mask,
+                image_features=div_features,
+                labels=labels_t,
+            ).scores,
+            dtype=np.float32,
+        )
+        dds_dyn = np.asarray(
+            dds_metric.score_dataset_dynamic(
+                dds_loader,
+                adapter=image_adapter,
+                selected_mask=cur_mask,
+                image_features=dds_features,
+                labels=labels_t,
+            ).scores,
+            dtype=np.float32,
+        )
+        total_scores = weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_dyn
+        next_mask = select_global_topk(total_scores, cut_ratio=cut_ratio)
+        cur_mask = next_mask
+
+        div_sum, dds_sum, total_sum = compute_subset_score(
+            cur_mask,
+            sa_scores=sa_scores,
+            labels_t=labels_t,
+            weights=weights,
+            div_metric=div_metric,
+            dds_metric=dds_metric,
+            div_loader=div_loader,
+            dds_loader=dds_loader,
+            image_adapter=image_adapter,
+            div_features=div_features,
+            dds_features=dds_features,
+        )
+        if total_sum > best_total:
+            best_total = total_sum
+            best_div = div_sum
+            best_dds = dds_sum
+            best_mask = cur_mask.copy()
+            best_iter = t
+
+    return best_mask, best_div, best_dds, best_total, best_iter
+
+
+def main() -> None:
+    args = parse_args()
+    set_seed(FIXED_SEED)
+
+    device = torch.device(args.device) if args.device is not None else CONFIG.global_device
+    dataset_for_names = _build_dataset(transform=None)
+    class_names = dataset_for_names.classes  # type: ignore[attr-defined]
+    labels = np.asarray(dataset_for_names.targets)
+    labels_t = torch.as_tensor(labels, dtype=torch.long, device=device)
+
+    weights_path = PROJECT_ROOT / "weights" / "scoring_weights.json"
+    all_weights = ensure_scoring_weights(weights_path, args.dataset)
+    weights = load_scoring_weights(all_weights, args.weight_group, FIXED_SEED)
+
+    dds_metric = DifficultyDirection(class_names=class_names, clip_model=args.clip_model, device=device)
+    div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
+    sa_metric = SemanticAlignment(class_names=class_names, clip_model=args.clip_model, device=device)
+
+    dds_loader = build_score_loader(dds_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
+    div_loader = build_score_loader(div_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
+    sa_loader = build_score_loader(sa_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
+
+    image_adapter, text_adapter, adapter_paths = load_trained_adapters(
+        dataset_name=args.dataset,
+        clip_model=args.clip_model,
+        input_dim=dds_metric.extractor.embed_dim,
+        seed=FIXED_SEED,
+        map_location=device,
+    )
+    image_adapter.to(device).eval()
+    text_adapter.to(device).eval()
+
+    def _compute_scores() -> dict[str, np.ndarray]:
+        dds_scores_local = dds_metric.score_dataset(
+            tqdm(dds_loader, desc="Scoring DDS", unit="batch"),
+            adapter=image_adapter,
+        ).scores
+        div_scores_local = div_metric.score_dataset(
+            tqdm(div_loader, desc="Scoring Div", unit="batch"),
+            adapter=image_adapter,
+        ).scores
+        sa_scores_local = sa_metric.score_dataset(
+            tqdm(sa_loader, desc="Scoring SA", unit="batch"),
+            adapter_image=image_adapter,
+            adapter_text=text_adapter,
+        ).scores
+        return {
+            "sa": np.asarray(sa_scores_local),
+            "div": np.asarray(div_scores_local),
+            "dds": np.asarray(dds_scores_local),
+            "labels": labels,
+        }
+
+    static_scores = get_or_compute_static_scores(
+        cache_root=PROJECT_ROOT / "static_scores",
+        dataset=args.dataset,
+        seed=FIXED_SEED,
+        clip_model=args.clip_model,
+        adapter_image_path=str(adapter_paths["image_path"]),
+        adapter_text_path=str(adapter_paths["text_path"]),
+        div_k=div_metric.k,
+        dds_k=dds_metric.k,
+        dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
+        dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
+        prompt_template=sa_metric.prompt_template,
+        num_samples=len(dataset_for_names),
+        compute_fn=_compute_scores,
+    )
+
+    sa_scores = np.asarray(static_scores["sa"], dtype=np.float32)
+    div_scores = np.asarray(static_scores["div"], dtype=np.float32)
+    dds_scores = np.asarray(static_scores["dds"], dtype=np.float32)
+    total_static = weights["sa"] * sa_scores + weights["div"] * div_scores + weights["dds"] * dds_scores
+
+    start = time.perf_counter()
+    div_features, _ = div_metric._encode_images(div_loader, image_adapter)
+    dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
+    print(f"[Init] Encoded image features for dynamic scoring in {time.perf_counter() - start:.2f}s")
+
+    cut_ratios = list(range(20, 91, 10))
+    rows: list[dict[str, object]] = []
+
+    for cr in cut_ratios:
+        print(f"[CR={cr}] evaluating topk and group_old ...")
+        topk_mask = select_global_topk(total_static, cut_ratio=cr)
+        topk_div, topk_dds, topk_total = compute_subset_score(
+            topk_mask,
+            sa_scores=sa_scores,
+            labels_t=labels_t,
+            weights=weights,
+            div_metric=div_metric,
+            dds_metric=dds_metric,
+            div_loader=div_loader,
+            dds_loader=dds_loader,
+            image_adapter=image_adapter,
+            div_features=div_features,
+            dds_features=dds_features,
+        )
+
+        _, grp_div, grp_dds, grp_total, best_iter = select_group_old_best(
+            n_samples=len(dataset_for_names),
+            cut_ratio=cr,
+            outer_iters=args.group_old_iters,
+            sa_scores=sa_scores,
+            labels_t=labels_t,
+            weights=weights,
+            div_metric=div_metric,
+            dds_metric=dds_metric,
+            div_loader=div_loader,
+            dds_loader=dds_loader,
+            image_adapter=image_adapter,
+            div_features=div_features,
+            dds_features=dds_features,
+        )
+
+        rows.append(
+            {
+                "cr": cr,
+                "topk_div": topk_div,
+                "topk_dds": topk_dds,
+                "topk_total": topk_total,
+                "group_old_div": grp_div,
+                "group_old_dds": grp_dds,
+                "group_old_total": grp_total,
+                "group_old_best_iter": best_iter,
+            }
+        )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "cr",
+                "topk_div",
+                "topk_dds",
+                "topk_total",
+                "group_old_div",
+                "group_old_dds",
+                "group_old_total",
+                "group_old_best_iter",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Saved CSV: {args.output}")
+
+
+if __name__ == "__main__":
+    main()

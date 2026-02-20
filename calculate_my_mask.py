@@ -276,14 +276,36 @@ def select_group_mask(
     else:
         target_size = 0
 
-    ga_population_size = 4
-    ga_generations = 200
+    ga_population_size = 8
+    ga_generations = 120
     ga_offspring = ga_population_size
-    crossover_sym_ratio = 0.7
-    mutation_ratio = 0.005
-    local_search_ratio = 0.01
+    crossover_sym_ratio = 0.8
 
-    def _real_stats(cur_mask: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    def _dynamic_parameter_adjustment(cr: int) -> tuple[float, float]:
+        if cr <= 30:
+            return 5, 5
+        if cr <= 60:
+            return 3, 3
+        return 1, 1
+
+    mutation_scale, local_search_scale = _dynamic_parameter_adjustment(cut_ratio)
+    mutation_ratio = 0.008 * mutation_scale
+    local_search_ratio = 0.01 * local_search_scale
+    k_mut_base = max(1, int(mutation_ratio * target_size))
+    k_ls_base = max(1, int(local_search_ratio * target_size))
+
+    stall_counter = 0
+    EPS_IMPROVE = 1e-8
+    STALL_TRIGGER = max(8, ga_generations // 25)
+    STALL_SHAKE = max(20, ga_generations // 8)
+
+    cached_real_stats: dict[tuple[int, ...], tuple[float, np.ndarray, np.ndarray]] = {}
+
+    def _real_stats_cached(cur_mask: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+        cur_key = tuple(np.flatnonzero(cur_mask).tolist())
+        cached = cached_real_stats.get(cur_key)
+        if cached is not None:
+            return cached
         div_scores = np.asarray(
             div_metric.score_dataset_dynamic(
                 div_loader,
@@ -311,7 +333,9 @@ def select_group_mask(
         )
         counts = np.bincount(labels_np[cur_mask.astype(bool)], minlength=num_classes).astype(np.int64)
         s_val = float(np.sum(s_ref[cur_mask.astype(bool)]))
-        return s_val, s_ref, counts
+        result = (s_val, s_ref, counts)
+        cached_real_stats[cur_key] = result
+        return result
 
     def _indices_to_mask(indices: np.ndarray) -> np.ndarray:
         mask = np.zeros(num_samples, dtype=np.uint8)
@@ -341,7 +365,7 @@ def select_group_mask(
 
     def _evaluate(indices: np.ndarray) -> dict[str, object]:
         mask = _indices_to_mask(indices)
-        fitness, s_ref, counts = _real_stats(mask)
+        fitness, s_ref, counts = _real_stats_cached(mask)
         return {
             "indices": np.sort(indices.astype(np.int64)),
             "mask": mask,
@@ -349,6 +373,64 @@ def select_group_mask(
             "s_ref": s_ref,
             "counts": counts,
         }
+
+    def _adaptive_mutation_and_search(
+        k_mut_base_value: int,
+        k_ls_base_value: int,
+        stall_steps: int,
+        max_steps: int,
+    ) -> tuple[int, int]:
+        k_mut = k_mut_base_value
+        k_ls = k_ls_base_value
+        if stall_steps >= max_steps:
+            max_exchange = max(0, num_samples - target_size)
+            k_mut = min(k_mut_base_value * 2, max_exchange)
+            k_ls = min(k_ls_base_value * 2, max_exchange)
+        return k_mut, k_ls
+
+    def _local_search_step(child: np.ndarray, proxy_scores: np.ndarray, k_ls_value: int) -> np.ndarray:
+        k_ls_value = min(k_ls_value, num_samples - child.size, child.size)
+        if k_ls_value <= 0:
+            return child
+        child_order = np.argsort(proxy_scores[child])
+        ls_drop = child[child_order[:k_ls_value]]
+        child_comp = np.setdiff1d(np.arange(num_samples, dtype=np.int64), child, assume_unique=False)
+        if child_comp.size == 0:
+            return child
+        ls_add_order = np.argsort(-proxy_scores[child_comp])
+        ls_add = child_comp[ls_add_order[:k_ls_value]]
+        child = np.setdiff1d(child, ls_drop, assume_unique=False)
+        child = np.concatenate([child, ls_add])
+        return child
+
+    def _shake(pop_data: list[dict[str, object]], k_mut_value: int, k_ls_value: int) -> dict[str, object]:
+        best_ind = pop_data[0]
+        shaken_child = np.array(best_ind["indices"], dtype=np.int64)
+        k_shake = min(
+            max(int(np.sqrt(max(target_size, 1)) * 2), 2),
+            shaken_child.size,
+            max(0, num_samples - shaken_child.size),
+        )
+        if k_shake <= 0:
+            return _evaluate(_repair_size(shaken_child))
+
+        drop_idx = np.random.choice(shaken_child, size=k_shake, replace=False).astype(np.int64)
+        comp_child = np.setdiff1d(np.arange(num_samples, dtype=np.int64), shaken_child, assume_unique=False)
+        add_idx = np.random.choice(comp_child, size=k_shake, replace=False).astype(np.int64)
+        shaken_child = np.setdiff1d(shaken_child, drop_idx, assume_unique=False)
+        shaken_child = np.concatenate([shaken_child, add_idx])
+        shaken_child = _repair_size(shaken_child)
+
+        if k_mut_value > 0:
+            drop_idx = np.random.choice(shaken_child, size=k_mut_value, replace=False).astype(np.int64)
+            comp_child = np.setdiff1d(np.arange(num_samples, dtype=np.int64), shaken_child, assume_unique=False)
+            add_idx = np.random.choice(comp_child, size=k_mut_value, replace=False).astype(np.int64)
+            shaken_child = np.setdiff1d(shaken_child, drop_idx, assume_unique=False)
+            shaken_child = np.concatenate([shaken_child, add_idx])
+
+        proxy_scores = np.asarray(best_ind["s_ref"], dtype=np.float32)
+        shaken_child = _local_search_step(shaken_child, proxy_scores, k_ls_value)
+        return _evaluate(_repair_size(shaken_child))
 
     def _tournament_select(population: list[dict[str, object]]) -> dict[str, object]:
         if len(population) == 1:
@@ -374,7 +456,23 @@ def select_group_mask(
         leave=True,
     )
 
+    best_fitness = max(float(item["fitness"]) for item in population)
+
     for _ in generation_iter:
+        cur_best = float(population[0]["fitness"])
+        if cur_best > best_fitness + EPS_IMPROVE:
+            best_fitness = cur_best
+            stall_counter = 0
+        else:
+            stall_counter += 1
+
+        k_mut, k_ls = _adaptive_mutation_and_search(
+            k_mut_base,
+            k_ls_base,
+            stall_counter,
+            STALL_TRIGGER,
+        )
+
         offspring: list[dict[str, object]] = []
         for _offspring_idx in range(ga_offspring):
             parent_a = _tournament_select(population)
@@ -404,7 +502,6 @@ def select_group_mask(
 
             child = _repair_size(child)
 
-            k_mut = max(1, int(mutation_ratio * target_size))
             k_mut = min(k_mut, child.size, num_samples - child.size)
             if k_mut > 0:
                 drop_idx = np.random.choice(child, size=k_mut, replace=False).astype(np.int64)
@@ -418,19 +515,14 @@ def select_group_mask(
                 parent_a["s_ref"] if float(parent_a["fitness"]) >= float(parent_b["fitness"]) else parent_b["s_ref"],
                 dtype=np.float32,
             )
-            k_ls = max(1, int(local_search_ratio * target_size))
-            k_ls = min(k_ls, child.size, num_samples - child.size)
-            if k_ls > 0:
-                child_order = np.argsort(proxy_scores[child])
-                ls_drop = child[child_order[:k_ls]]
-                child_comp = np.setdiff1d(np.arange(num_samples, dtype=np.int64), child, assume_unique=False)
-                ls_add_order = np.argsort(-proxy_scores[child_comp])
-                ls_add = child_comp[ls_add_order[:k_ls]]
-                child = np.setdiff1d(child, ls_drop, assume_unique=False)
-                child = np.concatenate([child, ls_add])
-                child = _repair_size(child)
+            child = _local_search_step(child, proxy_scores, k_ls)
+            child = _repair_size(child)
 
             offspring.append(_evaluate(child))
+
+        if stall_counter >= STALL_SHAKE:
+            offspring.append(_shake(population, k_mut, k_ls))
+            stall_counter = 0
 
         merged = population + offspring
         merged_sorted = sorted(merged, key=lambda item: float(item["fitness"]), reverse=True)
@@ -445,6 +537,7 @@ def select_group_mask(
             if len(dedup_population) >= ga_population_size:
                 break
         population = dedup_population
+        population.sort(key=lambda item: float(item["fitness"]), reverse=True)
 
         generation_best = max(float(item["fitness"]) for item in population)
         best_history.append(generation_best)
@@ -452,7 +545,7 @@ def select_group_mask(
 
     best_individual = max(population, key=lambda item: float(item["fitness"]))
     final_mask = np.asarray(best_individual["mask"], dtype=np.uint8)
-    _, final_s_all, _ = _real_stats(final_mask)
+    _, final_s_all, _ = _real_stats_cached(final_mask)
 
     selected_by_class: dict[int, int] = {}
     for class_id in range(num_classes):

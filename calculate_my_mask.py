@@ -68,13 +68,6 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--debug-outer", type=int, default=40)
-    parser.add_argument(
-        "--branch",
-        type=int,
-        default=3,
-        help="group 模式随机初始化分支数，最终取最优分支",
-    )
     parser.add_argument(
         "--compare",
         action=argparse.BooleanOptionalAction,
@@ -252,9 +245,6 @@ def select_group_mask(
     num_classes: int,
     cut_ratio: int,
     device: torch.device,
-    progress_desc: str | None = None,
-    debug_outer: int = 3,
-    branch_count: int = 1,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if cut_ratio <= 0 or cut_ratio > 100:
         raise ValueError("cr 必须在 1-100 之间。")
@@ -395,35 +385,6 @@ def select_group_mask(
         child = np.concatenate([child, ls_add])
         return child
 
-    def _shake(pop_data: list[dict[str, object]], k_mut_value: int, k_ls_value: int) -> dict[str, object]:
-        best_ind = pop_data[0]
-        shaken_child = np.array(best_ind["indices"], dtype=np.int64)
-        k_shake = min(
-            max(int(np.sqrt(max(target_size, 1)) * 2), 2),
-            shaken_child.size,
-            max(0, num_samples - shaken_child.size),
-        )
-        if k_shake <= 0:
-            return _evaluate(_repair_size(shaken_child))
-
-        drop_idx = np.random.choice(shaken_child, size=k_shake, replace=False).astype(np.int64)
-        comp_child = np.setdiff1d(np.arange(num_samples, dtype=np.int64), shaken_child, assume_unique=False)
-        add_idx = np.random.choice(comp_child, size=k_shake, replace=False).astype(np.int64)
-        shaken_child = np.setdiff1d(shaken_child, drop_idx, assume_unique=False)
-        shaken_child = np.concatenate([shaken_child, add_idx])
-        shaken_child = _repair_size(shaken_child)
-
-        if k_mut_value > 0:
-            drop_idx = np.random.choice(shaken_child, size=k_mut_value, replace=False).astype(np.int64)
-            comp_child = np.setdiff1d(np.arange(num_samples, dtype=np.int64), shaken_child, assume_unique=False)
-            add_idx = np.random.choice(comp_child, size=k_mut_value, replace=False).astype(np.int64)
-            shaken_child = np.setdiff1d(shaken_child, drop_idx, assume_unique=False)
-            shaken_child = np.concatenate([shaken_child, add_idx])
-
-        proxy_scores = np.asarray(best_ind["s_ref"], dtype=np.float32)
-        shaken_child = _local_search_step(shaken_child, proxy_scores, k_ls_value)
-        return _evaluate(_repair_size(shaken_child))
-
     def _tournament_select(population: list[dict[str, object]]) -> dict[str, object]:
         if len(population) == 1:
             return population[0]
@@ -439,11 +400,11 @@ def select_group_mask(
         initial_population_idx.append(np.sort(random_idx))
 
     population = [_evaluate(_repair_size(idx)) for idx in initial_population_idx]
-    best_history = [max(float(item["fitness"]) for item in population)]
+    score_history = [max(float(item["fitness"]) for item in population)]
 
     generation_iter = tqdm(
         range(ga_generations),
-        desc=(progress_desc or "Group optimization") + " [Memetic-GA]",
+        desc="Group optimization [Memetic-GA]",
         unit="gen",
         leave=True,
     )
@@ -537,19 +498,8 @@ def select_group_mask(
         population.sort(key=lambda item: float(item["fitness"]), reverse=True)
 
         generation_best = max(float(item["fitness"]) for item in population)
-        best_history.append(generation_best)
+        score_history.append(generation_best)
         generation_iter.set_postfix({"best_S": f"{generation_best:.4f}"})
-        if gen_idx % 10 == 0:
-            print(
-                (
-                    gen_idx,
-                    level,
-                    k_mut,
-                    k_ls,
-                    round(crossover_sym_ratio_eff, 6),
-                    round(generation_best, 6),
-                )
-            )
 
     # ====== GA 结束后的局部搜索收尾（基于真实动态得分） ======
     # 先取出最优个体的 indices 形式
@@ -611,13 +561,8 @@ def select_group_mask(
         "final_rate": final_rate,
         "selected_by_class": selected_by_class,
         "S": float(np.sum(final_s_all[final_mask.astype(bool)])),
-        "outer_iters": int(ga_generations),
-        "branch_count": int(ga_population_size),
-        "best_branch": 1,
-        "best_iter": int(np.argmax(np.asarray(best_history, dtype=np.float32))),
-        "branch_best_scores": [float(np.max(np.asarray(best_history, dtype=np.float32)))],
-        "branch_best_iters": [int(np.argmax(np.asarray(best_history, dtype=np.float32)))],
-        "branch_score_histories": [best_history],
+        "best_iter": int(np.argmax(np.asarray(score_history, dtype=np.float32))),
+        "score_history": score_history,
         "ga_population_size": int(ga_population_size),
         "ga_generations": int(ga_generations),
         "ga_offspring": int(ga_offspring),
@@ -630,8 +575,8 @@ def _sanitize_for_filename(text: str) -> str:
     return text.replace("/", "-").replace(" ", "_")
 
 
-def save_branch_score_plot(
-    branch_score_histories: Sequence[Sequence[float]],
+def save_score_curve_plot(
+    score_history: Sequence[float],
     *,
     dataset: str,
     method: str,
@@ -648,17 +593,14 @@ def save_branch_score_plot(
         out_dir
         / (
             f"dataset_{dataset}_method_{method}_weight_{weight_group}_"
-            f"model_{model_name}_seed_{seed}_cr_{cut_ratio}_clip_{clip_tag}_branch_curve.png"
+            f"model_{model_name}_seed_{seed}_cr_{cut_ratio}_clip_{clip_tag}_score_curve.png"
         )
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    for history in branch_score_histories:
-        if len(history) == 0:
-            continue
-        x = np.arange(len(history), dtype=np.int32)
-        ax.plot(x, np.asarray(history, dtype=np.float64), linewidth=1.6)
-    ax.set_title("Score trajectory by branch")
+    x = np.arange(len(score_history), dtype=np.int32)
+    ax.plot(x, np.asarray(score_history, dtype=np.float64), linewidth=1.6)
+    ax.set_title("Score trajectory")
     ax.set_xlabel("Iteration")
     ax.set_ylabel("S(D)")
     ax.grid(alpha=0.25)
@@ -761,7 +703,6 @@ def main() -> None:
         image_adapter.to(device).eval()
         text_adapter.to(device).eval()
 
-        dds_start = time.perf_counter()
         num_samples = len(dataset_for_names)
 
         def _compute_scores() -> dict[str, np.ndarray]:
@@ -801,29 +742,26 @@ def main() -> None:
             num_samples=num_samples,
             compute_fn=_compute_scores,
         )
+        static_score_seconds = time.perf_counter() - static_compute_start
         print(
-            f"[Seed {seed}] Static scores ready (cache/compute) | elapsed={time.perf_counter() - static_compute_start:.2f}s"
+            f"[Seed {seed}] Static scores ready (cache/compute) | elapsed={static_score_seconds:.2f}s"
         )
 
-        dds_scores = torch.from_numpy(static_scores["dds"])
-        div_scores = torch.from_numpy(static_scores["div"])
-        sa_scores = torch.from_numpy(static_scores["sa"])
-        dds_time = time.perf_counter() - dds_start
-        div_time = dds_time
-        sa_time = dds_time
 
-        if not (len(dds_scores) == len(div_scores) == len(sa_scores)):
+        dds_scores_np = np.asarray(static_scores["dds"])
+        div_scores_np = np.asarray(static_scores["div"])
+        sa_scores_np = np.asarray(static_scores["sa"], dtype=np.float32)
+
+        if not (len(dds_scores_np) == len(div_scores_np) == len(sa_scores_np)):
             raise RuntimeError("三个指标的样本数不一致，无法合并。")
 
-        total_scores = (
-            weights["dds"] * dds_scores
-            + weights["div"] * div_scores
-            + weights["sa"] * sa_scores
+        total_scores_np = (
+            weights["dds"] * dds_scores_np
+            + weights["div"] * div_scores_np
+            + weights["sa"] * sa_scores_np
         )
         labels = np.asarray(dataset_for_names.targets)
-        total_scores_np = np.asarray(total_scores)
         labels_t = torch.as_tensor(labels, dtype=torch.long, device=device)
-        sa_scores_np = np.asarray(sa_scores, dtype=np.float32)
         div_features_for_compare = None
         dds_features_for_compare = None
 
@@ -867,7 +805,6 @@ def main() -> None:
                 f"[Mask {task_idx}/{total_tasks}] seed={seed} | cr={cut_ratio} | method={method} | weight_group={weight_group}"
             )
             group_stats: dict[str, object] | None = None
-            debug_curve_path: str | None = None
             if method == "topk":
                 mask, selected_by_class = select_topk_mask(
                     total_scores_np,
@@ -875,10 +812,9 @@ def main() -> None:
                     num_classes=len(class_names),
                     cut_ratio=cut_ratio,
                 )
-                selection_strategy = "topk_per_class"
             else:
                 mask, selected_by_class, group_stats = select_group_mask(
-                    np.asarray(sa_scores),
+                    sa_scores_np,
                     dds_metric=dds_metric,
                     div_metric=div_metric,
                     dds_loader=dds_loader,
@@ -889,14 +825,9 @@ def main() -> None:
                     num_classes=len(class_names),
                     cut_ratio=cut_ratio,
                     device=device,
-                    progress_desc=(
-                        f"Group mask optimization (seed={seed}, cr={cut_ratio})"
-                    ),
-                    debug_outer=args.debug_outer,
-                    branch_count=args.branch,
                 )
-                debug_curve = save_branch_score_plot(
-                    group_stats.get("branch_score_histories", []),
+                debug_curve = save_score_curve_plot(
+                    group_stats.get("score_history", []),
                     dataset=dataset_name,
                     method=method,
                     weight_group=weight_group,
@@ -905,8 +836,7 @@ def main() -> None:
                     cut_ratio=cut_ratio,
                     clip_model=args.clip_model,
                 )
-                debug_curve_path = str(debug_curve)
-                print(f"[Debug] branch score curves saved to: {debug_curve}")
+                print(f"[Debug] score curve saved to: {debug_curve}")
 
                 if args.compare:
                     topk_mask, _ = select_topk_mask(
@@ -928,7 +858,6 @@ def main() -> None:
                         f"sum_group={sum_group:.4f} | sum_topk={sum_topk:.4f} | "
                         f"better={better} (Δ={diff:.4f})"
                     )
-                selection_strategy = "group_selection"
 
             total_time = time.perf_counter() - total_start
             mask_path = resolve_mask_path(
@@ -942,41 +871,15 @@ def main() -> None:
             mask_dir.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(mask_path, mask=mask.astype(np.uint8))
 
-            meta_info = {
-                "dataset": dataset_name,
-                "model_name": args.model_name,
-                "method": method_name,
-                "weight_group": weight_group,
-                "weight_seed": seed if weight_group == "learned" else None,
-                "clip_model": args.clip_model,
-                "adapter_seed": seed,
-                "adapter_image_path": str(adapter_paths["image_path"]),
-                "adapter_text_path": str(adapter_paths["text_path"]),
-                "cr": cut_ratio,
-                "num_samples": int(mask.shape[0]),
-                "selected_count": int(mask.sum()),
-                "selected_by_class": selected_by_class,
-                "selection_strategy": selection_strategy,
-                "seed": seed,
-                "group_stats": group_stats,
-                "mask_debug_curve": debug_curve_path,
-                "timing": {
-                    "dds_seconds": dds_time,
-                    "div_seconds": div_time,
-                    "sa_seconds": sa_time,
-                    "total_seconds": total_time,
-                },
-            }
-            with open(mask_dir / "meta_info.json", "w", encoding="utf-8") as f:
-                json.dump(meta_info, f, ensure_ascii=False, indent=2)
-
-            print(f"seed={seed} | cr={cut_ratio} | selected={int(mask.sum())}")
+            print(
+                f"seed={seed} | cr={cut_ratio} | selected={int(mask.sum())} "
+                f"| static_score_seconds={static_score_seconds:.2f} | total_seconds={total_time:.2f}"
+            )
             if group_stats is not None:
                 print(
                     "group_stats: "
                     f"sr={group_stats['sr']:.6f} | rate={group_stats['final_rate']:.6f} | "
                     f"m_c={group_stats['selected_by_class']} | "
-                    f"best_branch={group_stats['best_branch']} | "
                     f"best_iter={group_stats['best_iter']} | "
                     f"S(D)={group_stats['S']:.6f}"
                 )

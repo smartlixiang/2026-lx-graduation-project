@@ -276,10 +276,10 @@ def select_group_mask(
     else:
         target_size = 0
 
-    ga_population_size = 8
+    ga_population_size = 12
     ga_generations = 120
     ga_offspring = ga_population_size
-    crossover_sym_ratio = 0.8
+    crossover_sym_ratio = 0.7
 
     def _dynamic_parameter_adjustment(cr: int) -> tuple[float, float]:
         if cr <= 30:
@@ -543,8 +543,58 @@ def select_group_mask(
         best_history.append(generation_best)
         generation_iter.set_postfix({"best_S": f"{generation_best:.4f}"})
 
+    # ====== GA 结束后的局部搜索收尾（基于真实动态得分） ======
+    # 先取出最优个体的 indices 形式
     best_individual = max(population, key=lambda item: float(item["fitness"]))
-    final_mask = np.asarray(best_individual["mask"], dtype=np.uint8)
+    best_indices = np.asarray(best_individual["indices"], dtype=np.int64)
+    best_mask = _indices_to_mask(best_indices)
+
+    # 基于当前最优子集，计算真实的动态得分 s_ref，用作后续局部搜索的 "proxy_scores"
+    best_S, best_s_ref, _ = _real_stats_cached(best_mask)
+
+    # 局部搜索的超参数：最多迭代步数、最小提升阈值
+    REFINE_MAX_STEPS = 10
+    REFINE_EPS = 1e-8
+
+    # 参考 GA 内部的 k_ls_base，设置一个收尾用的步长（避免改动过猛）
+    k_ls_refine = min(
+        max(1, k_ls_base),
+        best_indices.size,
+        max(0, num_samples - best_indices.size),
+    )
+
+    # 可以按 cr 略微调整收尾强度：低 cr 多走几步，高 cr 少一点
+    if cut_ratio <= 30:
+        refine_steps = REFINE_MAX_STEPS + 5
+    elif cut_ratio <= 60:
+        refine_steps = REFINE_MAX_STEPS
+    else:
+        refine_steps = REFINE_MAX_STEPS - 2
+
+    refine_steps = max(1, refine_steps)
+
+    for _ in range(refine_steps):
+        if k_ls_refine <= 0:
+            break
+
+        # 在当前最优解的真实动态得分 best_s_ref 上做一次局部搜索
+        refined_indices = _local_search_step(best_indices, best_s_ref, k_ls_refine)
+        refined_indices = _repair_size(refined_indices)
+        refined_mask = _indices_to_mask(refined_indices)
+
+        refined_S, refined_s_ref, _ = _real_stats_cached(refined_mask)
+
+        # 只接受真正提高 S(D) 的 move；否则视为已经到达局部最优，提前停止
+        if refined_S > best_S + REFINE_EPS:
+            best_indices = refined_indices
+            best_mask = refined_mask
+            best_S = refined_S
+            best_s_ref = refined_s_ref
+        else:
+            break
+
+    # 用局部搜索后的 best_mask 作为最终解
+    final_mask = best_mask.astype(np.uint8)
     _, final_s_all, _ = _real_stats_cached(final_mask)
 
     selected_by_class: dict[int, int] = {}

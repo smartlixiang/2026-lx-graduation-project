@@ -283,14 +283,14 @@ def select_group_mask(
 
     def _dynamic_parameter_adjustment(cr: int) -> tuple[float, float]:
         if cr <= 30:
-            return 5, 5
+            return 3, 4
         if cr <= 60:
-            return 3, 3
+            return 2, 2
         return 1, 1
 
     mutation_scale, local_search_scale = _dynamic_parameter_adjustment(cut_ratio)
     mutation_ratio = 0.008 * mutation_scale
-    local_search_ratio = 0.01 * local_search_scale
+    local_search_ratio = 0.015 * local_search_scale
     k_mut_base = max(1, int(mutation_ratio * target_size))
     k_ls_base = max(1, int(local_search_ratio * target_size))
 

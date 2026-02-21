@@ -279,25 +279,31 @@ def select_group_mask(
     ga_population_size = 12
     ga_generations = 120
     ga_offspring = ga_population_size
-    crossover_sym_ratio = 0.7
+    # ====== adaptive schedule block ======
+    level = 1
+    WARMUP = 3
+    STALL_TRIGGER = 3
+    EPS = 1e-8
 
-    def _dynamic_parameter_adjustment(cr: int) -> tuple[float, float]:
-        if cr <= 30:
-            return 3, 4
-        if cr <= 60:
-            return 2, 2
-        return 1, 1
+    cr_ratio = cut_ratio / 100.0
 
-    mutation_scale, local_search_scale = _dynamic_parameter_adjustment(cut_ratio)
-    mutation_ratio = 0.008 * mutation_scale
-    local_search_ratio = 0.015 * local_search_scale
-    k_mut_base = max(1, int(mutation_ratio * target_size))
-    k_ls_base = max(1, int(local_search_ratio * target_size))
+    ls_max = 0.06 - 0.03 * cr_ratio
+    ls_min = 0.3 * ls_max
+    ls_step = (ls_max - ls_min) / 3.0
+    ls_levels = [ls_min + level_idx * ls_step for level_idx in range(4)]
+
+    m_max = 2.0 + 3.0 * (1.0 - cr_ratio)
+    mut_max = 0.01 * m_max
+    mut_min = mut_max / 4.0
+    mut_step = (mut_max - mut_min) / 3.0
+    mut_levels = [mut_min + level_idx * mut_step for level_idx in range(4)]
+
+    C_MAX = 0.9
+    c_min = 0.7 - 0.2 * cr_ratio
+    c_step = (C_MAX - c_min) / 3.0
+    c_levels = [c_min + level_idx * c_step for level_idx in range(4)]
 
     stall_counter = 0
-    EPS_IMPROVE = 1e-8
-    STALL_TRIGGER = max(8, ga_generations // 25)
-    STALL_SHAKE = max(20, ga_generations // 8)
 
     cached_real_stats: dict[tuple[int, ...], tuple[float, np.ndarray, np.ndarray]] = {}
 
@@ -374,20 +380,6 @@ def select_group_mask(
             "counts": counts,
         }
 
-    def _adaptive_mutation_and_search(
-        k_mut_base_value: int,
-        k_ls_base_value: int,
-        stall_steps: int,
-        max_steps: int,
-    ) -> tuple[int, int]:
-        k_mut = k_mut_base_value
-        k_ls = k_ls_base_value
-        if stall_steps >= max_steps:
-            max_exchange = max(0, num_samples - target_size)
-            k_mut = min(k_mut_base_value * 2, max_exchange)
-            k_ls = min(k_ls_base_value * 2, max_exchange)
-        return k_mut, k_ls
-
     def _local_search_step(child: np.ndarray, proxy_scores: np.ndarray, k_ls_value: int) -> np.ndarray:
         k_ls_value = min(k_ls_value, num_samples - child.size, child.size)
         if k_ls_value <= 0:
@@ -458,20 +450,28 @@ def select_group_mask(
 
     best_fitness = max(float(item["fitness"]) for item in population)
 
-    for _ in generation_iter:
+    for gen_idx in generation_iter:
         cur_best = float(population[0]["fitness"])
-        if cur_best > best_fitness + EPS_IMPROVE:
+        if cur_best > best_fitness + EPS:
             best_fitness = cur_best
             stall_counter = 0
         else:
             stall_counter += 1
 
-        k_mut, k_ls = _adaptive_mutation_and_search(
-            k_mut_base,
-            k_ls_base,
-            stall_counter,
-            STALL_TRIGGER,
-        )
+        if gen_idx < WARMUP:
+            level = gen_idx + 1
+        elif stall_counter > 0 and stall_counter % STALL_TRIGGER == 0:
+            if level > 0:
+                level -= 1
+            else:
+                level = 3
+
+        mutation_ratio_eff = mut_levels[level]
+        local_search_ratio_eff = ls_levels[level]
+        crossover_sym_ratio_eff = c_levels[3 - level]
+
+        k_mut = max(1, int(mutation_ratio_eff * target_size))
+        k_ls = max(1, int(local_search_ratio_eff * target_size))
 
         offspring: list[dict[str, object]] = []
         for _offspring_idx in range(ga_offspring):
@@ -484,7 +484,7 @@ def select_group_mask(
             sym = np.setdiff1d(np.union1d(parent_a_idx, parent_b_idx), inter, assume_unique=False)
             child = inter.copy()
 
-            max_from_sym = min(target_size, inter.size + int(np.floor(crossover_sym_ratio * target_size)))
+            max_from_sym = min(target_size, inter.size + int(np.floor(crossover_sym_ratio_eff * target_size)))
             if child.size < target_size and sym.size > 0:
                 need_sym = max(0, max_from_sym - child.size)
                 if need_sym > 0:
@@ -502,11 +502,11 @@ def select_group_mask(
 
             child = _repair_size(child)
 
-            k_mut = min(k_mut, child.size, num_samples - child.size)
-            if k_mut > 0:
-                drop_idx = np.random.choice(child, size=k_mut, replace=False).astype(np.int64)
+            child_k_mut = min(k_mut, child.size, num_samples - child.size)
+            if child_k_mut > 0:
+                drop_idx = np.random.choice(child, size=child_k_mut, replace=False).astype(np.int64)
                 comp_child = np.setdiff1d(np.arange(num_samples, dtype=np.int64), child, assume_unique=False)
-                add_idx = np.random.choice(comp_child, size=k_mut, replace=False).astype(np.int64)
+                add_idx = np.random.choice(comp_child, size=child_k_mut, replace=False).astype(np.int64)
                 child = np.setdiff1d(child, drop_idx, assume_unique=False)
                 child = np.concatenate([child, add_idx])
                 child = _repair_size(child)
@@ -515,14 +515,11 @@ def select_group_mask(
                 parent_a["s_ref"] if float(parent_a["fitness"]) >= float(parent_b["fitness"]) else parent_b["s_ref"],
                 dtype=np.float32,
             )
-            child = _local_search_step(child, proxy_scores, k_ls)
+            child_k_ls = min(k_ls, child.size, num_samples - child.size)
+            child = _local_search_step(child, proxy_scores, child_k_ls)
             child = _repair_size(child)
 
             offspring.append(_evaluate(child))
-
-        if stall_counter >= STALL_SHAKE:
-            offspring.append(_shake(population, k_mut, k_ls))
-            stall_counter = 0
 
         merged = population + offspring
         merged_sorted = sorted(merged, key=lambda item: float(item["fitness"]), reverse=True)
@@ -542,6 +539,17 @@ def select_group_mask(
         generation_best = max(float(item["fitness"]) for item in population)
         best_history.append(generation_best)
         generation_iter.set_postfix({"best_S": f"{generation_best:.4f}"})
+        if gen_idx % 10 == 0:
+            print(
+                (
+                    gen_idx,
+                    level,
+                    k_mut,
+                    k_ls,
+                    round(crossover_sym_ratio_eff, 6),
+                    round(generation_best, 6),
+                )
+            )
 
     # ====== GA 结束后的局部搜索收尾（基于真实动态得分） ======
     # 先取出最优个体的 indices 形式
@@ -556,22 +564,14 @@ def select_group_mask(
     REFINE_MAX_STEPS = 10
     REFINE_EPS = 1e-8
 
-    # 参考 GA 内部的 k_ls_base，设置一个收尾用的步长（避免改动过猛）
+    # 参考 GA 最后一个 level 的 local search 档位，设置收尾用步长（避免改动过猛）
     k_ls_refine = min(
-        max(1, k_ls_base),
+        max(1, int(ls_levels[level] * target_size)),
         best_indices.size,
         max(0, num_samples - best_indices.size),
     )
 
-    # 可以按 cr 略微调整收尾强度：低 cr 多走几步，高 cr 少一点
-    if cut_ratio <= 30:
-        refine_steps = REFINE_MAX_STEPS + 5
-    elif cut_ratio <= 60:
-        refine_steps = REFINE_MAX_STEPS
-    else:
-        refine_steps = REFINE_MAX_STEPS - 2
-
-    refine_steps = max(1, refine_steps)
+    refine_steps = REFINE_MAX_STEPS
 
     for _ in range(refine_steps):
         if k_ls_refine <= 0:

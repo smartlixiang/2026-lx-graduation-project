@@ -266,12 +266,12 @@ def select_group_mask(
     else:
         target_size = 0
 
-    ga_population_size = 12
-    ga_generations = 120
+    ga_population_size = 24
+    ga_generations = 160
     ga_offspring = ga_population_size
     # ====== adaptive schedule block ======
     level = 1
-    WARMUP = 3
+    WARMUP = 5
     STALL_TRIGGER = 3
     EPS = 1e-8
 
@@ -288,7 +288,7 @@ def select_group_mask(
     mut_step = (mut_max - mut_min) / 3.0
     mut_levels = [mut_min + level_idx * mut_step for level_idx in range(4)]
 
-    C_MAX = 0.9
+    C_MAX = 0.8
     c_min = 0.7 - 0.2 * cr_ratio
     c_step = (C_MAX - c_min) / 3.0
     c_levels = [c_min + level_idx * c_step for level_idx in range(4)]
@@ -420,7 +420,7 @@ def select_group_mask(
             stall_counter += 1
 
         if gen_idx < WARMUP:
-            level = gen_idx + 1
+            level = min(gen_idx + 1, 3)
         elif stall_counter > 0 and stall_counter % STALL_TRIGGER == 0:
             if level > 0:
                 level -= 1
@@ -746,7 +746,6 @@ def main() -> None:
         print(
             f"[Seed {seed}] Static scores ready (cache/compute) | elapsed={static_score_seconds:.2f}s"
         )
-
 
         dds_scores_np = np.asarray(static_scores["dds"])
         div_scores_np = np.asarray(static_scores["div"])

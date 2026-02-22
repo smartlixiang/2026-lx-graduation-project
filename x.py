@@ -1,4 +1,10 @@
 from __future__ import annotations
+from utils.static_score_cache import get_or_compute_static_scores
+from utils.seed import set_seed
+from utils.global_config import CONFIG
+from scoring import DifficultyDirection, Div, SemanticAlignment
+from model.adapter import load_trained_adapters
+from dataset.dataset_config import CIFAR10
 
 import argparse
 import csv
@@ -17,13 +23,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset.dataset_config import CIFAR10
-from model.adapter import load_trained_adapters
-from scoring import DifficultyDirection, Div, SemanticAlignment
-from utils.global_config import CONFIG
-from utils.seed import set_seed
-from utils.static_score_cache import get_or_compute_static_scores
-
 
 FIXED_SEED = 42
 
@@ -40,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-old-iters", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "result" / "subset_mask_scores_cifar10.csv")
+    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "subset_mask_scores_cifar10.csv")
     return parser.parse_args()
 
 
@@ -134,6 +133,14 @@ def select_global_topk(scores: np.ndarray, cut_ratio: int) -> np.ndarray:
     k = max(1, min(n, int(round(n * cut_ratio / 100.0))))
     idx = np.argpartition(-scores, k - 1)[:k]
     mask = np.zeros(n, dtype=np.uint8)
+    mask[idx] = 1
+    return mask
+
+
+def select_random_mask(n_samples: int, cut_ratio: int) -> np.ndarray:
+    k = max(1, min(n_samples, int(round(n_samples * cut_ratio / 100.0))))
+    idx = np.random.choice(n_samples, size=k, replace=False)
+    mask = np.zeros(n_samples, dtype=np.uint8)
     mask[idx] = 1
     return mask
 
@@ -344,12 +351,13 @@ def main() -> None:
     print(f"[Init] Encoded image features for dynamic scoring in {time.perf_counter() - start:.2f}s")
 
     cut_ratios = list(range(20, 91, 10))
+    eval_seeds = [1, 2, 3, 4, 5]
     rows: list[dict[str, object]] = []
 
-    for cr in cut_ratios:
-        print(f"[CR={cr}] evaluating topk and group_old ...")
+    for cr in tqdm(cut_ratios, desc="Evaluating cut ratios", unit="cr"):
+        print(f"\n[CR={cr}] evaluating topk/random/group_old ...")
         topk_mask = select_global_topk(total_static, cut_ratio=cr)
-        topk_div, topk_dds, topk_total = compute_subset_score(
+        _, _, topk_total = compute_subset_score(
             topk_mask,
             sa_scores=sa_scores,
             labels_t=labels_t,
@@ -363,33 +371,62 @@ def main() -> None:
             dds_features=dds_features,
         )
 
-        _, grp_div, grp_dds, grp_total, best_iter = select_group_old_best(
-            n_samples=len(dataset_for_names),
-            cut_ratio=cr,
-            outer_iters=args.group_old_iters,
-            sa_scores=sa_scores,
-            labels_t=labels_t,
-            weights=weights,
-            div_metric=div_metric,
-            dds_metric=dds_metric,
-            div_loader=div_loader,
-            dds_loader=dds_loader,
-            image_adapter=image_adapter,
-            div_features=div_features,
-            dds_features=dds_features,
-        )
+        random_scores: list[float] = []
+        group_old_scores: list[float] = []
+        for seed in tqdm(eval_seeds, desc=f"CR={cr} seeds", unit="seed", leave=False):
+            set_seed(seed)
+
+            random_mask = select_random_mask(len(dataset_for_names), cut_ratio=cr)
+            _, _, random_total = compute_subset_score(
+                random_mask,
+                sa_scores=sa_scores,
+                labels_t=labels_t,
+                weights=weights,
+                div_metric=div_metric,
+                dds_metric=dds_metric,
+                div_loader=div_loader,
+                dds_loader=dds_loader,
+                image_adapter=image_adapter,
+                div_features=div_features,
+                dds_features=dds_features,
+            )
+            random_scores.append(random_total)
+
+            _, _, _, grp_total, _ = select_group_old_best(
+                n_samples=len(dataset_for_names),
+                cut_ratio=cr,
+                outer_iters=args.group_old_iters,
+                sa_scores=sa_scores,
+                labels_t=labels_t,
+                weights=weights,
+                div_metric=div_metric,
+                dds_metric=dds_metric,
+                div_loader=div_loader,
+                dds_loader=dds_loader,
+                image_adapter=image_adapter,
+                div_features=div_features,
+                dds_features=dds_features,
+            )
+            group_old_scores.append(grp_total)
+
+            print(
+                f"  seed={seed} | random_total={random_total:.4f} | group_old_total={grp_total:.4f}"
+            )
 
         rows.append(
             {
                 "cr": cr,
-                "topk_div": topk_div,
-                "topk_dds": topk_dds,
-                "topk_total": topk_total,
-                "group_old_div": grp_div,
-                "group_old_dds": grp_dds,
-                "group_old_total": grp_total,
-                "group_old_best_iter": best_iter,
+                "topk": topk_total,
+                "random_mean": float(np.mean(random_scores)),
+                "random_max": float(np.max(random_scores)),
+                "group_old_mean": float(np.mean(group_old_scores)),
+                "group_old_max": float(np.max(group_old_scores)),
             }
+        )
+
+        print(
+            f"[CR={cr}] topk={topk_total:.4f}, random_mean={np.mean(random_scores):.4f}, random_max={np.max(random_scores):.4f}, "
+            f"group_old_mean={np.mean(group_old_scores):.4f}, group_old_max={np.max(group_old_scores):.4f}"
         )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -398,13 +435,11 @@ def main() -> None:
             f,
             fieldnames=[
                 "cr",
-                "topk_div",
-                "topk_dds",
-                "topk_total",
-                "group_old_div",
-                "group_old_dds",
-                "group_old_total",
-                "group_old_best_iter",
+                "topk",
+                "random_mean",
+                "random_max",
+                "group_old_mean",
+                "group_old_max",
             ],
         )
         writer.writeheader()

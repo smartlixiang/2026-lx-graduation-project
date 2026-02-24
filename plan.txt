@@ -951,108 +951,157 @@ Score(x_new) = ẇ_1 SA_new + ẇ_2 Div_new + ẇ_3 DDS_new
 
 这实现了一个简单、直接的“样本质量驱动的数据裁剪”：高分样本保留、低分样本舍弃。
 
-7.2 group 模式：结合动态指标的类别平衡子集优化
+7.2 group 模式 — 基于裁剪比率的自适应遗传选择（Group selection via adaptive GA）
 
-在 top-k 模式下，本项目直接基于静态指标加权得到的总分 Score_i 对样本进行排序，并在每个类别内截取前 cr 比例的样本构造子集 D_topk。该方式实现简单、可解释性强，但存在一个局限：Div、DDS 的定义本身依赖于“当前被视作已选子集”的结构，当只使用静态版本 Div_static、DDS_static 时，无法显式利用“在若干候选子集之间比较谁在结构上更优”这一信息。
+7.2.1 目的
 
-为此，本项目设计了 group 模式，目标是在给定总体裁剪比例 cr 的约束下，通过显式引入“候选子集 D”的概念，并在每一步迭代中重新计算基于 D 的动态指标 Div(D)、DDS(D)，用一个简单而稳定的组合优化策略近似最大化
+在给定裁剪比例 cr（cut ratio）的条件下，从训练集中选取 target_size = round(cr * N) 个样本，使得在该子集 D 上计算的动态综合得分 S(D) 尽可能高。
 
-S(D) = Σ_{i∈D} s_i(D),
+要求算法在有限预算（典型 ga_generations = 120~200、时间约 6 分钟）内稳健工作，兼顾低 cr（强探索）与高 cr（稳健收敛）两类情形。
 
-其中 s_i(D) = w_sa·SA_i + w_div·Div_i(D) + w_dds·DDS_i(D)，权重向量 (w_sa, w_div, w_dds) 来自前述“权重学习”阶段。与 YangCLIP 的连续松弛 + SGD 不同，group 模式完全在离散子集空间内工作，用“每轮直接取当前最优解”的方式更新 D，不再引入额外的连续化参数或梯度下降步骤，从而在保持优化效果的同时显著降低实现复杂度和计算开销。
+保持实现简单、可解释，易于复现实验与调参。
 
-calculate_my_mask
+7.2.2 设计概览（一句话）
 
-（1）优化目标与约束
+表示：固定大小的索引子集（indices）；适应度：在子集上重算的动态综合分；算子：父代交叉（inter/sym/complement）+ 随机变异 + 局部搜索；关键改进：4 档位周期退火的参数自适应（level-based），soft-fill 概率补样，以及对每代最优 offspring 做一次自洽（child-based）局部精修；停滞触发由连续 3 代无提升判定，降档或再升档形成周期退火。
 
-设训练集中共有 N 个样本，类别集合为 {1,…,C}，第 c 类样本数为 N_c。给定全局裁剪比例 cr（例如 80%），定义全局目标子集大小
+个体表示为长度为 target_size 的整型数组 indices（或等效的 0/1 mask）；内部操作基于 indices 进行集合运算（交、并、补）。
 
-N_D = round(cr · N),
+种群由若干个体组成（ga_population_size，可小到 4~12）。种群中保留 fitness 最优个体（精英保存）。
 
-并对每个类别设置类内配额
+7.2.3 适应度函数（Fitness）
 
-q_c = max(1, ⌊cr · N_c⌋),
+适应度定义为子集 D 上的动态综合分：
+S(D) = Σ_{i∈D} [ w_sa * SA_i + w_div * Div_i(D) + w_dds * DDS_i(D) ]
 
-即希望最终选出的子集 D 既满足 |D| ≈ N_D，又尽量在每个类别内保留约 cr 比例的样本，从而避免极端类别失衡。
+SA_i 为样本的静态得分，Div_i(D) 与 DDS_i(D) 为在 D 上的动态分量，需在 _real_stats_cached 中计算并缓存以避免重复开销。
 
-在 group 模式中，我们希望在满足上述约束的前提下，使得整体目标函数 S(D) 尽可能大，其中 S(D) 使用当前轮基于 D 计算的动态 Div(D)、DDS(D) 与静态 SA 共同构成。
+评估流程应优先使用缓存键（基于排序的 indices tuple）以复用结果。
 
-（2）动态指标的重算机制
+7.2.4 种群初始化（Initialization）
 
-与 top-k 模式不同，group 模式在每一轮迭代中都显式依赖当前子集 D：
+初始化使用两类个体混合：
 
-1）给定当前二值掩码 selected_mask（表示子集 D），调用 Div 模块的 score_dataset_dynamic 接口，在“选中子集”上构造动态参考，再对全体样本返回 Div_i(D)；
-2）同理，调用 DDS 模块的 score_dataset_dynamic 接口，得到动态 DDS_i(D)；
-3）将 SA_i（静态 margin SA，经类内分位点归一化）与上述 Div_i(D)、DDS_i(D) 按权重线性组合，得到当前轮全体样本的综合分 s_i(D)。
+一个或少数精英个体：按 SA 或静态综合（若需要）取 top-k；
 
-这种做法可以理解为：在每个候选子集 D 下，重新评估“哪些样本在当前子集结构下更有价值”，从而在 D 之间进行“整体价值”的比较，而不仅仅是单点排序。
+其余个体：随机采样 target_size（以保证初期多样性）。
 
-plan
+初始化时不要将 static_total 作为硬回填修复规则；static_total 可用作候选池（soft prior），但不应成为强制投影。
 
-（3）候选子集与类别平衡更新策略
+7.2.5 算子（Operators）
+1 选择（Selection）
 
-为了避免使用复杂的连续优化，group 模式在每一轮 t 采用一个简单而鲁棒的“候选集 + 类别优先 + 全局补齐”的确定性更新策略，将当前子集 D^(t) 映射到新的子集 D^(t+1)。
+锦标赛选择（2-ary tournament）作为主选择机制，简单且高效。
 
-记当前子集大小为
+2 交叉（Crossover）
 
-N_D = |D^(t)|,
+父代 A, B → child：
 
-剩余样本数 N_rem = N − N_D。定义剩余集合 R^(t) = { i | i ∉ D^(t) }。本项目采用如下三个步骤构造下一轮子集：
+inter = A ∩ B（保留公共基因）
 
-① 候选集构造（Candidate Set）
+sym = (A ∪ B) \ inter（父代差异）
 
-在当前轮综合分 s_i(D^(t)) 上，先从全体样本中取出“全局最优”的一批样本，再从剩余集合中补充一小部分高分样本，构成候选集 Cand^(t)：
+child 先放 inter，再从 sym 按 need_sym 补部分，剩余从 complement_union 补齐。
 
-A^(t) = 当前轮在全体样本上的前 N_D 个高分样本索引（全局 top N_D）
-B^(t) = 在剩余集合 R^(t) 中按 s_i(D^(t)) 降序取前 ρ · N_rem 个样本（ρ 为一个小比例，默认 0.1，即 10% 的剩余样本）
-Cand^(t) = A^(t) ∪ B^(t)
+need_sym 的上限由当代自适应 crossover_sym_ratio_eff 决定：max_from_sym = inter.size + floor(crossover_sym_ratio_eff * target_size)。
 
-候选集大小约为 N_D + ρ·(N − N_D)。A^(t) 保证“全局最优样本”不会被轻易丢弃，B^(t) 提供了从当前子集外部引入新样本的机会，避免陷入局部子集结构导致的“自我强化”。
+Soft-fill 替代硬 top-k：对 sym 或 complement 执行补样时，先构造一个候选池 pool = top_k_by_static(candidate, pool_mult * need)，再从 pool 中按概率（基于 rank 或 softmax）无放回采样 need 个，避免每次都取同一批样本（减少同质化）。推荐 pool_mult = 5，rank-based 权重 w(r) ∝ 1/(r+1)^γ，γ 默认 1。
 
-② 候选集内的“按类别配额优先选取”
+3 变异（Mutation）
 
-在候选集 Cand^(t) 上，为每个类别 c 分别计算候选索引集合
+每代按 k_mut 随机替换 child 中 k_mut 个索引（从 complement 中随机选 k_mut）。k_mut 由当代自适应 mutation_ratio_eff × target_size 决定。
 
-Cand_c^(t) = Cand^(t) ∩ { i | y_i = c },
+mutation_ratio 基线系数取 0.01（替代旧的 0.008），并按下述自适应档位映射为实际 ratio。
 
-并按当前轮综合分 s_i(D^(t)) 在每个 Cand_c^(t) 内降序排序。然后根据预设配额 q_c，从每个类别中优先选取：
+4 局部搜索（Local Search / Memetic）
 
-D_tmp^(t) = ⋃c Top{min(q_c, |Cand_c^(t)|)}(Cand_c^(t)).
+两阶段局部搜索策略：
 
-这一步实现了一个“软类别平衡”机制：只要候选集中某类别 c 的高分样本足够多，就尽可能让该类别在最终子集中接近 cr·N_c 的比例；若候选集中某类样本本身不足，则不会强行补齐，以免引入过多低质量样本。
+父代 proxy 本地搜索（现有）：在 child 生成后，使用父代更优者的 s_ref（在父代 D_parent 上计算）作为 proxy，对 child 做一次快速替换（按 proxy 挑出 child 内最差 k_ls，补入 complement 中 proxy 最好 k_ls），然后再评估 child。该步骤保留以提高效率。
 
-③ 全局补齐与截断
+本代最优 offspring 的自洽精修（新增）：在生成并评估所有 offspring 后，选出本代 fitness 最好的 offspring，用其自身的 s_ref（即基于 child 的真实 s_ref）做一次额外局部搜索与重新评估；若提升则替换，否则保持原样。此步骤每代额外最多一次完整动态评估（开销可接受）。
 
-在候选集中进行类别优先选取之后，得到一个临时子集 D_tmp^(t)，其大小 |D_tmp^(t)| 可能小于、等于或略大于目标大小 N_D。为保证最终子集规模稳定，本项目采用以下处理：
+7.2.6 自适应调度（level-based 周期退火，4 档）
 
-若 |D_tmp^(t)| < N_D：
-将候选集中尚未被选中的样本 Cand_rem^(t) = Cand^(t) \ D_tmp^(t) 按 s_i(D^(t)) 由高到低全局排序，依次补入 D_tmp^(t)，直到 |D_tmp^(t)| = N_D，得到 D^(t+1)。
+状态：level ∈ {0,1,2,3}（0 最收敛，3 最探索）。
 
-若 |D_tmp^(t)| > N_D（通常只在极端情况下发生）：
-在 D_tmp^(t) 内按 s_i(D^(t)) 由高到低排序，截断到前 N_D 个样本作为 D^(t+1)。
+预热：前 WARMUP=3 代依次升档（gen0→level1，gen1→level2，gen2→level3）。
 
-这样，在每一轮迭代中，新子集 D^(t+1) 都是“当前轮综合分 s_i(D^(t)) 下的一个类别平衡且全局得分较优的 N_D 子集”，无需任何连续化变量或梯度更新。
+瓶颈判定：连续 STALL_TRIGGER=3 代 best_S 无提升（提升阈值 EPS=1e-8）视为一次瓶颈事件。每遭遇一次（即 stall_counter 为 3、6、9…）执行一次档位更新：若 level>0 则 level -= 1（冷却）；若 level==0 则 level = 3（reheat）。当 best_S 有实质提升时把 stall_counter 置 0。
 
-（4）多分支随机初始化与最优分支选择
+将参数映射到档位：对每个参数（local_search_ratio, mutation_ratio, crossover_sym_ratio）先计算其当代的最小/最大，然后在这段区间内等差分成 4 个档位值，直接选择 levels[level] 做为当代有效值（不用任何线性混合或连续缩放公式）。
 
-为了缓解贪心更新可能带来的局部最优问题，group 模式引入了简单的多分支（multi-branch）机制：
+参数边界
 
-1）设分支数为 B（branch_count），为每个分支 b 随机初始化一个大小为 N_D 的子集 D_b^(0)，即在全体样本中均匀随机采样 N_D 个样本；
-2）对每个分支，独立运行 T 轮上述“候选集 + 类别优先 + 全局补齐”的迭代过程，得到一条子集序列 {D_b^(t)}_{t=0}^{T}；
-3）在每个分支内部，记录使得 S(D_b^(t)) 最大的那一轮 t_b^* 及其对应子集 D_b^；
-4）在所有分支之间，选取具有最大 S(D_b^) 的分支 b^，并将该分支的最优子集 D_b^ 作为 group 模式的最终子集 D_group。
+local_search_ratio：
 
-整个流程可以视作一个简化的“多次随机起点的贪心局部搜索”：随机初始化提供多样起点，候选集更新则在每个起点附近进行有限轮的结构调整，以期在有限计算预算内找到一个 S(D) 较大的、类别相对平衡的子集。脚本在实现时还会记录各分支的 S(D_b^(t)) 轨迹，便于后续分析 group 模式在不同分支上的收敛情况与稳定性。
+ls_max(cr) = 0.06 − 0.03 × (cr / 100)
 
-calculate_my_mask
+ls_min(cr) = 0.3 × ls_max(cr)
 
-（5）与 top-k 模式的关系与比较
+levels = 等差分成 4 档（L0 = ls_min, L3 = ls_max）
 
-top-k 模式可以被看作是 group 模式的一个“零迭代、无动态重算”的特例：只使用静态 SA/Div/DDS 得分，按类别比例直接截取前 cr 的样本。group 模式在此基础上进一步：
+mutation_ratio：
 
-1）允许 Div、DDS 在不同候选子集 D 下重算，把“当前被视为已选的子集结构”纳入评分；
-2）通过候选集与类别配额机制，在保持总体 cr 约束的前提下，让子集结构在迭代中逐步“向全局高分且类内覆盖合理的方向移动”；
-3）最终用 S(D) 的大小来选择最优分支，从而在简单可控的计算开销下获得比单次静态 top-k 更高的整体目标值。
+m_max_mult(cr) = 2.0 + 3.0 × (1 − cr / 100)
+
+mut_max = 0.01 × m_max_mult(cr)
+
+mut_min = mut_max / 4
+
+levels = 等差分成 4 档（M0 = mut_min, M3 = mut_max）
+
+crossover_sym_ratio：
+
+c_min(cr) = 0.7 − 0.2 × (cr / 100) （较小值表示更探索）
+
+c_max = 0.95（常数上界）
+
+levels = 等差分成 4 档，但交叉值与 level 方向反向：crossover_sym_ratio_eff = c_levels[3 − level]（level↑ → sym↓ → 更探索）
+
+7.2.7 算法主循环（伪流程）
+
+预计算并缓存静态分数（SA、静态 Div、静态 DDS）和必要的全局数组。
+
+初始化 population（1 个 SA-top 精英 + 其余随机）。score_history = []。explore level 初值 1。stall_counter = 0。
+
+For gen_idx in 0 .. ga_generations−1：
+
+若 gen_idx < WARMUP：按预热规则设置 level。
+
+依据 level / cr 计算三参数的当代有效值（mut_ratio_eff、ls_ratio_eff、crossover_sym_ratio_eff），并换算为 k_mut、k_ls、max_from_sym。
+
+标准 GA: 生成 offspring（selection + crossover + soft-fill + mutation），对每个 child 做父代 proxy local_search，然后 _evaluate(child)（真实评估并缓存）。
+
+对 offspring 中最优个体做一次自洽 local_search（child-s_ref），再 _evaluate，如提升则替换。
+
+合并 population 与 offspring，按 fitness 排序保留前 ga_population_size；记录当代 best_S 到 score_history；更新 stall_counter（若 best_S 提升则置 0）。
+
+若 stall_counter 达到 STALL_TRIGGER 的倍数，更新 level（冷却或 reheat）。
+
+结束后对最终 best_mask 做一次 optional 精修（如需要），返回 mask 与统计信息。
+
+7.2.8 实现要点与工程实践建议
+
+缓存：_real_stats_cached 必须使用 canonical 且稳定的 key（如排序的 indices tuple）写缓存，避免重复计算。
+
+soft-fill 池大小：pool_mult 取 5 足够；rank-based 权重用 w(r)=1/(r+1) 效果稳健。
+
+日志：每代打印 gen_idx, level, k_mut, k_ls, crossover_sym_ratio_eff, best_S，便于诊断周期行为。
+
+可控开关：把 --verbose 控制打印，默认关闭以节省 IO。
+
+删除历史冗余：移除不再使用的 _shake() 实现与多 branch 轨迹记录（已在代码重构中清理）。
+
+最小评估开销约束：自洽 local_search 只对每代最优 offspring 做 1 次，避免每个子代两次评估带来的线性开销翻倍。
+
+种群内平均 Jaccard 相似度（可选）以衡量多样性
+
+7.2.9 期望行为（经验上）
+
+低 cr（20~30）会在预热期和初期快速上升，然后若卡在局部会通过降档→reheat 的周期机制跳出并尝试新的盆地；自洽 local_search 有望在 GA 给出的盆地边缘把解抬高一段。
+
+高 cr（≥60）表现更稳定、后期以重组 + 局部细化为主，不会因初期过大步长而崩坏。
 
 八、与直接使用训练动态评分的对比与方案意义
 

@@ -2,6 +2,7 @@ data/
 adapter_weights/
 pretrained_clip/
 weights/proxy_logs/
+weights/static_cache/
 checkpoint/
 debug/
 mask/

@@ -18,6 +18,13 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets
 from tqdm import tqdm
+from utils.group_lambda import (
+    DEFAULT_EPS,
+    DEFAULT_M,
+    DEFAULT_R,
+    compute_balance_penalty,
+    get_or_estimate_lambda,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -158,7 +165,11 @@ def compute_subset_score(
     image_adapter,
     div_features,
     dds_features,
-) -> tuple[float, float, float]:
+    lambda_value: float,
+    labels_np: np.ndarray,
+    num_classes: int,
+    target_size: int,
+) -> tuple[float, float, float, float, float]:
     div_dyn = np.asarray(
         div_metric.score_dataset_dynamic(
             div_loader,
@@ -183,7 +194,9 @@ def compute_subset_score(
     div_sum = float(div_dyn[chosen].sum())
     dds_sum = float(dds_dyn[chosen].sum())
     total = float((weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_dyn)[chosen].sum())
-    return div_sum, dds_sum, total
+    penalty = compute_balance_penalty(selected_mask, labels_np, num_classes, target_size)
+    adjusted = float(total - lambda_value * penalty)
+    return div_sum, dds_sum, total, penalty, adjusted
 
 
 def select_group_old_best(
@@ -201,14 +214,17 @@ def select_group_old_best(
     image_adapter,
     div_features,
     dds_features,
-) -> tuple[np.ndarray, float, float, float, int]:
+    lambda_value: float,
+    labels_np: np.ndarray,
+    num_classes: int,
+) -> tuple[np.ndarray, float, float, float, float, float, int]:
     k = max(1, min(n_samples, int(round(n_samples * cut_ratio / 100.0))))
     cur_idx = np.random.choice(n_samples, size=k, replace=False)
     cur_mask = np.zeros(n_samples, dtype=np.uint8)
     cur_mask[cur_idx] = 1
 
     best_mask = cur_mask.copy()
-    best_div, best_dds, best_total = compute_subset_score(
+    best_div, best_dds, best_total, best_penalty, best_total_adj = compute_subset_score(
         cur_mask,
         sa_scores=sa_scores,
         labels_t=labels_t,
@@ -220,6 +236,10 @@ def select_group_old_best(
         image_adapter=image_adapter,
         div_features=div_features,
         dds_features=dds_features,
+        lambda_value=lambda_value,
+        labels_np=labels_np,
+        num_classes=num_classes,
+        target_size=k,
     )
     best_iter = 0
 
@@ -248,7 +268,7 @@ def select_group_old_best(
         next_mask = select_global_topk(total_scores, cut_ratio=cut_ratio)
         cur_mask = next_mask
 
-        div_sum, dds_sum, total_sum = compute_subset_score(
+        div_sum, dds_sum, total_sum, pen_sum, total_sum_adj = compute_subset_score(
             cur_mask,
             sa_scores=sa_scores,
             labels_t=labels_t,
@@ -260,15 +280,21 @@ def select_group_old_best(
             image_adapter=image_adapter,
             div_features=div_features,
             dds_features=dds_features,
+            lambda_value=lambda_value,
+            labels_np=labels_np,
+            num_classes=num_classes,
+            target_size=k,
         )
-        if total_sum > best_total:
+        if total_sum_adj > best_total_adj:
+            best_total_adj = total_sum_adj
             best_total = total_sum
             best_div = div_sum
             best_dds = dds_sum
+            best_penalty = pen_sum
             best_mask = cur_mask.copy()
             best_iter = t
 
-    return best_mask, best_div, best_dds, best_total, best_iter
+    return best_mask, best_div, best_dds, best_total, best_penalty, best_total_adj, best_iter
 
 
 def main() -> None:
@@ -352,12 +378,49 @@ def main() -> None:
 
     cut_ratios = list(range(20, 91, 10))
     eval_seeds = [1, 2, 3, 4, 5]
+    lambda_sample_M = DEFAULT_M
+    lambda_ratio_r = DEFAULT_R
+    lambda_eps = DEFAULT_EPS
     rows: list[dict[str, object]] = []
 
     for cr in tqdm(cut_ratios, desc="Evaluating cut ratios", unit="cr"):
         print(f"\n[CR={cr}] evaluating topk/random/group_old ...")
+        target_size = max(1, min(len(dataset_for_names), int(round(len(dataset_for_names) * cr / 100.0))))
+        lambda_info_topk = get_or_estimate_lambda(
+            cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
+            dataset=args.dataset,
+            seed=FIXED_SEED,
+            cr=cr,
+            weight_group=args.weight_group,
+            n_samples=len(dataset_for_names),
+            target_size=target_size,
+            eval_score_fn=lambda mask: compute_subset_score(
+                mask,
+                sa_scores=sa_scores,
+                labels_t=labels_t,
+                weights=weights,
+                div_metric=div_metric,
+                dds_metric=dds_metric,
+                div_loader=div_loader,
+                dds_loader=dds_loader,
+                image_adapter=image_adapter,
+                div_features=div_features,
+                dds_features=dds_features,
+                lambda_value=0.0,
+                labels_np=labels,
+                num_classes=len(class_names),
+                target_size=target_size,
+            )[2],
+            penalty_fn=lambda mask: compute_balance_penalty(mask, labels, len(class_names), target_size),
+            M=lambda_sample_M,
+            r=lambda_ratio_r,
+            eps=lambda_eps,
+            tqdm_desc=f"Estimating lambda (seed={FIXED_SEED}, cr={cr})",
+        )
+        lambda_topk = float(lambda_info_topk["lambda"])
+        print(f"[Lambda] dataset={args.dataset} | seed={FIXED_SEED} | cr={cr} | lambda={lambda_topk:.8f}")
         topk_mask = select_global_topk(total_static, cut_ratio=cr)
-        _, _, topk_total = compute_subset_score(
+        _, _, _, _, topk_total = compute_subset_score(
             topk_mask,
             sa_scores=sa_scores,
             labels_t=labels_t,
@@ -369,6 +432,10 @@ def main() -> None:
             image_adapter=image_adapter,
             div_features=div_features,
             dds_features=dds_features,
+            lambda_value=lambda_topk,
+            labels_np=labels,
+            num_classes=len(class_names),
+            target_size=target_size,
         )
 
         random_scores: list[float] = []
@@ -377,7 +444,40 @@ def main() -> None:
             set_seed(seed)
 
             random_mask = select_random_mask(len(dataset_for_names), cut_ratio=cr)
-            _, _, random_total = compute_subset_score(
+            lambda_info_seed = get_or_estimate_lambda(
+                cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
+                dataset=args.dataset,
+                seed=seed,
+                cr=cr,
+                weight_group=args.weight_group,
+                n_samples=len(dataset_for_names),
+                target_size=target_size,
+                eval_score_fn=lambda mask: compute_subset_score(
+                    mask,
+                    sa_scores=sa_scores,
+                    labels_t=labels_t,
+                    weights=weights,
+                    div_metric=div_metric,
+                    dds_metric=dds_metric,
+                    div_loader=div_loader,
+                    dds_loader=dds_loader,
+                    image_adapter=image_adapter,
+                    div_features=div_features,
+                    dds_features=dds_features,
+                    lambda_value=0.0,
+                    labels_np=labels,
+                    num_classes=len(class_names),
+                    target_size=target_size,
+                )[2],
+                penalty_fn=lambda mask: compute_balance_penalty(mask, labels, len(class_names), target_size),
+                M=lambda_sample_M,
+                r=lambda_ratio_r,
+                eps=lambda_eps,
+                tqdm_desc=f"Estimating lambda (seed={seed}, cr={cr})",
+            )
+            lambda_seed = float(lambda_info_seed["lambda"])
+
+            _, _, _, _, random_total = compute_subset_score(
                 random_mask,
                 sa_scores=sa_scores,
                 labels_t=labels_t,
@@ -389,10 +489,14 @@ def main() -> None:
                 image_adapter=image_adapter,
                 div_features=div_features,
                 dds_features=dds_features,
+                lambda_value=lambda_seed,
+                labels_np=labels,
+                num_classes=len(class_names),
+                target_size=target_size,
             )
             random_scores.append(random_total)
 
-            _, _, _, grp_total, _ = select_group_old_best(
+            _, _, _, _, _, grp_total, _ = select_group_old_best(
                 n_samples=len(dataset_for_names),
                 cut_ratio=cr,
                 outer_iters=args.group_old_iters,
@@ -406,6 +510,9 @@ def main() -> None:
                 image_adapter=image_adapter,
                 div_features=div_features,
                 dds_features=dds_features,
+                lambda_value=lambda_seed,
+                labels_np=labels,
+                num_classes=len(class_names),
             )
             group_old_scores.append(grp_total)
 

@@ -25,6 +25,13 @@ from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
+from utils.group_lambda import (  # noqa: E402
+    DEFAULT_EPS,
+    DEFAULT_M,
+    DEFAULT_R,
+    compute_balance_penalty,
+    get_or_estimate_lambda,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -245,6 +252,9 @@ def select_group_mask(
     num_classes: int,
     cut_ratio: int,
     device: torch.device,
+    dataset_name: str,
+    seed: int,
+    weight_group: str,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if cut_ratio <= 0 or cut_ratio > 100:
         raise ValueError("cr 必须在 1-100 之间。")
@@ -266,9 +276,12 @@ def select_group_mask(
     else:
         target_size = 0
 
-    ga_population_size = 24
+    ga_population_size = 16
     ga_generations = 160
     ga_offspring = ga_population_size
+    lambda_sample_M = DEFAULT_M
+    lambda_ratio_r = DEFAULT_R
+    lambda_eps = DEFAULT_EPS
     # ====== adaptive schedule block ======
     level = 1
     WARMUP = 5
@@ -361,11 +374,16 @@ def select_group_mask(
 
     def _evaluate(indices: np.ndarray) -> dict[str, object]:
         mask = _indices_to_mask(indices)
-        fitness, s_ref, counts = _real_stats_cached(mask)
+        raw_score, s_ref, counts = _real_stats_cached(mask)
+        penalty = compute_balance_penalty(mask, labels_np, num_classes, target_size)
+        adjusted_score = raw_score - lambda_val * penalty
         return {
             "indices": np.sort(indices.astype(np.int64)),
             "mask": mask,
-            "fitness": float(fitness),
+            "fitness": float(adjusted_score),
+            "raw_score": float(raw_score),
+            "penalty": float(penalty),
+            "adjusted_score": float(adjusted_score),
             "s_ref": s_ref,
             "counts": counts,
         }
@@ -394,13 +412,41 @@ def select_group_mask(
         return a if float(a["fitness"]) >= float(b["fitness"]) else b
 
     static_topk = _pick_top_static(np.arange(num_samples, dtype=np.int64), target_size)
+
+    lambda_info = get_or_estimate_lambda(
+        cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
+        dataset=dataset_name,
+        seed=seed,
+        cr=cut_ratio,
+        weight_group=weight_group,
+        n_samples=num_samples,
+        target_size=target_size,
+        eval_score_fn=lambda mask: _real_stats_cached(mask)[0],
+        penalty_fn=lambda mask: compute_balance_penalty(mask, labels_np, num_classes, target_size),
+        M=lambda_sample_M,
+        r=lambda_ratio_r,
+        eps=lambda_eps,
+        tqdm_desc=f"Estimating lambda (seed={seed}, cr={cut_ratio})",
+    )
+    lambda_val = float(lambda_info["lambda"])
+    print(
+        "[Lambda] "
+        f"dataset={dataset_name} | seed={seed} | cr={cut_ratio} | "
+        f"lambda={lambda_val:.8f} | "
+        f"mu_S={lambda_info.get('mu_S', float('nan')):.6f}, sigma_S={lambda_info.get('sigma_S', float('nan')):.6f}, "
+        f"mu_pen={lambda_info.get('mu_pen', float('nan')):.6f}, sigma_pen={lambda_info.get('sigma_pen', float('nan')):.6f}, "
+        f"M={int(lambda_info.get('M', lambda_sample_M))}, r={lambda_info.get('r', lambda_ratio_r):.4f}"
+    )
+
     initial_population_idx: list[np.ndarray] = [static_topk]
     while len(initial_population_idx) < ga_population_size:
         random_idx = np.random.choice(num_samples, size=target_size, replace=False).astype(np.int64)
         initial_population_idx.append(np.sort(random_idx))
 
     population = [_evaluate(_repair_size(idx)) for idx in initial_population_idx]
-    score_history = [max(float(item["fitness"]) for item in population)]
+    best_initial = max(population, key=lambda item: float(item["fitness"]))
+    score_history = [float(best_initial["raw_score"])]
+    correction_history = [float(lambda_val * float(best_initial["penalty"]))]
 
     generation_iter = tqdm(
         range(ga_generations),
@@ -497,9 +543,11 @@ def select_group_mask(
         population = dedup_population
         population.sort(key=lambda item: float(item["fitness"]), reverse=True)
 
-        generation_best = max(float(item["fitness"]) for item in population)
-        score_history.append(generation_best)
-        generation_iter.set_postfix({"best_S": f"{generation_best:.4f}"})
+        generation_best_item = max(population, key=lambda item: float(item["fitness"]))
+        generation_best = float(generation_best_item["fitness"])
+        score_history.append(float(generation_best_item["raw_score"]))
+        correction_history.append(float(lambda_val * float(generation_best_item["penalty"])))
+        generation_iter.set_postfix({"best_S_prime": f"{generation_best:.4f}"})
 
     # ====== GA 结束后的局部搜索收尾（基于真实动态得分） ======
     # 先取出最优个体的 indices 形式
@@ -509,6 +557,8 @@ def select_group_mask(
 
     # 基于当前最优子集，计算真实的动态得分 s_ref，用作后续局部搜索的 "proxy_scores"
     best_S, best_s_ref, _ = _real_stats_cached(best_mask)
+    best_penalty = compute_balance_penalty(best_mask, labels_np, num_classes, target_size)
+    best_S_prime = best_S - lambda_val * best_penalty
 
     # 局部搜索的超参数：最多迭代步数、最小提升阈值
     REFINE_MAX_STEPS = 10
@@ -533,12 +583,16 @@ def select_group_mask(
         refined_mask = _indices_to_mask(refined_indices)
 
         refined_S, refined_s_ref, _ = _real_stats_cached(refined_mask)
+        refined_penalty = compute_balance_penalty(refined_mask, labels_np, num_classes, target_size)
+        refined_S_prime = refined_S - lambda_val * refined_penalty
 
         # 只接受真正提高 S(D) 的 move；否则视为已经到达局部最优，提前停止
-        if refined_S > best_S + REFINE_EPS:
+        if refined_S_prime > best_S_prime + REFINE_EPS:
             best_indices = refined_indices
             best_mask = refined_mask
             best_S = refined_S
+            best_penalty = refined_penalty
+            best_S_prime = refined_S_prime
             best_s_ref = refined_s_ref
         else:
             break
@@ -561,11 +615,16 @@ def select_group_mask(
         "final_rate": final_rate,
         "selected_by_class": selected_by_class,
         "S": float(np.sum(final_s_all[final_mask.astype(bool)])),
+        "penalty": float(compute_balance_penalty(final_mask, labels_np, num_classes, target_size)),
+        "S_prime": float(best_S_prime),
         "best_iter": int(np.argmax(np.asarray(score_history, dtype=np.float32))),
         "score_history": score_history,
+        "correction_history": correction_history,
         "ga_population_size": int(ga_population_size),
         "ga_generations": int(ga_generations),
         "ga_offspring": int(ga_offspring),
+        "lambda": lambda_val,
+        "lambda_info": lambda_info,
     }
 
     return final_mask, selected_by_class, stats
@@ -577,6 +636,7 @@ def _sanitize_for_filename(text: str) -> str:
 
 def save_score_curve_plot(
     score_history: Sequence[float],
+    correction_history: Sequence[float],
     *,
     dataset: str,
     method: str,
@@ -598,12 +658,20 @@ def save_score_curve_plot(
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
+    ax2 = ax.twinx()
     x = np.arange(len(score_history), dtype=np.int32)
-    ax.plot(x, np.asarray(score_history, dtype=np.float64), linewidth=1.6)
-    ax.set_title("Score trajectory")
+    score_arr = np.asarray(score_history, dtype=np.float64)
+    corr_arr = np.asarray(correction_history, dtype=np.float64)
+    line1 = ax.plot(x, score_arr, linewidth=1.6, color="#1f77b4", label="S(D)")
+    line2 = ax2.plot(x, corr_arr, linewidth=1.6, color="#ff7f0e", label="λ·penalty(D)")
+    ax.set_title("Score & correction trajectory")
     ax.set_xlabel("Iteration")
-    ax.set_ylabel("S(D)")
+    ax.set_ylabel("S(D)", color="#1f77b4")
+    ax2.set_ylabel("λ·penalty(D)", color="#ff7f0e")
     ax.grid(alpha=0.25)
+    handles = line1 + line2
+    labels = [h.get_label() for h in handles]
+    ax.legend(handles, labels, loc="best")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -824,9 +892,13 @@ def main() -> None:
                     num_classes=len(class_names),
                     cut_ratio=cut_ratio,
                     device=device,
+                    dataset_name=dataset_name,
+                    seed=seed,
+                    weight_group=weight_group,
                 )
                 debug_curve = save_score_curve_plot(
                     group_stats.get("score_history", []),
+                    group_stats.get("correction_history", []),
                     dataset=dataset_name,
                     method=method,
                     weight_group=weight_group,
@@ -880,7 +952,7 @@ def main() -> None:
                     f"sr={group_stats['sr']:.6f} | rate={group_stats['final_rate']:.6f} | "
                     f"m_c={group_stats['selected_by_class']} | "
                     f"best_iter={group_stats['best_iter']} | "
-                    f"S(D)={group_stats['S']:.6f}"
+                    f"S(D)={group_stats['S']:.6f} | pen(D)={group_stats['penalty']:.6f} | S'(D)={group_stats['S_prime']:.6f}"
                 )
             print(f"mask saved to: {mask_path}")
 

@@ -276,8 +276,8 @@ def select_group_mask(
     else:
         target_size = 0
 
-    ga_population_size = 16
-    ga_generations = 160
+    ga_population_size = 8
+    ga_generations = 100
     ga_offspring = ga_population_size
     lambda_sample_M = DEFAULT_M
     lambda_ratio_r = DEFAULT_R
@@ -302,7 +302,7 @@ def select_group_mask(
     mut_levels = [mut_min + level_idx * mut_step for level_idx in range(4)]
 
     C_MAX = 0.8
-    c_min = 0.7 - 0.2 * cr_ratio
+    c_min = 0.7 - 0.2 * (1 - cr_ratio)
     c_step = (C_MAX - c_min) / 3.0
     c_levels = [c_min + level_idx * c_step for level_idx in range(4)]
 

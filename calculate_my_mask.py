@@ -81,6 +81,18 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="group 模式下是否额外对比 topk",
     )
+    parser.add_argument("--repair-pool-random", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--repair-pool-m-base", type=float, default=2.0)
+    parser.add_argument("--repair-pool-m-slope", type=float, default=3.0)
+    parser.add_argument("--repair-softmax-temp", type=float, default=1.0)
+    parser.add_argument("--stage2-cycles", type=int, default=2)
+    parser.add_argument("--early-ratio-cr20", type=float, default=0.60)
+    parser.add_argument("--early-ratio-cr90", type=float, default=0.30)
+    parser.add_argument("--use-e2-div-cover", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--e2-topk-offspring", type=int, default=1)
+    parser.add_argument("--e2-steps-per-child", type=int, default=1)
+    parser.add_argument("--e2-r-ratio", type=float, default=0.01)
+    parser.add_argument("--e2-max-pairs", type=int, default=30)
     return parser.parse_args()
 
 
@@ -255,15 +267,20 @@ def select_group_mask(
     dataset_name: str,
     seed: int,
     weight_group: str,
-    two_stage: bool = True,
-    stage_split_ratio: float = 0.40,
-    stage1_repair_mode: str = "sa",
-    stage2_repair_mode: str = "weighted_static",
-    stage_switch_elite_keep_ratio: float = 0.20,
-    stage_switch_big_mut_ratio: float = 0.20,
-    stage_switch_big_mut_times: int = 1,
     div_static_scores: np.ndarray | None = None,
     dds_static_scores: np.ndarray | None = None,
+    repair_pool_random: bool = True,
+    repair_pool_m_base: float = 2.0,
+    repair_pool_m_slope: float = 3.0,
+    repair_softmax_temp: float = 1.0,
+    stage2_cycles: int = 2,
+    early_ratio_cr20: float = 0.60,
+    early_ratio_cr90: float = 0.30,
+    use_e2_div_cover: bool = True,
+    e2_topk_offspring: int = 1,
+    e2_steps_per_child: int = 1,
+    e2_r_ratio: float = 0.01,
+    e2_max_pairs: int = 30,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if cut_ratio <= 0 or cut_ratio > 100:
         raise ValueError("cr 必须在 1-100 之间。")
@@ -307,23 +324,39 @@ def select_group_mask(
     else:
         target_size = 0
 
-    ga_population_size = 16
-    ga_generations = 150
+    ga_population_size = 20
+    ga_generations = 60
     ga_offspring = ga_population_size
     lambda_sample_M = DEFAULT_M
     lambda_ratio_r = DEFAULT_R
     lambda_eps = DEFAULT_EPS
-    cr_ratio = cut_ratio / 100.0
+    cr_ratio = target_size / max(1, num_samples)
 
-    local_search_ratio_stage1 = 0.05 - 0.03 * cr_ratio
-    local_search_ratio_stage2 = 0.08 - 0.04 * cr_ratio
-    mutation_ratio_stage1 = 0.008 * (1.0 + 3.0 * (1.0 - cr_ratio))
+    local_search_ratio_stage1 = 0.06 - 0.04 * cr_ratio
+    local_search_ratio_stage2 = 0.08 - 0.05 * cr_ratio
+    mutation_ratio_stage1 = 0.01 * (1.0 + 3.0 * (1.0 - cr_ratio))
     mutation_ratio_stage2 = 0.02 * (1.0 + 1.0 * (1.0 - cr_ratio))
     crossover_sym_ratio_stage1 = 0.7 - 0.05 * (1 - cr_ratio)
     crossover_sym_ratio_stage2 = 0.85 - 0.15 * (1 - cr_ratio)
 
-    stage_split_ratio = float(np.clip(stage_split_ratio, 0.0, 1.0))
-    stage1_gens = int(ga_generations * stage_split_ratio)
+    cr_for_interp = float(np.clip(cut_ratio, 20, 90))
+    early_ratio = early_ratio_cr20 + (cr_for_interp - 20.0) * (early_ratio_cr90 - early_ratio_cr20) / 70.0
+    early_ratio = float(np.clip(early_ratio, 0.30, 0.60))
+    stage2_cycles = max(1, int(stage2_cycles))
+    phase_schedule: list[str] = []
+    base_cycle_len = ga_generations // stage2_cycles
+    rem = ga_generations % stage2_cycles
+    for cycle_idx in range(stage2_cycles):
+        cycle_len = base_cycle_len + (rem if cycle_idx == stage2_cycles - 1 else 0)
+        early_len = int(np.round(cycle_len * early_ratio))
+        early_len = min(cycle_len, max(0, early_len))
+        late_len = cycle_len - early_len
+        phase_schedule.extend(["early"] * early_len)
+        phase_schedule.extend(["late"] * late_len)
+    if len(phase_schedule) < ga_generations:
+        phase_schedule.extend(["late"] * (ga_generations - len(phase_schedule)))
+    elif len(phase_schedule) > ga_generations:
+        phase_schedule = phase_schedule[:ga_generations]
 
     cached_real_stats: dict[tuple[int, ...], tuple[float, np.ndarray, np.ndarray]] = {}
 
@@ -375,19 +408,95 @@ def select_group_mask(
         order = np.argsort(-score_np[candidate_idx], kind="mergesort")
         return candidate_idx[order[: min(k, candidate_idx.size)]].astype(np.int64)
 
-    def _repair_size(indices: np.ndarray, repair_score_np: np.ndarray) -> np.ndarray:
+    weighted_static_np = (
+        weights["sa"] * sa_scores_np
+        + weights["div"] * div_static_np
+        + weights["dds"] * dds_static_np
+    ).astype(np.float32)
+    if div_static_scores is None or dds_static_scores is None:
+        raise RuntimeError("weighted static scores are required for random repair.")
+
+    def _stable_softmax_prob(values: np.ndarray, temp: float) -> np.ndarray:
+        if values.size == 0:
+            return np.empty(0, dtype=np.float64)
+        t = max(float(temp), 1e-6)
+        logits = values.astype(np.float64) / t
+        finite_mask = np.isfinite(logits)
+        if not np.any(finite_mask):
+            return np.full(values.size, 1.0 / values.size, dtype=np.float64)
+        safe_logits = logits.copy()
+        safe_logits[~finite_mask] = -1e30
+        max_v = np.max(safe_logits)
+        exps = np.exp(safe_logits - max_v)
+        exps[~np.isfinite(exps)] = 0.0
+        s = np.sum(exps)
+        if not np.isfinite(s) or s <= 0:
+            return np.full(values.size, 1.0 / values.size, dtype=np.float64)
+        return exps / s
+
+    def _sample_from_pool(
+        cand_idx: np.ndarray,
+        k_pool: int,
+        rank_score_np: np.ndarray,
+        prob_score_np: np.ndarray,
+        k: int,
+        temp: float,
+    ) -> np.ndarray:
+        cand_idx = np.unique(cand_idx.astype(np.int64))
+        if k <= 0 or cand_idx.size == 0:
+            return np.empty(0, dtype=np.int64)
+        order = np.argsort(-rank_score_np[cand_idx], kind="mergesort")
+        pool = cand_idx[order[: min(k_pool, cand_idx.size)]]
+        if pool.size == 0:
+            return np.empty(0, dtype=np.int64)
+        if k >= pool.size:
+            return pool.astype(np.int64)
+        p = _stable_softmax_prob(prob_score_np[pool], temp)
+        try:
+            sampled = np.random.choice(pool, size=k, replace=False, p=p)
+        except Exception:
+            sampled = np.random.choice(pool, size=k, replace=False)
+        return sampled.astype(np.int64)
+
+    current_phase = "early"
+
+    def _repair_size(indices: np.ndarray, repair_score_np: np.ndarray | None = None) -> np.ndarray:
+        del repair_score_np
         unique_idx = np.unique(indices.astype(np.int64))
         if target_size == 0:
             return np.empty(0, dtype=np.int64)
-        if unique_idx.size > target_size:
-            return _pick_top_by_score(unique_idx, target_size, repair_score_np)
-        if unique_idx.size < target_size:
+        if unique_idx.size == target_size:
+            return unique_idx.astype(np.int64)
+
+        rank_score_np = sa_scores_np if current_phase == "early" else weighted_static_np
+        prob_score_np = weighted_static_np if current_phase == "early" else sa_scores_np
+
+        if not repair_pool_random:
+            if unique_idx.size > target_size:
+                return _pick_top_by_score(unique_idx, target_size, rank_score_np)
             comp = np.setdiff1d(np.arange(num_samples, dtype=np.int64), unique_idx, assume_unique=False)
-            fill = _pick_top_by_score(comp, target_size - unique_idx.size, repair_score_np)
-            unique_idx = np.concatenate([unique_idx, fill])
+            fill = _pick_top_by_score(comp, target_size - unique_idx.size, rank_score_np)
+            return np.concatenate([unique_idx, fill]).astype(np.int64)
+
+        change_n = abs(target_size - unique_idx.size)
+        m = float(repair_pool_m_base + repair_pool_m_slope * cr_ratio)
+        k_pool = max(change_n, int(np.round(m * change_n)))
+        k_pool = min(k_pool, max(200, int(0.05 * num_samples)))
+
         if unique_idx.size > target_size:
-            unique_idx = _pick_top_by_score(unique_idx, target_size, repair_score_np)
-        return unique_idx.astype(np.int64)
+            return _sample_from_pool(unique_idx, max(1, min(k_pool, unique_idx.size)), rank_score_np, prob_score_np, target_size, repair_softmax_temp)
+
+        comp = np.setdiff1d(np.arange(num_samples, dtype=np.int64), unique_idx, assume_unique=False)
+        need = target_size - unique_idx.size
+        fill = _sample_from_pool(comp, max(1, min(k_pool, comp.size)), rank_score_np, prob_score_np, need, repair_softmax_temp)
+        repaired = np.unique(np.concatenate([unique_idx, fill]))
+        if repaired.size < target_size:
+            extra = _pick_top_by_score(np.setdiff1d(np.arange(num_samples, dtype=np.int64), repaired,
+                                       assume_unique=False), target_size - repaired.size, rank_score_np)
+            repaired = np.concatenate([repaired, extra])
+        if repaired.size > target_size:
+            repaired = _sample_from_pool(repaired, repaired.size, rank_score_np, prob_score_np, target_size, repair_softmax_temp)
+        return repaired.astype(np.int64)
 
     def _evaluate(indices: np.ndarray) -> dict[str, object]:
         mask = _indices_to_mask(indices)
@@ -428,27 +537,12 @@ def select_group_mask(
         b = population[int(chosen[1])]
         return a if float(a["fitness"]) >= float(b["fitness"]) else b
 
-    weighted_static_np = (
-        weights["sa"] * sa_scores_np
-        + weights["div"] * div_static_np
-        + weights["dds"] * dds_static_np
-    ).astype(np.float32)
-
     if np.std(weighted_static_np) <= 1e-12 or np.std(sa_scores_np) <= 1e-12:
         weighted_static_corr_with_sa = 1.0
     else:
         weighted_static_corr_with_sa = float(np.corrcoef(weighted_static_np, sa_scores_np)[0, 1])
-    print(
-        "[Group][weighted_static] "
-        f"sa(mean={float(np.mean(sa_scores_np)):.6f}, std={float(np.std(sa_scores_np)):.6f}) | "
-        f"div(mean={float(np.mean(div_static_np)):.6f}, std={float(np.std(div_static_np)):.6f}) | "
-        f"dds(mean={float(np.mean(dds_static_np)):.6f}, std={float(np.std(dds_static_np)):.6f}) | "
-        f"weighted(mean={float(np.mean(weighted_static_np)):.6f}, std={float(np.std(weighted_static_np)):.6f}) | "
-        f"corr(weighted,sa)={weighted_static_corr_with_sa:.6f}"
-    )
 
     static_topk = _pick_top_by_score(np.arange(num_samples, dtype=np.int64), target_size, sa_scores_np)
-
     lambda_info = get_or_estimate_lambda(
         cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
         dataset=dataset_name,
@@ -459,104 +553,35 @@ def select_group_mask(
         target_size=target_size,
         eval_score_fn=lambda mask: _real_stats_cached(mask)[0],
         penalty_fn=lambda mask: compute_balance_penalty(mask, labels_np, num_classes, target_size),
-        M=lambda_sample_M,
+        M=max(10, min(lambda_sample_M, num_samples)),
         r=lambda_ratio_r,
         eps=lambda_eps,
-        tqdm_desc=f"Estimating lambda (seed={seed}, cr={cut_ratio})",
+        tqdm_desc=f"Estimating lambda (seed={seed}, cr={cut_ratio}, wg={weight_group})",
     )
     lambda_val = float(lambda_info["lambda"])
-    print(
-        "[Lambda] "
-        f"dataset={dataset_name} | seed={seed} | cr={cut_ratio} | "
-        f"lambda={lambda_val:.8f} | "
-        f"mu_S={lambda_info.get('mu_S', float('nan')):.6f}, sigma_S={lambda_info.get('sigma_S', float('nan')):.6f}, "
-        f"mu_pen={lambda_info.get('mu_pen', float('nan')):.6f}, sigma_pen={lambda_info.get('sigma_pen', float('nan')):.6f}, "
-        f"M={int(lambda_info.get('M', lambda_sample_M))}, r={lambda_info.get('r', lambda_ratio_r):.4f}"
-    )
 
     initial_population_idx: list[np.ndarray] = [static_topk]
-    while len(initial_population_idx) < ga_population_size:
-        random_idx = np.random.choice(num_samples, size=target_size, replace=False).astype(np.int64)
-        initial_population_idx.append(np.sort(random_idx))
+    for _ in range(max(0, ga_population_size - 1)):
+        init_idx = np.random.choice(num_samples, size=target_size, replace=False).astype(np.int64)
+        initial_population_idx.append(init_idx)
 
-    init_repair_score_np = sa_scores_np
-    population = [_evaluate(_repair_size(idx, init_repair_score_np)) for idx in initial_population_idx]
-    best_initial = max(population, key=lambda item: float(item["fitness"]))
-    score_history = [float(best_initial["raw_score"])]
-    correction_history = [float(lambda_val * float(best_initial["penalty"]))]
+    current_phase = phase_schedule[0] if phase_schedule else "early"
+    population = [_evaluate(_repair_size(idx)) for idx in initial_population_idx]
+    population.sort(key=lambda item: float(item["fitness"]), reverse=True)
 
-    generation_iter = tqdm(
-        range(ga_generations),
-        desc="Group optimization [Memetic-GA]",
-        unit="gen",
-        leave=True,
-    )
+    score_history: list[float] = []
+    correction_history: list[float] = []
 
-    stage_switch_executed = False
-    stage_switch_info: dict[str, object] = {
-        "triggered": False,
-        "times": 0,
-        "k_big": 0,
-        "elite_keep": 0,
-    }
+    div_feat_np = div_features.detach().cpu().numpy() if isinstance(div_features, torch.Tensor) else np.asarray(div_features)
 
+    generation_iter = tqdm(range(ga_generations), desc="GA Selection", unit="gen")
     for gen_idx in generation_iter:
-        just_did_big_mutation = False
-        if two_stage:
-            in_stage1 = gen_idx < stage1_gens
-            stage_name = "stage1" if in_stage1 else "stage2"
-            repair_mode = stage1_repair_mode if in_stage1 else stage2_repair_mode
-            repair_score_np = sa_scores_np if in_stage1 else weighted_static_np
-
-            if (
-                stage_switch_big_mut_times > 0
-                and not stage_switch_executed
-                and gen_idx == stage1_gens
-                and stage1_gens < ga_generations
-            ):
-                pop_sorted = sorted(population, key=lambda item: float(item["fitness"]), reverse=True)
-                elite_keep = max(1, int(ga_population_size * stage_switch_elite_keep_ratio))
-                elite_keep = min(elite_keep, ga_population_size)
-                k_big = max(1, int(stage_switch_big_mut_ratio * target_size))
-                k_big = min(k_big, target_size)
-                mutated_population: list[dict[str, object]] = pop_sorted[:elite_keep]
-                for base_item in pop_sorted[elite_keep:]:
-                    base = np.asarray(base_item["indices"], dtype=np.int64)
-                    if base.size == 0:
-                        mutated_population.append(base_item)
-                        continue
-                    cur_k_big = min(k_big, base.size, num_samples - base.size)
-                    if cur_k_big <= 0:
-                        mutated_population.append(base_item)
-                        continue
-                    drop_idx = np.random.choice(base, size=cur_k_big, replace=False).astype(np.int64)
-                    base_after_drop = np.setdiff1d(base, drop_idx, assume_unique=False)
-                    comp_base = np.setdiff1d(np.arange(num_samples, dtype=np.int64), base_after_drop, assume_unique=False)
-                    add_idx = np.random.choice(comp_base, size=cur_k_big, replace=False).astype(np.int64)
-                    new_indices = np.concatenate([base_after_drop, add_idx])
-                    new_indices = _repair_size(new_indices, weighted_static_np)
-                    mutated_population.append(_evaluate(new_indices))
-                population = mutated_population
-                population.sort(key=lambda item: float(item["fitness"]), reverse=True)
-                stage_switch_executed = True
-                just_did_big_mutation = True
-                stage_switch_info = {
-                    "triggered": True,
-                    "times": int(stage_switch_big_mut_times),
-                    "k_big": int(k_big),
-                    "elite_keep": int(elite_keep),
-                }
-
-            mutation_ratio_eff = mutation_ratio_stage1 if in_stage1 else mutation_ratio_stage2
-            local_search_ratio_eff = local_search_ratio_stage1 if in_stage1 else local_search_ratio_stage2
-            crossover_sym_ratio_eff = crossover_sym_ratio_stage1 if in_stage1 else crossover_sym_ratio_stage2
-        else:
-            stage_name = "single"
-            repair_mode = "sa"
-            repair_score_np = sa_scores_np
-            mutation_ratio_eff = mutation_ratio_stage1
-            local_search_ratio_eff = local_search_ratio_stage1
-            crossover_sym_ratio_eff = crossover_sym_ratio_stage1
+        current_phase = phase_schedule[gen_idx]
+        in_stage1 = current_phase == "early"
+        stage_name = current_phase
+        mutation_ratio_eff = mutation_ratio_stage1 if in_stage1 else mutation_ratio_stage2
+        local_search_ratio_eff = local_search_ratio_stage1 if in_stage1 else local_search_ratio_stage2
+        crossover_sym_ratio_eff = crossover_sym_ratio_stage1 if in_stage1 else crossover_sym_ratio_stage2
 
         k_mut = max(1, int(mutation_ratio_eff * target_size))
         k_ls = max(1, int(local_search_ratio_eff * target_size))
@@ -576,7 +601,7 @@ def select_group_mask(
             if child.size < target_size and sym.size > 0:
                 need_sym = max(0, max_from_sym - child.size)
                 if need_sym > 0:
-                    add_sym = _pick_top_by_score(sym, need_sym, repair_score_np)
+                    add_sym = _pick_top_by_score(sym, need_sym, sa_scores_np if in_stage1 else weighted_static_np)
                     child = np.concatenate([child, add_sym])
 
             if child.size < target_size:
@@ -585,10 +610,10 @@ def select_group_mask(
                     np.union1d(parent_a_idx, parent_b_idx),
                     assume_unique=False,
                 )
-                add_comp = _pick_top_by_score(complement_union, target_size - child.size, repair_score_np)
+                add_comp = _pick_top_by_score(complement_union, target_size - child.size, sa_scores_np if in_stage1 else weighted_static_np)
                 child = np.concatenate([child, add_comp])
 
-            child = _repair_size(child, repair_score_np)
+            child = _repair_size(child)
 
             child_k_mut = min(k_mut, child.size, num_samples - child.size)
             if child_k_mut > 0:
@@ -597,7 +622,7 @@ def select_group_mask(
                 add_idx = np.random.choice(comp_child, size=child_k_mut, replace=False).astype(np.int64)
                 child = np.setdiff1d(child, drop_idx, assume_unique=False)
                 child = np.concatenate([child, add_idx])
-                child = _repair_size(child, repair_score_np)
+                child = _repair_size(child)
 
             proxy_scores = np.asarray(
                 parent_a["s_ref"] if float(parent_a["fitness"]) >= float(parent_b["fitness"]) else parent_b["s_ref"],
@@ -605,9 +630,57 @@ def select_group_mask(
             )
             child_k_ls = min(k_ls, child.size, num_samples - child.size)
             child = _local_search_step(child, proxy_scores, child_k_ls)
-            child = _repair_size(child, repair_score_np)
-
+            child = _repair_size(child)
             offspring.append(_evaluate(child))
+
+        if use_e2_div_cover and offspring:
+            offspring_sorted = sorted(offspring, key=lambda item: float(item["fitness"]), reverse=True)
+            top_children = offspring_sorted[: max(0, int(e2_topk_offspring))]
+            for cand in top_children:
+                base_indices = np.asarray(cand["indices"], dtype=np.int64)
+                for _ in range(max(0, int(e2_steps_per_child))):
+                    if base_indices.size == 0 or base_indices.size >= num_samples:
+                        break
+                    r = max(1, int(e2_r_ratio * target_size))
+                    child_feat = div_feat_np[base_indices]
+                    sim_mat = child_feat @ child_feat.T
+                    np.fill_diagonal(sim_mat, -np.inf)
+                    redundancy = np.max(sim_mat, axis=1)
+                    redundancy = np.where(np.isfinite(redundancy), redundancy, -1e9)
+                    drop_k = min(r, base_indices.size)
+                    drop_local = np.argsort(-redundancy)[:drop_k]
+                    drop_cands = base_indices[drop_local]
+
+                    comp = np.setdiff1d(np.arange(num_samples, dtype=np.int64), base_indices, assume_unique=False)
+                    if comp.size == 0:
+                        break
+                    comp_feat = div_feat_np[comp]
+                    near_sim = comp_feat @ child_feat.T
+                    novelty = 1.0 - np.max(near_sim, axis=1)
+                    add_k = min(r, comp.size)
+                    add_order = np.argsort(-novelty)[:add_k]
+                    add_cands = comp[add_order]
+                    add_novelty = novelty[add_order]
+
+                    pairs: list[tuple[float, int, int]] = []
+                    for d_idx, d in enumerate(drop_cands):
+                        for a_idx, a in enumerate(add_cands):
+                            delta_hat = float(add_novelty[a_idx] - redundancy[drop_local[d_idx]])
+                            pairs.append((delta_hat, int(d), int(a)))
+                    if not pairs:
+                        break
+                    pairs.sort(key=lambda x: x[0], reverse=True)
+                    pairs = pairs[: max(1, int(e2_max_pairs))]
+                    _, d_best, a_best = pairs[0]
+                    new_child = np.setdiff1d(base_indices, np.asarray([d_best], dtype=np.int64), assume_unique=False)
+                    new_child = np.concatenate([new_child, np.asarray([a_best], dtype=np.int64)])
+                    new_child = _repair_size(new_child)
+                    new_eval = _evaluate(new_child)
+                    if float(new_eval["fitness"]) > float(cand["fitness"]):
+                        cand.update(new_eval)
+                        base_indices = np.asarray(cand["indices"], dtype=np.int64)
+                    else:
+                        break
 
         merged = population + offspring
         merged_sorted = sorted(merged, key=lambda item: float(item["fitness"]), reverse=True)
@@ -630,51 +703,36 @@ def select_group_mask(
         correction_history.append(float(lambda_val * float(generation_best_item["penalty"])))
         if gen_idx % 5 == 0:
             print(
-                f"[GA] gen={gen_idx:03d} stage={stage_name} repair={repair_mode} "
+                f"[GA] gen={gen_idx:03d} stage={stage_name} "
                 f"mut={mutation_ratio_eff:.5f} ls={local_search_ratio_eff:.5f} "
-                f"cross={crossover_sym_ratio_eff:.5f} switch_big_mut={just_did_big_mutation}"
+                f"cross={crossover_sym_ratio_eff:.5f}"
             )
         generation_iter.set_postfix({"best_S_prime": f"{generation_best:.4f}"})
 
-    # ====== GA 结束后的局部搜索收尾（基于真实动态得分） ======
-    # 先取出最优个体的 indices 形式
     best_individual = max(population, key=lambda item: float(item["fitness"]))
     best_indices = np.asarray(best_individual["indices"], dtype=np.int64)
     best_mask = _indices_to_mask(best_indices)
 
-    # 基于当前最优子集，计算真实的动态得分 s_ref，用作后续局部搜索的 "proxy_scores"
     best_S, best_s_ref, _ = _real_stats_cached(best_mask)
     best_penalty = compute_balance_penalty(best_mask, labels_np, num_classes, target_size)
     best_S_prime = best_S - lambda_val * best_penalty
 
-    # 局部搜索的超参数：最多迭代步数、最小提升阈值
     REFINE_MAX_STEPS = 10
     REFINE_EPS = 1e-8
-
-    # 参考 GA 最后阶段 local search 档位，设置收尾用步长（避免改动过猛）
-    if two_stage:
-        refine_ratio = local_search_ratio_stage2 if ga_generations > stage1_gens else local_search_ratio_stage1
-    else:
-        refine_ratio = local_search_ratio_stage1
+    refine_ratio = local_search_ratio_stage2 if (phase_schedule and phase_schedule[-1] == "late") else local_search_ratio_stage1
     k_ls_refine = min(max(1, int(refine_ratio * target_size)), best_indices.size, max(0, num_samples - best_indices.size))
 
-    refine_steps = REFINE_MAX_STEPS
-
-    for _ in range(refine_steps):
+    current_phase = phase_schedule[-1] if phase_schedule else "late"
+    for _ in range(REFINE_MAX_STEPS):
         if k_ls_refine <= 0:
             break
-
-        # 在当前最优解的真实动态得分 best_s_ref 上做一次局部搜索
         refined_indices = _local_search_step(best_indices, best_s_ref, k_ls_refine)
-        refine_repair_score_np = weighted_static_np if two_stage else sa_scores_np
-        refined_indices = _repair_size(refined_indices, refine_repair_score_np)
+        refined_indices = _repair_size(refined_indices)
         refined_mask = _indices_to_mask(refined_indices)
 
         refined_S, refined_s_ref, _ = _real_stats_cached(refined_mask)
         refined_penalty = compute_balance_penalty(refined_mask, labels_np, num_classes, target_size)
         refined_S_prime = refined_S - lambda_val * refined_penalty
-
-        # 只接受真正提高 S(D) 的 move；否则视为已经到达局部最优，提前停止
         if refined_S_prime > best_S_prime + REFINE_EPS:
             best_indices = refined_indices
             best_mask = refined_mask
@@ -685,7 +743,6 @@ def select_group_mask(
         else:
             break
 
-    # 用局部搜索后的 best_mask 作为最终解
     final_mask = best_mask.astype(np.uint8)
     _, final_s_all, _ = _real_stats_cached(final_mask)
 
@@ -713,18 +770,15 @@ def select_group_mask(
         "ga_offspring": int(ga_offspring),
         "lambda": lambda_val,
         "lambda_info": lambda_info,
-        "two_stage": bool(two_stage),
-        "stage1_gens": int(stage1_gens),
-        "stage_split_ratio": float(stage_split_ratio),
-        "stage1_repair_mode": stage1_repair_mode,
-        "stage2_repair_mode": stage2_repair_mode,
+        "stage2_cycles": int(stage2_cycles),
+        "phase_schedule": phase_schedule,
+        "early_ratio": float(early_ratio),
         "mutation_ratio_stage1": float(mutation_ratio_stage1),
         "local_search_ratio_stage1": float(local_search_ratio_stage1),
         "crossover_sym_ratio_stage1": float(crossover_sym_ratio_stage1),
         "mutation_ratio_stage2": float(mutation_ratio_stage2),
         "local_search_ratio_stage2": float(local_search_ratio_stage2),
         "crossover_sym_ratio_stage2": float(crossover_sym_ratio_stage2),
-        "stage_switch_big_mutation": stage_switch_info,
         "weighted_static_has_div": bool(weighted_static_has_div),
         "weighted_static_has_dds": bool(weighted_static_has_dds),
         "weighted_static_corr_with_sa": float(weighted_static_corr_with_sa),
@@ -1000,6 +1054,18 @@ def main() -> None:
                     weight_group=weight_group,
                     div_static_scores=div_scores_np,
                     dds_static_scores=dds_scores_np,
+                    repair_pool_random=args.repair_pool_random,
+                    repair_pool_m_base=args.repair_pool_m_base,
+                    repair_pool_m_slope=args.repair_pool_m_slope,
+                    repair_softmax_temp=args.repair_softmax_temp,
+                    stage2_cycles=args.stage2_cycles,
+                    early_ratio_cr20=args.early_ratio_cr20,
+                    early_ratio_cr90=args.early_ratio_cr90,
+                    use_e2_div_cover=args.use_e2_div_cover,
+                    e2_topk_offspring=args.e2_topk_offspring,
+                    e2_steps_per_child=args.e2_steps_per_child,
+                    e2_r_ratio=args.e2_r_ratio,
+                    e2_max_pairs=args.e2_max_pairs,
                 )
                 debug_curve = save_score_curve_plot(
                     group_stats.get("score_history", []),

@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cr",
         type=str,
-        default="80",
+        default="20,30,40,50,60,70,80,90",
         help="cut_ratio 列表（百分比），支持逗号分隔或单值",
     )
     parser.add_argument("--clip-model", type=str, default="ViT-B/32", help="CLIP 模型规格")

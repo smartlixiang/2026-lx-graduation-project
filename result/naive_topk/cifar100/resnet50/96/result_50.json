@@ -4,8 +4,8 @@
     "data_root": "data",
     "model": "resnet50",
     "cut_ratio": 50,
-    "selection_method": "random",
-    "seed": 22,
+    "selection_method": "naive_topk",
+    "seed": 96,
     "epochs": 200,
     "batch_size": 128,
     "optimizer": "SGD",
@@ -24,18 +24,18 @@
     "num_selected": 25000,
     "num_total": 50000
   },
-  "accuracy": 0.6782,
+  "accuracy": 0.6585,
   "accuracy_samples": [
-    0.6786,
-    0.677,
-    0.6783,
-    0.6795,
-    0.6802,
-    0.679,
-    0.6774,
-    0.6772,
-    0.6763,
-    0.6783
+    0.6593,
+    0.6571,
+    0.6579,
+    0.6606,
+    0.6594,
+    0.6571,
+    0.6574,
+    0.6574,
+    0.6587,
+    0.66
   ],
-  "time_seconds": 6738.275401353836
+  "time_seconds": 6497.073599100113
 }

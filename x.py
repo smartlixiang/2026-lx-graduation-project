@@ -4,7 +4,7 @@ from utils.seed import set_seed
 from utils.global_config import CONFIG
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from model.adapter import load_trained_adapters
-from dataset.dataset_config import CIFAR10
+from dataset.dataset_config import CIFAR10, CIFAR100
 
 import argparse
 import csv
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="计算 CIFAR10 在 cr=20..90 下 topk 与 group_old 的子集评分（Div/DDS 在子集上动态计算）"
     )
-    parser.add_argument("--dataset", type=str, default=CIFAR10, choices=[CIFAR10])
+    parser.add_argument("--dataset", type=str, default=CIFAR10, choices=[CIFAR10, CIFAR100])
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--model-name", type=str, default="resnet50")

@@ -1,0 +1,41 @@
+{
+  "metadata": {
+    "dataset": "cifar100",
+    "data_root": "data",
+    "model": "resnet50",
+    "cut_ratio": 70,
+    "selection_method": "herding",
+    "seed": 96,
+    "epochs": 200,
+    "batch_size": 128,
+    "optimizer": "SGD",
+    "momentum": 0.9,
+    "weight_decay": 0.0005,
+    "init_lr": 0.1,
+    "lr_schedule": {
+      "type": "MultiStepLR",
+      "milestones": [
+        60,
+        120,
+        160
+      ],
+      "gamma": 0.2
+    },
+    "num_selected": 35000,
+    "num_total": 50000
+  },
+  "accuracy": 0.7379,
+  "accuracy_samples": [
+    0.738,
+    0.7368,
+    0.7382,
+    0.7379,
+    0.7375,
+    0.7381,
+    0.7377,
+    0.7379,
+    0.7394,
+    0.737
+  ],
+  "time_seconds": 3029.1586298942566
+}

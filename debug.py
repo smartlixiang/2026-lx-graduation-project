@@ -4,7 +4,7 @@ This version implements the user's intended baseline:
 - Compute utility score u = A + B + C - R (AbsorptionEfficiency, Informativeness,
   CoverageGain, RiskScore)
 - Normalize u with a global quantile-based min-max
-- Select top-k within each true class proportional to cut_ratio
+- Select top-k within each true class proportional to keep_ratio
 - Train downstream model on the selected subset (true labels)
 """
 
@@ -129,22 +129,22 @@ def _select_topk_indices(
     true_labels: np.ndarray,
     scores: np.ndarray,
     num_classes: int,
-    cut_ratio: int,
+    keep_ratio: int,
 ) -> np.ndarray:
     """Select class-proportional top-k within each TRUE class by scores."""
-    if not 0 < cut_ratio <= 100:
-        raise ValueError("cut_ratio must be in (0, 100]")
+    if not 0 < keep_ratio <= 100:
+        raise ValueError("keep_ratio must be in (0, 100]")
     if true_labels.shape[0] != scores.shape[0]:
         raise ValueError("true_labels and scores must have the same length")
 
     selected: list[int] = []
-    ratio = cut_ratio / 100.0
+    ratio = keep_ratio / 100.0
 
     for class_id in range(num_classes):
         class_indices = np.flatnonzero(true_labels == class_id)
         if class_indices.size == 0:
             continue
-        if cut_ratio == 100:
+        if keep_ratio == 100:
             num_select = class_indices.size
         else:
             num_select = max(1, int(class_indices.size * ratio))
@@ -262,15 +262,15 @@ def main() -> None:
         "model": MODEL_NAME,
         "seed": SEED,
         "proxy_log": str(proxy_log_path),
-        "cut_ratios": CUT_RATIOS,
+        "keep_ratios": CUT_RATIOS,
         "epochs": EPOCHS,
         "metrics": {},
     }
 
     num_classes = data_loader.num_classes
 
-    for cut_ratio in CUT_RATIOS:
-        selected_indices = _select_topk_indices(labels_full, u_scores, num_classes, cut_ratio)
+    for keep_ratio in CUT_RATIOS:
+        selected_indices = _select_topk_indices(labels_full, u_scores, num_classes, keep_ratio)
         subset = Subset(train_dataset, selected_indices.tolist())
         generator = torch.Generator().manual_seed(SEED)
         train_subset_loader = DataLoader(
@@ -286,7 +286,7 @@ def main() -> None:
         model_fn = get_model(MODEL_NAME)
         model = model_fn(num_classes=num_classes).to(device)
 
-        print(f"\nTraining with cut_ratio={cut_ratio} (selected={len(subset)})")
+        print(f"\nTraining with keep_ratio={keep_ratio} (selected={len(subset)})")
         history = _train_model(model, train_subset_loader, test_loader, device, EPOCHS)
 
         test_acc_samples = history["test_acc"]
@@ -296,9 +296,9 @@ def main() -> None:
             "best_test_acc": float(np.max(test_acc_samples)) if test_acc_samples else 0.0,
             "avg_test_acc": float(np.mean(test_acc_samples)) if test_acc_samples else 0.0,
         }
-        results["metrics"][str(cut_ratio)] = metrics
+        results["metrics"][str(keep_ratio)] = metrics
 
-        selection_path = OUT_DIR / f"selection_cr{cut_ratio}.npz"
+        selection_path = OUT_DIR / f"selection_cr{keep_ratio}.npz"
         np.savez(
             selection_path,
             indices=selected_indices,
@@ -306,7 +306,7 @@ def main() -> None:
             u_scores=u_scores[selected_indices],
         )
 
-        history_path = OUT_DIR / f"history_cr{cut_ratio}.json"
+        history_path = OUT_DIR / f"history_cr{keep_ratio}.json"
         history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
     summary_path = OUT_DIR / "summary.json"

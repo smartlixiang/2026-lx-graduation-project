@@ -23,15 +23,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=["random", "naive_topk", "learned_topk"],
+        default=["random", "naive_topk", "learned_topk", "herding", "naive_group", "learned_group"],
         help="Selection methods to compare",
     )
     parser.add_argument(
-        "--output",
-        default="acc_curve_cifar10_resnet50_methods.png",
-        help="Output image path",
+        "--krs",
+        default="20,30,40,50,60,70,80,90",
+        help="Keep ratio list, e.g. '20,30,40,50,60,70,80,90'",
     )
+    parser.add_argument("--output", default=None, help="Output image path")
     return parser.parse_args()
+
+
+def parse_kr_list(raw: str) -> list[int]:
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("--krs cannot be empty")
+    return sorted({int(v) for v in values})
 
 
 def load_seed_results(seed_dir: Path) -> dict[int, float]:
@@ -40,18 +48,21 @@ def load_seed_results(seed_dir: Path) -> dict[int, float]:
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         metadata = payload.get("metadata", {})
-        cut_ratio = int(metadata.get("cut_ratio", path.stem.split("_")[-1]))
+        keep_ratio = int(
+            metadata.get("keep_ratio", metadata.get("cut_ratio", path.stem.split("_")[-1]))
+        )
         acc_samples = payload.get("accuracy_samples")
         if acc_samples:
             acc_value = mean(acc_samples[-10:])
         else:
             acc_value = float(payload.get("accuracy", 0.0))
-        results[cut_ratio] = acc_value
+        results[keep_ratio] = acc_value
     return results
 
 
 def main() -> None:
     args = parse_args()
+    keep_ratios = parse_kr_list(args.krs)
     result_root = Path(args.result_dir)
     methods = args.methods
     color_map = {
@@ -60,8 +71,13 @@ def main() -> None:
         "my_naive": "blue",
     }
 
+    output_name = args.output or f"{args.dataset}_{args.model}.png"
+
     plt.figure(figsize=(8, 5))
-    all_cut_ratios: set[int] = set()
+    ranking_sum = {method: 0.0 for method in methods}
+    ranking_count = {method: 0 for method in methods}
+    method_to_mean: dict[str, dict[int, float]] = {}
+
     for method in methods:
         method_root = result_root / method / args.dataset / args.model
         if not method_root.exists():
@@ -73,37 +89,85 @@ def main() -> None:
         for seed_dir in seed_dirs:
             seed_results.append(load_seed_results(seed_dir))
 
-        common_cut_ratios = sorted(
-            set.intersection(*(set(r.keys()) for r in seed_results))
-        )
-        if not common_cut_ratios:
-            raise ValueError(
-                f"No common cut ratios found across seeds for method: {method}"
-            )
+        avg_by_kr: dict[int, float] = {}
+        for keep_ratio in keep_ratios:
+            values = [result[keep_ratio] for result in seed_results if keep_ratio in result]
+            if values:
+                avg_by_kr[keep_ratio] = mean(values)
+        method_to_mean[method] = avg_by_kr
 
-        avg_acc = []
-        for cut_ratio in common_cut_ratios:
-            values = [r[cut_ratio] for r in seed_results]
-            avg_acc.append(mean(values))
-        all_cut_ratios.update(common_cut_ratios)
+        x_values = [kr for kr in keep_ratios if kr in avg_by_kr]
+        y_values = [avg_by_kr[kr] for kr in x_values]
+        if not x_values:
+            print(f"[WARN] method={method} has no results for requested keep ratios: {keep_ratios}")
+            continue
 
         plt.plot(
-            common_cut_ratios,
-            avg_acc,
+            x_values,
+            y_values,
             marker="o",
             linewidth=2,
             color=color_map.get(method),
             label=method,
         )
 
-    plt.xlabel("Cut Ratio (cr)")
+    print("\nMean accuracy by keep ratio (4 decimal places):")
+    header = ["method"] + [str(kr) for kr in keep_ratios]
+    # build table rows as strings
+    table_rows = []
+    for method in methods:
+        kr_to_value = method_to_mean.get(method, {})
+        row = [method] + [f"{kr_to_value.get(kr):.4f}" if kr in kr_to_value else "-" for kr in keep_ratios]
+        table_rows.append(row)
+
+    # compute column widths
+    cols = [header] + table_rows
+    col_count = len(header)
+    widths = [0] * col_count
+    for r in cols:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+
+    # print header (method left-aligned, others right-aligned)
+    header_line = (
+        f"{header[0].ljust(widths[0])}  "
+        + "  ".join(header[i].rjust(widths[i]) for i in range(1, col_count))
+    )
+    print(header_line)
+
+    for row in table_rows:
+        line = f"{row[0].ljust(widths[0])}  " + "  ".join(row[i].rjust(widths[i]) for i in range(1, col_count))
+        print(line)
+
+    for kr in keep_ratios:
+        present = [(method, method_to_mean.get(method, {}).get(kr)) for method in methods]
+        present = [(m, v) for m, v in present if v is not None]
+        present.sort(key=lambda item: item[1], reverse=True)
+        for rank, (method, _) in enumerate(present, start=1):
+            ranking_sum[method] += rank
+            ranking_count[method] += 1
+
+    print("\naverage_rank (lower is better):")
+    # print average ranks in aligned two-column form
+    ar_rows = []
+    for method in methods:
+        if ranking_count[method] > 0:
+            val = f"{(ranking_sum[method] / ranking_count[method]):.4f}"
+        else:
+            val = "-"
+        ar_rows.append((method, val))
+    name_w = max(len(m) for m, _ in ar_rows)
+    val_w = max(len(v) for _, v in ar_rows)
+    for m, v in ar_rows:
+        print(f"{m.ljust(name_w)}  {v.rjust(val_w)}")
+
+    plt.xlabel("Keep Ratio (kr)")
     plt.ylabel("Accuracy (mean of last 10 epochs)")
     plt.title(f"{args.dataset.upper()} {args.model} - Mean Accuracy")
     plt.grid(True, linestyle="--", alpha=0.5)
-    if all_cut_ratios:
-        plt.xticks(sorted(all_cut_ratios))
+    plt.xticks(keep_ratios)
     plt.legend()
-    output_path = Path(args.output)
+    output_path = Path(output_name)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(output_path, dpi=160)

@@ -192,14 +192,14 @@ def _save_divk_dds_grid_hist(
 def _compute_div_dds_overlap_rows(
     div_scores: np.ndarray,
     dds_scores_by_combo: list[tuple[tuple[int, int], np.ndarray]],
-    cut_ratios: list[int],
+    keep_ratios: list[int],
 ) -> tuple[list[str], list[list[str]]]:
-    header = ["DDS Params"] + [f"Top {ratio}%" for ratio in cut_ratios]
+    header = ["DDS Params"] + [f"Top {ratio}%" for ratio in keep_ratios]
     rows: list[list[str]] = []
 
     for (k, upper_pct), dds_scores in dds_scores_by_combo:
         row = [f"k={k}, upper={upper_pct}%"]
-        for ratio in cut_ratios:
+        for ratio in keep_ratios:
             div_idx = _select_topk_indices(div_scores, ratio)
             dds_idx = _select_topk_indices(dds_scores, ratio)
             row.append(f"{_overlap_rate(div_idx, dds_idx):.4f}")
@@ -210,14 +210,14 @@ def _compute_div_dds_overlap_rows(
 def _compute_divk_dds_overlap_rows(
     dds_scores: np.ndarray,
     div_scores_by_k: list[tuple[float, np.ndarray]],
-    cut_ratios: list[int],
+    keep_ratios: list[int],
 ) -> tuple[list[str], list[list[str]]]:
-    header = ["Div k"] + [f"Top {ratio}%" for ratio in cut_ratios]
+    header = ["Div k"] + [f"Top {ratio}%" for ratio in keep_ratios]
     rows: list[list[str]] = []
 
     for div_k, div_scores_variant in div_scores_by_k:
         row = [f"k={div_k * 100:.1f}%"]
-        for ratio in cut_ratios:
+        for ratio in keep_ratios:
             dds_idx = _select_topk_indices(dds_scores, ratio)
             div_idx = _select_topk_indices(div_scores_variant, ratio)
             row.append(f"{_overlap_rate(dds_idx, div_idx):.4f}")
@@ -225,13 +225,13 @@ def _compute_divk_dds_overlap_rows(
     return header, rows
 
 
-def _select_topk_indices(scores: np.ndarray, cut_ratio: int) -> np.ndarray:
+def _select_topk_indices(scores: np.ndarray, keep_ratio: int) -> np.ndarray:
     if scores.ndim != 1:
         raise ValueError("scores 必须为一维数组。")
-    if not (0 < cut_ratio <= 100):
-        raise ValueError("cut_ratio 必须在 (0, 100] 范围内。")
+    if not (0 < keep_ratio <= 100):
+        raise ValueError("keep_ratio 必须在 (0, 100] 范围内。")
     total = scores.shape[0]
-    k = max(1, int(round(total * cut_ratio / 100.0)))
+    k = max(1, int(round(total * keep_ratio / 100.0)))
     selected = np.argpartition(-scores, kth=k - 1)[:k]
     return np.sort(selected)
 
@@ -262,7 +262,7 @@ def _print_aligned_table(title: str, header: list[str], rows: list[list[str]]) -
     print(bottom_border)
 
 
-def _print_overlap_table(score_map: dict[str, np.ndarray], cut_ratios: list[int]) -> None:
+def _print_overlap_table(score_map: dict[str, np.ndarray], keep_ratios: list[int]) -> None:
     pairs = [
         ("SA", "Div", "SA vs Div"),
         ("SA", "DDS", "SA vs DDS"),
@@ -270,12 +270,12 @@ def _print_overlap_table(score_map: dict[str, np.ndarray], cut_ratios: list[int]
         ("Total Learned", "Total Naive", "Total Learned vs Naive"),
     ]
 
-    header = ["Pair"] + [f"Top {ratio}%" for ratio in cut_ratios]
+    header = ["Pair"] + [f"Top {ratio}%" for ratio in keep_ratios]
     rows: list[list[str]] = []
 
     for left_key, right_key, row_name in pairs:
         row = [row_name]
-        for ratio in cut_ratios:
+        for ratio in keep_ratios:
             left_idx = _select_topk_indices(score_map[left_key], ratio)
             right_idx = _select_topk_indices(score_map[right_key], ratio)
             row.append(f"{_overlap_rate(left_idx, right_idx):.4f}")
@@ -445,7 +445,7 @@ def main() -> None:
     div_dds_header, div_dds_rows = _compute_div_dds_overlap_rows(
         np.asarray(div_scores),
         dds_scores_by_combo,
-        cut_ratios=list(range(20, 100, 10)),
+        keep_ratios=list(range(20, 100, 10)),
     )
     _print_aligned_table(
         "Div(default) vs DDS(parameter combos) overlap rate table:",
@@ -473,7 +473,7 @@ def main() -> None:
     divk_dds_header, divk_dds_rows = _compute_divk_dds_overlap_rows(
         np.asarray(dds_scores),
         div_scores_by_k,
-        cut_ratios=list(range(20, 100, 10)),
+        keep_ratios=list(range(20, 100, 10)),
     )
     _print_aligned_table(
         "DDS(default) vs Div(k sweep) overlap rate table:",
@@ -495,7 +495,7 @@ def main() -> None:
         "Total Learned": np.asarray(total_scores_learned),
         "Total Naive": np.asarray(total_scores_naive),
     }
-    _print_overlap_table(overlap_scores, cut_ratios=list(range(20, 100, 10)))
+    _print_overlap_table(overlap_scores, keep_ratios=list(range(20, 100, 10)))
 
 
 if __name__ == "__main__":

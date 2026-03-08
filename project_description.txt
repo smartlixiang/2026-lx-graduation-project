@@ -125,8 +125,8 @@
 - 数据集：
   - 使用 CIFAR-10（训练集做子集选择；测试集评测 top-1 accuracy）。
   - 数据集存放在本项目的 data/ 目录。
-- Backbone：ResNet-50，每个 cut_ratio 均从头训练（不 warm-start）。
-- cut_ratio 扫描：cr ∈ {20, 30, 40, 60, 70, 80, 90, 100}（单位 %；100 表示全训练集）。
+- Backbone：ResNet-50，每个 keep_ratio 均从头训练（不 warm-start）。
+- keep_ratio 扫描：kr ∈ {20, 30, 40, 60, 70, 80, 90, 100}（单位 %；100 表示全训练集）。
 - 固定训练超参（不做网格搜索）：
   - optimizer: SGD
   - momentum: 0.9
@@ -136,7 +136,7 @@
   - epochs: 200
   - LR schedule: epoch = 60 / 120 / 160 时将 lr *= 0.2（除以 5）
 - 重复次数/随机种子：
-  - 每个 (cr, 方法) 跑 3 个随机种子，报告 mean/std。
+  - 每个 (kr, 方法) 跑 3 个随机种子，报告 mean/std。
   - 随机种子来自 utils/global_config.py 中的 CONFIG.exp_seeds。
   - naive 随机子集采样使用与训练相同的 seed。
 
@@ -147,10 +147,10 @@
   - result/[方法名]/[数据集名]/[模型名]/[随机种子]/result_[裁剪比例].json
   - JSON 内容包含训练元数据、最后 10 轮测试集准确率均值（key=accuracy）、以及总运行时间（秒）。
 - 使用示例：
-  - python train_after_selection.py --dataset cifar10 --mode random --cr 100 --seed 22,42,96 --skip_saved
+  - python train_after_selection.py --dataset cifar10 --mode random --kr 100 --seed 22,42,96 --skip_saved
 
 ## calculate_my_mask.py（测试脚本）
-- 作用：计算基于 SA/Div/DDS 权重的样本评分，并按类别 top-k（k 由裁剪比例 cr 决定）生成 0/1 mask。
+- 作用：计算基于 SA/Div/DDS 权重的样本评分，并按类别 top-k（k 由裁剪比例 kr 决定）生成 0/1 mask。
 - method 命名约定：
   - 本方法默认使用 my_naive 或 my_learned（分别对应 weight_group=naive 与其他权重组）。
   - 如需自定义方法名，可显式传入 --method 覆盖。
@@ -172,17 +172,17 @@
   - 参数来源：dataset、seed（可选 clip_model 会在 meta.json 中校验一致性）。
 
 - checkpoint
-  - 命名规则：checkpoint/<mode>/<dataset>/<model>/<seed>/checkpoint_<cut_ratio>.pt
-  - 参数来源：mode、dataset、model、seed、cut_ratio。
+  - 命名规则：checkpoint/<mode>/<dataset>/<model>/<seed>/checkpoint_<keep_ratio>.pt
+  - 参数来源：mode、dataset、model、seed、keep_ratio。
 
 - mask
-  - 命名规则：mask/<method>/<dataset>/<model>/<seed>/mask_<cut_ratio>.npz
-  - 参数来源：method、dataset、model、seed、cut_ratio。
+  - 命名规则：mask/<method>/<dataset>/<model>/<seed>/mask_<keep_ratio>.npz
+  - 参数来源：method、dataset、model、seed、keep_ratio。
   - 伴随文件：meta_info.json。
 
 - result
-  - 命名规则：result/<mode>/<dataset>/<model>/<seed>/result_<cut_ratio>.json
-  - 参数来源：mode、dataset、model、seed、cut_ratio。
+  - 命名规则：result/<mode>/<dataset>/<model>/<seed>/result_<keep_ratio>.json
+  - 参数来源：mode、dataset、model、seed、keep_ratio。
 
 - static_scores
   - 命名规则：static_scores/<dataset>/<seed>/<param_dir>/

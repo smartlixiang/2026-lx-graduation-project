@@ -955,9 +955,9 @@ Score(x_new) = ẇ_1 SA_new + ẇ_2 Div_new + ẇ_3 DDS_new
 
 7.2.1 目的
 
-在给定裁剪比例 cr（cut ratio）的条件下，从训练集中选取 target_size = round(cr * N) 个样本，使得在该子集 D 上计算的动态综合得分 S(D) 尽可能高。
+在给定裁剪比例 kr（cut ratio）的条件下，从训练集中选取 target_size = round(kr * N) 个样本，使得在该子集 D 上计算的动态综合得分 S(D) 尽可能高。
 
-要求算法在有限预算（典型 ga_generations = 120~200、时间约 6 分钟）内稳健工作，兼顾低 cr（强探索）与高 cr（稳健收敛）两类情形。
+要求算法在有限预算（典型 ga_generations = 120~200、时间约 6 分钟）内稳健工作，兼顾低 kr（强探索）与高 kr（稳健收敛）两类情形。
 
 保持实现简单、可解释，易于复现实验与调参。
 
@@ -1035,17 +1035,17 @@ mutation_ratio 基线系数取 0.01（替代旧的 0.008），并按下述自适
 
 local_search_ratio：
 
-ls_max(cr) = 0.06 − 0.03 × (cr / 100)
+ls_max(kr) = 0.06 − 0.03 × (kr / 100)
 
-ls_min(cr) = 0.3 × ls_max(cr)
+ls_min(kr) = 0.3 × ls_max(kr)
 
 levels = 等差分成 4 档（L0 = ls_min, L3 = ls_max）
 
 mutation_ratio：
 
-m_max_mult(cr) = 2.0 + 3.0 × (1 − cr / 100)
+m_max_mult(kr) = 2.0 + 3.0 × (1 − kr / 100)
 
-mut_max = 0.01 × m_max_mult(cr)
+mut_max = 0.01 × m_max_mult(kr)
 
 mut_min = mut_max / 4
 
@@ -1053,7 +1053,7 @@ levels = 等差分成 4 档（M0 = mut_min, M3 = mut_max）
 
 crossover_sym_ratio：
 
-c_min(cr) = 0.7 − 0.2 × (cr / 100) （较小值表示更探索）
+c_min(kr) = 0.7 − 0.2 × (kr / 100) （较小值表示更探索）
 
 c_max = 0.95（常数上界）
 
@@ -1069,7 +1069,7 @@ For gen_idx in 0 .. ga_generations−1：
 
 若 gen_idx < WARMUP：按预热规则设置 level。
 
-依据 level / cr 计算三参数的当代有效值（mut_ratio_eff、ls_ratio_eff、crossover_sym_ratio_eff），并换算为 k_mut、k_ls、max_from_sym。
+依据 level / kr 计算三参数的当代有效值（mut_ratio_eff、ls_ratio_eff、crossover_sym_ratio_eff），并换算为 k_mut、k_ls、max_from_sym。
 
 标准 GA: 生成 offspring（selection + crossover + soft-fill + mutation），对每个 child 做父代 proxy local_search，然后 _evaluate(child)（真实评估并缓存）。
 
@@ -1099,9 +1099,9 @@ soft-fill 池大小：pool_mult 取 5 足够；rank-based 权重用 w(r)=1/(r+1)
 
 7.2.9 期望行为（经验上）
 
-低 cr（20~30）会在预热期和初期快速上升，然后若卡在局部会通过降档→reheat 的周期机制跳出并尝试新的盆地；自洽 local_search 有望在 GA 给出的盆地边缘把解抬高一段。
+低 kr（20~30）会在预热期和初期快速上升，然后若卡在局部会通过降档→reheat 的周期机制跳出并尝试新的盆地；自洽 local_search 有望在 GA 给出的盆地边缘把解抬高一段。
 
-高 cr（≥60）表现更稳定、后期以重组 + 局部细化为主，不会因初期过大步长而崩坏。
+高 kr（≥60）表现更稳定、后期以重组 + 局部细化为主，不会因初期过大步长而崩坏。
 
 八、与直接使用训练动态评分的对比与方案意义
 

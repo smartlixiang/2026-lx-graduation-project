@@ -41,16 +41,16 @@ def load_cached_lambda(
     path: Path,
     dataset: str,
     seed: int,
-    cr: int,
+    kr: int,
     weight_group: str,
 ) -> dict[str, float] | None:
     cache = _load_cache(path)
-    cr_entry = cache.get(str(dataset), {}).get(str(seed), {}).get(str(cr), {})
-    if isinstance(cr_entry, dict) and "lambda" in cr_entry:
+    kr_entry = cache.get(str(dataset), {}).get(str(seed), {}).get(str(kr), {})
+    if isinstance(kr_entry, dict) and "lambda" in kr_entry:
         # backward compatibility for old cache layout without weight_group nesting
-        record = cr_entry
+        record = kr_entry
     else:
-        record = cr_entry.get(str(weight_group), {}) if isinstance(cr_entry, dict) else {}
+        record = kr_entry.get(str(weight_group), {}) if isinstance(kr_entry, dict) else {}
     if not isinstance(record, dict):
         return None
     lam = record.get("lambda")
@@ -67,13 +67,13 @@ def save_cached_lambda(
     path: Path,
     dataset: str,
     seed: int,
-    cr: int,
+    kr: int,
     weight_group: str,
     record: dict[str, float],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     cache = _load_cache(path)
-    ds_key, seed_key, cr_key = str(dataset), str(seed), str(cr)
+    ds_key, seed_key, kr_key = str(dataset), str(seed), str(kr)
     ds_entry = cache.setdefault(ds_key, {})
     if not isinstance(ds_entry, dict):
         ds_entry = {}
@@ -82,11 +82,11 @@ def save_cached_lambda(
     if not isinstance(seed_entry, dict):
         seed_entry = {}
         ds_entry[seed_key] = seed_entry
-    cr_entry = seed_entry.setdefault(cr_key, {})
-    if not isinstance(cr_entry, dict):
-        cr_entry = {}
-        seed_entry[cr_key] = cr_entry
-    cr_entry[str(weight_group)] = record
+    kr_entry = seed_entry.setdefault(kr_key, {})
+    if not isinstance(kr_entry, dict):
+        kr_entry = {}
+        seed_entry[kr_key] = kr_entry
+    kr_entry[str(weight_group)] = record
 
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with open(tmp_path, "w", encoding="utf-8") as f:
@@ -101,7 +101,7 @@ def get_or_estimate_lambda(
     cache_path: Path,
     dataset: str,
     seed: int,
-    cr: int,
+    kr: int,
     weight_group: str,
     n_samples: int,
     target_size: int,
@@ -112,7 +112,7 @@ def get_or_estimate_lambda(
     eps: float = DEFAULT_EPS,
     tqdm_desc: str = "Estimating lambda",
 ) -> dict[str, float]:
-    cached = load_cached_lambda(cache_path, dataset, seed, cr, weight_group)
+    cached = load_cached_lambda(cache_path, dataset, seed, kr, weight_group)
     if cached is not None:
         return cached
 
@@ -145,5 +145,5 @@ def get_or_estimate_lambda(
         "r": float(r),
         "eps": float(eps),
     }
-    save_cached_lambda(cache_path, dataset, seed, cr, weight_group, record)
+    save_cached_lambda(cache_path, dataset, seed, kr, weight_group, record)
     return record

@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data_root", type=str, default=str(Path("data")))
     parser.add_argument(
-        "--cr",  # cut ratios
+        "--kr",  # keep ratios
         type=str,
         default="20,30,40,50,60,70,80,90",
         help="裁剪比例列表（百分比），支持逗号分隔或单值",
@@ -94,21 +94,21 @@ def _extract_labels(dataset: torch.utils.data.Dataset) -> np.ndarray:
 def select_random_indices_by_class(
     labels: np.ndarray,
     num_classes: int,
-    cut_ratio: int,
+    keep_ratio: int,
     seed: int,
 ) -> np.ndarray:
-    if cut_ratio <= 0:
-        raise ValueError("cut_ratio must be positive")
-    if cut_ratio > 100:
-        raise ValueError("cut_ratio must be <= 100")
+    if keep_ratio <= 0:
+        raise ValueError("keep_ratio must be positive")
+    if keep_ratio > 100:
+        raise ValueError("keep_ratio must be <= 100")
     rng = np.random.default_rng(seed)
     selected: list[int] = []
-    ratio = cut_ratio / 100.0
+    ratio = keep_ratio / 100.0
     for class_id in range(num_classes):
         class_indices = np.flatnonzero(labels == class_id)
         if class_indices.size == 0:
             continue
-        if cut_ratio == 100:
+        if keep_ratio == 100:
             num_select = class_indices.size
         else:
             num_select = max(1, int(class_indices.size * ratio))
@@ -120,7 +120,7 @@ def select_random_indices_by_class(
 def load_selection_mask(
     dataset_name: str,
     mode: str,
-    cut_ratio: int,
+    keep_ratio: int,
     seed: int,
     model_name: str,
 ) -> np.ndarray:
@@ -135,7 +135,7 @@ def load_selection_mask(
         dataset=dataset_name,
         model=model_name,
         seed=mask_seed,
-        cut_ratio=cut_ratio,
+        keep_ratio=keep_ratio,
     )
     if not mask_path.exists():
         raise FileNotFoundError(f"未找到 mask 文件: {mask_path}")
@@ -195,7 +195,7 @@ def train_one_epoch(
 def prepare_selection_indices(
     dataset_name: str,
     mode: str,
-    cut_ratio: int,
+    keep_ratio: int,
     seed: int,
     dataset: torch.utils.data.Dataset,
     num_classes: int,
@@ -203,9 +203,9 @@ def prepare_selection_indices(
 ) -> np.ndarray:
     if mode == "random":
         labels = _extract_labels(dataset)
-        return select_random_indices_by_class(labels, num_classes, cut_ratio, seed)
+        return select_random_indices_by_class(labels, num_classes, keep_ratio, seed)
 
-    mask = load_selection_mask(dataset_name, mode, cut_ratio, seed, model_name)
+    mask = load_selection_mask(dataset_name, mode, keep_ratio, seed, model_name)
     mask = np.asarray(mask).astype(bool)
     return np.flatnonzero(mask)
 
@@ -226,16 +226,16 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     train_dataset = train_loader.dataset
 
     model_name = args.model
-    cut_ratios = parse_ratio_list(args.cr)
+    keep_ratios = parse_ratio_list(args.kr)
     model_factory = get_model(model_name)
 
-    for cut_ratio in cut_ratios:
+    for keep_ratio in keep_ratios:
         result_path = resolve_result_path(
             mode=args.mode,
             dataset=args.dataset,
             model=model_name,
             seed=seed,
-            cut_ratio=cut_ratio,
+            keep_ratio=keep_ratio,
             root=Path(args.result_root),
         )
         result_dir = result_path.parent
@@ -244,7 +244,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             dataset=args.dataset,
             model=model_name,
             seed=seed,
-            cut_ratio=cut_ratio,
+            keep_ratio=keep_ratio,
         )
         checkpoint_dir = checkpoint_path.parent
         if args.skip_saved and result_path.exists():
@@ -254,7 +254,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         selected_indices = prepare_selection_indices(
             args.dataset,
             args.mode,
-            cut_ratio,
+            keep_ratio,
             seed,
             train_dataset,
             data_loader.num_classes,
@@ -338,7 +338,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 "dataset": args.dataset,
                 "data_root": str(Path(args.data_root)),
                 "model": model_name,
-                "cut_ratio": cut_ratio,
+                "keep_ratio": keep_ratio,
                 "selection_method": args.mode,
                 "seed": seed,
                 "epochs": args.epochs,

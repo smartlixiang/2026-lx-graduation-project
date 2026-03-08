@@ -24,12 +24,12 @@ def resolve_checkpoint_path(
     dataset: str,
     model: str,
     seed: int,
-    cut_ratio: int,
+    keep_ratio: int,
     *,
     root: Path | str | None = None,
 ) -> Path:
     base = Path(root) if root is not None else PROJECT_ROOT / "checkpoint"
-    return base / mode / dataset / model / str(seed) / f"checkpoint_{int(cut_ratio)}.pt"
+    return base / mode / dataset / model / str(seed) / f"checkpoint_{int(keep_ratio)}.pt"
 
 
 def resolve_mask_path(
@@ -37,12 +37,12 @@ def resolve_mask_path(
     dataset: str,
     model: str,
     seed: int,
-    cut_ratio: int,
+    keep_ratio: int,
     *,
     root: Path | str | None = None,
 ) -> Path:
     base = Path(root) if root is not None else PROJECT_ROOT / "mask"
-    return base / mode / dataset / model / str(seed) / f"mask_{int(cut_ratio)}.npz"
+    return base / mode / dataset / model / str(seed) / f"mask_{int(keep_ratio)}.npz"
 
 
 def resolve_result_path(
@@ -50,9 +50,9 @@ def resolve_result_path(
     dataset: str,
     model: str,
     seed: int,
-    cut_ratio: int,
+    keep_ratio: int,
     *,
     root: Path | str | None = None,
 ) -> Path:
     base = Path(root) if root is not None else PROJECT_ROOT / "result"
-    return base / mode / dataset / model / str(seed) / f"result_{int(cut_ratio)}.json"
+    return base / mode / dataset / model / str(seed) / f"result_{int(keep_ratio)}.json"

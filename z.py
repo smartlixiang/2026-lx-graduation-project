@@ -9,7 +9,7 @@ import numpy as np
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "比较同 dataset/model/seed/cr 下 group 与 topk mask 的重合度（仅统计两者都存在的 pair）。"
+            "比较同 dataset/model/seed/kr 下 group 与 topk mask 的重合度（仅统计两者都存在的 pair）。"
         )
     )
     parser.add_argument("--mask-root", type=str, default="mask", help="mask 根目录")
@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
         help="权重组名（对应目录前缀，如 naive_topk / naive_group）",
     )
     parser.add_argument("--seed", type=int, default=None, help="仅比较指定 seed")
-    parser.add_argument("--cr", type=int, default=None, help="仅比较指定 cut ratio")
+    parser.add_argument("--kr", type=int, default=None, help="仅比较指定 cut ratio")
     return parser.parse_args()
 
 
@@ -63,7 +63,7 @@ def overlap_stats(group_mask: np.ndarray, topk_mask: np.ndarray) -> dict[str, fl
 def format_table(rows: list[dict[str, object]]) -> str:
     headers = [
         "seed",
-        "cr",
+        "kr",
         "group_selected",
         "topk_selected",
         "intersection",
@@ -78,7 +78,7 @@ def format_table(rows: list[dict[str, object]]) -> str:
         str_rows.append(
             [
                 str(row["seed"]),
-                str(row["cr"]),
+                str(row["kr"]),
                 str(row["group_selected"]),
                 str(row["topk_selected"]),
                 str(row["intersection"]),
@@ -133,27 +133,27 @@ def main() -> None:
         if not stem.startswith("mask_"):
             continue
         try:
-            cr = int(stem.split("_", 1)[1])
+            kr = int(stem.split("_", 1)[1])
         except ValueError:
             continue
 
-        if args.cr is not None and cr != args.cr:
+        if args.kr is not None and kr != args.kr:
             continue
 
-        topk_mask_path = topk_base / str(seed) / f"mask_{cr}.npz"
+        topk_mask_path = topk_base / str(seed) / f"mask_{kr}.npz"
         if not topk_mask_path.exists():
             continue
 
         group_mask = load_mask(group_mask_path)
         topk_mask = load_mask(topk_mask_path)
         stats = overlap_stats(group_mask, topk_mask)
-        rows.append({"seed": seed, "cr": cr, **stats})
+        rows.append({"seed": seed, "kr": kr, **stats})
 
     if not rows:
         print("未找到同时存在的 group/topk mask 对。")
         return
 
-    rows.sort(key=lambda x: (int(x["seed"]), int(x["cr"])))
+    rows.sort(key=lambda x: (int(x["seed"]), int(x["kr"])))
     print(format_table(rows))
 
 

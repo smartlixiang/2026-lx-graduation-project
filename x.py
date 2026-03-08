@@ -36,7 +36,7 @@ FIXED_SEED = 42
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="计算 CIFAR10 在 cr=20..90 下 topk 与 group_old 的子集评分（Div/DDS 在子集上动态计算）"
+        description="计算 CIFAR10 在 kr=20..90 下 topk 与 group_old 的子集评分（Div/DDS 在子集上动态计算）"
     )
     parser.add_argument("--dataset", type=str, default=CIFAR10, choices=[CIFAR10, CIFAR100])
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-old-iters", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "subset_mask_scores_cifar10.csv")
+    parser.add_argument("--output", type=Path, default=None, help="可选输出路径；默认保存到 group_baseline/<dataset>/<weight-group>.csv")
     return parser.parse_args()
 
 
@@ -135,17 +135,17 @@ def build_score_loader(preprocess, device: torch.device, batch_size: int, num_wo
     )
 
 
-def select_global_topk(scores: np.ndarray, cut_ratio: int) -> np.ndarray:
+def select_global_topk(scores: np.ndarray, keep_ratio: int) -> np.ndarray:
     n = scores.shape[0]
-    k = max(1, min(n, int(round(n * cut_ratio / 100.0))))
+    k = max(1, min(n, int(round(n * keep_ratio / 100.0))))
     idx = np.argpartition(-scores, k - 1)[:k]
     mask = np.zeros(n, dtype=np.uint8)
     mask[idx] = 1
     return mask
 
 
-def select_random_mask(n_samples: int, cut_ratio: int) -> np.ndarray:
-    k = max(1, min(n_samples, int(round(n_samples * cut_ratio / 100.0))))
+def select_random_mask(n_samples: int, keep_ratio: int) -> np.ndarray:
+    k = max(1, min(n_samples, int(round(n_samples * keep_ratio / 100.0))))
     idx = np.random.choice(n_samples, size=k, replace=False)
     mask = np.zeros(n_samples, dtype=np.uint8)
     mask[idx] = 1
@@ -202,7 +202,7 @@ def compute_subset_score(
 def select_group_old_best(
     *,
     n_samples: int,
-    cut_ratio: int,
+    keep_ratio: int,
     outer_iters: int,
     sa_scores: np.ndarray,
     labels_t: torch.Tensor,
@@ -218,7 +218,7 @@ def select_group_old_best(
     labels_np: np.ndarray,
     num_classes: int,
 ) -> tuple[np.ndarray, float, float, float, float, float, int]:
-    k = max(1, min(n_samples, int(round(n_samples * cut_ratio / 100.0))))
+    k = max(1, min(n_samples, int(round(n_samples * keep_ratio / 100.0))))
     cur_idx = np.random.choice(n_samples, size=k, replace=False)
     cur_mask = np.zeros(n_samples, dtype=np.uint8)
     cur_mask[cur_idx] = 1
@@ -265,7 +265,7 @@ def select_group_old_best(
             dtype=np.float32,
         )
         total_scores = weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_dyn
-        next_mask = select_global_topk(total_scores, cut_ratio=cut_ratio)
+        next_mask = select_global_topk(total_scores, keep_ratio=keep_ratio)
         cur_mask = next_mask
 
         div_sum, dds_sum, total_sum, pen_sum, total_sum_adj = compute_subset_score(
@@ -376,21 +376,21 @@ def main() -> None:
     dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
     print(f"[Init] Encoded image features for dynamic scoring in {time.perf_counter() - start:.2f}s")
 
-    cut_ratios = list(range(20, 91, 10))
+    keep_ratios = list(range(20, 91, 10))
     eval_seeds = [1, 2, 3, 4, 5]
     lambda_sample_M = DEFAULT_M
     lambda_ratio_r = DEFAULT_R
     lambda_eps = DEFAULT_EPS
     rows: list[dict[str, object]] = []
 
-    for cr in tqdm(cut_ratios, desc="Evaluating cut ratios", unit="cr"):
-        print(f"\n[CR={cr}] evaluating topk/random/group_old ...")
-        target_size = max(1, min(len(dataset_for_names), int(round(len(dataset_for_names) * cr / 100.0))))
+    for kr in tqdm(keep_ratios, desc="Evaluating keep ratios", unit="kr"):
+        print(f"\n[KR={kr}] evaluating topk/random/group_old ...")
+        target_size = max(1, min(len(dataset_for_names), int(round(len(dataset_for_names) * kr / 100.0))))
         lambda_info_topk = get_or_estimate_lambda(
             cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
             dataset=args.dataset,
             seed=FIXED_SEED,
-            cr=cr,
+            kr=kr,
             weight_group=args.weight_group,
             n_samples=len(dataset_for_names),
             target_size=target_size,
@@ -415,11 +415,11 @@ def main() -> None:
             M=lambda_sample_M,
             r=lambda_ratio_r,
             eps=lambda_eps,
-            tqdm_desc=f"Estimating lambda (seed={FIXED_SEED}, cr={cr})",
+            tqdm_desc=f"Estimating lambda (seed={FIXED_SEED}, kr={kr})",
         )
         lambda_topk = float(lambda_info_topk["lambda"])
-        print(f"[Lambda] dataset={args.dataset} | seed={FIXED_SEED} | cr={cr} | lambda={lambda_topk:.8f}")
-        topk_mask = select_global_topk(total_static, cut_ratio=cr)
+        print(f"[Lambda] dataset={args.dataset} | seed={FIXED_SEED} | kr={kr} | lambda={lambda_topk:.8f}")
+        topk_mask = select_global_topk(total_static, keep_ratio=kr)
         _, _, _, _, topk_total = compute_subset_score(
             topk_mask,
             sa_scores=sa_scores,
@@ -440,15 +440,15 @@ def main() -> None:
 
         random_scores: list[float] = []
         group_old_scores: list[float] = []
-        for seed in tqdm(eval_seeds, desc=f"CR={cr} seeds", unit="seed", leave=False):
+        for seed in tqdm(eval_seeds, desc=f"KR={kr} seeds", unit="seed", leave=False):
             set_seed(seed)
 
-            random_mask = select_random_mask(len(dataset_for_names), cut_ratio=cr)
+            random_mask = select_random_mask(len(dataset_for_names), keep_ratio=kr)
             lambda_info_seed = get_or_estimate_lambda(
                 cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
                 dataset=args.dataset,
                 seed=seed,
-                cr=cr,
+                kr=kr,
                 weight_group=args.weight_group,
                 n_samples=len(dataset_for_names),
                 target_size=target_size,
@@ -473,7 +473,7 @@ def main() -> None:
                 M=lambda_sample_M,
                 r=lambda_ratio_r,
                 eps=lambda_eps,
-                tqdm_desc=f"Estimating lambda (seed={seed}, cr={cr})",
+                tqdm_desc=f"Estimating lambda (seed={seed}, kr={kr})",
             )
             lambda_seed = float(lambda_info_seed["lambda"])
 
@@ -498,7 +498,7 @@ def main() -> None:
 
             _, _, _, _, _, grp_total, _ = select_group_old_best(
                 n_samples=len(dataset_for_names),
-                cut_ratio=cr,
+                keep_ratio=kr,
                 outer_iters=args.group_old_iters,
                 sa_scores=sa_scores,
                 labels_t=labels_t,
@@ -522,7 +522,7 @@ def main() -> None:
 
         rows.append(
             {
-                "cr": cr,
+                "kr": kr,
                 "topk": topk_total,
                 "random_mean": float(np.mean(random_scores)),
                 "random_max": float(np.max(random_scores)),
@@ -532,16 +532,20 @@ def main() -> None:
         )
 
         print(
-            f"[CR={cr}] topk={topk_total:.4f}, random_mean={np.mean(random_scores):.4f}, random_max={np.max(random_scores):.4f}, "
+            f"[KR={kr}] topk={topk_total:.4f}, random_mean={np.mean(random_scores):.4f}, random_max={np.max(random_scores):.4f}, "
             f"group_old_mean={np.mean(group_old_scores):.4f}, group_old_max={np.max(group_old_scores):.4f}"
         )
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "w", encoding="utf-8", newline="") as f:
+    output_path = args.output
+    if output_path is None:
+        output_path = PROJECT_ROOT / "group_baseline" / args.dataset / f"{args.weight_group}.csv"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=[
-                "cr",
+                "kr",
                 "topk",
                 "random_mean",
                 "random_max",
@@ -552,7 +556,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"Saved CSV: {args.output}")
+    print(f"Saved CSV: {output_path}")
 
 
 if __name__ == "__main__":

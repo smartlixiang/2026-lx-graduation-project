@@ -44,10 +44,10 @@ def parse_args() -> argparse.Namespace:
         help="目标数据集名称",
     )
     parser.add_argument(
-        "--cr",
+        "--kr",
         type=str,
         default="20,30,40,50,60,70,80,90",
-        help="cut_ratio 列表（百分比），支持逗号分隔或单值",
+        help="keep_ratio 列表（百分比），支持逗号分隔或单值",
     )
     parser.add_argument("--clip-model", type=str, default="ViT-B/32", help="CLIP 模型规格")
     parser.add_argument("--device", type=str, default=None, help="设备，例如 cuda 或 cpu")
@@ -86,8 +86,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repair-pool-m-slope", type=float, default=3.0)
     parser.add_argument("--repair-softmax-temp", type=float, default=1.0)
     parser.add_argument("--stage2-cycles", type=int, default=2)
-    parser.add_argument("--early-ratio-cr20", type=float, default=0.60)
-    parser.add_argument("--early-ratio-cr90", type=float, default=0.30)
+    parser.add_argument("--early-ratio-kr20", type=float, default=0.60)
+    parser.add_argument("--early-ratio-kr90", type=float, default=0.30)
     parser.add_argument("--use-e2-div-cover", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--e2-topk-offspring", type=int, default=1)
     parser.add_argument("--e2-steps-per-child", type=int, default=1)
@@ -227,19 +227,19 @@ def select_topk_mask(
     scores: np.ndarray,
     labels: np.ndarray,
     num_classes: int,
-    cut_ratio: int,
+    keep_ratio: int,
 ) -> tuple[np.ndarray, dict[int, int]]:
-    if cut_ratio <= 0 or cut_ratio > 100:
-        raise ValueError("cr 必须在 1-100 之间。")
+    if keep_ratio <= 0 or keep_ratio > 100:
+        raise ValueError("kr 必须在 1-100 之间。")
     mask = np.zeros(scores.shape[0], dtype=np.uint8)
     selected_by_class: dict[int, int] = {}
-    ratio = cut_ratio / 100.0
+    ratio = keep_ratio / 100.0
     for class_id in range(num_classes):
         class_indices = np.flatnonzero(labels == class_id)
         if class_indices.size == 0:
             selected_by_class[class_id] = 0
             continue
-        if cut_ratio == 100:
+        if keep_ratio == 100:
             num_select = class_indices.size
         else:
             num_select = max(1, int(class_indices.size * ratio))
@@ -262,7 +262,7 @@ def select_group_mask(
     labels: np.ndarray,
     weights: dict[str, float],
     num_classes: int,
-    cut_ratio: int,
+    keep_ratio: int,
     device: torch.device,
     dataset_name: str,
     seed: int,
@@ -274,22 +274,22 @@ def select_group_mask(
     repair_pool_m_slope: float = 3.0,
     repair_softmax_temp: float = 1.0,
     stage2_cycles: int = 2,
-    early_ratio_cr20: float = 0.60,
-    early_ratio_cr90: float = 0.30,
+    early_ratio_kr20: float = 0.60,
+    early_ratio_kr90: float = 0.30,
     use_e2_div_cover: bool = True,
     e2_topk_offspring: int = 1,
     e2_steps_per_child: int = 1,
     e2_r_ratio: float = 0.01,
     e2_max_pairs: int = 30,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
-    if cut_ratio <= 0 or cut_ratio > 100:
-        raise ValueError("cr 必须在 1-100 之间。")
+    if keep_ratio <= 0 or keep_ratio > 100:
+        raise ValueError("kr 必须在 1-100 之间。")
 
     num_samples = sa_scores.shape[0]
     if labels.shape[0] != num_samples:
         raise ValueError("sa_scores 与 labels 的样本数不一致。")
 
-    sr = float(cut_ratio) / 100.0
+    sr = float(keep_ratio) / 100.0
     sa_scores_np = np.asarray(sa_scores, dtype=np.float32)
 
     if div_static_scores is not None:
@@ -330,17 +330,17 @@ def select_group_mask(
     lambda_sample_M = DEFAULT_M
     lambda_ratio_r = DEFAULT_R
     lambda_eps = DEFAULT_EPS
-    cr_ratio = target_size / max(1, num_samples)
+    kr_ratio = target_size / max(1, num_samples)
 
-    local_search_ratio_stage1 = 0.06 - 0.04 * cr_ratio
-    local_search_ratio_stage2 = 0.08 - 0.05 * cr_ratio
-    mutation_ratio_stage1 = 0.01 * (1.0 + 3.0 * (1.0 - cr_ratio))
-    mutation_ratio_stage2 = 0.02 * (1.0 + 1.0 * (1.0 - cr_ratio))
-    crossover_sym_ratio_stage1 = 0.7 - 0.05 * (1 - cr_ratio)
-    crossover_sym_ratio_stage2 = 0.85 - 0.15 * (1 - cr_ratio)
+    local_search_ratio_stage1 = 0.06 - 0.04 * kr_ratio
+    local_search_ratio_stage2 = 0.08 - 0.05 * kr_ratio
+    mutation_ratio_stage1 = 0.01 * (1.0 + 3.0 * (1.0 - kr_ratio))
+    mutation_ratio_stage2 = 0.02 * (1.0 + 1.0 * (1.0 - kr_ratio))
+    crossover_sym_ratio_stage1 = 0.7 - 0.05 * (1 - kr_ratio)
+    crossover_sym_ratio_stage2 = 0.85 - 0.15 * (1 - kr_ratio)
 
-    cr_for_interp = float(np.clip(cut_ratio, 20, 90))
-    early_ratio = early_ratio_cr20 + (cr_for_interp - 20.0) * (early_ratio_cr90 - early_ratio_cr20) / 70.0
+    kr_for_interp = float(np.clip(keep_ratio, 20, 90))
+    early_ratio = early_ratio_kr20 + (kr_for_interp - 20.0) * (early_ratio_kr90 - early_ratio_kr20) / 70.0
     early_ratio = float(np.clip(early_ratio, 0.30, 0.60))
     stage2_cycles = max(1, int(stage2_cycles))
     phase_schedule: list[str] = []
@@ -479,7 +479,7 @@ def select_group_mask(
             return np.concatenate([unique_idx, fill]).astype(np.int64)
 
         change_n = abs(target_size - unique_idx.size)
-        m = float(repair_pool_m_base + repair_pool_m_slope * cr_ratio)
+        m = float(repair_pool_m_base + repair_pool_m_slope * kr_ratio)
         k_pool = max(change_n, int(np.round(m * change_n)))
         k_pool = min(k_pool, max(200, int(0.05 * num_samples)))
 
@@ -547,7 +547,7 @@ def select_group_mask(
         cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
         dataset=dataset_name,
         seed=seed,
-        cr=cut_ratio,
+        kr=keep_ratio,
         weight_group=weight_group,
         n_samples=num_samples,
         target_size=target_size,
@@ -556,7 +556,7 @@ def select_group_mask(
         M=max(10, min(lambda_sample_M, num_samples)),
         r=lambda_ratio_r,
         eps=lambda_eps,
-        tqdm_desc=f"Estimating lambda (seed={seed}, cr={cut_ratio}, wg={weight_group})",
+        tqdm_desc=f"Estimating lambda (seed={seed}, kr={keep_ratio}, wg={weight_group})",
     )
     lambda_val = float(lambda_info["lambda"])
 
@@ -800,7 +800,7 @@ def save_score_curve_plot(
     weight_group: str,
     model_name: str,
     seed: int,
-    cut_ratio: int,
+    keep_ratio: int,
     clip_model: str,
 ) -> Path:
     out_dir = PROJECT_ROOT / "mask_debug"
@@ -810,7 +810,7 @@ def save_score_curve_plot(
         out_dir
         / (
             f"dataset_{dataset}_method_{method}_weight_{weight_group}_"
-            f"model_{model_name}_seed_{seed}_cr_{cut_ratio}_clip_{clip_tag}_score_curve.png"
+            f"model_{model_name}_seed_{seed}_cr_{keep_ratio}_clip_{clip_tag}_score_curve.png"
         )
     )
 
@@ -905,14 +905,14 @@ def main() -> None:
     )
 
     method_name = f"{weight_group}_{method}"
-    cut_ratios = parse_ratio_list(args.cr)
-    if not cut_ratios:
-        raise ValueError("cr 参数不能为空。")
+    keep_ratios = parse_ratio_list(args.kr)
+    if not keep_ratios:
+        raise ValueError("kr 参数不能为空。")
     seeds = parse_seed_list(args.seeds)
     if not seeds:
         raise ValueError("seeds 参数不能为空。")
 
-    total_tasks = len(seeds) * len(cut_ratios)
+    total_tasks = len(seeds) * len(keep_ratios)
     task_idx = 0
 
     for seed in seeds:
@@ -1023,10 +1023,10 @@ def main() -> None:
             )
             return float(subset_scores[selected_mask.astype(bool)].sum())
 
-        for cut_ratio in cut_ratios:
+        for keep_ratio in keep_ratios:
             task_idx += 1
             print(
-                f"[Mask {task_idx}/{total_tasks}] seed={seed} | cr={cut_ratio} | method={method} | weight_group={weight_group}"
+                f"[Mask {task_idx}/{total_tasks}] seed={seed} | kr={keep_ratio} | method={method} | weight_group={weight_group}"
             )
             group_stats: dict[str, object] | None = None
             if method == "topk":
@@ -1034,7 +1034,7 @@ def main() -> None:
                     total_scores_np,
                     labels,
                     num_classes=len(class_names),
-                    cut_ratio=cut_ratio,
+                    keep_ratio=keep_ratio,
                 )
             else:
                 mask, selected_by_class, group_stats = select_group_mask(
@@ -1047,7 +1047,7 @@ def main() -> None:
                     labels=labels,
                     weights=weights,
                     num_classes=len(class_names),
-                    cut_ratio=cut_ratio,
+                    keep_ratio=keep_ratio,
                     device=device,
                     dataset_name=dataset_name,
                     seed=seed,
@@ -1059,8 +1059,8 @@ def main() -> None:
                     repair_pool_m_slope=args.repair_pool_m_slope,
                     repair_softmax_temp=args.repair_softmax_temp,
                     stage2_cycles=args.stage2_cycles,
-                    early_ratio_cr20=args.early_ratio_cr20,
-                    early_ratio_cr90=args.early_ratio_cr90,
+                    early_ratio_kr20=args.early_ratio_kr20,
+                    early_ratio_kr90=args.early_ratio_kr90,
                     use_e2_div_cover=args.use_e2_div_cover,
                     e2_topk_offspring=args.e2_topk_offspring,
                     e2_steps_per_child=args.e2_steps_per_child,
@@ -1075,7 +1075,7 @@ def main() -> None:
                     weight_group=weight_group,
                     model_name=args.model_name,
                     seed=seed,
-                    cut_ratio=cut_ratio,
+                    keep_ratio=keep_ratio,
                     clip_model=args.clip_model,
                 )
                 print(f"[Debug] score curve saved to: {debug_curve}")
@@ -1085,7 +1085,7 @@ def main() -> None:
                         total_scores_np,
                         labels,
                         num_classes=len(class_names),
-                        cut_ratio=cut_ratio,
+                        keep_ratio=keep_ratio,
                     )
                     inter = int(np.logical_and(mask == 1, topk_mask == 1).sum())
                     sel = int(mask.sum())
@@ -1107,14 +1107,14 @@ def main() -> None:
                 dataset=dataset_name,
                 model=args.model_name,
                 seed=seed,
-                cut_ratio=cut_ratio,
+                keep_ratio=keep_ratio,
             )
             mask_dir = mask_path.parent
             mask_dir.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(mask_path, mask=mask.astype(np.uint8))
 
             print(
-                f"seed={seed} | cr={cut_ratio} | selected={int(mask.sum())} "
+                f"seed={seed} | kr={keep_ratio} | selected={int(mask.sum())} "
                 f"| static_score_seconds={static_score_seconds:.2f} | total_seconds={total_time:.2f}"
             )
             if group_stats is not None:

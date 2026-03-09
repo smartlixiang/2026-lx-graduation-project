@@ -12,6 +12,7 @@ from tqdm import tqdm
 DEFAULT_M = 100
 DEFAULT_R = 0.05
 DEFAULT_EPS = 1e-8
+DEFAULT_MEAN_CAP_RATIO = 0.1
 
 MEAN_BETA_BY_DATASET = {
     "cifar10": 0.03,
@@ -68,15 +69,24 @@ def load_cached_lambda(
         return None
     if not np.isfinite(lam_f):
         return None
-    lambda_mean = record.get("lambda_mean")
-    if lambda_mean is None:
-        return None
-    try:
-        lambda_mean_f = float(lambda_mean)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(lambda_mean_f):
-        return None
+    # Herding mean-correction cache is reusable only for the new format where
+    # lambda_mean is std-based with a mean-based upper cap.
+    required_mean_fields = (
+        "lambda_mean",
+        "lambda_std_mean",
+        "lambda_mean_base",
+        "lambda_mean_cap",
+    )
+    for field in required_mean_fields:
+        value = record.get(field)
+        if value is None:
+            return None
+        try:
+            value_f = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(value_f):
+            return None
     return {k: float(v) for k, v in record.items() if isinstance(v, (int, float))}
 
 
@@ -128,6 +138,7 @@ def get_or_estimate_lambda(
     M: int = DEFAULT_M,
     r: float = DEFAULT_R,
     eps: float = DEFAULT_EPS,
+    c: float = DEFAULT_MEAN_CAP_RATIO,
     tqdm_desc: str = "Estimating lambda",
 ) -> dict[str, float]:
     cached = load_cached_lambda(cache_path, dataset, seed, kr, weight_group)
@@ -165,7 +176,10 @@ def get_or_estimate_lambda(
     beta = float(MEAN_BETA_BY_DATASET.get(str(dataset).lower(), 0.03))
     lambda_std = float(beta * sigma_s / (sigma_h + eps))
     lambda_mean_base = float(beta * abs(mu_s) / (mu_h + eps))
-    lambda_mean = float(np.clip(lambda_std, 0.5 * lambda_mean_base, 2.0 * lambda_mean_base))
+    lambda_mean_cap = float(c * lambda_mean_base)
+    # mean-based term is treated as an auxiliary regularizer and only provides
+    # an upper cap; no lower-bound lifting is applied.
+    lambda_mean = float(min(lambda_std, lambda_mean_cap))
 
     record: dict[str, float] = {
         "lambda": lambda_cls,
@@ -181,7 +195,9 @@ def get_or_estimate_lambda(
         "lambda_mean_cls": lambda_mean_cls,
         "lambda_std_mean": lambda_std,
         "lambda_mean_base": lambda_mean_base,
+        "lambda_mean_cap": lambda_mean_cap,
         "beta": beta,
+        "c": float(c),
         "M": float(M),
         "r": float(r),
         "eps": float(eps),

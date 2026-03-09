@@ -50,9 +50,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _build_dataset(transform) -> datasets.CIFAR10:
+def _build_dataset(dataset_name: str, transform):
     data_root = PROJECT_ROOT / "data"
-    return datasets.CIFAR10(root=str(data_root), train=True, download=True, transform=transform)
+    if dataset_name == CIFAR10:
+        return datasets.CIFAR10(root=str(data_root), train=True, download=True, transform=transform)
+    if dataset_name == CIFAR100:
+        return datasets.CIFAR100(root=str(data_root), train=True, download=True, transform=transform)
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
 def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str, object]]:
@@ -124,8 +128,8 @@ def load_scoring_weights(all_weights: dict[str, dict[str, object]], weight_group
     return {k: float(selected[k]) for k in required}
 
 
-def build_score_loader(preprocess, device: torch.device, batch_size: int, num_workers: int) -> DataLoader:
-    dataset = _build_dataset(preprocess)
+def build_score_loader(dataset_name: str, preprocess, device: torch.device, batch_size: int, num_workers: int) -> DataLoader:
+    dataset = _build_dataset(dataset_name, preprocess)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -302,7 +306,7 @@ def main() -> None:
     set_seed(FIXED_SEED)
 
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
-    dataset_for_names = _build_dataset(transform=None)
+    dataset_for_names = _build_dataset(args.dataset, transform=None)
     class_names = dataset_for_names.classes  # type: ignore[attr-defined]
     labels = np.asarray(dataset_for_names.targets)
     labels_t = torch.as_tensor(labels, dtype=torch.long, device=device)
@@ -315,9 +319,9 @@ def main() -> None:
     div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
     sa_metric = SemanticAlignment(class_names=class_names, clip_model=args.clip_model, device=device)
 
-    dds_loader = build_score_loader(dds_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
-    div_loader = build_score_loader(div_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
-    sa_loader = build_score_loader(sa_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
+    dds_loader = build_score_loader(args.dataset, dds_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
+    div_loader = build_score_loader(args.dataset, div_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
+    sa_loader = build_score_loader(args.dataset, sa_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
 
     image_adapter, text_adapter, adapter_paths = load_trained_adapters(
         dataset_name=args.dataset,

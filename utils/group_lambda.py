@@ -13,6 +13,11 @@ DEFAULT_M = 100
 DEFAULT_R = 0.05
 DEFAULT_EPS = 1e-8
 
+MEAN_BETA_BY_DATASET = {
+    "cifar10": 0.03,
+    "cifar100": 0.05,
+}
+
 
 def compute_balance_penalty(
     selected_mask: np.ndarray,
@@ -53,12 +58,24 @@ def load_cached_lambda(
         record = kr_entry.get(str(weight_group), {}) if isinstance(kr_entry, dict) else {}
     if not isinstance(record, dict):
         return None
-    lam = record.get("lambda")
+    if "lambda_cls" in record:
+        lam = record.get("lambda_cls")
+    else:
+        lam = record.get("lambda")
     try:
         lam_f = float(lam)
     except (TypeError, ValueError):
         return None
     if not np.isfinite(lam_f):
+        return None
+    lambda_mean = record.get("lambda_mean")
+    if lambda_mean is None:
+        return None
+    try:
+        lambda_mean_f = float(lambda_mean)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(lambda_mean_f):
         return None
     return {k: float(v) for k, v in record.items() if isinstance(v, (int, float))}
 
@@ -107,6 +124,7 @@ def get_or_estimate_lambda(
     target_size: int,
     eval_score_fn: Callable[[np.ndarray], float],
     penalty_fn: Callable[[np.ndarray], float],
+    mean_penalty_fn: Callable[[np.ndarray], float],
     M: int = DEFAULT_M,
     r: float = DEFAULT_R,
     eps: float = DEFAULT_EPS,
@@ -118,12 +136,17 @@ def get_or_estimate_lambda(
 
     s_values: list[float] = []
     pen_values: list[float] = []
-    for _ in tqdm(range(M), desc=tqdm_desc, unit="sample", leave=False):
-        idx = np.random.choice(n_samples, size=target_size, replace=False)
+    mean_pen_values: list[float] = []
+    base_seed = int(seed)
+    for sample_idx in tqdm(range(1, M + 1), desc=tqdm_desc, unit="sample", leave=False):
+        sample_seed = base_seed * sample_idx
+        rng = np.random.default_rng(sample_seed)
+        idx = rng.choice(n_samples, size=target_size, replace=False)
         mask = np.zeros(n_samples, dtype=np.uint8)
         mask[idx] = 1
         s_values.append(float(eval_score_fn(mask)))
         pen_values.append(float(penalty_fn(mask)))
+        mean_pen_values.append(float(mean_penalty_fn(mask)))
 
     s_arr = np.asarray(s_values, dtype=np.float64)
     pen_arr = np.asarray(pen_values, dtype=np.float64)
@@ -131,16 +154,34 @@ def get_or_estimate_lambda(
     sigma_s = float(np.std(s_arr))
     mu_pen = float(np.mean(pen_arr))
     sigma_pen = float(np.std(pen_arr))
-    lambda_std = float(r * (sigma_s / (sigma_pen + eps)))
-    lambda_mean = float(r * (mu_s / (mu_pen + eps)))
-    lam = float(min(lambda_std, lambda_mean))
+    h_arr = np.asarray(mean_pen_values, dtype=np.float64)
+    mu_h = float(np.mean(h_arr))
+    sigma_h = float(np.std(h_arr))
+
+    lambda_std_cls = float(r * (sigma_s / (sigma_pen + eps)))
+    lambda_mean_cls = float(r * (mu_s / (mu_pen + eps)))
+    lambda_cls = float(min(lambda_std_cls, lambda_mean_cls))
+
+    beta = float(MEAN_BETA_BY_DATASET.get(str(dataset).lower(), 0.03))
+    lambda_std = float(beta * sigma_s / (sigma_h + eps))
+    lambda_mean_base = float(beta * abs(mu_s) / (mu_h + eps))
+    lambda_mean = float(np.clip(lambda_std, 0.5 * lambda_mean_base, 2.0 * lambda_mean_base))
 
     record: dict[str, float] = {
-        "lambda": lam,
+        "lambda": lambda_cls,
+        "lambda_cls": lambda_cls,
+        "lambda_mean": lambda_mean,
         "mu_S": mu_s,
         "sigma_S": sigma_s,
         "mu_pen": mu_pen,
         "sigma_pen": sigma_pen,
+        "mu_mean_pen": mu_h,
+        "sigma_mean_pen": sigma_h,
+        "lambda_std_cls": lambda_std_cls,
+        "lambda_mean_cls": lambda_mean_cls,
+        "lambda_std_mean": lambda_std,
+        "lambda_mean_base": lambda_mean_base,
+        "beta": beta,
         "M": float(M),
         "r": float(r),
         "eps": float(eps),

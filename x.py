@@ -7,6 +7,7 @@ from model.adapter import load_trained_adapters
 from dataset.dataset_config import CIFAR10, CIFAR100
 
 import argparse
+import hashlib
 import csv
 import json
 import sys
@@ -139,6 +140,79 @@ def build_score_loader(dataset_name: str, preprocess, device: torch.device, batc
     )
 
 
+def _hash_file(path: Path) -> str:
+    hasher = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _mean_stats_cache_path(dataset_name: str, clip_model: str, adapter_image_path: str) -> Path:
+    adapter_sha1 = _hash_file(Path(adapter_image_path))
+    clip_tag = clip_model.replace("/", "-").replace(" ", "_")
+    return PROJECT_ROOT / "static_scores" / "group_mean_stats" / dataset_name / clip_tag / f"img_adapter_{adapter_sha1}.npz"
+
+
+def _get_or_compute_group_mean_stats(
+    *,
+    cache_path: Path,
+    image_features: np.ndarray,
+    labels: np.ndarray,
+    num_classes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    n_samples = int(image_features.shape[0])
+    feat_dim = int(image_features.shape[1]) if image_features.ndim == 2 else 0
+    if cache_path.exists():
+        try:
+            cached = np.load(cache_path, allow_pickle=False)
+            means = np.asarray(cached["full_class_mean"], dtype=np.float32)
+            vars_ = np.asarray(cached["full_class_var"], dtype=np.float32)
+            if means.shape == (num_classes, feat_dim) and vars_.shape == (num_classes,):
+                return means, vars_
+        except Exception:
+            pass
+
+    full_class_mean = np.zeros((num_classes, feat_dim), dtype=np.float32)
+    full_class_var = np.zeros((num_classes,), dtype=np.float32)
+    for class_id in range(num_classes):
+        class_feats = image_features[labels == class_id]
+        if class_feats.shape[0] == 0:
+            continue
+        class_mean = np.mean(class_feats, axis=0, dtype=np.float32)
+        diff = class_feats - class_mean
+        sigma2 = float(np.mean(np.sum(diff * diff, axis=1)))
+        full_class_mean[class_id] = class_mean
+        full_class_var[class_id] = np.float32(max(sigma2, 0.0))
+
+    np.savez_compressed(cache_path, full_class_mean=full_class_mean, full_class_var=full_class_var)
+    return full_class_mean, full_class_var
+
+
+def compute_mean_penalty(
+    selected_mask: np.ndarray,
+    *,
+    labels_np: np.ndarray,
+    num_classes: int,
+    image_features_np: np.ndarray,
+    full_class_mean: np.ndarray,
+    full_class_var: np.ndarray,
+    eps: float,
+) -> float:
+    selected = selected_mask.astype(bool)
+    penalty_sum = 0.0
+    for class_id in range(num_classes):
+        class_selected = selected & (labels_np == class_id)
+        if int(np.sum(class_selected)) <= 0:
+            continue
+        subset_mean = np.mean(image_features_np[class_selected], axis=0, dtype=np.float32)
+        diff = subset_mean - full_class_mean[class_id]
+        dist2 = float(np.dot(diff, diff))
+        penalty_sum += dist2 / (float(full_class_var[class_id]) + eps)
+    return float(penalty_sum)
+
+
 def select_global_topk(scores: np.ndarray, keep_ratio: int) -> np.ndarray:
     n = scores.shape[0]
     k = max(1, min(n, int(round(n * keep_ratio / 100.0))))
@@ -169,11 +243,16 @@ def compute_subset_score(
     image_adapter,
     div_features,
     dds_features,
-    lambda_value: float,
+    lambda_cls: float,
+    lambda_mean: float,
     labels_np: np.ndarray,
     num_classes: int,
     target_size: int,
-) -> tuple[float, float, float, float, float]:
+    image_features_np: np.ndarray,
+    full_class_mean: np.ndarray,
+    full_class_var: np.ndarray,
+    eps: float,
+) -> tuple[float, float, float, float, float, float]:
     div_dyn = np.asarray(
         div_metric.score_dataset_dynamic(
             div_loader,
@@ -199,8 +278,17 @@ def compute_subset_score(
     dds_sum = float(dds_dyn[chosen].sum())
     total = float((weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_dyn)[chosen].sum())
     penalty = compute_balance_penalty(selected_mask, labels_np, num_classes, target_size)
-    adjusted = float(total - lambda_value * penalty)
-    return div_sum, dds_sum, total, penalty, adjusted
+    mean_penalty = compute_mean_penalty(
+        selected_mask,
+        labels_np=labels_np,
+        num_classes=num_classes,
+        image_features_np=image_features_np,
+        full_class_mean=full_class_mean,
+        full_class_var=full_class_var,
+        eps=eps,
+    )
+    adjusted = float(total - lambda_cls * penalty - lambda_mean * mean_penalty)
+    return div_sum, dds_sum, total, penalty, mean_penalty, adjusted
 
 
 def select_group_old_best(
@@ -218,17 +306,21 @@ def select_group_old_best(
     image_adapter,
     div_features,
     dds_features,
-    lambda_value: float,
+    lambda_cls: float,
+    lambda_mean: float,
     labels_np: np.ndarray,
     num_classes: int,
-) -> tuple[np.ndarray, float, float, float, float, float, int]:
+    image_features_np: np.ndarray,
+    full_class_mean: np.ndarray,
+    full_class_var: np.ndarray,
+) -> tuple[np.ndarray, float, float, float, float, float, float, int]:
     k = max(1, min(n_samples, int(round(n_samples * keep_ratio / 100.0))))
     cur_idx = np.random.choice(n_samples, size=k, replace=False)
     cur_mask = np.zeros(n_samples, dtype=np.uint8)
     cur_mask[cur_idx] = 1
 
     best_mask = cur_mask.copy()
-    best_div, best_dds, best_total, best_penalty, best_total_adj = compute_subset_score(
+    best_div, best_dds, best_total, best_penalty, best_mean_penalty, best_total_adj = compute_subset_score(
         cur_mask,
         sa_scores=sa_scores,
         labels_t=labels_t,
@@ -240,10 +332,15 @@ def select_group_old_best(
         image_adapter=image_adapter,
         div_features=div_features,
         dds_features=dds_features,
-        lambda_value=lambda_value,
+        lambda_cls=lambda_cls,
+        lambda_mean=lambda_mean,
         labels_np=labels_np,
         num_classes=num_classes,
         target_size=k,
+        image_features_np=image_features_np,
+        full_class_mean=full_class_mean,
+        full_class_var=full_class_var,
+        eps=DEFAULT_EPS,
     )
     best_iter = 0
 
@@ -272,7 +369,7 @@ def select_group_old_best(
         next_mask = select_global_topk(total_scores, keep_ratio=keep_ratio)
         cur_mask = next_mask
 
-        div_sum, dds_sum, total_sum, pen_sum, total_sum_adj = compute_subset_score(
+        div_sum, dds_sum, total_sum, pen_sum, mean_pen_sum, total_sum_adj = compute_subset_score(
             cur_mask,
             sa_scores=sa_scores,
             labels_t=labels_t,
@@ -284,10 +381,15 @@ def select_group_old_best(
             image_adapter=image_adapter,
             div_features=div_features,
             dds_features=dds_features,
-            lambda_value=lambda_value,
+            lambda_cls=lambda_cls,
+            lambda_mean=lambda_mean,
             labels_np=labels_np,
             num_classes=num_classes,
             target_size=k,
+            image_features_np=image_features_np,
+            full_class_mean=full_class_mean,
+            full_class_var=full_class_var,
+            eps=DEFAULT_EPS,
         )
         if total_sum_adj > best_total_adj:
             best_total_adj = total_sum_adj
@@ -295,10 +397,11 @@ def select_group_old_best(
             best_div = div_sum
             best_dds = dds_sum
             best_penalty = pen_sum
+            best_mean_penalty = mean_pen_sum
             best_mask = cur_mask.copy()
             best_iter = t
 
-    return best_mask, best_div, best_dds, best_total, best_penalty, best_total_adj, best_iter
+    return best_mask, best_div, best_dds, best_total, best_penalty, best_mean_penalty, best_total_adj, best_iter
 
 
 def main() -> None:
@@ -378,6 +481,16 @@ def main() -> None:
     start = time.perf_counter()
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
     dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
+    div_features_np = (
+        div_features.detach().cpu().numpy() if isinstance(div_features, torch.Tensor) else np.asarray(div_features)
+    ).astype(np.float32)
+    mean_stats_cache = _mean_stats_cache_path(args.dataset, args.clip_model, str(adapter_paths["image_path"]))
+    full_class_mean, full_class_var = _get_or_compute_group_mean_stats(
+        cache_path=mean_stats_cache,
+        image_features=div_features_np,
+        labels=labels,
+        num_classes=len(class_names),
+    )
     print(f"[Init] Encoded image features for dynamic scoring in {time.perf_counter() - start:.2f}s")
 
     keep_ratios = list(range(20, 91, 10))
@@ -410,21 +523,39 @@ def main() -> None:
                 image_adapter=image_adapter,
                 div_features=div_features,
                 dds_features=dds_features,
-                lambda_value=0.0,
+                lambda_cls=0.0,
+                lambda_mean=0.0,
                 labels_np=labels,
                 num_classes=len(class_names),
                 target_size=target_size,
+                image_features_np=div_features_np,
+                full_class_mean=full_class_mean,
+                full_class_var=full_class_var,
+                eps=lambda_eps,
             )[2],
             penalty_fn=lambda mask: compute_balance_penalty(mask, labels, len(class_names), target_size),
+            mean_penalty_fn=lambda mask: compute_mean_penalty(
+                mask,
+                labels_np=labels,
+                num_classes=len(class_names),
+                image_features_np=div_features_np,
+                full_class_mean=full_class_mean,
+                full_class_var=full_class_var,
+                eps=lambda_eps,
+            ),
             M=lambda_sample_M,
             r=lambda_ratio_r,
             eps=lambda_eps,
             tqdm_desc=f"Estimating lambda (seed={FIXED_SEED}, kr={kr})",
         )
-        lambda_topk = float(lambda_info_topk["lambda"])
-        print(f"[Lambda] dataset={args.dataset} | seed={FIXED_SEED} | kr={kr} | lambda={lambda_topk:.8f}")
+        lambda_topk_cls = float(lambda_info_topk.get("lambda_cls", lambda_info_topk["lambda"]))
+        lambda_topk_mean = float(lambda_info_topk["lambda_mean"])
+        print(
+            f"[Lambda] dataset={args.dataset} | seed={FIXED_SEED} | kr={kr} "
+            f"| lambda_cls={lambda_topk_cls:.8f} | lambda_mean={lambda_topk_mean:.8f}"
+        )
         topk_mask = select_global_topk(total_static, keep_ratio=kr)
-        _, _, _, _, topk_total = compute_subset_score(
+        _, _, _, _, _, topk_total = compute_subset_score(
             topk_mask,
             sa_scores=sa_scores,
             labels_t=labels_t,
@@ -436,10 +567,15 @@ def main() -> None:
             image_adapter=image_adapter,
             div_features=div_features,
             dds_features=dds_features,
-            lambda_value=lambda_topk,
+            lambda_cls=lambda_topk_cls,
+            lambda_mean=lambda_topk_mean,
             labels_np=labels,
             num_classes=len(class_names),
             target_size=target_size,
+            image_features_np=div_features_np,
+            full_class_mean=full_class_mean,
+            full_class_var=full_class_var,
+            eps=lambda_eps,
         )
 
         random_scores: list[float] = []
@@ -468,20 +604,35 @@ def main() -> None:
                     image_adapter=image_adapter,
                     div_features=div_features,
                     dds_features=dds_features,
-                    lambda_value=0.0,
+                    lambda_cls=0.0,
+                    lambda_mean=0.0,
                     labels_np=labels,
                     num_classes=len(class_names),
                     target_size=target_size,
+                    image_features_np=div_features_np,
+                    full_class_mean=full_class_mean,
+                    full_class_var=full_class_var,
+                    eps=lambda_eps,
                 )[2],
                 penalty_fn=lambda mask: compute_balance_penalty(mask, labels, len(class_names), target_size),
+                mean_penalty_fn=lambda mask: compute_mean_penalty(
+                    mask,
+                    labels_np=labels,
+                    num_classes=len(class_names),
+                    image_features_np=div_features_np,
+                    full_class_mean=full_class_mean,
+                    full_class_var=full_class_var,
+                    eps=lambda_eps,
+                ),
                 M=lambda_sample_M,
                 r=lambda_ratio_r,
                 eps=lambda_eps,
                 tqdm_desc=f"Estimating lambda (seed={seed}, kr={kr})",
             )
-            lambda_seed = float(lambda_info_seed["lambda"])
+            lambda_seed_cls = float(lambda_info_seed.get("lambda_cls", lambda_info_seed["lambda"]))
+            lambda_seed_mean = float(lambda_info_seed["lambda_mean"])
 
-            _, _, _, _, random_total = compute_subset_score(
+            _, _, _, _, _, random_total = compute_subset_score(
                 random_mask,
                 sa_scores=sa_scores,
                 labels_t=labels_t,
@@ -493,14 +644,19 @@ def main() -> None:
                 image_adapter=image_adapter,
                 div_features=div_features,
                 dds_features=dds_features,
-                lambda_value=lambda_seed,
+                lambda_cls=lambda_seed_cls,
+                lambda_mean=lambda_seed_mean,
                 labels_np=labels,
                 num_classes=len(class_names),
                 target_size=target_size,
+                image_features_np=div_features_np,
+                full_class_mean=full_class_mean,
+                full_class_var=full_class_var,
+                eps=lambda_eps,
             )
             random_scores.append(random_total)
 
-            _, _, _, _, _, grp_total, _ = select_group_old_best(
+            _, _, _, _, _, _, grp_total, _ = select_group_old_best(
                 n_samples=len(dataset_for_names),
                 keep_ratio=kr,
                 outer_iters=args.group_old_iters,
@@ -514,9 +670,13 @@ def main() -> None:
                 image_adapter=image_adapter,
                 div_features=div_features,
                 dds_features=dds_features,
-                lambda_value=lambda_seed,
+                lambda_cls=lambda_seed_cls,
+                lambda_mean=lambda_seed_mean,
                 labels_np=labels,
                 num_classes=len(class_names),
+                image_features_np=div_features_np,
+                full_class_mean=full_class_mean,
+                full_class_var=full_class_var,
             )
             group_old_scores.append(grp_total)
 

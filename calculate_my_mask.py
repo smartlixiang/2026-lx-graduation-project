@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -223,6 +224,77 @@ def build_score_loader(
     )
 
 
+def _hash_file(path: Path) -> str:
+    hasher = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _mean_stats_cache_path(
+    dataset_name: str,
+    clip_model: str,
+    adapter_image_path: str,
+) -> Path:
+    adapter_sha1 = _hash_file(Path(adapter_image_path))
+    clip_tag = clip_model.replace("/", "-").replace(" ", "_")
+    return PROJECT_ROOT / "static_scores" / "group_mean_stats" / dataset_name / clip_tag / f"img_adapter_{adapter_sha1}.npz"
+
+
+def _get_or_compute_group_mean_stats(
+    *,
+    cache_path: Path,
+    image_features: np.ndarray,
+    labels: np.ndarray,
+    num_classes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    n_samples = int(image_features.shape[0])
+    feat_dim = int(image_features.shape[1]) if image_features.ndim == 2 else 0
+    if cache_path.exists():
+        try:
+            cached = np.load(cache_path, allow_pickle=False)
+            cached_n = int(np.asarray(cached["n_samples"]).item())
+            cached_dim = int(np.asarray(cached["feat_dim"]).item())
+            cached_cls = int(np.asarray(cached["num_classes"]).item())
+            means = np.asarray(cached["full_class_mean"], dtype=np.float32)
+            vars_ = np.asarray(cached["full_class_var"], dtype=np.float32)
+            if (
+                cached_n == n_samples
+                and cached_dim == feat_dim
+                and cached_cls == int(num_classes)
+                and means.shape == (num_classes, feat_dim)
+                and vars_.shape == (num_classes,)
+            ):
+                return means, vars_
+        except Exception:
+            pass
+
+    full_class_mean = np.zeros((num_classes, feat_dim), dtype=np.float32)
+    full_class_var = np.zeros((num_classes,), dtype=np.float32)
+    for class_id in range(num_classes):
+        class_mask = labels == class_id
+        class_feats = image_features[class_mask]
+        if class_feats.shape[0] == 0:
+            continue
+        class_mean = np.mean(class_feats, axis=0, dtype=np.float32)
+        diff = class_feats - class_mean
+        sigma2 = float(np.mean(np.sum(diff * diff, axis=1)))
+        full_class_mean[class_id] = class_mean
+        full_class_var[class_id] = np.float32(max(sigma2, 0.0))
+
+    np.savez_compressed(
+        cache_path,
+        full_class_mean=full_class_mean,
+        full_class_var=full_class_var,
+        n_samples=np.asarray(n_samples, dtype=np.int64),
+        feat_dim=np.asarray(feat_dim, dtype=np.int64),
+        num_classes=np.asarray(num_classes, dtype=np.int64),
+    )
+    return full_class_mean, full_class_var
+
+
 def select_topk_mask(
     scores: np.ndarray,
     labels: np.ndarray,
@@ -267,6 +339,8 @@ def select_group_mask(
     dataset_name: str,
     seed: int,
     weight_group: str,
+    clip_model: str,
+    adapter_image_path: str,
     div_static_scores: np.ndarray | None = None,
     dds_static_scores: np.ndarray | None = None,
     repair_pool_random: bool = True,
@@ -317,6 +391,25 @@ def select_group_mask(
     labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
     dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
+
+    # Herding-style class-conditional mean preservation uses the same image-side
+    # semantic space as Div/DDS: CLIP image encoder + image adapter features.
+    div_features_np = (
+        div_features.detach().cpu().numpy()
+        if isinstance(div_features, torch.Tensor)
+        else np.asarray(div_features)
+    ).astype(np.float32)
+    mean_stats_cache_path = _mean_stats_cache_path(
+        dataset_name=dataset_name,
+        clip_model=clip_model,
+        adapter_image_path=adapter_image_path,
+    )
+    full_class_mean, full_class_var = _get_or_compute_group_mean_stats(
+        cache_path=mean_stats_cache_path,
+        image_features=div_features_np,
+        labels=labels_np,
+        num_classes=num_classes,
+    )
 
     target_size = int(round(sr * num_samples))
     if num_samples > 0:
@@ -498,18 +591,37 @@ def select_group_mask(
             repaired = _sample_from_pool(repaired, repaired.size, rank_score_np, prob_score_np, target_size, repair_softmax_temp)
         return repaired.astype(np.int64)
 
+    def _compute_mean_penalty(cur_mask: np.ndarray) -> float:
+        # Class-conditional mean penalty:
+        # sum_c ||mu_subset[c]-mu_full[c]||^2 / (sigma2_full[c] + eps)
+        selected = cur_mask.astype(bool)
+        penalty_sum = 0.0
+        for class_id in range(num_classes):
+            class_sel_mask = selected & (labels_np == class_id)
+            count = int(np.sum(class_sel_mask))
+            if count <= 0:
+                # Robust fallback for degenerate subsets.
+                continue
+            subset_mean = np.mean(div_features_np[class_sel_mask], axis=0, dtype=np.float32)
+            diff = subset_mean - full_class_mean[class_id]
+            dist2 = float(np.dot(diff, diff))
+            penalty_sum += dist2 / (float(full_class_var[class_id]) + lambda_eps)
+        return float(penalty_sum)
+
     def _evaluate(indices: np.ndarray) -> dict[str, object]:
         mask = _indices_to_mask(indices)
         raw_score, s_ref, counts = _real_stats_cached(mask)
-        penalty = compute_balance_penalty(mask, labels_np, num_classes, target_size)
-        adjusted_score = raw_score - lambda_val * penalty
+        class_penalty = compute_balance_penalty(mask, labels_np, num_classes, target_size)
+        mean_penalty = _compute_mean_penalty(mask)
+        fitness = raw_score - lambda_cls * class_penalty - lambda_mean * mean_penalty
         return {
             "indices": np.sort(indices.astype(np.int64)),
             "mask": mask,
-            "fitness": float(adjusted_score),
+            "fitness": float(fitness),
             "raw_score": float(raw_score),
-            "penalty": float(penalty),
-            "adjusted_score": float(adjusted_score),
+            "penalty": float(class_penalty),
+            "mean_penalty": float(mean_penalty),
+            "adjusted_score": float(fitness),
             "s_ref": s_ref,
             "counts": counts,
         }
@@ -553,12 +665,14 @@ def select_group_mask(
         target_size=target_size,
         eval_score_fn=lambda mask: _real_stats_cached(mask)[0],
         penalty_fn=lambda mask: compute_balance_penalty(mask, labels_np, num_classes, target_size),
+        mean_penalty_fn=_compute_mean_penalty,
         M=max(10, min(lambda_sample_M, num_samples)),
         r=lambda_ratio_r,
         eps=lambda_eps,
-        tqdm_desc=f"Estimating lambda (seed={seed}, kr={keep_ratio}, wg={weight_group})",
+        tqdm_desc=f"Estimating lambdas (seed={seed}, kr={keep_ratio}, wg={weight_group})",
     )
-    lambda_val = float(lambda_info["lambda"])
+    lambda_cls = float(lambda_info.get("lambda_cls", lambda_info.get("lambda", 0.0)))
+    lambda_mean = float(lambda_info["lambda_mean"])
 
     initial_population_idx: list[np.ndarray] = [static_topk]
     for _ in range(max(0, ga_population_size - 1)):
@@ -571,8 +685,9 @@ def select_group_mask(
 
     score_history: list[float] = []
     correction_history: list[float] = []
+    mean_penalty_history: list[float] = []
 
-    div_feat_np = div_features.detach().cpu().numpy() if isinstance(div_features, torch.Tensor) else np.asarray(div_features)
+    div_feat_np = div_features_np
 
     generation_iter = tqdm(range(ga_generations), desc="GA Selection", unit="gen")
     for gen_idx in generation_iter:
@@ -700,7 +815,10 @@ def select_group_mask(
         generation_best_item = max(population, key=lambda item: float(item["fitness"]))
         generation_best = float(generation_best_item["fitness"])
         score_history.append(float(generation_best_item["raw_score"]))
-        correction_history.append(float(lambda_val * float(generation_best_item["penalty"])))
+        class_corr = float(lambda_cls * float(generation_best_item["penalty"]))
+        mean_corr = float(lambda_mean * float(generation_best_item["mean_penalty"]))
+        correction_history.append(class_corr + mean_corr)
+        mean_penalty_history.append(float(generation_best_item["mean_penalty"]))
         if gen_idx % 5 == 0:
             print(
                 f"[GA] gen={gen_idx:03d} stage={stage_name} "
@@ -715,7 +833,8 @@ def select_group_mask(
 
     best_S, best_s_ref, _ = _real_stats_cached(best_mask)
     best_penalty = compute_balance_penalty(best_mask, labels_np, num_classes, target_size)
-    best_S_prime = best_S - lambda_val * best_penalty
+    best_mean_penalty = _compute_mean_penalty(best_mask)
+    best_S_prime = best_S - lambda_cls * best_penalty - lambda_mean * best_mean_penalty
 
     REFINE_MAX_STEPS = 10
     REFINE_EPS = 1e-8
@@ -732,12 +851,14 @@ def select_group_mask(
 
         refined_S, refined_s_ref, _ = _real_stats_cached(refined_mask)
         refined_penalty = compute_balance_penalty(refined_mask, labels_np, num_classes, target_size)
-        refined_S_prime = refined_S - lambda_val * refined_penalty
+        refined_mean_penalty = _compute_mean_penalty(refined_mask)
+        refined_S_prime = refined_S - lambda_cls * refined_penalty - lambda_mean * refined_mean_penalty
         if refined_S_prime > best_S_prime + REFINE_EPS:
             best_indices = refined_indices
             best_mask = refined_mask
             best_S = refined_S
             best_penalty = refined_penalty
+            best_mean_penalty = refined_mean_penalty
             best_S_prime = refined_S_prime
             best_s_ref = refined_s_ref
         else:
@@ -761,14 +882,18 @@ def select_group_mask(
         "selected_by_class": selected_by_class,
         "S": float(np.sum(final_s_all[final_mask.astype(bool)])),
         "penalty": float(compute_balance_penalty(final_mask, labels_np, num_classes, target_size)),
+        "final_mean_penalty": float(_compute_mean_penalty(final_mask)),
         "S_prime": float(best_S_prime),
         "best_iter": int(np.argmax(np.asarray(score_history, dtype=np.float32))),
         "score_history": score_history,
         "correction_history": correction_history,
+        "mean_penalty_history": mean_penalty_history,
         "ga_population_size": int(ga_population_size),
         "ga_generations": int(ga_generations),
         "ga_offspring": int(ga_offspring),
-        "lambda": lambda_val,
+        "lambda": lambda_cls,
+        "lambda_cls": lambda_cls,
+        "lambda_mean": lambda_mean,
         "lambda_info": lambda_info,
         "stage2_cycles": int(stage2_cycles),
         "phase_schedule": phase_schedule,
@@ -820,11 +945,11 @@ def save_score_curve_plot(
     score_arr = np.asarray(score_history, dtype=np.float64)
     corr_arr = np.asarray(correction_history, dtype=np.float64)
     line1 = ax.plot(x, score_arr, linewidth=1.6, color="#1f77b4", label="S(D)")
-    line2 = ax2.plot(x, corr_arr, linewidth=1.6, color="#ff7f0e", label="λ·penalty(D)")
+    line2 = ax2.plot(x, corr_arr, linewidth=1.6, color="#ff7f0e", label="λ·penalties(D)")
     ax.set_title("Score & correction trajectory")
     ax.set_xlabel("Iteration")
     ax.set_ylabel("S(D)", color="#1f77b4")
-    ax2.set_ylabel("λ·penalty(D)", color="#ff7f0e")
+    ax2.set_ylabel("λ·penalties(D)", color="#ff7f0e")
     ax.grid(alpha=0.25)
     handles = line1 + line2
     labels = [h.get_label() for h in handles]
@@ -1052,6 +1177,8 @@ def main() -> None:
                     dataset_name=dataset_name,
                     seed=seed,
                     weight_group=weight_group,
+                    clip_model=args.clip_model,
+                    adapter_image_path=str(adapter_paths["image_path"]),
                     div_static_scores=div_scores_np,
                     dds_static_scores=dds_scores_np,
                     repair_pool_random=args.repair_pool_random,
@@ -1123,7 +1250,9 @@ def main() -> None:
                     f"sr={group_stats['sr']:.6f} | rate={group_stats['final_rate']:.6f} | "
                     f"m_c={group_stats['selected_by_class']} | "
                     f"best_iter={group_stats['best_iter']} | "
-                    f"S(D)={group_stats['S']:.6f} | pen(D)={group_stats['penalty']:.6f} | S'(D)={group_stats['S_prime']:.6f}"
+                    f"S(D)={group_stats['S']:.6f} | pen(D)={group_stats['penalty']:.6f} | "
+                    f"mean_pen(D)={group_stats['final_mean_penalty']:.6f} | "
+                    f"lambda_mean={group_stats['lambda_mean']:.6f} | S'(D)={group_stats['S_prime']:.6f}"
                 )
             print(f"mask saved to: {mask_path}")
 

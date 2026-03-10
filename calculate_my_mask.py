@@ -86,14 +86,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repair-pool-m-base", type=float, default=2.0)
     parser.add_argument("--repair-pool-m-slope", type=float, default=3.0)
     parser.add_argument("--repair-softmax-temp", type=float, default=1.0)
-    parser.add_argument("--stage2-cycles", type=int, default=2)
-    parser.add_argument("--early-ratio-kr20", type=float, default=0.60)
-    parser.add_argument("--early-ratio-kr90", type=float, default=0.30)
-    parser.add_argument("--use-e2-div-cover", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--e2-topk-offspring", type=int, default=1)
-    parser.add_argument("--e2-steps-per-child", type=int, default=1)
-    parser.add_argument("--e2-r-ratio", type=float, default=0.01)
-    parser.add_argument("--e2-max-pairs", type=int, default=30)
     return parser.parse_args()
 
 
@@ -360,14 +352,6 @@ def select_group_mask(
     repair_pool_m_base: float = 2.0,
     repair_pool_m_slope: float = 3.0,
     repair_softmax_temp: float = 1.0,
-    stage2_cycles: int = 2,
-    early_ratio_kr20: float = 0.60,
-    early_ratio_kr90: float = 0.30,
-    use_e2_div_cover: bool = True,
-    e2_topk_offspring: int = 1,
-    e2_steps_per_child: int = 1,
-    e2_r_ratio: float = 0.01,
-    e2_max_pairs: int = 30,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
         raise ValueError("kr 必须在 1-100 之间。")
@@ -383,8 +367,6 @@ def select_group_mask(
         div_static_np = np.asarray(div_static_scores, dtype=np.float32)
         if div_static_np.shape[0] != num_samples:
             raise ValueError("div_static_scores 与 sa_scores 的样本数不一致。")
-    else:
-        div_static_np = np.zeros(num_samples, dtype=np.float32)
 
     if dds_static_scores is not None:
         dds_static_np = np.asarray(dds_static_scores, dtype=np.float32)
@@ -393,19 +375,11 @@ def select_group_mask(
     else:
         dds_static_np = np.zeros(num_samples, dtype=np.float32)
 
-    weighted_static_has_div = div_static_scores is not None
-    weighted_static_has_dds = dds_static_scores is not None
-
-    if weighted_static_has_div != weighted_static_has_dds:
-        missing_name = "dds_static_scores" if weighted_static_has_div else "div_static_scores"
-        print(f"[Group][weighted_static] Only one static score provided; {missing_name} will be treated as all zeros.")
-
     labels_np = np.asarray(labels, dtype=np.int64)
     all_indices = np.arange(num_samples, dtype=np.int64)
     class_indices_list = [np.flatnonzero(labels_np == class_id).astype(np.int64) for class_id in range(num_classes)]
     labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
-    dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
 
     # Herding-style class-conditional mean preservation uses the same image-side
     # semantic space as Div/DDS: CLIP image encoder + image adapter features.
@@ -445,31 +419,10 @@ def select_group_mask(
     lambda_eps = DEFAULT_EPS
     kr_ratio = target_size / max(1, num_samples)
 
-    local_search_ratio_stage1 = 0.06 - 0.04 * kr_ratio
-    local_search_ratio_stage2 = 0.08 - 0.05 * kr_ratio
-    mutation_ratio_stage1 = 0.01 * (1.0 + 3.0 * (1.0 - kr_ratio))
-    mutation_ratio_stage2 = 0.02 * (1.0 + 1.0 * (1.0 - kr_ratio))
-    crossover_sym_ratio_stage1 = 0.7 - 0.05 * (1 - kr_ratio)
-    crossover_sym_ratio_stage2 = 0.85 - 0.15 * (1 - kr_ratio)
-
-    kr_for_interp = float(np.clip(keep_ratio, 20, 90))
-    early_ratio = early_ratio_kr20 + (kr_for_interp - 20.0) * (early_ratio_kr90 - early_ratio_kr20) / 70.0
-    early_ratio = float(np.clip(early_ratio, 0.30, 0.60))
-    stage2_cycles = max(1, int(stage2_cycles))
-    phase_schedule: list[str] = []
-    base_cycle_len = ga_generations // stage2_cycles
-    rem = ga_generations % stage2_cycles
-    for cycle_idx in range(stage2_cycles):
-        cycle_len = base_cycle_len + (rem if cycle_idx == stage2_cycles - 1 else 0)
-        early_len = int(np.round(cycle_len * early_ratio))
-        early_len = min(cycle_len, max(0, early_len))
-        late_len = cycle_len - early_len
-        phase_schedule.extend(["early"] * early_len)
-        phase_schedule.extend(["late"] * late_len)
-    if len(phase_schedule) < ga_generations:
-        phase_schedule.extend(["late"] * (ga_generations - len(phase_schedule)))
-    elif len(phase_schedule) > ga_generations:
-        phase_schedule = phase_schedule[:ga_generations]
+    # Keep ratio dependent parameters are preserved, while guide score is unified to SA + DDS.
+    local_search_ratio = 0.08 - 0.05 * kr_ratio
+    mutation_ratio = 0.02 * (1.0 + 1.0 * (1.0 - kr_ratio))
+    crossover_sym_ratio = 0.85 - 0.15 * (1 - kr_ratio)
 
     cached_real_stats: dict[bytes, tuple[float, np.ndarray, np.ndarray]] = {}
 
@@ -522,20 +475,11 @@ def select_group_mask(
             ).scores,
             dtype=np.float32,
         )
-        dds_scores = np.asarray(
-            dds_metric.score_dataset_dynamic(
-                dds_loader,
-                adapter=image_adapter,
-                selected_mask=cur_mask,
-                image_features=dds_features,
-                labels=labels_t,
-            ).scores,
-            dtype=np.float32,
-        )
+        # DDS is fixed as a full-dataset static score; only Div remains subset-dynamic.
         s_ref = (
             weights["sa"] * sa_scores_np
             + weights["div"] * div_scores
-            + weights["dds"] * dds_scores
+            + weights["dds"] * dds_static_np
         )
         counts = np.bincount(labels_np[selected], minlength=num_classes).astype(np.int64)
         s_val = float(np.sum(s_ref[selected]))
@@ -555,13 +499,8 @@ def select_group_mask(
         order = np.argsort(-score_np[candidate_idx], kind="mergesort")
         return candidate_idx[order[: min(k, candidate_idx.size)]].astype(np.int64)
 
-    weighted_static_np = (
-        weights["sa"] * sa_scores_np
-        + weights["div"] * div_static_np
-        + weights["dds"] * dds_static_np
-    ).astype(np.float32)
-    if div_static_scores is None or dds_static_scores is None:
-        raise RuntimeError("weighted static scores are required for random repair.")
+    # Unified static guide for GA operators.
+    guide_score_np = (sa_scores_np + dds_static_np).astype(np.float32)
 
     def _stable_softmax_prob(values: np.ndarray, temp: float) -> np.ndarray:
         if values.size == 0:
@@ -605,8 +544,6 @@ def select_group_mask(
             sampled = np.random.choice(pool, size=k, replace=False)
         return sampled.astype(np.int64)
 
-    current_phase = "early"
-
     def _repair_size(indices: np.ndarray, repair_score_np: np.ndarray | None = None) -> np.ndarray:
         del repair_score_np
         unique_idx = np.unique(indices.astype(np.int64))
@@ -615,8 +552,8 @@ def select_group_mask(
         if unique_idx.size == target_size:
             return unique_idx.astype(np.int64)
 
-        rank_score_np = sa_scores_np if current_phase == "early" else weighted_static_np
-        prob_score_np = weighted_static_np if current_phase == "early" else sa_scores_np
+        rank_score_np = guide_score_np
+        prob_score_np = guide_score_np
 
         if not repair_pool_random:
             if unique_idx.size > target_size:
@@ -710,12 +647,7 @@ def select_group_mask(
         b = population[int(chosen[1])]
         return a if float(a["fitness"]) >= float(b["fitness"]) else b
 
-    if np.std(weighted_static_np) <= 1e-12 or np.std(sa_scores_np) <= 1e-12:
-        weighted_static_corr_with_sa = 1.0
-    else:
-        weighted_static_corr_with_sa = float(np.corrcoef(weighted_static_np, sa_scores_np)[0, 1])
-
-    static_topk = _pick_top_by_score(all_indices, target_size, sa_scores_np)
+    static_topk = _pick_top_by_score(all_indices, target_size, guide_score_np)
     lambda_info = get_or_estimate_lambda(
         cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
         dataset=dataset_name,
@@ -754,7 +686,6 @@ def select_group_mask(
         init_idx = np.random.choice(num_samples, size=target_size, replace=False).astype(np.int64)
         initial_population_idx.append(init_idx)
 
-    current_phase = phase_schedule[0] if phase_schedule else "early"
     population = [_evaluate(_repair_size(idx)) for idx in initial_population_idx]
     population.sort(key=lambda item: float(item["fitness"]), reverse=True)
 
@@ -764,16 +695,11 @@ def select_group_mask(
     mean_correction_history: list[float] = []
     mean_penalty_history: list[float] = []
 
-    div_feat_np = div_features_np
-
     generation_iter = tqdm(range(ga_generations), desc="GA Selection", unit="gen")
     for gen_idx in generation_iter:
-        current_phase = phase_schedule[gen_idx]
-        in_stage1 = current_phase == "early"
-        stage_name = current_phase
-        mutation_ratio_eff = mutation_ratio_stage1 if in_stage1 else mutation_ratio_stage2
-        local_search_ratio_eff = local_search_ratio_stage1 if in_stage1 else local_search_ratio_stage2
-        crossover_sym_ratio_eff = crossover_sym_ratio_stage1 if in_stage1 else crossover_sym_ratio_stage2
+        mutation_ratio_eff = mutation_ratio
+        local_search_ratio_eff = local_search_ratio
+        crossover_sym_ratio_eff = crossover_sym_ratio
 
         k_mut = max(1, int(mutation_ratio_eff * target_size))
         k_ls = max(1, int(local_search_ratio_eff * target_size))
@@ -793,12 +719,12 @@ def select_group_mask(
             if child.size < target_size and sym.size > 0:
                 need_sym = max(0, max_from_sym - child.size)
                 if need_sym > 0:
-                    add_sym = _pick_top_by_score(sym, need_sym, sa_scores_np if in_stage1 else weighted_static_np)
+                    add_sym = _pick_top_by_score(sym, need_sym, guide_score_np)
                     child = np.concatenate([child, add_sym])
 
             if child.size < target_size:
                 complement_union = _complement_indices(_indices_union(parent_a_idx, parent_b_idx), membership_buffer)
-                add_comp = _pick_top_by_score(complement_union, target_size - child.size, sa_scores_np if in_stage1 else weighted_static_np)
+                add_comp = _pick_top_by_score(complement_union, target_size - child.size, guide_score_np)
                 child = np.concatenate([child, add_comp])
 
             child = _repair_size(child)
@@ -813,64 +739,10 @@ def select_group_mask(
                 child = np.concatenate([child, add_idx])
                 child = _repair_size(child)
 
-            proxy_scores = np.asarray(
-                parent_a["s_ref"] if float(parent_a["fitness"]) >= float(parent_b["fitness"]) else parent_b["s_ref"],
-                dtype=np.float32,
-            )
             child_k_ls = min(k_ls, child.size, num_samples - child.size)
-            child = _local_search_step(child, proxy_scores, child_k_ls)
+            child = _local_search_step(child, guide_score_np, child_k_ls)
             child = _repair_size(child)
             offspring.append(_evaluate(child))
-
-        if use_e2_div_cover and offspring:
-            offspring_sorted = sorted(offspring, key=lambda item: float(item["fitness"]), reverse=True)
-            top_children = offspring_sorted[: max(0, int(e2_topk_offspring))]
-            for cand in top_children:
-                base_indices = np.asarray(cand["indices"], dtype=np.int64)
-                for _ in range(max(0, int(e2_steps_per_child))):
-                    if base_indices.size == 0 or base_indices.size >= num_samples:
-                        break
-                    r = max(1, int(e2_r_ratio * target_size))
-                    child_feat = div_feat_np[base_indices]
-                    sim_mat = child_feat @ child_feat.T
-                    np.fill_diagonal(sim_mat, -np.inf)
-                    redundancy = np.max(sim_mat, axis=1)
-                    redundancy = np.where(np.isfinite(redundancy), redundancy, -1e9)
-                    drop_k = min(r, base_indices.size)
-                    drop_local = np.argsort(-redundancy)[:drop_k]
-                    drop_cands = base_indices[drop_local]
-
-                    comp = _complement_indices(base_indices, membership_buffer)
-                    if comp.size == 0:
-                        break
-                    comp_feat = div_feat_np[comp]
-                    near_sim = comp_feat @ child_feat.T
-                    novelty = 1.0 - np.max(near_sim, axis=1)
-                    add_k = min(r, comp.size)
-                    add_order = np.argsort(-novelty)[:add_k]
-                    add_cands = comp[add_order]
-                    add_novelty = novelty[add_order]
-
-                    pairs: list[tuple[float, int, int]] = []
-                    for d_idx, d in enumerate(drop_cands):
-                        for a_idx, a in enumerate(add_cands):
-                            delta_hat = float(add_novelty[a_idx] - redundancy[drop_local[d_idx]])
-                            pairs.append((delta_hat, int(d), int(a)))
-                    if not pairs:
-                        break
-                    pairs.sort(key=lambda x: x[0], reverse=True)
-                    pairs = pairs[: max(1, int(e2_max_pairs))]
-                    _, d_best, a_best = pairs[0]
-                    _build_membership(np.asarray([d_best], dtype=np.int64), membership_buffer)
-                    new_child = base_indices[~membership_buffer[base_indices]]
-                    new_child = np.concatenate([new_child, np.asarray([a_best], dtype=np.int64)])
-                    new_child = _repair_size(new_child)
-                    new_eval = _evaluate(new_child)
-                    if float(new_eval["fitness"]) > float(cand["fitness"]):
-                        cand.update(new_eval)
-                        base_indices = np.asarray(cand["indices"], dtype=np.int64)
-                    else:
-                        break
 
         merged = population + offspring
         merged_sorted = sorted(merged, key=lambda item: float(item["fitness"]), reverse=True)
@@ -898,7 +770,7 @@ def select_group_mask(
         mean_penalty_history.append(float(generation_best_item["mean_penalty"]))
         if gen_idx % 5 == 0:
             print(
-                f"[GA] gen={gen_idx:03d} stage={stage_name} "
+                f"[GA] gen={gen_idx:03d} "
                 f"mut={mutation_ratio_eff:.5f} ls={local_search_ratio_eff:.5f} "
                 f"cross={crossover_sym_ratio_eff:.5f}"
             )
@@ -915,10 +787,9 @@ def select_group_mask(
 
     REFINE_MAX_STEPS = 10
     REFINE_EPS = 1e-8
-    refine_ratio = local_search_ratio_stage2 if (phase_schedule and phase_schedule[-1] == "late") else local_search_ratio_stage1
+    refine_ratio = local_search_ratio
     k_ls_refine = min(max(1, int(refine_ratio * target_size)), best_indices.size, max(0, num_samples - best_indices.size))
 
-    current_phase = phase_schedule[-1] if phase_schedule else "late"
     for _ in range(REFINE_MAX_STEPS):
         if k_ls_refine <= 0:
             break
@@ -970,6 +841,9 @@ def select_group_mask(
         "ga_population_size": int(ga_population_size),
         "ga_generations": int(ga_generations),
         "ga_offspring": int(ga_offspring),
+        "mutation_ratio": float(mutation_ratio),
+        "local_search_ratio": float(local_search_ratio),
+        "crossover_sym_ratio": float(crossover_sym_ratio),
         "lambda": lambda_cls,
         "lambda_cls": lambda_cls,
         "lambda_mean": lambda_mean,
@@ -978,18 +852,6 @@ def select_group_mask(
         "lambda_std_cls": float(lambda_std_cls),
         "lambda_std_mean": float(lambda_std_mean),
         "lambda_info": lambda_info,
-        "stage2_cycles": int(stage2_cycles),
-        "phase_schedule": phase_schedule,
-        "early_ratio": float(early_ratio),
-        "mutation_ratio_stage1": float(mutation_ratio_stage1),
-        "local_search_ratio_stage1": float(local_search_ratio_stage1),
-        "crossover_sym_ratio_stage1": float(crossover_sym_ratio_stage1),
-        "mutation_ratio_stage2": float(mutation_ratio_stage2),
-        "local_search_ratio_stage2": float(local_search_ratio_stage2),
-        "crossover_sym_ratio_stage2": float(crossover_sym_ratio_stage2),
-        "weighted_static_has_div": bool(weighted_static_has_div),
-        "weighted_static_has_dds": bool(weighted_static_has_dds),
-        "weighted_static_corr_with_sa": float(weighted_static_corr_with_sa),
     }
 
     return final_mask, selected_by_class, stats
@@ -1198,15 +1060,11 @@ def main() -> None:
         labels = np.asarray(dataset_for_names.targets)
         labels_t = torch.as_tensor(labels, dtype=torch.long, device=device)
         div_features_for_compare = None
-        dds_features_for_compare = None
 
         def compute_subset_dynamic_sum(selected_mask: np.ndarray) -> float:
-            nonlocal div_features_for_compare, dds_features_for_compare
+            nonlocal div_features_for_compare
             if div_features_for_compare is None:
                 div_features_for_compare, _ = div_metric._encode_images(div_loader, image_adapter)
-            if dds_features_for_compare is None:
-                dds_features_for_compare, _ = dds_metric._encode_images(dds_loader, image_adapter)
-
             div_scores_dyn = np.asarray(
                 div_metric.score_dataset_dynamic(
                     div_loader,
@@ -1217,20 +1075,10 @@ def main() -> None:
                 ).scores,
                 dtype=np.float32,
             )
-            dds_scores_dyn = np.asarray(
-                dds_metric.score_dataset_dynamic(
-                    dds_loader,
-                    adapter=image_adapter,
-                    selected_mask=selected_mask,
-                    image_features=dds_features_for_compare,
-                    labels=labels_t,
-                ).scores,
-                dtype=np.float32,
-            )
             subset_scores = (
                 weights["sa"] * sa_scores_np
                 + weights["div"] * div_scores_dyn
-                + weights["dds"] * dds_scores_dyn
+                + weights["dds"] * dds_scores_np
             )
             return float(subset_scores[selected_mask.astype(bool)].sum())
 
@@ -1271,14 +1119,6 @@ def main() -> None:
                     repair_pool_m_base=args.repair_pool_m_base,
                     repair_pool_m_slope=args.repair_pool_m_slope,
                     repair_softmax_temp=args.repair_softmax_temp,
-                    stage2_cycles=args.stage2_cycles,
-                    early_ratio_kr20=args.early_ratio_kr20,
-                    early_ratio_kr90=args.early_ratio_kr90,
-                    use_e2_div_cover=args.use_e2_div_cover,
-                    e2_topk_offspring=args.e2_topk_offspring,
-                    e2_steps_per_child=args.e2_steps_per_child,
-                    e2_r_ratio=args.e2_r_ratio,
-                    e2_max_pairs=args.e2_max_pairs,
                 )
                 debug_curve = save_score_curve_plot(
                     group_stats.get("score_history", []),

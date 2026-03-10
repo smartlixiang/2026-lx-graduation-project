@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seeds", type=str, default="22,42,96")
     parser.add_argument("--output-dir", type=str, default="test")
     parser.add_argument("--mean-linear-a", type=float, default=1.0)
+    parser.add_argument("--class-scale", type=float, default=5.0)
     parser.add_argument("--mean-linear-b", type=float, default=0.0)
     parser.add_argument("--scan-a", type=str, default="")
     parser.add_argument("--scan-b", type=str, default="")
@@ -247,13 +248,11 @@ def compute_subset_base(
     *,
     sa_scores: np.ndarray,
     weights: dict[str, float],
+    dds_scores: np.ndarray,
     div_metric: Div,
-    dds_metric: DifficultyDirection,
     div_loader: DataLoader,
-    dds_loader: DataLoader,
     image_adapter,
     div_features,
-    dds_features,
     labels_t: torch.Tensor,
     labels_np: np.ndarray,
     num_classes: int,
@@ -265,6 +264,7 @@ def compute_subset_base(
     lambda_std_cls: float,
     lambda_std_mean: float,
 ) -> dict[str, float]:
+    # Div remains subset-dynamic; DDS is fixed as static full-dataset cached scores.
     div_dyn = np.asarray(
         div_metric.score_dataset_dynamic(
             div_loader,
@@ -275,18 +275,8 @@ def compute_subset_base(
         ).scores,
         dtype=np.float32,
     )
-    dds_dyn = np.asarray(
-        dds_metric.score_dataset_dynamic(
-            dds_loader,
-            adapter=image_adapter,
-            selected_mask=selected_mask,
-            image_features=dds_features,
-            labels=labels_t,
-        ).scores,
-        dtype=np.float32,
-    )
     chosen = selected_mask.astype(bool)
-    score_ref = weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_dyn
+    score_ref = weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_scores
     raw_score = float(np.sum(score_ref[chosen]))
     class_penalty_raw = compute_balance_penalty(selected_mask, labels_np, num_classes, target_size)
     mean_penalty_raw = compute_mean_penalty(
@@ -315,14 +305,15 @@ def mean_scale_from_linear(a: float, b: float, kr: int) -> float:
     return float(max(0.0, a - b * float(kr)))
 
 
-def finalize_scores(base_row: dict[str, float], mean_scale: float) -> dict[str, float]:
-    class_correction = float(base_row["class_base"])
+def finalize_scores(base_row: dict[str, float], mean_scale: float, class_scale: float) -> dict[str, float]:
+    class_correction = float(class_scale * base_row["class_base"])
     mean_correction = float(mean_scale * base_row["mean_base"])
     adjusted_score = float(base_row["raw_score"] - class_correction - mean_correction)
     out = dict(base_row)
     out.update(
         {
             "mean_scale": float(mean_scale),
+            "class_scale": float(class_scale),
             "class_correction": class_correction,
             "mean_correction": mean_correction,
             "adjusted_score": adjusted_score,
@@ -541,9 +532,9 @@ def main() -> None:
     dataset_plain = _build_dataset(args.dataset, transform=None)
     class_names = dataset_plain.classes  # type: ignore[attr-defined]
     labels_np = np.asarray(dataset_plain.targets, dtype=np.int64)
+    labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
     n_samples = int(labels_np.shape[0])
     num_classes = int(len(class_names))
-    labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
 
     weights_path = PROJECT_ROOT / "weights" / "scoring_weights.json"
     all_weights = ensure_scoring_weights(weights_path, args.dataset)
@@ -552,8 +543,8 @@ def main() -> None:
     div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
     sa_metric = SemanticAlignment(class_names=class_names, clip_model=args.clip_model, device=device)
 
-    dds_loader = build_loader(args.dataset, dds_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
     div_loader = build_loader(args.dataset, div_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
+    dds_loader = build_loader(args.dataset, dds_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
     sa_loader = build_loader(args.dataset, sa_metric.extractor.preprocess, device, args.batch_size, args.num_workers)
 
     adapter_seed = int(seeds[0])
@@ -598,9 +589,9 @@ def main() -> None:
         compute_fn=_compute_scores,
     )
     sa_scores = np.asarray(static_scores["sa"], dtype=np.float32)
+    dds_scores = np.asarray(static_scores["dds"], dtype=np.float32)
 
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
-    dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
     div_features_np = (
         div_features.detach().cpu().numpy() if isinstance(div_features, torch.Tensor) else np.asarray(div_features)
     ).astype(np.float32)
@@ -643,13 +634,11 @@ def main() -> None:
                 random_mask,
                 sa_scores=sa_scores,
                 weights=weights,
+                dds_scores=dds_scores,
                 div_metric=div_metric,
-                dds_metric=dds_metric,
                 div_loader=div_loader,
-                dds_loader=dds_loader,
                 image_adapter=image_adapter,
                 div_features=div_features,
-                dds_features=dds_features,
                 labels_t=labels_t,
                 labels_np=labels_np,
                 num_classes=num_classes,
@@ -672,13 +661,11 @@ def main() -> None:
                         mask,
                         sa_scores=sa_scores,
                         weights=weights,
+                        dds_scores=dds_scores,
                         div_metric=div_metric,
-                        dds_metric=dds_metric,
                         div_loader=div_loader,
-                        dds_loader=dds_loader,
                         image_adapter=image_adapter,
                         div_features=div_features,
-                        dds_features=dds_features,
                         labels_t=labels_t,
                         labels_np=labels_np,
                         num_classes=num_classes,
@@ -716,7 +703,7 @@ def main() -> None:
                     if k != "seed"
                 }
 
-            finalized = finalize_scores(base_avg, mean_scale)
+            finalized = finalize_scores(base_avg, mean_scale, args.class_scale)
             table_rows.append((method, finalized))
             per_method_agg[method] = finalized
             summary_rows.append(
@@ -731,7 +718,7 @@ def main() -> None:
             for per_seed_base in vals:
                 seed_value = int(per_seed_base.get("seed", -1))
                 per_seed_core = {k: v for k, v in per_seed_base.items() if k != "seed"}
-                final_seed = finalize_scores(per_seed_core, mean_scale)
+                final_seed = finalize_scores(per_seed_core, mean_scale, args.class_scale)
                 diagnostics_rows.append(
                     {
                         "dataset": args.dataset,
@@ -790,6 +777,7 @@ def main() -> None:
                 "class_base",
                 "mean_base",
                 "mean_scale",
+                "class_scale",
                 "class_correction",
                 "mean_correction",
                 "adjusted_score",
@@ -810,6 +798,7 @@ def main() -> None:
                 "class_base",
                 "mean_base",
                 "mean_scale",
+                "class_scale",
                 "class_correction",
                 "mean_correction",
                 "adjusted_score",
@@ -871,7 +860,7 @@ def main() -> None:
                     if method not in summary_by_kr_method[kr]:
                         continue
                     base = summary_by_kr_method[kr][method]
-                    score_vals[method] = float(base["raw_score"] - base["class_base"] - mean_scale_scan * base["mean_base"])
+                    score_vals[method] = float(base["raw_score"] - args.class_scale * base["class_base"] - mean_scale_scan * base["mean_base"])
                 if acc_data and str(kr) in acc_data:
                     acc_vals = acc_data[str(kr)]
                     sp = spearman_corr(acc_vals, score_vals)
@@ -915,11 +904,11 @@ def main() -> None:
 
     print("\nExample commands:")
     print(
-        "python test.py --dataset cifar100 --mean-linear-a 3.0 --mean-linear-b 0.03 "
+        "python test.py --dataset cifar100 --class-scale 5 --mean-linear-a 7.0 --mean-linear-b 0.06 "
         "--acc-source test/cifar100_acc.json --save-diagnostics"
     )
     print(
-        "python test.py --dataset cifar100 --scan-a 1.0,2.0,3.0,4.0 --scan-b 0.0,0.01,0.02,0.03,0.04 "
+        "python test.py --dataset cifar100 --class-scale 5 --scan-a 4,5,6,7,8,9,10 --scan-b 0.03,0.04,0.05,0.06,0.07,0.08,0.09 "
         "--acc-source test/cifar100_acc.json --save-diagnostics"
     )
 

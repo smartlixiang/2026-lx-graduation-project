@@ -38,7 +38,7 @@ FIXED_SEED = 42
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="计算 CIFAR10 在 kr=20..90 下 topk 与 group_old 的子集评分（Div/DDS 在子集上动态计算）"
+        description="计算 CIFAR10 在 kr=20..90 下 topk 与 group_old 的子集评分（Div 动态，DDS 静态）"
     )
     parser.add_argument("--dataset", type=str, default=CIFAR10, choices=[CIFAR10, CIFAR100])
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
@@ -238,12 +238,10 @@ def compute_subset_score(
     labels_t: torch.Tensor,
     weights: dict[str, float],
     div_metric: Div,
-    dds_metric: DifficultyDirection,
+    dds_scores: np.ndarray,
     div_loader: DataLoader,
-    dds_loader: DataLoader,
     image_adapter,
     div_features,
-    dds_features,
     lambda_cls: float,
     lambda_mean: float,
     labels_np: np.ndarray,
@@ -264,20 +262,10 @@ def compute_subset_score(
         ).scores,
         dtype=np.float32,
     )
-    dds_dyn = np.asarray(
-        dds_metric.score_dataset_dynamic(
-            dds_loader,
-            adapter=image_adapter,
-            selected_mask=selected_mask,
-            image_features=dds_features,
-            labels=labels_t,
-        ).scores,
-        dtype=np.float32,
-    )
     chosen = selected_mask.astype(bool)
     div_sum = float(div_dyn[chosen].sum())
-    dds_sum = float(dds_dyn[chosen].sum())
-    total = float((weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_dyn)[chosen].sum())
+    dds_sum = float(dds_scores[chosen].sum())
+    total = float((weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_scores)[chosen].sum())
     penalty = compute_balance_penalty(selected_mask, labels_np, num_classes, target_size)
     mean_penalty = compute_mean_penalty(
         selected_mask,
@@ -301,12 +289,10 @@ def select_group_old_best(
     labels_t: torch.Tensor,
     weights: dict[str, float],
     div_metric: Div,
-    dds_metric: DifficultyDirection,
+    dds_scores: np.ndarray,
     div_loader: DataLoader,
-    dds_loader: DataLoader,
     image_adapter,
     div_features,
-    dds_features,
     lambda_cls: float,
     lambda_mean: float,
     labels_np: np.ndarray,
@@ -327,12 +313,10 @@ def select_group_old_best(
         labels_t=labels_t,
         weights=weights,
         div_metric=div_metric,
-        dds_metric=dds_metric,
+        dds_scores=dds_scores,
         div_loader=div_loader,
-        dds_loader=dds_loader,
         image_adapter=image_adapter,
         div_features=div_features,
-        dds_features=dds_features,
         lambda_cls=lambda_cls,
         lambda_mean=lambda_mean,
         labels_np=labels_np,
@@ -356,17 +340,7 @@ def select_group_old_best(
             ).scores,
             dtype=np.float32,
         )
-        dds_dyn = np.asarray(
-            dds_metric.score_dataset_dynamic(
-                dds_loader,
-                adapter=image_adapter,
-                selected_mask=cur_mask,
-                image_features=dds_features,
-                labels=labels_t,
-            ).scores,
-            dtype=np.float32,
-        )
-        total_scores = weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_dyn
+        total_scores = weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_scores
         next_mask = select_global_topk(total_scores, keep_ratio=keep_ratio)
         cur_mask = next_mask
 
@@ -376,12 +350,10 @@ def select_group_old_best(
             labels_t=labels_t,
             weights=weights,
             div_metric=div_metric,
-            dds_metric=dds_metric,
+            dds_scores=dds_scores,
             div_loader=div_loader,
-            dds_loader=dds_loader,
             image_adapter=image_adapter,
             div_features=div_features,
-            dds_features=dds_features,
             lambda_cls=lambda_cls,
             lambda_mean=lambda_mean,
             labels_np=labels_np,
@@ -481,7 +453,6 @@ def main() -> None:
 
     start = time.perf_counter()
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
-    dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
     div_features_np = (
         div_features.detach().cpu().numpy() if isinstance(div_features, torch.Tensor) else np.asarray(div_features)
     ).astype(np.float32)
@@ -518,12 +489,10 @@ def main() -> None:
                 labels_t=labels_t,
                 weights=weights,
                 div_metric=div_metric,
-                dds_metric=dds_metric,
+                dds_scores=dds_scores,
                 div_loader=div_loader,
-                dds_loader=dds_loader,
                 image_adapter=image_adapter,
                 div_features=div_features,
-                dds_features=dds_features,
                 lambda_cls=0.0,
                 lambda_mean=0.0,
                 labels_np=labels,
@@ -562,12 +531,10 @@ def main() -> None:
             labels_t=labels_t,
             weights=weights,
             div_metric=div_metric,
-            dds_metric=dds_metric,
+            dds_scores=dds_scores,
             div_loader=div_loader,
-            dds_loader=dds_loader,
             image_adapter=image_adapter,
             div_features=div_features,
-            dds_features=dds_features,
             lambda_cls=lambda_topk_cls,
             lambda_mean=lambda_topk_mean,
             labels_np=labels,
@@ -599,12 +566,10 @@ def main() -> None:
                     labels_t=labels_t,
                     weights=weights,
                     div_metric=div_metric,
-                    dds_metric=dds_metric,
+                    dds_scores=dds_scores,
                     div_loader=div_loader,
-                    dds_loader=dds_loader,
                     image_adapter=image_adapter,
                     div_features=div_features,
-                    dds_features=dds_features,
                     lambda_cls=0.0,
                     lambda_mean=0.0,
                     labels_np=labels,
@@ -642,12 +607,10 @@ def main() -> None:
                     labels_t=labels_t,
                     weights=weights,
                     div_metric=div_metric,
-                    dds_metric=dds_metric,
+                    dds_scores=dds_scores,
                     div_loader=div_loader,
-                    dds_loader=dds_loader,
                     image_adapter=image_adapter,
                     div_features=div_features,
-                    dds_features=dds_features,
                     lambda_cls=lambda_seed_cls,
                     lambda_mean=lambda_seed_mean,
                     labels_np=labels,
@@ -669,12 +632,10 @@ def main() -> None:
                 labels_t=labels_t,
                 weights=weights,
                 div_metric=div_metric,
-                dds_metric=dds_metric,
+                dds_scores=dds_scores,
                 div_loader=div_loader,
-                dds_loader=dds_loader,
                 image_adapter=image_adapter,
                 div_features=div_features,
-                dds_features=dds_features,
                 lambda_cls=lambda_seed_cls,
                 lambda_mean=lambda_seed_mean,
                 labels_np=labels,
@@ -707,12 +668,10 @@ def main() -> None:
                             labels_t=labels_t,
                             weights=weights,
                             div_metric=div_metric,
-                            dds_metric=dds_metric,
+                            dds_scores=dds_scores,
                             div_loader=div_loader,
-                            dds_loader=dds_loader,
                             image_adapter=image_adapter,
                             div_features=div_features,
-                            dds_features=dds_features,
                             lambda_cls=lambda_seed_cls,
                             lambda_mean=lambda_seed_mean,
                             labels_np=labels,

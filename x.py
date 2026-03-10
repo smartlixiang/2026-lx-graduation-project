@@ -38,7 +38,7 @@ FIXED_SEED = 42
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="计算 CIFAR10 在 kr=20..90 下 topk 与 group_old 的子集评分（Div 动态，DDS 静态）"
+        description="计算 CIFAR10 在 kr=20..90 下 topk 与 group_old 的子集评分（Div 动态，SA/DDS 静态）"
     )
     parser.add_argument("--dataset", type=str, default=CIFAR10, choices=[CIFAR10, CIFAR100])
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
@@ -447,8 +447,12 @@ def main() -> None:
     )
 
     sa_scores = np.asarray(static_scores["sa"], dtype=np.float32)
-    div_scores = np.asarray(static_scores["div"], dtype=np.float32)
     dds_scores = np.asarray(static_scores["dds"], dtype=np.float32)
+    div_scores = np.asarray(static_scores["div"], dtype=np.float32)
+    if sa_scores.ndim != 1 or dds_scores.ndim != 1:
+        raise ValueError("Cached SA/DDS scores must be 1D full-length arrays.")
+    if not (sa_scores.shape == dds_scores.shape == div_scores.shape == (len(dataset_for_names),)):
+        raise ValueError("Cached static scores shape mismatch with dataset size.")
     total_static = weights["sa"] * sa_scores + weights["div"] * div_scores + weights["dds"] * dds_scores
 
     start = time.perf_counter()
@@ -518,8 +522,12 @@ def main() -> None:
             eps=lambda_eps,
             tqdm_desc=f"Estimating lambda (seed={FIXED_SEED}, kr={kr})",
         )
-        lambda_topk_cls = float(lambda_info_topk.get("lambda_cls", lambda_info_topk["lambda"]))
-        lambda_topk_mean = float(lambda_info_topk["lambda_mean"])
+        lambda_topk_cls = 5.0 * float(lambda_info_topk["lambda_std_cls"])
+        if args.dataset == CIFAR10:
+            mean_scale_topk = max(0.0, 4.6 - 0.04 * float(kr))
+        else:
+            mean_scale_topk = max(0.0, 7.5 - 0.05 * float(kr))
+        lambda_topk_mean = mean_scale_topk * float(lambda_info_topk["lambda_std_mean"])
         print(
             f"[Lambda] dataset={args.dataset} | seed={FIXED_SEED} | kr={kr} "
             f"| lambda_cls={lambda_topk_cls:.8f} | lambda_mean={lambda_topk_mean:.8f}"
@@ -595,8 +603,12 @@ def main() -> None:
                 eps=lambda_eps,
                 tqdm_desc=f"Estimating lambda (seed={seed}, kr={kr})",
             )
-            lambda_seed_cls = float(lambda_info_seed.get("lambda_cls", lambda_info_seed["lambda"]))
-            lambda_seed_mean = float(lambda_info_seed["lambda_mean"])
+            lambda_seed_cls = 5.0 * float(lambda_info_seed["lambda_std_cls"])
+            if args.dataset == CIFAR10:
+                mean_scale_seed = max(0.0, 4.6 - 0.04 * float(kr))
+            else:
+                mean_scale_seed = max(0.0, 7.5 - 0.05 * float(kr))
+            lambda_seed_mean = mean_scale_seed * float(lambda_info_seed["lambda_std_mean"])
 
             random_repeat = 2
             for rep_idx in range(random_repeat):

@@ -113,9 +113,9 @@ def _get_group_penalty_scales(dataset_name: str, keep_ratio: int) -> tuple[float
     """Return fixed penalty scales used by group mode."""
     dataset_key = dataset_name.strip().lower()
     if dataset_key == CIFAR10:
-        scale_mean = max(0.0, 3.0 - 0.03 * float(keep_ratio))
+        scale_mean = max(0.0, 4.6 - 0.04 * float(keep_ratio))
     elif dataset_key == CIFAR100:
-        scale_mean = max(0.0, 7.0 - 0.06 * float(keep_ratio))
+        scale_mean = max(0.0, 7.5 - 0.05 * float(keep_ratio))
     else:
         raise ValueError(f"Unsupported dataset for group penalty scaling: {dataset_name}")
     scale_cls = 5.0

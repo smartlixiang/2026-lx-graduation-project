@@ -38,11 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mean-linear-b", type=float, default=None)
     parser.add_argument("--acc-source", type=str, default="")
     parser.add_argument("--save-diagnostics", action="store_true")
+    parser.add_argument("--class-scale", type=float, default=5.0)
     return parser.parse_args()
 def resolve_dataset_linear_params(dataset: str, a: float | None, b: float | None) -> tuple[float, float]:
     defaults = {
-        CIFAR10: (3.0, 0.03),
-        CIFAR100: (7.0, 0.06),
+        CIFAR10: (4.8, 0.05),
+        CIFAR100: (7.5, 0.05),
     }
     da, db = defaults[dataset]
     return (da if a is None else float(a), db if b is None else float(b))
@@ -214,14 +215,12 @@ def compute_subset_base(
     selected_mask: np.ndarray,
     *,
     sa_scores: np.ndarray,
+    dds_scores: np.ndarray,
     weights: dict[str, float],
     div_metric: Div,
-    dds_metric: DifficultyDirection,
     div_loader: DataLoader,
-    dds_loader: DataLoader,
     image_adapter,
     div_features,
-    dds_features,
     labels_t: torch.Tensor,
     labels_np: np.ndarray,
     num_classes: int,
@@ -243,18 +242,8 @@ def compute_subset_base(
         ).scores,
         dtype=np.float32,
     )
-    dds_dyn = np.asarray(
-        dds_metric.score_dataset_dynamic(
-            dds_loader,
-            adapter=image_adapter,
-            selected_mask=selected_mask,
-            image_features=dds_features,
-            labels=labels_t,
-        ).scores,
-        dtype=np.float32,
-    )
     chosen = selected_mask.astype(bool)
-    score_ref = weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_dyn
+    score_ref = weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_scores
     raw_score = float(np.sum(score_ref[chosen]))
     class_penalty_raw = compute_balance_penalty(selected_mask, labels_np, num_classes, target_size)
     mean_penalty_raw = compute_mean_penalty(
@@ -279,13 +268,14 @@ def compute_subset_base(
     }
 def mean_scale_from_linear(a: float, b: float, kr: int) -> float:
     return float(max(0.0, a - b * float(kr)))
-def finalize_scores(base_row: dict[str, float], mean_scale: float) -> dict[str, float]:
-    class_correction = float(base_row["class_base"])
+def finalize_scores(base_row: dict[str, float], class_scale: float, mean_scale: float) -> dict[str, float]:
+    class_correction = float(class_scale * base_row["class_base"])
     mean_correction = float(mean_scale * base_row["mean_base"])
     adjusted_score = float(base_row["raw_score"] - class_correction - mean_correction)
     out = dict(base_row)
     out.update(
         {
+            "class_scale": float(class_scale),
             "mean_scale": float(mean_scale),
             "class_correction": class_correction,
             "mean_correction": mean_correction,
@@ -297,7 +287,7 @@ def print_table(kr: int, rows: list[tuple[str, dict[str, float]]]) -> None:
     print(f"\n=== KR={kr} ===")
     header = (
         f"{'method':<16}{'raw_score':>14}{'class_base':>14}{'mean_base':>14}"
-        f"{'mean_scale':>13}{'class_corr':>14}{'mean_corr':>14}{'adjusted':>14}"
+        f"{'class_scale':>13}{'mean_scale':>13}{'class_corr':>14}{'mean_corr':>14}{'adjusted':>14}"
     )
     print(header)
     print("-" * len(header))
@@ -307,6 +297,7 @@ def print_table(kr: int, rows: list[tuple[str, dict[str, float]]]) -> None:
             f"{vals['raw_score']:>14.4f}"
             f"{vals['class_base']:>14.4f}"
             f"{vals['mean_base']:>14.4f}"
+            f"{vals['class_scale']:>13.4f}"
             f"{vals['mean_scale']:>13.4f}"
             f"{vals['class_correction']:>14.4f}"
             f"{vals['mean_correction']:>14.4f}"
@@ -497,8 +488,8 @@ def main() -> None:
         compute_fn=_compute_scores,
     )
     sa_scores = np.asarray(static_scores["sa"], dtype=np.float32)
+    dds_scores = np.asarray(static_scores["dds"], dtype=np.float32)
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
-    dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
     div_features_np = (
         div_features.detach().cpu().numpy() if isinstance(div_features, torch.Tensor) else np.asarray(div_features)
     ).astype(np.float32)
@@ -608,7 +599,7 @@ def main() -> None:
                     for k in vals[0].keys()
                     if k != "seed"
                 }
-            finalized = finalize_scores(base_avg, mean_scale)
+            finalized = finalize_scores(base_avg, args.class_scale, mean_scale)
             table_rows.append((method, finalized))
             per_method_agg[method] = finalized
             summary_rows.append(
@@ -622,7 +613,7 @@ def main() -> None:
             for per_seed_base in vals:
                 seed_value = int(per_seed_base.get("seed", -1))
                 per_seed_core = {k: v for k, v in per_seed_base.items() if k != "seed"}
-                final_seed = finalize_scores(per_seed_core, mean_scale)
+                final_seed = finalize_scores(per_seed_core, args.class_scale, mean_scale)
                 diagnostics_rows.append(
                     {
                         "dataset": args.dataset,
@@ -677,6 +668,7 @@ def main() -> None:
                 "lambda_std_mean",
                 "class_base",
                 "mean_base",
+                "class_scale",
                 "mean_scale",
                 "class_correction",
                 "mean_correction",
@@ -697,6 +689,7 @@ def main() -> None:
                 "lambda_std_mean",
                 "class_base",
                 "mean_base",
+                "class_scale",
                 "mean_scale",
                 "class_correction",
                 "mean_correction",
@@ -740,7 +733,7 @@ def main() -> None:
         print("[Info] --acc-source empty, skip rank consistency analysis.")
     print("\nExample commands:")
     print(
-        "python test_final.py --dataset cifar10 --acc-source test/cifar10_acc.json --save-diagnostics"
+        "python test_final.py --dataset cifar10 --class-scale 5.0 --mean-linear-a 4.8 --mean-linear-b 0.05 --acc-source test/cifar10_acc.json --save-diagnostics"
     )
     print(
         "python test_final.py --dataset cifar100 --acc-source test/cifar100_acc.json --save-diagnostics"

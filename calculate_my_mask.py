@@ -388,6 +388,8 @@ def select_group_mask(
         print(f"[Group][weighted_static] Only one static score provided; {missing_name} will be treated as all zeros.")
 
     labels_np = np.asarray(labels, dtype=np.int64)
+    all_indices = np.arange(num_samples, dtype=np.int64)
+    class_indices_list = [np.flatnonzero(labels_np == class_id).astype(np.int64) for class_id in range(num_classes)]
     labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
     dds_features, _ = dds_metric._encode_images(dds_loader, image_adapter)
@@ -410,6 +412,11 @@ def select_group_mask(
         labels=labels_np,
         num_classes=num_classes,
     )
+    class_features_list = [div_features_np[class_indices] for class_indices in class_indices_list]
+
+    membership_buffer = np.zeros(num_samples, dtype=bool)
+    membership_buffer_b = np.zeros(num_samples, dtype=bool)
+    membership_work_buffer = np.zeros(num_samples, dtype=bool)
 
     target_size = int(round(sr * num_samples))
     if num_samples > 0:
@@ -451,13 +458,47 @@ def select_group_mask(
     elif len(phase_schedule) > ga_generations:
         phase_schedule = phase_schedule[:ga_generations]
 
-    cached_real_stats: dict[tuple[int, ...], tuple[float, np.ndarray, np.ndarray]] = {}
+    cached_real_stats: dict[bytes, tuple[float, np.ndarray, np.ndarray]] = {}
+
+    def _mask_cache_key(cur_mask: np.ndarray) -> bytes:
+        # Performance optimization: stable/compact key while keeping exact mask semantics.
+        return np.asarray(cur_mask, dtype=np.uint8).tobytes()
+
+    def _build_membership(indices: np.ndarray, out_buffer: np.ndarray) -> np.ndarray:
+        out_buffer.fill(False)
+        if indices.size > 0:
+            out_buffer[indices] = True
+        return out_buffer
+
+    def _complement_indices(indices: np.ndarray, out_buffer: np.ndarray) -> np.ndarray:
+        _build_membership(indices, out_buffer)
+        return all_indices[~out_buffer]
+
+    def _dedup_sorted(indices: np.ndarray) -> np.ndarray:
+        return np.unique(indices.astype(np.int64))
+
+    def _indices_intersection(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        _build_membership(a, membership_buffer)
+        return b[membership_buffer[b]]
+
+    def _indices_symmetric_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        _build_membership(a, membership_buffer)
+        _build_membership(b, membership_buffer_b)
+        np.logical_xor(membership_buffer, membership_buffer_b, out=membership_work_buffer)
+        return all_indices[membership_work_buffer]
+
+    def _indices_union(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        _build_membership(a, membership_buffer)
+        _build_membership(b, membership_buffer_b)
+        np.logical_or(membership_buffer, membership_buffer_b, out=membership_work_buffer)
+        return all_indices[membership_work_buffer]
 
     def _real_stats_cached(cur_mask: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
-        cur_key = tuple(np.flatnonzero(cur_mask).tolist())
+        cur_key = _mask_cache_key(cur_mask)
         cached = cached_real_stats.get(cur_key)
         if cached is not None:
             return cached
+        selected = cur_mask.astype(bool)
         div_scores = np.asarray(
             div_metric.score_dataset_dynamic(
                 div_loader,
@@ -483,8 +524,8 @@ def select_group_mask(
             + weights["div"] * div_scores
             + weights["dds"] * dds_scores
         )
-        counts = np.bincount(labels_np[cur_mask.astype(bool)], minlength=num_classes).astype(np.int64)
-        s_val = float(np.sum(s_ref[cur_mask.astype(bool)]))
+        counts = np.bincount(labels_np[selected], minlength=num_classes).astype(np.int64)
+        s_val = float(np.sum(s_ref[selected]))
         result = (s_val, s_ref, counts)
         cached_real_stats[cur_key] = result
         return result
@@ -567,7 +608,7 @@ def select_group_mask(
         if not repair_pool_random:
             if unique_idx.size > target_size:
                 return _pick_top_by_score(unique_idx, target_size, rank_score_np)
-            comp = np.setdiff1d(np.arange(num_samples, dtype=np.int64), unique_idx, assume_unique=False)
+            comp = _complement_indices(unique_idx, membership_buffer)
             fill = _pick_top_by_score(comp, target_size - unique_idx.size, rank_score_np)
             return np.concatenate([unique_idx, fill]).astype(np.int64)
 
@@ -579,13 +620,16 @@ def select_group_mask(
         if unique_idx.size > target_size:
             return _sample_from_pool(unique_idx, max(1, min(k_pool, unique_idx.size)), rank_score_np, prob_score_np, target_size, repair_softmax_temp)
 
-        comp = np.setdiff1d(np.arange(num_samples, dtype=np.int64), unique_idx, assume_unique=False)
+        comp = _complement_indices(unique_idx, membership_buffer)
         need = target_size - unique_idx.size
         fill = _sample_from_pool(comp, max(1, min(k_pool, comp.size)), rank_score_np, prob_score_np, need, repair_softmax_temp)
-        repaired = np.unique(np.concatenate([unique_idx, fill]))
+        repaired = _dedup_sorted(np.concatenate([unique_idx, fill]))
         if repaired.size < target_size:
-            extra = _pick_top_by_score(np.setdiff1d(np.arange(num_samples, dtype=np.int64), repaired,
-                                       assume_unique=False), target_size - repaired.size, rank_score_np)
+            extra = _pick_top_by_score(
+                _complement_indices(repaired, membership_buffer),
+                target_size - repaired.size,
+                rank_score_np,
+            )
             repaired = np.concatenate([repaired, extra])
         if repaired.size > target_size:
             repaired = _sample_from_pool(repaired, repaired.size, rank_score_np, prob_score_np, target_size, repair_softmax_temp)
@@ -597,12 +641,16 @@ def select_group_mask(
         selected = cur_mask.astype(bool)
         penalty_sum = 0.0
         for class_id in range(num_classes):
-            class_sel_mask = selected & (labels_np == class_id)
-            count = int(np.sum(class_sel_mask))
+            class_indices = class_indices_list[class_id]
+            if class_indices.size == 0:
+                continue
+            class_selected = selected[class_indices]
+            count = int(np.sum(class_selected))
             if count <= 0:
                 # Robust fallback for degenerate subsets.
                 continue
-            subset_mean = np.mean(div_features_np[class_sel_mask], axis=0, dtype=np.float32)
+            subset_sum = np.sum(class_features_list[class_id][class_selected], axis=0, dtype=np.float32)
+            subset_mean = subset_sum / float(count)
             diff = subset_mean - full_class_mean[class_id]
             dist2 = float(np.dot(diff, diff))
             penalty_sum += dist2 / (float(full_class_var[class_id]) + lambda_eps)
@@ -654,7 +702,7 @@ def select_group_mask(
     else:
         weighted_static_corr_with_sa = float(np.corrcoef(weighted_static_np, sa_scores_np)[0, 1])
 
-    static_topk = _pick_top_by_score(np.arange(num_samples, dtype=np.int64), target_size, sa_scores_np)
+    static_topk = _pick_top_by_score(all_indices, target_size, sa_scores_np)
     lambda_info = get_or_estimate_lambda(
         cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
         dataset=dataset_name,
@@ -708,8 +756,8 @@ def select_group_mask(
             parent_a_idx = np.asarray(parent_a["indices"], dtype=np.int64)
             parent_b_idx = np.asarray(parent_b["indices"], dtype=np.int64)
 
-            inter = np.intersect1d(parent_a_idx, parent_b_idx, assume_unique=False)
-            sym = np.setdiff1d(np.union1d(parent_a_idx, parent_b_idx), inter, assume_unique=False)
+            inter = _indices_intersection(parent_a_idx, parent_b_idx)
+            sym = _indices_symmetric_diff(parent_a_idx, parent_b_idx)
             child = inter.copy()
 
             max_from_sym = min(target_size, inter.size + int(np.floor(crossover_sym_ratio_eff * target_size)))
@@ -720,11 +768,7 @@ def select_group_mask(
                     child = np.concatenate([child, add_sym])
 
             if child.size < target_size:
-                complement_union = np.setdiff1d(
-                    np.arange(num_samples, dtype=np.int64),
-                    np.union1d(parent_a_idx, parent_b_idx),
-                    assume_unique=False,
-                )
+                complement_union = _complement_indices(_indices_union(parent_a_idx, parent_b_idx), membership_buffer)
                 add_comp = _pick_top_by_score(complement_union, target_size - child.size, sa_scores_np if in_stage1 else weighted_static_np)
                 child = np.concatenate([child, add_comp])
 
@@ -733,9 +777,10 @@ def select_group_mask(
             child_k_mut = min(k_mut, child.size, num_samples - child.size)
             if child_k_mut > 0:
                 drop_idx = np.random.choice(child, size=child_k_mut, replace=False).astype(np.int64)
-                comp_child = np.setdiff1d(np.arange(num_samples, dtype=np.int64), child, assume_unique=False)
+                comp_child = _complement_indices(child, membership_buffer)
                 add_idx = np.random.choice(comp_child, size=child_k_mut, replace=False).astype(np.int64)
-                child = np.setdiff1d(child, drop_idx, assume_unique=False)
+                _build_membership(drop_idx, membership_buffer)
+                child = child[~membership_buffer[child]]
                 child = np.concatenate([child, add_idx])
                 child = _repair_size(child)
 
@@ -766,7 +811,7 @@ def select_group_mask(
                     drop_local = np.argsort(-redundancy)[:drop_k]
                     drop_cands = base_indices[drop_local]
 
-                    comp = np.setdiff1d(np.arange(num_samples, dtype=np.int64), base_indices, assume_unique=False)
+                    comp = _complement_indices(base_indices, membership_buffer)
                     if comp.size == 0:
                         break
                     comp_feat = div_feat_np[comp]
@@ -787,7 +832,8 @@ def select_group_mask(
                     pairs.sort(key=lambda x: x[0], reverse=True)
                     pairs = pairs[: max(1, int(e2_max_pairs))]
                     _, d_best, a_best = pairs[0]
-                    new_child = np.setdiff1d(base_indices, np.asarray([d_best], dtype=np.int64), assume_unique=False)
+                    _build_membership(np.asarray([d_best], dtype=np.int64), membership_buffer)
+                    new_child = base_indices[~membership_buffer[base_indices]]
                     new_child = np.concatenate([new_child, np.asarray([a_best], dtype=np.int64)])
                     new_child = _repair_size(new_child)
                     new_eval = _evaluate(new_child)
@@ -800,9 +846,9 @@ def select_group_mask(
         merged = population + offspring
         merged_sorted = sorted(merged, key=lambda item: float(item["fitness"]), reverse=True)
         dedup_population: list[dict[str, object]] = []
-        seen: set[tuple[int, ...]] = set()
+        seen: set[bytes] = set()
         for item in merged_sorted:
-            key = tuple(np.asarray(item["indices"], dtype=np.int64).tolist())
+            key = np.asarray(item["indices"], dtype=np.int64).tobytes()
             if key in seen:
                 continue
             seen.add(key)
@@ -869,7 +915,7 @@ def select_group_mask(
 
     selected_by_class: dict[int, int] = {}
     for class_id in range(num_classes):
-        class_indices = np.flatnonzero(labels == class_id)
+        class_indices = class_indices_list[class_id]
         if class_indices.size == 0:
             selected_by_class[class_id] = 0
             continue

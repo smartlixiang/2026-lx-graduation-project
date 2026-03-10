@@ -11,10 +11,10 @@
     "lambda_std_mean": 420.9683694070252,
     "class_base": 2.4190047346903714,
     "mean_base": 3.7726605196153216,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 2.4190047346903714,
-    "mean_correction": 3.7726605196153216,
-    "adjusted_score": 3733.161362089444
+    "mean_correction": 9.054385247076771,
+    "adjusted_score": 3727.8796373619825
   },
   {
     "dataset": "cifar10",
@@ -28,10 +28,10 @@
     "lambda_std_mean": 439.2302026449874,
     "class_base": 2.9358127824688385,
     "mean_base": 3.913465331071302,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 2.9358127824688385,
-    "mean_correction": 3.913465331071302,
-    "adjusted_score": 3727.83529219896
+    "mean_correction": 9.392316794571125,
+    "adjusted_score": 3722.3564407354597
   },
   {
     "dataset": "cifar10",
@@ -45,10 +45,10 @@
     "lambda_std_mean": 464.32578579522345,
     "class_base": 2.742790539485383,
     "mean_base": 3.599808263714628,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 2.742790539485383,
-    "mean_correction": 3.599808263714628,
-    "adjusted_score": 3717.776785962425
+    "mean_correction": 8.639539832915107,
+    "adjusted_score": 3712.7370543932248
   },
   {
     "dataset": "cifar10",
@@ -62,10 +62,10 @@
     "lambda_std_mean": 420.9683694070252,
     "class_base": 0.0,
     "mean_base": 2.4735654641988543,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 0.0,
-    "mean_correction": 2.4735654641988543,
-    "adjusted_score": 3716.113348598301
+    "mean_correction": 5.93655711407725,
+    "adjusted_score": 3712.6503569484225
   },
   {
     "dataset": "cifar10",
@@ -79,10 +79,10 @@
     "lambda_std_mean": 439.2302026449874,
     "class_base": 0.0,
     "mean_base": 2.580870058304133,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 0.0,
-    "mean_correction": 2.580870058304133,
-    "adjusted_score": 3739.0856338479457
+    "mean_correction": 6.194088139929919,
+    "adjusted_score": 3735.47241576632
   },
   {
     "dataset": "cifar10",
@@ -96,10 +96,10 @@
     "lambda_std_mean": 464.32578579522345,
     "class_base": 0.0,
     "mean_base": 2.72832904167572,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 0.0,
-    "mean_correction": 2.72832904167572,
-    "adjusted_score": 3722.196475645824
+    "mean_correction": 6.547989700021728,
+    "adjusted_score": 3718.376814987478
   },
   {
     "dataset": "cifar10",
@@ -113,10 +113,10 @@
     "lambda_std_mean": 420.9683694070252,
     "class_base": 0.0,
     "mean_base": 545.5587033442254,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 0.0,
-    "mean_correction": 545.5587033442254,
-    "adjusted_score": 4231.203991968275
+    "mean_correction": 1309.3408880261409,
+    "adjusted_score": 3467.421807286359
   },
   {
     "dataset": "cifar10",
@@ -130,10 +130,10 @@
     "lambda_std_mean": 439.2302026449874,
     "class_base": 0.0,
     "mean_base": 612.5745323554014,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 0.0,
-    "mean_correction": 612.5745323554014,
-    "adjusted_score": 4120.760916863349
+    "mean_correction": 1470.1788776529634,
+    "adjusted_score": 3263.1565715657866
   },
   {
     "dataset": "cifar10",
@@ -147,10 +147,10 @@
     "lambda_std_mean": 464.32578579522345,
     "class_base": 0.0,
     "mean_base": 630.9623170802815,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 0.0,
-    "mean_correction": 630.9623170802815,
-    "adjusted_score": 4104.6836790134685
+    "mean_correction": 1514.3095609926756,
+    "adjusted_score": 3221.336435101074
   },
   {
     "dataset": "cifar10",
@@ -164,10 +164,10 @@
     "lambda_std_mean": 420.9683694070252,
     "class_base": 10.606405375180858,
     "mean_base": 395.48049211024914,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 10.606405375180858,
-    "mean_correction": 395.48049211024914,
-    "adjusted_score": 4595.51417673332
+    "mean_correction": 949.1531810645979,
+    "adjusted_score": 4041.8414877789714
   },
   {
     "dataset": "cifar10",
@@ -181,10 +181,10 @@
     "lambda_std_mean": 439.2302026449874,
     "class_base": 15.210306225362363,
     "mean_base": 422.3578406071034,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 15.210306225362363,
-    "mean_correction": 422.3578406071034,
-    "adjusted_score": 4491.4362476987835
+    "mean_correction": 1013.6588174570481,
+    "adjusted_score": 3900.1352708488394
   },
   {
     "dataset": "cifar10",
@@ -198,10 +198,10 @@
     "lambda_std_mean": 464.32578579522345,
     "class_base": 12.298318870595748,
     "mean_base": 435.1899719968528,
-    "mean_scale": 1.0,
+    "mean_scale": 2.4,
     "class_correction": 12.298318870595748,
-    "mean_correction": 435.1899719968528,
-    "adjusted_score": 4501.424306788802
+    "mean_correction": 1044.4559327924467,
+    "adjusted_score": 3892.1583459932076
   },
   {
     "dataset": "cifar10",
@@ -215,10 +215,10 @@
     "lambda_std_mean": 892.4060034079375,
     "class_base": 4.525319852683286,
     "mean_base": 4.2273170889746,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 4.525319852683286,
-    "mean_correction": 4.2273170889746,
-    "adjusted_score": 5581.223925558342
+    "mean_correction": 8.877365886846661,
+    "adjusted_score": 5576.57387676047
   },
   {
     "dataset": "cifar10",
@@ -232,10 +232,10 @@
     "lambda_std_mean": 875.1603017028093,
     "class_base": 2.554158316569185,
     "mean_base": 4.611021104250381,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 2.554158316569185,
-    "mean_correction": 4.611021104250381,
-    "adjusted_score": 5614.30747682918
+    "mean_correction": 9.6831443189258,
+    "adjusted_score": 5609.235353614505
   },
   {
     "dataset": "cifar10",
@@ -249,10 +249,10 @@
     "lambda_std_mean": 893.5045424443222,
     "class_base": 4.156954864920231,
     "mean_base": 4.880457233714351,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 4.156954864920231,
-    "mean_correction": 4.880457233714351,
-    "adjusted_score": 5598.201845713866
+    "mean_correction": 10.248960190800137,
+    "adjusted_score": 5592.8333427567795
   },
   {
     "dataset": "cifar10",
@@ -266,10 +266,10 @@
     "lambda_std_mean": 892.4060034079375,
     "class_base": 0.0,
     "mean_base": 2.649763955255551,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 0.0,
-    "mean_correction": 2.649763955255551,
-    "adjusted_score": 5563.723771200995
+    "mean_correction": 5.564504306036658,
+    "adjusted_score": 5560.809030850213
   },
   {
     "dataset": "cifar10",
@@ -283,10 +283,10 @@
     "lambda_std_mean": 875.1603017028093,
     "class_base": 0.0,
     "mean_base": 2.598557398389249,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 0.0,
-    "mean_correction": 2.598557398389249,
-    "adjusted_score": 5598.573805882861
+    "mean_correction": 5.4569705366174235,
+    "adjusted_score": 5595.7153927446325
   },
   {
     "dataset": "cifar10",
@@ -300,10 +300,10 @@
     "lambda_std_mean": 893.5045424443222,
     "class_base": 0.0,
     "mean_base": 2.653025776815398,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 0.0,
-    "mean_correction": 2.653025776815398,
-    "adjusted_score": 5573.265919535685
+    "mean_correction": 5.5713541313123365,
+    "adjusted_score": 5570.347591181187
   },
   {
     "dataset": "cifar10",
@@ -317,10 +317,10 @@
     "lambda_std_mean": 892.4060034079375,
     "class_base": 0.0,
     "mean_base": 687.9789437322991,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 0.0,
-    "mean_correction": 687.9789437322991,
-    "adjusted_score": 6008.864806267701
+    "mean_correction": 1444.7557818378282,
+    "adjusted_score": 5252.087968162172
   },
   {
     "dataset": "cifar10",
@@ -334,10 +334,10 @@
     "lambda_std_mean": 875.1603017028093,
     "class_base": 0.0,
     "mean_base": 731.1272470301176,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 0.0,
-    "mean_correction": 731.1272470301176,
-    "adjusted_score": 5952.220409219883
+    "mean_correction": 1535.367218763247,
+    "adjusted_score": 5147.980437486753
   },
   {
     "dataset": "cifar10",
@@ -351,10 +351,10 @@
     "lambda_std_mean": 893.5045424443222,
     "class_base": 0.0,
     "mean_base": 717.7107793573284,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 0.0,
-    "mean_correction": 717.7107793573284,
-    "adjusted_score": 5957.569494080171
+    "mean_correction": 1507.1926366503897,
+    "adjusted_score": 5168.087636787111
   },
   {
     "dataset": "cifar10",
@@ -368,10 +368,10 @@
     "lambda_std_mean": 892.4060034079375,
     "class_base": 12.43844746393275,
     "mean_base": 488.449168300881,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 12.43844746393275,
-    "mean_correction": 488.449168300881,
-    "adjusted_score": 6481.007892047686
+    "mean_correction": 1025.7432534318502,
+    "adjusted_score": 5943.713806916717
   },
   {
     "dataset": "cifar10",
@@ -385,10 +385,10 @@
     "lambda_std_mean": 875.1603017028093,
     "class_base": 17.373597715829977,
     "mean_base": 490.60191309435174,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 17.373597715829977,
-    "mean_correction": 490.60191309435174,
-    "adjusted_score": 6392.531813408568
+    "mean_correction": 1030.2640174981386,
+    "adjusted_score": 5852.869709004781
   },
   {
     "dataset": "cifar10",
@@ -402,10 +402,10 @@
     "lambda_std_mean": 893.5045424443222,
     "class_base": 16.073558811024892,
     "mean_base": 496.39557841363603,
-    "mean_scale": 1.0,
+    "mean_scale": 2.1,
     "class_correction": 16.073558811024892,
-    "mean_correction": 496.39557841363603,
-    "adjusted_score": 6392.661722150339
+    "mean_correction": 1042.4307146686358,
+    "adjusted_score": 5846.626585895339
   },
   {
     "dataset": "cifar10",
@@ -419,10 +419,10 @@
     "lambda_std_mean": 1730.277630828067,
     "class_base": 5.250891812283754,
     "mean_base": 5.39309014426458,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 5.250891812283754,
-    "mean_correction": 5.39309014426458,
-    "adjusted_score": 7442.5044555434515
+    "mean_correction": 9.707562259676244,
+    "adjusted_score": 7438.18998342804
   },
   {
     "dataset": "cifar10",
@@ -436,10 +436,10 @@
     "lambda_std_mean": 1508.5284627606377,
     "class_base": 2.320975179479031,
     "mean_base": 4.949835214748533,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 2.320975179479031,
-    "mean_correction": 4.949835214748533,
-    "adjusted_score": 7463.034365387022
+    "mean_correction": 8.90970338654736,
+    "adjusted_score": 7459.074497215223
   },
   {
     "dataset": "cifar10",
@@ -453,10 +453,10 @@
     "lambda_std_mean": 1453.879640430481,
     "class_base": 3.516019688553572,
     "mean_base": 4.872367246261639,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 3.516019688553572,
-    "mean_correction": 4.872367246261639,
-    "adjusted_score": 7457.252238065184
+    "mean_correction": 8.770261043270951,
+    "adjusted_score": 7453.354344268176
   },
   {
     "dataset": "cifar10",
@@ -470,10 +470,10 @@
     "lambda_std_mean": 1730.277630828067,
     "class_base": 0.0,
     "mean_base": 3.75964074855198,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 0.0,
-    "mean_correction": 3.75964074855198,
-    "adjusted_score": 7434.954226438948
+    "mean_correction": 6.7673533473935645,
+    "adjusted_score": 7431.9465138401065
   },
   {
     "dataset": "cifar10",
@@ -487,10 +487,10 @@
     "lambda_std_mean": 1508.5284627606377,
     "class_base": 0.0,
     "mean_base": 3.277812171813794,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 0.0,
-    "mean_correction": 3.277812171813794,
-    "adjusted_score": 7481.929219078186
+    "mean_correction": 5.900061909264829,
+    "adjusted_score": 7479.306969340735
   },
   {
     "dataset": "cifar10",
@@ -504,10 +504,10 @@
     "lambda_std_mean": 1453.879640430481,
     "class_base": 0.0,
     "mean_base": 3.1590682571770965,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 0.0,
-    "mean_correction": 3.1590682571770965,
-    "adjusted_score": 7448.299916117823
+    "mean_correction": 5.686322862918773,
+    "adjusted_score": 7445.772661512081
   },
   {
     "dataset": "cifar10",
@@ -521,10 +521,10 @@
     "lambda_std_mean": 1730.277630828067,
     "class_base": 0.0,
     "mean_base": 827.7734298692949,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 0.0,
-    "mean_correction": 827.7734298692949,
-    "adjusted_score": 7726.980476380705
+    "mean_correction": 1489.9921737647308,
+    "adjusted_score": 7064.761732485269
   },
   {
     "dataset": "cifar10",
@@ -538,10 +538,10 @@
     "lambda_std_mean": 1508.5284627606377,
     "class_base": 0.0,
     "mean_base": 792.7715705497109,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 0.0,
-    "mean_correction": 792.7715705497109,
-    "adjusted_score": 7718.511632575289
+    "mean_correction": 1426.9888269894795,
+    "adjusted_score": 7084.29437613552
   },
   {
     "dataset": "cifar10",
@@ -555,10 +555,10 @@
     "lambda_std_mean": 1453.879640430481,
     "class_base": 0.0,
     "mean_base": 738.5100978091252,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 0.0,
-    "mean_correction": 738.5100978091252,
-    "adjusted_score": 7790.020175628375
+    "mean_correction": 1329.3181760564255,
+    "adjusted_score": 7199.212097381074
   },
   {
     "dataset": "cifar10",
@@ -572,10 +572,10 @@
     "lambda_std_mean": 1730.277630828067,
     "class_base": 17.817632891120155,
     "mean_base": 559.8884914454006,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 17.817632891120155,
-    "mean_correction": 559.8884914454006,
-    "adjusted_score": 8259.90520378848
+    "mean_correction": 1007.7992846017212,
+    "adjusted_score": 7811.994410632159
   },
   {
     "dataset": "cifar10",
@@ -589,10 +589,10 @@
     "lambda_std_mean": 1508.5284627606377,
     "class_base": 19.080575021996218,
     "mean_base": 515.3298204076747,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 19.080575021996218,
-    "mean_correction": 515.3298204076747,
-    "adjusted_score": 8204.396245195328
+    "mean_correction": 927.5936767338144,
+    "adjusted_score": 7792.132388869189
   },
   {
     "dataset": "cifar10",
@@ -606,10 +606,10 @@
     "lambda_std_mean": 1453.879640430481,
     "class_base": 21.866293872623643,
     "mean_base": 494.88650700493923,
-    "mean_scale": 1.0,
+    "mean_scale": 1.8,
     "class_correction": 21.866293872623643,
-    "mean_correction": 494.88650700493923,
-    "adjusted_score": 8209.991339747437
+    "mean_correction": 890.7957126088907,
+    "adjusted_score": 7814.082134143487
   },
   {
     "dataset": "cifar10",
@@ -623,10 +623,10 @@
     "lambda_std_mean": 2291.490255292997,
     "class_base": 4.046767247463007,
     "mean_base": 4.500404837026073,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 4.046767247463007,
-    "mean_correction": 4.500404837026073,
-    "adjusted_score": 9304.528023228011
+    "mean_correction": 6.7506072555391095,
+    "adjusted_score": 9302.277820809499
   },
   {
     "dataset": "cifar10",
@@ -640,10 +640,10 @@
     "lambda_std_mean": 2810.139399790775,
     "class_base": 3.1484257295455116,
     "mean_base": 6.911805206408788,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 3.1484257295455116,
-    "mean_correction": 6.911805206408788,
-    "adjusted_score": 9336.397776876545
+    "mean_correction": 10.367707809613183,
+    "adjusted_score": 9332.941874273341
   },
   {
     "dataset": "cifar10",
@@ -657,10 +657,10 @@
     "lambda_std_mean": 2814.2335954656455,
     "class_base": 5.242852331946324,
     "mean_base": 5.807481611190456,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 5.242852331946324,
-    "mean_correction": 5.807481611190456,
-    "adjusted_score": 9302.726033244362
+    "mean_correction": 8.711222416785684,
+    "adjusted_score": 9299.822292438768
   },
   {
     "dataset": "cifar10",
@@ -674,10 +674,10 @@
     "lambda_std_mean": 2291.490255292997,
     "class_base": 0.0,
     "mean_base": 3.2049676661569984,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 0.0,
-    "mean_correction": 3.2049676661569984,
-    "adjusted_score": 9295.824329208843
+    "mean_correction": 4.807451499235498,
+    "adjusted_score": 9294.221845375765
   },
   {
     "dataset": "cifar10",
@@ -691,10 +691,10 @@
     "lambda_std_mean": 2810.139399790775,
     "class_base": 0.0,
     "mean_base": 3.930370593075763,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 0.0,
-    "mean_correction": 3.930370593075763,
-    "adjusted_score": 9353.165332531924
+    "mean_correction": 5.895555889613645,
+    "adjusted_score": 9351.200147235386
   },
   {
     "dataset": "cifar10",
@@ -708,10 +708,10 @@
     "lambda_std_mean": 2814.2335954656455,
     "class_base": 0.0,
     "mean_base": 3.936096894868481,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 0.0,
-    "mean_correction": 3.936096894868481,
-    "adjusted_score": 9311.015074980132
+    "mean_correction": 5.904145342302722,
+    "adjusted_score": 9309.047026532697
   },
   {
     "dataset": "cifar10",
@@ -725,10 +725,10 @@
     "lambda_std_mean": 2291.490255292997,
     "class_base": 0.0,
     "mean_base": 673.9878315139083,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 0.0,
-    "mean_correction": 673.9878315139083,
-    "adjusted_score": 9669.970176298591
+    "mean_correction": 1010.9817472708625,
+    "adjusted_score": 9332.976260541638
   },
   {
     "dataset": "cifar10",
@@ -742,10 +742,10 @@
     "lambda_std_mean": 2810.139399790775,
     "class_base": 0.0,
     "mean_base": 926.401900871346,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 0.0,
-    "mean_correction": 926.401900871346,
-    "adjusted_score": 9396.476028816154
+    "mean_correction": 1389.6028513070191,
+    "adjusted_score": 8933.27507838048
   },
   {
     "dataset": "cifar10",
@@ -759,10 +759,10 @@
     "lambda_std_mean": 2814.2335954656455,
     "class_base": 0.0,
     "mean_base": 890.5568881173166,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 0.0,
-    "mean_correction": 890.5568881173166,
-    "adjusted_score": 9425.878658757683
+    "mean_correction": 1335.8353321759748,
+    "adjusted_score": 8980.600214699025
   },
   {
     "dataset": "cifar10",
@@ -776,10 +776,10 @@
     "lambda_std_mean": 2291.490255292997,
     "class_base": 26.17752563202633,
     "mean_base": 468.70889170402575,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 26.17752563202633,
-    "mean_correction": 468.70889170402575,
-    "adjusted_score": 10106.557918601447
+    "mean_correction": 703.0633375560386,
+    "adjusted_score": 9872.203472749434
   },
   {
     "dataset": "cifar10",
@@ -793,10 +793,10 @@
     "lambda_std_mean": 2810.139399790775,
     "class_base": 27.877322964519482,
     "mean_base": 641.2760087369642,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 27.877322964519482,
-    "mean_correction": 641.2760087369642,
-    "adjusted_score": 9871.441394861016
+    "mean_correction": 961.9140131054462,
+    "adjusted_score": 9550.803390492534
   },
   {
     "dataset": "cifar10",
@@ -810,10 +810,10 @@
     "lambda_std_mean": 2814.2335954656455,
     "class_base": 27.150485290436322,
     "mean_base": 542.3353018785112,
-    "mean_scale": 1.0,
+    "mean_scale": 1.5,
     "class_correction": 27.150485290436322,
-    "mean_correction": 542.3353018785112,
-    "adjusted_score": 9929.388236268553
+    "mean_correction": 813.5029528177669,
+    "adjusted_score": 9658.220585329296
   },
   {
     "dataset": "cifar10",
@@ -827,10 +827,10 @@
     "lambda_std_mean": 3602.25342802608,
     "class_base": 3.5460633136472888,
     "mean_base": 4.616476068337232,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 3.5460633136472888,
-    "mean_correction": 4.616476068337232,
-    "adjusted_score": 11139.782773118015
+    "mean_correction": 5.53977128200468,
+    "adjusted_score": 11138.859477904347
   },
   {
     "dataset": "cifar10",
@@ -844,10 +844,10 @@
     "lambda_std_mean": 4394.551108079319,
     "class_base": 2.771393881299858,
     "mean_base": 7.836399181988172,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 2.771393881299858,
-    "mean_correction": 7.836399181988172,
-    "adjusted_score": 11203.575800686713
+    "mean_correction": 9.403679018385809,
+    "adjusted_score": 11202.008520850315
   },
   {
     "dataset": "cifar10",
@@ -861,10 +861,10 @@
     "lambda_std_mean": 3573.9270480644354,
     "class_base": 5.118982354805715,
     "mean_base": 5.390754101192891,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 5.118982354805715,
-    "mean_correction": 5.390754101192891,
-    "adjusted_score": 11157.845732294001
+    "mean_correction": 6.46890492143147,
+    "adjusted_score": 11156.767581473761
   },
   {
     "dataset": "cifar10",
@@ -878,10 +878,10 @@
     "lambda_std_mean": 3602.25342802608,
     "class_base": 0.0,
     "mean_base": 3.8033129420263427,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 0.0,
-    "mean_correction": 3.8033129420263427,
-    "adjusted_score": 11154.975007370474
+    "mean_correction": 4.563975530431612,
+    "adjusted_score": 11154.214344782069
   },
   {
     "dataset": "cifar10",
@@ -895,10 +895,10 @@
     "lambda_std_mean": 4394.551108079319,
     "class_base": 0.0,
     "mean_base": 4.639832659667407,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 0.0,
-    "mean_correction": 4.639832659667407,
-    "adjusted_score": 11223.792784527832
+    "mean_correction": 5.56779919160089,
+    "adjusted_score": 11222.8648179959
   },
   {
     "dataset": "cifar10",
@@ -912,10 +912,10 @@
     "lambda_std_mean": 3573.9270480644354,
     "class_base": 0.0,
     "mean_base": 3.773405527220185,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 0.0,
-    "mean_correction": 3.773405527220185,
-    "adjusted_score": 11174.10940697278
+    "mean_correction": 4.528086632664223,
+    "adjusted_score": 11173.354725867335
   },
   {
     "dataset": "cifar10",
@@ -929,10 +929,10 @@
     "lambda_std_mean": 3602.25342802608,
     "class_base": 0.0,
     "mean_base": 636.5923263496612,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 0.0,
-    "mean_correction": 636.5923263496612,
-    "adjusted_score": 11433.00044708784
+    "mean_correction": 763.9107916195936,
+    "adjusted_score": 11305.681981817906
   },
   {
     "dataset": "cifar10",
@@ -946,10 +946,10 @@
     "lambda_std_mean": 4394.551108079319,
     "class_base": 0.0,
     "mean_base": 868.411039521616,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 0.0,
-    "mean_correction": 868.411039521616,
-    "adjusted_score": 11147.467866728384
+    "mean_correction": 1042.0932474259394,
+    "adjusted_score": 10973.785658824061
   },
   {
     "dataset": "cifar10",
@@ -963,10 +963,10 @@
     "lambda_std_mean": 3573.9270480644354,
     "class_base": 0.0,
     "mean_base": 674.8277891758239,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 0.0,
-    "mean_correction": 674.8277891758239,
-    "adjusted_score": 11369.900726449176
+    "mean_correction": 809.7933470109888,
+    "adjusted_score": 11234.93516861401
   },
   {
     "dataset": "cifar10",
@@ -980,10 +980,10 @@
     "lambda_std_mean": 3602.25342802608,
     "class_base": 26.48755118628714,
     "mean_base": 447.9982928223465,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 26.48755118628714,
-    "mean_correction": 447.9982928223465,
-    "adjusted_score": 11814.369624741366
+    "mean_correction": 537.5979513868159,
+    "adjusted_score": 11724.769966176898
   },
   {
     "dataset": "cifar10",
@@ -997,10 +997,10 @@
     "lambda_std_mean": 4394.551108079319,
     "class_base": 31.430867077330156,
     "mean_base": 586.6009536457544,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 31.430867077330156,
-    "mean_correction": 586.6009536457544,
-    "adjusted_score": 11645.791421464415
+    "mean_correction": 703.9211443749055,
+    "adjusted_score": 11528.471230735264
   },
   {
     "dataset": "cifar10",
@@ -1014,10 +1014,10 @@
     "lambda_std_mean": 3573.9270480644354,
     "class_base": 27.34001939498507,
     "mean_base": 440.27474448328456,
-    "mean_scale": 1.0,
+    "mean_scale": 1.2000000000000002,
     "class_correction": 27.34001939498507,
-    "mean_correction": 440.27474448328456,
-    "adjusted_score": 11740.50925955923
+    "mean_correction": 528.3296933799415,
+    "adjusted_score": 11652.454310662573
   },
   {
     "dataset": "cifar10",
@@ -1031,10 +1031,10 @@
     "lambda_std_mean": 7123.277746013707,
     "class_base": 4.397205087753458,
     "mean_base": 6.034528087364004,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 4.397205087753458,
-    "mean_correction": 6.034528087364004,
-    "adjusted_score": 13012.509673074883
+    "mean_correction": 5.431075278627603,
+    "adjusted_score": 13013.11312588362
   },
   {
     "dataset": "cifar10",
@@ -1048,10 +1048,10 @@
     "lambda_std_mean": 6167.101299819315,
     "class_base": 4.2282707501818155,
     "mean_base": 6.102270895326153,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 4.2282707501818155,
-    "mean_correction": 6.102270895326153,
-    "adjusted_score": 13090.114770854492
+    "mean_correction": 5.492043805793537,
+    "adjusted_score": 13090.724997944024
   },
   {
     "dataset": "cifar10",
@@ -1065,10 +1065,10 @@
     "lambda_std_mean": 5802.912321343177,
     "class_base": 5.062149453656497,
     "mean_base": 5.334444689764023,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 5.062149453656497,
-    "mean_correction": 5.334444689764023,
-    "adjusted_score": 13027.172741794078
+    "mean_correction": 4.80100022078762,
+    "adjusted_score": 13027.706186263054
   },
   {
     "dataset": "cifar10",
@@ -1082,10 +1082,10 @@
     "lambda_std_mean": 7123.277746013707,
     "class_base": 0.0,
     "mean_base": 4.58676103428111,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 0.0,
-    "mean_correction": 4.58676103428111,
-    "adjusted_score": 13050.158356153219
+    "mean_correction": 4.1280849308529985,
+    "adjusted_score": 13050.617032256647
   },
   {
     "dataset": "cifar10",
@@ -1099,10 +1099,10 @@
     "lambda_std_mean": 6167.101299819315,
     "class_base": 0.0,
     "mean_base": 3.97106794723896,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 0.0,
-    "mean_correction": 3.97106794723896,
-    "adjusted_score": 13132.31604142776
+    "mean_correction": 3.5739611525150634,
+    "adjusted_score": 13132.713148222485
   },
   {
     "dataset": "cifar10",
@@ -1116,10 +1116,10 @@
     "lambda_std_mean": 5802.912321343177,
     "class_base": 0.0,
     "mean_base": 3.73656244637964,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 0.0,
-    "mean_correction": 3.73656244637964,
-    "adjusted_score": 13073.35132817862
+    "mean_correction": 3.3629062017416755,
+    "adjusted_score": 13073.72498442326
   },
   {
     "dataset": "cifar10",
@@ -1133,10 +1133,10 @@
     "lambda_std_mean": 7123.277746013707,
     "class_base": 0.0,
     "mean_base": 694.0220159614149,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 0.0,
-    "mean_correction": 694.0220159614149,
-    "adjusted_score": 13030.379351226085
+    "mean_correction": 624.6198143652733,
+    "adjusted_score": 13099.781552822227
   },
   {
     "dataset": "cifar10",
@@ -1150,10 +1150,10 @@
     "lambda_std_mean": 6167.101299819315,
     "class_base": 0.0,
     "mean_base": 663.5915735772536,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 0.0,
-    "mean_correction": 663.5915735772536,
-    "adjusted_score": 13052.863504547746
+    "mean_correction": 597.2324162195282,
+    "adjusted_score": 13119.22266190547
   },
   {
     "dataset": "cifar10",
@@ -1167,10 +1167,10 @@
     "lambda_std_mean": 5802.912321343177,
     "class_base": 0.0,
     "mean_base": 605.1988646243199,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 0.0,
-    "mean_correction": 605.1988646243199,
-    "adjusted_score": 13125.765979125681
+    "mean_correction": 544.6789781618878,
+    "adjusted_score": 13186.285865588112
   },
   {
     "dataset": "cifar10",
@@ -1184,10 +1184,10 @@
     "lambda_std_mean": 7123.277746013707,
     "class_base": 34.73451150713778,
     "mean_base": 499.63949844093815,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 34.73451150713778,
-    "mean_correction": 499.63949844093815,
-    "adjusted_score": 13415.917005676924
+    "mean_correction": 449.6755485968443,
+    "adjusted_score": 13465.880955521017
   },
   {
     "dataset": "cifar10",
@@ -1201,10 +1201,10 @@
     "lambda_std_mean": 6167.101299819315,
     "class_base": 35.04390797750688,
     "mean_base": 464.5260049527307,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 35.04390797750688,
-    "mean_correction": 464.5260049527307,
-    "adjusted_score": 13406.454501132263
+    "mean_correction": 418.0734044574576,
+    "adjusted_score": 13452.907101627536
   },
   {
     "dataset": "cifar10",
@@ -1218,10 +1218,10 @@
     "lambda_std_mean": 5802.912321343177,
     "class_base": 20.248597814625988,
     "mean_base": 394.7300034072367,
-    "mean_scale": 1.0,
+    "mean_scale": 0.8999999999999999,
     "class_correction": 20.248597814625988,
-    "mean_correction": 394.7300034072367,
-    "adjusted_score": 13450.708898778139
+    "mean_correction": 355.257003066513,
+    "adjusted_score": 13490.181899118861
   },
   {
     "dataset": "cifar10",
@@ -1235,10 +1235,10 @@
     "lambda_std_mean": 10662.447852824025,
     "class_base": 5.2531734996307256,
     "mean_base": 5.2550279921952585,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 5.2531734996307256,
-    "mean_correction": 5.2550279921952585,
-    "adjusted_score": 14861.956642258174
+    "mean_correction": 3.1530167953171557,
+    "adjusted_score": 14864.058653455053
   },
   {
     "dataset": "cifar10",
@@ -1252,10 +1252,10 @@
     "lambda_std_mean": 8529.370500963474,
     "class_base": 4.662265083601575,
     "mean_base": 4.963988972897814,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 4.662265083601575,
-    "mean_correction": 4.963988972897814,
-    "adjusted_score": 14935.021206881001
+    "mean_correction": 2.978393383738689,
+    "adjusted_score": 14937.00680247016
   },
   {
     "dataset": "cifar10",
@@ -1269,10 +1269,10 @@
     "lambda_std_mean": 11145.57427205474,
     "class_base": 6.082691736281023,
     "mean_base": 5.927542316988055,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 6.082691736281023,
-    "mean_correction": 5.927542316988055,
-    "adjusted_score": 14890.635273759231
+    "mean_correction": 3.5565253901928338,
+    "adjusted_score": 14893.006290686026
   },
   {
     "dataset": "cifar10",
@@ -1286,10 +1286,10 @@
     "lambda_std_mean": 10662.447852824025,
     "class_base": 0.0,
     "mean_base": 4.079414882146506,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 0.0,
-    "mean_correction": 4.079414882146506,
-    "adjusted_score": 14904.699881992854
+    "mean_correction": 2.447648929287904,
+    "adjusted_score": 14906.331647945712
   },
   {
     "dataset": "cifar10",
@@ -1303,10 +1303,10 @@
     "lambda_std_mean": 8529.370500963474,
     "class_base": 0.0,
     "mean_base": 3.2633070226698586,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 0.0,
-    "mean_correction": 3.2633070226698586,
-    "adjusted_score": 14998.79333360233
+    "mean_correction": 1.9579842136019154,
+    "adjusted_score": 15000.098656411397
   },
   {
     "dataset": "cifar10",
@@ -1320,10 +1320,10 @@
     "lambda_std_mean": 11145.57427205474,
     "class_base": 0.0,
     "mean_base": 4.264257343443602,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 0.0,
-    "mean_correction": 4.264257343443602,
-    "adjusted_score": 14930.075586406556
+    "mean_correction": 2.5585544060661616,
+    "adjusted_score": 14931.781289343933
   },
   {
     "dataset": "cifar10",
@@ -1337,10 +1337,10 @@
     "lambda_std_mean": 10662.447852824025,
     "class_base": 0.0,
     "mean_base": 473.8717815989916,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 0.0,
-    "mean_correction": 473.8717815989916,
-    "adjusted_score": 14911.339155901009
+    "mean_correction": 284.323068959395,
+    "adjusted_score": 15100.887868540605
   },
   {
     "dataset": "cifar10",
@@ -1354,10 +1354,10 @@
     "lambda_std_mean": 8529.370500963474,
     "class_base": 0.0,
     "mean_base": 420.808824897754,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 0.0,
-    "mean_correction": 420.808824897754,
-    "adjusted_score": 15012.682386039745
+    "mean_correction": 252.48529493865243,
+    "adjusted_score": 15181.005915998847
   },
   {
     "dataset": "cifar10",
@@ -1371,10 +1371,10 @@
     "lambda_std_mean": 11145.57427205474,
     "class_base": 0.0,
     "mean_base": 530.31089075396,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 0.0,
-    "mean_correction": 530.31089075396,
-    "adjusted_score": 14860.14125768354
+    "mean_correction": 318.18653445237607,
+    "adjusted_score": 15072.265613985124
   },
   {
     "dataset": "cifar10",
@@ -1388,10 +1388,10 @@
     "lambda_std_mean": 10662.447852824025,
     "class_base": 31.01689941326083,
     "mean_base": 367.90333620969943,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 31.01689941326083,
-    "mean_correction": 367.90333620969943,
-    "adjusted_score": 15146.34148312704
+    "mean_correction": 220.7420017258197,
+    "adjusted_score": 15293.50281761092
   },
   {
     "dataset": "cifar10",
@@ -1405,10 +1405,10 @@
     "lambda_std_mean": 8529.370500963474,
     "class_base": 33.13794567113735,
     "mean_base": 311.92705469362863,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 33.13794567113735,
-    "mean_correction": 311.92705469362863,
-    "adjusted_score": 15188.700624635236
+    "mean_correction": 187.1562328161772,
+    "adjusted_score": 15313.471446512685
   },
   {
     "dataset": "cifar10",
@@ -1422,10 +1422,10 @@
     "lambda_std_mean": 11145.57427205474,
     "class_base": 30.101525771852245,
     "mean_base": 372.1103078684024,
-    "mean_scale": 1.0,
+    "mean_scale": 0.6000000000000001,
     "class_correction": 30.101525771852245,
-    "mean_correction": 372.1103078684024,
-    "adjusted_score": 15074.024494484745
+    "mean_correction": 223.26618472104147,
+    "adjusted_score": 15222.868617632106
   },
   {
     "dataset": "cifar10",
@@ -1439,10 +1439,10 @@
     "lambda_std_mean": 20593.937940455507,
     "class_base": 3.330048702299196,
     "mean_base": 4.970757971183814,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 3.330048702299196,
-    "mean_correction": 4.970757971183814,
-    "adjusted_score": 16745.728490201516
+    "mean_correction": 1.4912273913551455,
+    "adjusted_score": 16749.208020781345
   },
   {
     "dataset": "cifar10",
@@ -1456,10 +1456,10 @@
     "lambda_std_mean": 22851.258382117092,
     "class_base": 6.332624201675396,
     "mean_base": 5.401507234044346,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 6.332624201675396,
-    "mean_correction": 5.401507234044346,
-    "adjusted_score": 16831.228759189282
+    "mean_correction": 1.6204521702133052,
+    "adjusted_score": 16835.009814253113
   },
   {
     "dataset": "cifar10",
@@ -1473,10 +1473,10 @@
     "lambda_std_mean": 18401.14060786471,
     "class_base": 3.6106406417175854,
     "mean_base": 4.623605262452325,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 3.6106406417175854,
-    "mean_correction": 4.623605262452325,
-    "adjusted_score": 16745.74622284583
+    "mean_correction": 1.3870815787356987,
+    "adjusted_score": 16748.98274652955
   },
   {
     "dataset": "cifar10",
@@ -1490,10 +1490,10 @@
     "lambda_std_mean": 20593.937940455507,
     "class_base": 0.0,
     "mean_base": 3.5345467407368205,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 0.0,
-    "mean_correction": 3.5345467407368205,
-    "adjusted_score": 16732.246703259265
+    "mean_correction": 1.060364022221047,
+    "adjusted_score": 16734.72088597778
   },
   {
     "dataset": "cifar10",
@@ -1507,10 +1507,10 @@
     "lambda_std_mean": 22851.258382117092,
     "class_base": 0.0,
     "mean_base": 3.92197165349234,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 0.0,
-    "mean_correction": 3.92197165349234,
-    "adjusted_score": 16836.992090846506
+    "mean_correction": 1.176591496047703,
+    "adjusted_score": 16839.73747100395
   },
   {
     "dataset": "cifar10",
@@ -1524,10 +1524,10 @@
     "lambda_std_mean": 18401.14060786471,
     "class_base": 0.0,
     "mean_base": 3.1581959579280725,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 0.0,
-    "mean_correction": 3.1581959579280725,
-    "adjusted_score": 16761.437507167073
+    "mean_correction": 0.9474587873784226,
+    "adjusted_score": 16763.648244337623
   },
   {
     "dataset": "cifar10",
@@ -1541,10 +1541,10 @@
     "lambda_std_mean": 20593.937940455507,
     "class_base": 0.0,
     "mean_base": 263.3707420269522,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 0.0,
-    "mean_correction": 263.3707420269522,
-    "adjusted_score": 16731.803086098047
+    "mean_correction": 79.01122260808573,
+    "adjusted_score": 16916.162605516914
   },
   {
     "dataset": "cifar10",
@@ -1558,10 +1558,10 @@
     "lambda_std_mean": 22851.258382117092,
     "class_base": 0.0,
     "mean_base": 321.06758159456876,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 0.0,
-    "mean_correction": 321.06758159456876,
-    "adjusted_score": 16729.46171528043
+    "mean_correction": 96.32027447837072,
+    "adjusted_score": 16954.20902239663
   },
   {
     "dataset": "cifar10",
@@ -1575,10 +1575,10 @@
     "lambda_std_mean": 18401.14060786471,
     "class_base": 0.0,
     "mean_base": 256.53421356091224,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 0.0,
-    "mean_correction": 256.53421356091224,
-    "adjusted_score": 16770.010708314087
+    "mean_correction": 76.96026406827374,
+    "adjusted_score": 16949.584657806725
   },
   {
     "dataset": "cifar10",
@@ -1592,10 +1592,10 @@
     "lambda_std_mean": 20593.937940455507,
     "class_base": 26.759319929189967,
     "mean_base": 221.895043973949,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 26.759319929189967,
-    "mean_correction": 221.895043973949,
-    "adjusted_score": 16848.32219859686
+    "mean_correction": 66.56851319218475,
+    "adjusted_score": 17003.648729378623
   },
   {
     "dataset": "cifar10",
@@ -1609,10 +1609,10 @@
     "lambda_std_mean": 22851.258382117092,
     "class_base": 39.565370012177056,
     "mean_base": 258.90387023362484,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 39.565370012177056,
-    "mean_correction": 258.90387023362484,
-    "adjusted_score": 16861.124509754198
+    "mean_correction": 77.67116107008752,
+    "adjusted_score": 17042.357218917736
   },
   {
     "dataset": "cifar10",
@@ -1626,9 +1626,9 @@
     "lambda_std_mean": 18401.14060786471,
     "class_base": 25.19512975264469,
     "mean_base": 199.4494813088249,
-    "mean_scale": 1.0,
+    "mean_scale": 0.30000000000000027,
     "class_correction": 25.19512975264469,
-    "mean_correction": 199.4494813088249,
-    "adjusted_score": 16846.867107688533
+    "mean_correction": 59.83484439264752,
+    "adjusted_score": 16986.48174460471
   }
 ]

@@ -536,8 +536,8 @@ def select_group_mask(
         target_k: int,
         n_classes: int,
     ) -> np.ndarray:
-        pool_by_static = min(num_samples, max(4 * target_k, 512))
-        pool_by_div = min(num_samples, max(2 * target_k, 256))
+        pool_by_static = min(num_samples, max(3 * target_k, 512))
+        pool_by_div = min(num_samples, max(1 * target_k, 256))
         static_head = _pick_top_by_score(all_indices, pool_by_static, guide_score)
         div_head = _pick_top_by_score(all_indices, pool_by_div, div_static)
 
@@ -552,7 +552,7 @@ def select_group_mask(
 
         candidate_pool = np.unique(np.concatenate([static_head, div_head, class_cover_arr]).astype(np.int64))
         min_pool = min(num_samples, max(4 * target_k, 512))
-        max_pool = min(num_samples, max(6 * target_k, 1024))
+        max_pool = min(num_samples, max(4 * target_k, 1024))
         if candidate_pool.size < min_pool:
             fill = _pick_top_by_score(all_indices, min_pool, guide_score)
             candidate_pool = np.unique(np.concatenate([candidate_pool, fill]).astype(np.int64))
@@ -560,63 +560,177 @@ def select_group_mask(
             candidate_pool = _pick_top_by_score(candidate_pool, max_pool, guide_score)
         return np.sort(candidate_pool.astype(np.int64))
 
-    def _greedy_construct(candidate_pool: np.ndarray, cheap_score: np.ndarray, greedy_eval_k: int) -> tuple[dict[str, object], list[float], list[float], list[float], list[float]]:
-        selected = np.empty(0, dtype=np.int64)
+    def _fast_initialize_subset(
+        sa_scores_np: np.ndarray,
+        dds_static_np: np.ndarray,
+        div_static_np: np.ndarray,
+        labels_np: np.ndarray,
+        num_classes: int,
+        target_size: int,
+        weights: dict[str, float],
+    ) -> tuple[dict[str, object], np.ndarray]:
+        alpha_div_init = 0.5
+        base_score_np = (
+            weights["sa"] * sa_scores_np
+            + weights["dds"] * dds_static_np
+            + alpha_div_init * div_static_np
+        ).astype(np.float32)
+
+        selected_parts: list[np.ndarray] = []
+        for class_id in range(num_classes):
+            cls_idx = np.flatnonzero(labels_np == class_id).astype(np.int64)
+            if cls_idx.size == 0:
+                continue
+            base_take = int(round(float(cls_idx.size) * sr))
+            if target_size > 0:
+                base_take = max(1, base_take)
+            take = min(base_take, cls_idx.size)
+            if take > 0:
+                selected_parts.append(_pick_top_by_score(cls_idx, take, base_score_np))
+
+        selected = np.unique(np.concatenate(selected_parts).astype(np.int64)) if selected_parts else np.empty(0, dtype=np.int64)
+
+        if selected.size < target_size:
+            remain = _complement_indices(selected)
+            fill = _pick_top_by_score(remain, target_size - selected.size, base_score_np)
+            selected = np.unique(np.concatenate([selected, fill]).astype(np.int64))
+        elif selected.size > target_size:
+            order = np.argsort(base_score_np[selected], kind="mergesort")
+            drop_n = selected.size - target_size
+            keep_mask = np.ones(selected.size, dtype=bool)
+            keep_mask[order[:drop_n]] = False
+            selected = np.sort(selected[keep_mask].astype(np.int64))
+
+        init_item = _evaluate_indices(selected)
+        return init_item, base_score_np
+
+    def _block_refine(
+        current_item: dict[str, object],
+        candidate_pool: np.ndarray,
+        base_score_np: np.ndarray,
+        target_size: int,
+        keep_ratio: int,
+    ) -> tuple[dict[str, object], int, int, int, list[float], list[float], list[float], list[float]]:
+        if keep_ratio <= 30:
+            block_size = max(64, target_size // 40)
+        elif keep_ratio <= 60:
+            block_size = max(128, target_size // 30)
+        else:
+            block_size = max(256, target_size // 25)
+        block_size = max(1, min(block_size, target_size))
+
+        max_block_rounds = 30
+        num_block_trials = 12
+        rounds_used = 0
+        accepted = 0
+        cur_item = current_item
+
         score_hist: list[float] = []
         class_corr_hist: list[float] = []
         mean_corr_hist: list[float] = []
         fitness_hist: list[float] = []
-        greedy_bar = tqdm(
-            range(target_size),
-            desc=f"[group-greedy] seed={seed} kr={keep_ratio}",
-            unit="iter",
+
+        block_bar = tqdm(
+            range(max_block_rounds),
+            desc=f"[group-block] seed={seed} kr={keep_ratio}",
+            unit="round",
             leave=False,
         )
-        for _ in greedy_bar:
-            available = _complement_indices(selected)
-            avail_in_pool = available[np.isin(available, candidate_pool, assume_unique=False)]
-            if avail_in_pool.size == 0:
-                avail_in_pool = available
-            ranked = _pick_top_by_score(avail_in_pool, min(greedy_eval_k, avail_in_pool.size), cheap_score)
-            best_item = None
-            best_fit = -np.inf
-            for cand in ranked:
-                trial = np.concatenate([selected, np.asarray([cand], dtype=np.int64)])
-                item = _evaluate_indices(trial)
-                if float(item["fitness"]) > best_fit:
-                    best_fit = float(item["fitness"])
-                    best_item = item
-            if best_item is None:
-                # construct by cheap score for underfilled stage
-                selected = np.concatenate([selected, ranked[:1]])
-                continue
-            selected = np.asarray(best_item["indices"], dtype=np.int64)
-            score_hist.append(float(best_item["raw_score"]))
-            class_corr_hist.append(float(lambda_cls * float(best_item["penalty"])))
-            mean_corr_hist.append(float(lambda_mean * float(best_item["mean_penalty"])))
-            fitness_hist.append(float(best_item["fitness"]))
-            greedy_bar.set_postfix(best_fitness=f"{float(best_item['fitness']):.4f}")
+        for _ in block_bar:
+            rounds_used += 1
+            current = np.asarray(cur_item["indices"], dtype=np.int64)
+            if current.size == 0:
+                break
+            pool_minus = candidate_pool[np.isin(candidate_pool, current, invert=True, assume_unique=False)]
+            if pool_minus.size == 0:
+                break
 
-        if selected.size < target_size:
-            filler = _pick_top_by_score(_complement_indices(selected), target_size - selected.size, cheap_score)
-            selected = np.unique(np.concatenate([selected, filler]).astype(np.int64))
-        final_item = _evaluate_indices(selected)
-        if not fitness_hist or abs(fitness_hist[-1] - float(final_item["fitness"])) > 1e-12:
-            score_hist.append(float(final_item["raw_score"]))
-            class_corr_hist.append(float(lambda_cls * float(final_item["penalty"])))
-            mean_corr_hist.append(float(lambda_mean * float(final_item["mean_penalty"])))
-            fitness_hist.append(float(final_item["fitness"]))
-        return final_item, score_hist, class_corr_hist, mean_corr_hist, fitness_hist
+            cur_bs = min(block_size, current.size, pool_minus.size)
+            if cur_bs <= 0:
+                break
+
+            drop_pool_k = min(max(4 * cur_bs, 64), current.size)
+            add_pool_k = min(max(8 * cur_bs, 128), pool_minus.size)
+
+            drop_order = np.argsort(base_score_np[current], kind="mergesort")
+            drop_pool = current[drop_order[:drop_pool_k]]
+            add_pool = _pick_top_by_score(pool_minus, add_pool_k, base_score_np)
+            if drop_pool.size < cur_bs or add_pool.size < cur_bs:
+                break
+
+            best_item = cur_item
+            best_fit = float(cur_item["fitness"])
+
+            drop_head_k = max(cur_bs, int(0.7 * cur_bs))
+            add_head_k = max(cur_bs, int(0.7 * cur_bs))
+            for _trial in range(num_block_trials):
+                d_head = drop_pool[: min(drop_head_k, drop_pool.size)]
+                a_head = add_pool[: min(add_head_k, add_pool.size)]
+
+                d_need_rand = max(0, cur_bs - d_head.size)
+                a_need_rand = max(0, cur_bs - a_head.size)
+
+                d_rand_src = drop_pool[d_head.size :]
+                a_rand_src = add_pool[a_head.size :]
+
+                if d_need_rand > 0 and d_rand_src.size > 0:
+                    d_rand = np.random.choice(d_rand_src, size=min(d_need_rand, d_rand_src.size), replace=False)
+                    drop_block = np.unique(np.concatenate([d_head, d_rand]).astype(np.int64))
+                else:
+                    drop_block = np.asarray(d_head, dtype=np.int64)
+
+                if a_need_rand > 0 and a_rand_src.size > 0:
+                    a_rand = np.random.choice(a_rand_src, size=min(a_need_rand, a_rand_src.size), replace=False)
+                    add_block = np.unique(np.concatenate([a_head, a_rand]).astype(np.int64))
+                else:
+                    add_block = np.asarray(a_head, dtype=np.int64)
+
+                if drop_block.size < cur_bs:
+                    extra_d = np.setdiff1d(drop_pool, drop_block, assume_unique=False)
+                    drop_block = np.unique(
+                        np.concatenate([drop_block, extra_d[: max(0, cur_bs - drop_block.size)]]).astype(np.int64)
+                    )
+                if add_block.size < cur_bs:
+                    extra_a = np.setdiff1d(add_pool, add_block, assume_unique=False)
+                    add_block = np.unique(
+                        np.concatenate([add_block, extra_a[: max(0, cur_bs - add_block.size)]]).astype(np.int64)
+                    )
+
+                drop_block = drop_block[:cur_bs]
+                add_block = add_block[:cur_bs]
+                remain = current[np.isin(current, drop_block, invert=True, assume_unique=False)]
+                trial = np.unique(np.concatenate([remain, add_block]).astype(np.int64))
+                if trial.size != target_size:
+                    continue
+                item = _evaluate_indices(trial)
+                fit = float(item["fitness"])
+                if fit > best_fit:
+                    best_fit = fit
+                    best_item = item
+
+            if best_fit > float(cur_item["fitness"]) + 1e-8:
+                cur_item = best_item
+                accepted += 1
+                score_hist.append(float(cur_item["raw_score"]))
+                class_corr_hist.append(float(lambda_cls * float(cur_item["penalty"])))
+                mean_corr_hist.append(float(lambda_mean * float(cur_item["mean_penalty"])))
+                fitness_hist.append(float(cur_item["fitness"]))
+                block_bar.set_postfix(best_fitness=f"{float(cur_item['fitness']):.4f}", accepted=accepted)
+            else:
+                break
+
+        return cur_item, block_size, rounds_used, accepted, score_hist, class_corr_hist, mean_corr_hist, fitness_hist
 
     def _swap_refine(
         current_item: dict[str, object],
         candidate_pool: np.ndarray,
-        cheap_score: np.ndarray,
+        guide_score_np: np.ndarray,
         drop_k: int,
         add_k: int,
         max_rounds: int,
     ) -> tuple[dict[str, object], int, int, list[float], list[float], list[float], list[float]]:
         swap_eps = 1e-8
+        max_swap_pairs = 128
         rounds_used = 0
         accepted = 0
         score_hist: list[float] = []
@@ -638,18 +752,33 @@ def select_group_mask(
                 break
             drop_order = np.argsort(guide_score_np[current], kind="mergesort")
             drop_cands = current[drop_order[: min(drop_k, current.size)]]
-            add_cands = _pick_top_by_score(pool_minus, min(add_k, pool_minus.size), cheap_score)
+            add_cands = _pick_top_by_score(pool_minus, min(add_k, pool_minus.size), guide_score_np)
+
+            if drop_cands.size == 0 or add_cands.size == 0:
+                break
+
+            drop_limit = min(drop_cands.size, max(1, int(np.sqrt(max_swap_pairs))))
+            add_limit = min(add_cands.size, max(1, max_swap_pairs // drop_limit))
+            drop_cands = drop_cands[:drop_limit]
+            add_cands = add_cands[:add_limit]
+
             best_item = cur_item
             best_fit = float(cur_item["fitness"])
+            pair_count = 0
             for d in drop_cands:
                 remain = current[current != d]
                 for a in add_cands:
+                    pair_count += 1
+                    if pair_count > max_swap_pairs:
+                        break
                     trial = np.concatenate([remain, np.asarray([a], dtype=np.int64)])
                     item = _evaluate_indices(trial)
                     fit = float(item["fitness"])
                     if fit > best_fit:
                         best_fit = fit
                         best_item = item
+                if pair_count > max_swap_pairs:
+                    break
             if best_fit > float(cur_item["fitness"]) + swap_eps:
                 cur_item = best_item
                 accepted += 1
@@ -670,36 +799,50 @@ def select_group_mask(
     )
 
     candidate_pool = _build_candidate_pool(guide_score_np, div_static_np, labels_np, target_size, num_classes)
-    greedy_eval_k = min(64, int(candidate_pool.size))
-    drop_k = min(max(8, int(0.05 * target_size)), target_size)
-    add_k = min(max(32, int(0.10 * target_size)), max(1, int(candidate_pool.size - target_size)))
-    max_swap_rounds = 20
+    init_item, base_score_np = _fast_initialize_subset(
+        sa_scores_np,
+        dds_static_np,
+        div_static_np,
+        labels_np,
+        num_classes,
+        target_size,
+        weights,
+    )
 
-    cheap_a = guide_score_np + 0.5 * div_static_np
-    cheap_b = 0.7 * guide_score_np + 1.3 * div_static_np
+    score_history = [float(init_item["raw_score"])]
+    class_correction_history = [float(lambda_cls * float(init_item["penalty"]))]
+    mean_correction_history = [float(lambda_mean * float(init_item["mean_penalty"]))]
+    fitness_history = [float(init_item["fitness"])]
 
-    item_a, s1, c1, m1, f1 = _greedy_construct(candidate_pool, cheap_a, greedy_eval_k)
-    init_fitness_a = float(item_a["fitness"])
-    item_a, rounds_a, accepted_a, s1r, c1r, m1r, f1r = _swap_refine(item_a, candidate_pool, cheap_a, drop_k, add_k, max_swap_rounds)
-    hist_a = (s1 + s1r, c1 + c1r, m1 + m1r, f1 + f1r)
+    block_item, block_size, block_rounds_used, accepted_block_moves, sb, cb, mb, fb = _block_refine(
+        init_item,
+        candidate_pool,
+        base_score_np,
+        target_size,
+        keep_ratio,
+    )
+    score_history.extend(sb)
+    class_correction_history.extend(cb)
+    mean_correction_history.extend(mb)
+    fitness_history.extend(fb)
 
-    item_b, s2, c2, m2, f2 = _greedy_construct(candidate_pool, cheap_b, greedy_eval_k)
-    init_fitness_b = float(item_b["fitness"])
-    item_b, rounds_b, accepted_b, s2r, c2r, m2r, f2r = _swap_refine(item_b, candidate_pool, cheap_b, drop_k, add_k, max_swap_rounds)
-    hist_b = (s2 + s2r, c2 + c2r, m2 + m2r, f2 + f2r)
+    drop_k = min(12, target_size)
+    pool_minus_size = int(candidate_pool.size - np.asarray(block_item["indices"], dtype=np.int64).size)
+    add_k = min(24, max(0, pool_minus_size))
+    max_swap_rounds = 6
 
-    if float(item_b["fitness"]) > float(item_a["fitness"]):
-        best_item = item_b
-        score_history, class_correction_history, mean_correction_history, fitness_history = hist_b
-        rounds_used = rounds_b
-        accepted_swaps = accepted_b
-        init_fitness = init_fitness_b
-    else:
-        best_item = item_a
-        score_history, class_correction_history, mean_correction_history, fitness_history = hist_a
-        rounds_used = rounds_a
-        accepted_swaps = accepted_a
-        init_fitness = init_fitness_a
+    best_item, swap_rounds_used, accepted_swaps, ss, cs, ms, fs = _swap_refine(
+        block_item,
+        candidate_pool,
+        base_score_np,
+        drop_k,
+        add_k,
+        max_swap_rounds,
+    )
+    score_history.extend(ss)
+    class_correction_history.extend(cs)
+    mean_correction_history.extend(ms)
+    fitness_history.extend(fs)
 
     final_mask = np.asarray(best_item["mask"], dtype=np.uint8)
     selected_by_class: dict[int, int] = {}
@@ -709,17 +852,19 @@ def select_group_mask(
 
     final_rate = float(final_mask.mean())
     stats: dict[str, object] = {
-        "solver": "greedy_swap",
+        "solver": "fast_greedy_block_swap",
         "sr": float(sr),
         "final_rate": final_rate,
         "candidate_pool_size": int(candidate_pool.size),
-        "greedy_eval_k": int(greedy_eval_k),
-        "drop_k": int(drop_k),
-        "add_k": int(add_k),
+        "block_size": int(block_size),
+        "max_block_rounds": 30,
+        "num_block_rounds_used": int(block_rounds_used),
+        "num_accepted_block_moves": int(accepted_block_moves),
         "max_swap_rounds": int(max_swap_rounds),
-        "num_swap_rounds_used": int(rounds_used),
+        "num_swap_rounds_used": int(swap_rounds_used),
         "num_accepted_swaps": int(accepted_swaps),
-        "init_fitness": float(init_fitness),
+        "init_fitness": float(init_item["fitness"]),
+        "post_block_fitness": float(block_item["fitness"]),
         "final_fitness": float(best_item["fitness"]),
         "raw_score": float(best_item["raw_score"]),
         "penalty": float(best_item["penalty"]),

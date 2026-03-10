@@ -5,6 +5,7 @@ from utils.global_config import CONFIG
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from model.adapter import load_trained_adapters
 from dataset.dataset_config import CIFAR10, CIFAR100
+from utils.path_rules import resolve_mask_path
 
 import argparse
 import hashlib
@@ -494,7 +495,7 @@ def main() -> None:
     print(f"[Init] Encoded image features for dynamic scoring in {time.perf_counter() - start:.2f}s")
 
     keep_ratios = list(range(20, 91, 10))
-    eval_seeds = [1, 2, 3, 4, 5]
+    eval_seeds = [22, 42, 96]
     lambda_sample_M = DEFAULT_M
     lambda_ratio_r = DEFAULT_R
     lambda_eps = DEFAULT_EPS
@@ -580,10 +581,10 @@ def main() -> None:
 
         random_scores: list[float] = []
         group_old_scores: list[float] = []
+        herding_scores: list[float] = []
         for seed in tqdm(eval_seeds, desc=f"KR={kr} seeds", unit="seed", leave=False):
             set_seed(seed)
 
-            random_mask = select_random_mask(len(dataset_for_names), keep_ratio=kr)
             lambda_info_seed = get_or_estimate_lambda(
                 cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
                 dataset=args.dataset,
@@ -632,29 +633,33 @@ def main() -> None:
             lambda_seed_cls = float(lambda_info_seed.get("lambda_cls", lambda_info_seed["lambda"]))
             lambda_seed_mean = float(lambda_info_seed["lambda_mean"])
 
-            _, _, _, _, _, random_total = compute_subset_score(
-                random_mask,
-                sa_scores=sa_scores,
-                labels_t=labels_t,
-                weights=weights,
-                div_metric=div_metric,
-                dds_metric=dds_metric,
-                div_loader=div_loader,
-                dds_loader=dds_loader,
-                image_adapter=image_adapter,
-                div_features=div_features,
-                dds_features=dds_features,
-                lambda_cls=lambda_seed_cls,
-                lambda_mean=lambda_seed_mean,
-                labels_np=labels,
-                num_classes=len(class_names),
-                target_size=target_size,
-                image_features_np=div_features_np,
-                full_class_mean=full_class_mean,
-                full_class_var=full_class_var,
-                eps=lambda_eps,
-            )
-            random_scores.append(random_total)
+            random_repeat = 2
+            for rep_idx in range(random_repeat):
+                random_mask = select_random_mask(len(dataset_for_names), keep_ratio=kr)
+                _, _, _, _, _, random_total = compute_subset_score(
+                    random_mask,
+                    sa_scores=sa_scores,
+                    labels_t=labels_t,
+                    weights=weights,
+                    div_metric=div_metric,
+                    dds_metric=dds_metric,
+                    div_loader=div_loader,
+                    dds_loader=dds_loader,
+                    image_adapter=image_adapter,
+                    div_features=div_features,
+                    dds_features=dds_features,
+                    lambda_cls=lambda_seed_cls,
+                    lambda_mean=lambda_seed_mean,
+                    labels_np=labels,
+                    num_classes=len(class_names),
+                    target_size=target_size,
+                    image_features_np=div_features_np,
+                    full_class_mean=full_class_mean,
+                    full_class_var=full_class_var,
+                    eps=lambda_eps,
+                )
+                random_scores.append(random_total)
+                print(f"  seed={seed} rep={rep_idx + 1}/{random_repeat} | random_total={random_total:.4f}")
 
             _, _, _, _, _, _, grp_total, _ = select_group_old_best(
                 n_samples=len(dataset_for_names),
@@ -680,9 +685,53 @@ def main() -> None:
             )
             group_old_scores.append(grp_total)
 
-            print(
-                f"  seed={seed} | random_total={random_total:.4f} | group_old_total={grp_total:.4f}"
+            herding_mask_path = resolve_mask_path(
+                "herding",
+                args.dataset,
+                args.model_name,
+                seed,
+                kr,
             )
+            if herding_mask_path.exists():
+                try:
+                    with np.load(herding_mask_path, allow_pickle=False) as loaded_mask:
+                        if "mask" in loaded_mask:
+                            herding_mask = np.asarray(loaded_mask["mask"], dtype=np.uint8)
+                        else:
+                            first_key = next(iter(loaded_mask.files), None)
+                            herding_mask = np.asarray(loaded_mask[first_key], dtype=np.uint8) if first_key else np.zeros(len(dataset_for_names), dtype=np.uint8)
+                    if herding_mask.shape[0] == len(dataset_for_names):
+                        _, _, _, _, _, herding_total = compute_subset_score(
+                            herding_mask,
+                            sa_scores=sa_scores,
+                            labels_t=labels_t,
+                            weights=weights,
+                            div_metric=div_metric,
+                            dds_metric=dds_metric,
+                            div_loader=div_loader,
+                            dds_loader=dds_loader,
+                            image_adapter=image_adapter,
+                            div_features=div_features,
+                            dds_features=dds_features,
+                            lambda_cls=lambda_seed_cls,
+                            lambda_mean=lambda_seed_mean,
+                            labels_np=labels,
+                            num_classes=len(class_names),
+                            target_size=target_size,
+                            image_features_np=div_features_np,
+                            full_class_mean=full_class_mean,
+                            full_class_var=full_class_var,
+                            eps=lambda_eps,
+                        )
+                        herding_scores.append(herding_total)
+                    else:
+                        print(f"[HerdingMask] invalid length for {herding_mask_path}, expect {len(dataset_for_names)}")
+                except Exception as exc:
+                    print(f"[HerdingMask] failed to load {herding_mask_path}: {exc}")
+            else:
+                print(f"[HerdingMask] missing local mask: {herding_mask_path}")
+
+            print(f"  seed={seed} | group_old_total={grp_total:.4f}")
 
         rows.append(
             {
@@ -692,12 +741,16 @@ def main() -> None:
                 "random_max": float(np.max(random_scores)),
                 "group_old_mean": float(np.mean(group_old_scores)),
                 "group_old_max": float(np.max(group_old_scores)),
+                "herding_mean": float(np.mean(herding_scores)) if herding_scores else float("nan"),
+                "herding_max": float(np.max(herding_scores)) if herding_scores else float("nan"),
             }
         )
 
         print(
             f"[KR={kr}] topk={topk_total:.4f}, random_mean={np.mean(random_scores):.4f}, random_max={np.max(random_scores):.4f}, "
-            f"group_old_mean={np.mean(group_old_scores):.4f}, group_old_max={np.max(group_old_scores):.4f}"
+            f"group_old_mean={np.mean(group_old_scores):.4f}, group_old_max={np.max(group_old_scores):.4f}, "
+            f"herding_mean={(np.mean(herding_scores) if herding_scores else float('nan')):.4f}, "
+            f"herding_max={(np.max(herding_scores) if herding_scores else float('nan')):.4f}"
         )
 
     output_path = args.output
@@ -715,6 +768,8 @@ def main() -> None:
                 "random_max",
                 "group_old_mean",
                 "group_old_max",
+                "herding_mean",
+                "herding_max",
             ],
         )
         writer.writeheader()

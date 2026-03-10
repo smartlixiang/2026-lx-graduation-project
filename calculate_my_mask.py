@@ -117,6 +117,19 @@ def parse_ratio_list(ratio_text: str) -> list[int]:
     return [int(item) for item in items]
 
 
+def _get_group_penalty_scales(dataset_name: str, keep_ratio: int) -> tuple[float, float]:
+    """Return fixed penalty scales used by group mode."""
+    dataset_key = dataset_name.strip().lower()
+    if dataset_key == CIFAR10:
+        scale_mean = max(0.0, 3.0 - 0.03 * float(keep_ratio))
+    elif dataset_key == CIFAR100:
+        scale_mean = max(0.0, 7.0 - 0.06 * float(keep_ratio))
+    else:
+        raise ValueError(f"Unsupported dataset for group penalty scaling: {dataset_name}")
+    scale_cls = 5.0
+    return float(scale_cls), float(scale_mean)
+
+
 def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str, object]]:
     data: dict[str, dict[str, dict[str, float]]] = {}
     updated = False
@@ -424,8 +437,8 @@ def select_group_mask(
     else:
         target_size = 0
 
-    ga_population_size = 20
-    ga_generations = 60
+    ga_population_size = 16
+    ga_generations = 50
     ga_offspring = ga_population_size
     lambda_sample_M = DEFAULT_M
     lambda_ratio_r = DEFAULT_R
@@ -719,8 +732,22 @@ def select_group_mask(
         eps=lambda_eps,
         tqdm_desc=f"Estimating lambdas (seed={seed}, kr={keep_ratio}, wg={weight_group})",
     )
-    lambda_cls = float(lambda_info.get("lambda_cls", lambda_info.get("lambda", 0.0)))
-    lambda_mean = float(lambda_info["lambda_mean"])
+    if "lambda_std_cls" not in lambda_info or "lambda_std_mean" not in lambda_info:
+        raise KeyError(
+            "group_lambda cache missing required fields: lambda_std_cls/lambda_std_mean; "
+            "please regenerate utils/group_lambda.json with current format."
+        )
+    scale_cls, scale_mean = _get_group_penalty_scales(dataset_name, keep_ratio)
+    lambda_std_cls = float(lambda_info["lambda_std_cls"])
+    lambda_std_mean = float(lambda_info["lambda_std_mean"])
+    lambda_cls = float(scale_cls * lambda_std_cls)
+    lambda_mean = float(scale_mean * lambda_std_mean)
+    print(
+        f"[GroupLambda] dataset={dataset_name} kr={keep_ratio} "
+        f"scale_cls={scale_cls:.6f} scale_mean={scale_mean:.6f} "
+        f"lambda_std_cls={lambda_std_cls:.8f} lambda_std_mean={lambda_std_mean:.8f} "
+        f"lambda_cls={lambda_cls:.8f} lambda_mean={lambda_mean:.8f}"
+    )
 
     initial_population_idx: list[np.ndarray] = [static_topk]
     for _ in range(max(0, ga_population_size - 1)):
@@ -733,6 +760,8 @@ def select_group_mask(
 
     score_history: list[float] = []
     correction_history: list[float] = []
+    class_correction_history: list[float] = []
+    mean_correction_history: list[float] = []
     mean_penalty_history: list[float] = []
 
     div_feat_np = div_features_np
@@ -864,6 +893,8 @@ def select_group_mask(
         class_corr = float(lambda_cls * float(generation_best_item["penalty"]))
         mean_corr = float(lambda_mean * float(generation_best_item["mean_penalty"]))
         correction_history.append(class_corr + mean_corr)
+        class_correction_history.append(class_corr)
+        mean_correction_history.append(mean_corr)
         mean_penalty_history.append(float(generation_best_item["mean_penalty"]))
         if gen_idx % 5 == 0:
             print(
@@ -933,6 +964,8 @@ def select_group_mask(
         "best_iter": int(np.argmax(np.asarray(score_history, dtype=np.float32))),
         "score_history": score_history,
         "correction_history": correction_history,
+        "class_correction_history": class_correction_history,
+        "mean_correction_history": mean_correction_history,
         "mean_penalty_history": mean_penalty_history,
         "ga_population_size": int(ga_population_size),
         "ga_generations": int(ga_generations),
@@ -940,6 +973,10 @@ def select_group_mask(
         "lambda": lambda_cls,
         "lambda_cls": lambda_cls,
         "lambda_mean": lambda_mean,
+        "scale_cls": float(scale_cls),
+        "scale_mean": float(scale_mean),
+        "lambda_std_cls": float(lambda_std_cls),
+        "lambda_std_mean": float(lambda_std_mean),
         "lambda_info": lambda_info,
         "stage2_cycles": int(stage2_cycles),
         "phase_schedule": phase_schedule,
@@ -964,7 +1001,8 @@ def _sanitize_for_filename(text: str) -> str:
 
 def save_score_curve_plot(
     score_history: Sequence[float],
-    correction_history: Sequence[float],
+    class_correction_history: Sequence[float],
+    mean_correction_history: Sequence[float],
     *,
     dataset: str,
     method: str,
@@ -989,15 +1027,17 @@ def save_score_curve_plot(
     ax2 = ax.twinx()
     x = np.arange(len(score_history), dtype=np.int32)
     score_arr = np.asarray(score_history, dtype=np.float64)
-    corr_arr = np.asarray(correction_history, dtype=np.float64)
+    class_corr_arr = np.asarray(class_correction_history, dtype=np.float64)
+    mean_corr_arr = np.asarray(mean_correction_history, dtype=np.float64)
     line1 = ax.plot(x, score_arr, linewidth=1.6, color="#1f77b4", label="S(D)")
-    line2 = ax2.plot(x, corr_arr, linewidth=1.6, color="#ff7f0e", label="λ·penalties(D)")
+    line2 = ax.plot(x, class_corr_arr, linewidth=1.6, color="#ff7f0e", label="λ_cls·class_penalty(D)")
+    line3 = ax2.plot(x, mean_corr_arr, linewidth=1.6, color="#2ca02c", label="λ_mean·mean_penalty(D)")
     ax.set_title("Score & correction trajectory")
     ax.set_xlabel("Iteration")
-    ax.set_ylabel("S(D)", color="#1f77b4")
-    ax2.set_ylabel("λ·penalties(D)", color="#ff7f0e")
+    ax.set_ylabel("S(D) / λ_cls·class_penalty(D)")
+    ax2.set_ylabel("λ_mean·mean_penalty(D)", color="#2ca02c")
     ax.grid(alpha=0.25)
-    handles = line1 + line2
+    handles = line1 + line2 + line3
     labels = [h.get_label() for h in handles]
     ax.legend(handles, labels, loc="best")
     fig.tight_layout()
@@ -1242,7 +1282,8 @@ def main() -> None:
                 )
                 debug_curve = save_score_curve_plot(
                     group_stats.get("score_history", []),
-                    group_stats.get("correction_history", []),
+                    group_stats.get("class_correction_history", []),
+                    group_stats.get("mean_correction_history", []),
                     dataset=dataset_name,
                     method=method,
                     weight_group=weight_group,

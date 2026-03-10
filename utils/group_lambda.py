@@ -69,15 +69,13 @@ def load_cached_lambda(
         return None
     if not np.isfinite(lam_f):
         return None
-    # Herding mean-correction cache is reusable only for the new format where
-    # lambda_mean is std-based with a mean-based upper cap.
-    required_mean_fields = (
-        "lambda_mean",
+    # Group mode now depends on std-based statistics and applies scaling in
+    # calculate_my_mask.py, so these two fields must be present in cache.
+    required_fields = (
+        "lambda_std_cls",
         "lambda_std_mean",
-        "lambda_mean_base",
-        "lambda_mean_cap",
     )
-    for field in required_mean_fields:
+    for field in required_fields:
         value = record.get(field)
         if value is None:
             return None

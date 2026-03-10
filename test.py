@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from utils.static_score_cache import get_or_compute_static_scores
 from utils.seed import set_seed
 from utils.path_rules import resolve_mask_path
@@ -9,8 +10,10 @@ from model.adapter import load_trained_adapters
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100
 
 import argparse
+import csv
 import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -25,6 +28,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+METHODS = ["random", "herding", "learned_topk", "learned_group"]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare group score components under different keep ratios")
@@ -37,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--krs", type=str, default="20,30,40,50,60,70,80,90")
     parser.add_argument("--seeds", type=str, default="22,42,96")
     parser.add_argument("--output-dir", type=str, default="test")
+    parser.add_argument("--mean-linear-a", type=float, default=1.0)
+    parser.add_argument("--mean-linear-b", type=float, default=0.0)
+    parser.add_argument("--scan-a", type=str, default="")
+    parser.add_argument("--scan-b", type=str, default="")
+    parser.add_argument("--acc-source", type=str, default="")
+    parser.add_argument("--save-diagnostics", action="store_true")
     return parser.parse_args()
 
 
@@ -51,6 +62,10 @@ def _build_dataset(dataset_name: str, transform):
 
 def parse_csv_ints(text: str) -> list[int]:
     return [int(x.strip()) for x in text.split(",") if x.strip()]
+
+
+def parse_csv_floats(text: str) -> list[float]:
+    return [float(x.strip()) for x in text.split(",") if x.strip()]
 
 
 def build_loader(dataset_name: str, preprocess, device: torch.device, batch_size: int, num_workers: int) -> DataLoader:
@@ -137,19 +152,13 @@ def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str,
 
 
 def load_scoring_weights(all_weights: dict[str, dict[str, object]], seed: int) -> dict[str, float]:
-    # Read learned scoring weights for the given seed from weights/scoring_weights.json.
     learned_weights = all_weights.get(str(seed))
     if not isinstance(learned_weights, dict):
         raise KeyError(f"missing learned weights for seed={seed}")
     return {k: float(learned_weights[k]) for k in ("sa", "div", "dds")}
 
 
-# Note:
-# `group_lambda.json` may contain cached `lambda_cls` / `lambda_mean` as final values
-# under older scaling settings. This test script must NOT directly reuse them.
-# We only reuse scaling-independent statistics `lambda_std_cls` and
-# `lambda_std_mean`, then apply fixed factors: class-balance uses 5, and herding uses dataset defaults (cifar10=2, cifar100=6).
-def load_lambda_scaled(dataset: str, seed: int, kr: int) -> tuple[float, float] | None:
+def load_lambda_std(dataset: str, seed: int, kr: int) -> tuple[float, float] | None:
     cache_path = PROJECT_ROOT / "utils" / "group_lambda.json"
     if not cache_path.exists():
         print(f"[Warning] lambda cache file missing: {cache_path}")
@@ -166,12 +175,7 @@ def load_lambda_scaled(dataset: str, seed: int, kr: int) -> tuple[float, float] 
     if "lambda_std_cls" not in record or "lambda_std_mean" not in record:
         print(f"[Warning] lambda_std fields missing in learned group for dataset={dataset}, seed={seed}, kr={kr}")
         return None
-
-    lambda_cls = 5.0 * float(record["lambda_std_cls"])
-    mean_scale_by_dataset = {"cifar10": 2.0, "cifar100": 6.0}
-    mean_scale = float(mean_scale_by_dataset.get(str(dataset).lower(), 2.0))
-    lambda_mean = mean_scale * float(record["lambda_std_mean"])
-    return lambda_cls, lambda_mean
+    return float(record["lambda_std_cls"]), float(record["lambda_std_mean"])
 
 
 def load_mask_for_method(method: str, dataset: str, model_name: str, seed: int, kr: int, n_samples: int) -> np.ndarray | None:
@@ -213,7 +217,6 @@ def load_mask_for_method(method: str, dataset: str, model_name: str, seed: int, 
 def compute_mean_penalty(
     selected_mask: np.ndarray,
     *,
-    labels_np: np.ndarray,
     num_classes: int,
     class_indices_list: list[np.ndarray],
     class_features_list: list[np.ndarray],
@@ -239,7 +242,7 @@ def compute_mean_penalty(
     return float(penalty_sum)
 
 
-def compute_subset_scores(
+def compute_subset_base(
     selected_mask: np.ndarray,
     *,
     sa_scores: np.ndarray,
@@ -259,8 +262,8 @@ def compute_subset_scores(
     class_features_list: list[np.ndarray],
     full_class_mean: np.ndarray,
     full_class_var: np.ndarray,
-    lambda_cls: float,
-    lambda_mean: float,
+    lambda_std_cls: float,
+    lambda_std_mean: float,
 ) -> dict[str, float]:
     div_dyn = np.asarray(
         div_metric.score_dataset_dynamic(
@@ -285,10 +288,9 @@ def compute_subset_scores(
     chosen = selected_mask.astype(bool)
     score_ref = weights["sa"] * sa_scores + weights["div"] * div_dyn + weights["dds"] * dds_dyn
     raw_score = float(np.sum(score_ref[chosen]))
-    class_penalty = compute_balance_penalty(selected_mask, labels_np, num_classes, target_size)
-    mean_penalty = compute_mean_penalty(
+    class_penalty_raw = compute_balance_penalty(selected_mask, labels_np, num_classes, target_size)
+    mean_penalty_raw = compute_mean_penalty(
         selected_mask,
-        labels_np=labels_np,
         num_classes=num_classes,
         class_indices_list=class_indices_list,
         class_features_list=class_features_list,
@@ -296,29 +298,57 @@ def compute_subset_scores(
         full_class_var=full_class_var,
         eps=DEFAULT_EPS,
     )
-    class_correction = float(lambda_cls * class_penalty)
-    mean_correction = float(lambda_mean * mean_penalty)
-    adjusted_score = float(raw_score - class_correction - mean_correction)
+    class_base = float(lambda_std_cls * class_penalty_raw)
+    mean_base = float(lambda_std_mean * mean_penalty_raw)
     return {
         "raw_score": raw_score,
-        "class_correction": class_correction,
-        "mean_correction": mean_correction,
-        "adjusted_score": adjusted_score,
+        "class_penalty_raw": float(class_penalty_raw),
+        "mean_penalty_raw": float(mean_penalty_raw),
+        "lambda_std_cls": float(lambda_std_cls),
+        "lambda_std_mean": float(lambda_std_mean),
+        "class_base": class_base,
+        "mean_base": mean_base,
     }
+
+
+def mean_scale_from_linear(a: float, b: float, kr: int) -> float:
+    return float(max(0.0, a - b * float(kr)))
+
+
+def finalize_scores(base_row: dict[str, float], mean_scale: float) -> dict[str, float]:
+    class_correction = float(base_row["class_base"])
+    mean_correction = float(mean_scale * base_row["mean_base"])
+    adjusted_score = float(base_row["raw_score"] - class_correction - mean_correction)
+    out = dict(base_row)
+    out.update(
+        {
+            "mean_scale": float(mean_scale),
+            "class_correction": class_correction,
+            "mean_correction": mean_correction,
+            "adjusted_score": adjusted_score,
+        }
+    )
+    return out
 
 
 def print_table(kr: int, rows: list[tuple[str, dict[str, float]]]) -> None:
     print(f"\n=== KR={kr} ===")
-    header = f"{'method':<16}{'raw_score':>14}{'class_correction':>20}{'mean_correction':>20}{'adjusted_score':>18}"
+    header = (
+        f"{'method':<16}{'raw_score':>14}{'class_base':>14}{'mean_base':>14}"
+        f"{'mean_scale':>13}{'class_corr':>14}{'mean_corr':>14}{'adjusted':>14}"
+    )
     print(header)
     print("-" * len(header))
     for method, vals in rows:
         print(
             f"{method:<16}"
             f"{vals['raw_score']:>14.4f}"
-            f"{vals['class_correction']:>20.4f}"
-            f"{vals['mean_correction']:>20.4f}"
-            f"{vals['adjusted_score']:>18.4f}"
+            f"{vals['class_base']:>14.4f}"
+            f"{vals['mean_base']:>14.4f}"
+            f"{vals['mean_scale']:>13.4f}"
+            f"{vals['class_correction']:>14.4f}"
+            f"{vals['mean_correction']:>14.4f}"
+            f"{vals['adjusted_score']:>14.4f}"
         )
 
 
@@ -349,12 +379,161 @@ def save_plot(dataset: str, kr: int, rows: list[tuple[str, dict[str, float]]], o
     plt.close(fig)
 
 
+def save_mean_scale_curve(dataset: str, keep_ratios: list[int], a: float, b: float, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    xs = np.asarray(keep_ratios, dtype=np.float32)
+    ys = np.asarray([mean_scale_from_linear(a, b, int(kr)) for kr in keep_ratios], dtype=np.float32)
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(xs, ys, marker="o")
+    ax.set_xlabel("keep_ratio")
+    ax.set_ylabel("mean_scale")
+    ax.set_title(f"mean_scale(kr) = max(0, {a:.4f} - {b:.4f} * kr) | {dataset}")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_dir / f"mean_scale_curve_{dataset}.png", dpi=150)
+    plt.close(fig)
+
+
+def save_scan_heatmap(dataset: str, scan_rows: list[dict[str, float]], a_values: list[float], b_values: list[float], output_dir: Path) -> None:
+    if not scan_rows:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    grid = np.full((len(a_values), len(b_values)), np.nan, dtype=np.float32)
+    a_index = {v: i for i, v in enumerate(a_values)}
+    b_index = {v: i for i, v in enumerate(b_values)}
+    for row in scan_rows:
+        ai = a_index[float(row["a"])]
+        bi = b_index[float(row["b"])]
+        grid[ai, bi] = float(row["mean_spearman"])
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    im = ax.imshow(grid, aspect="auto", origin="lower", cmap="viridis")
+    ax.set_xticks(np.arange(len(b_values)))
+    ax.set_xticklabels([f"{v:.4f}" for v in b_values], rotation=45, ha="right")
+    ax.set_yticks(np.arange(len(a_values)))
+    ax.set_yticklabels([f"{v:.4f}" for v in a_values])
+    ax.set_xlabel("b")
+    ax.set_ylabel("a")
+    ax.set_title(f"mean_spearman heatmap | {dataset}")
+    fig.colorbar(im, ax=ax, label="mean_spearman")
+    fig.tight_layout()
+    fig.savefig(output_dir / f"scan_heatmap_{dataset}.png", dpi=150)
+    plt.close(fig)
+
+
+def load_acc_source(path_text: str) -> dict[str, dict[str, float]]:
+    if not path_text:
+        return {}
+    path = Path(path_text)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    if not path.exists():
+        print(f"[Warning] acc source missing: {path}")
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        print(f"[Warning] bad acc source format: {path}")
+        return {}
+    parsed: dict[str, dict[str, float]] = {}
+    for kr, row in data.items():
+        if not isinstance(row, dict):
+            continue
+        parsed[str(kr)] = {}
+        for method in METHODS:
+            if method not in row:
+                print(f"[Warning] acc source missing method={method} for kr={kr}")
+                continue
+            parsed[str(kr)][method] = float(row[method])
+    return parsed
+
+
+def rank_from_scores(items: dict[str, float], descending: bool = True) -> list[str]:
+    return [k for k, _ in sorted(items.items(), key=lambda kv: kv[1], reverse=descending)]
+
+
+def _rank_values(order: list[str]) -> dict[str, float]:
+    return {name: float(i + 1) for i, name in enumerate(order)}
+
+
+def spearman_corr(acc_vals: dict[str, float], score_vals: dict[str, float]) -> float:
+    common = [m for m in METHODS if m in acc_vals and m in score_vals]
+    if len(common) < 2:
+        return float("nan")
+    acc_order = rank_from_scores({m: acc_vals[m] for m in common}, descending=True)
+    score_order = rank_from_scores({m: score_vals[m] for m in common}, descending=True)
+    acc_rank = _rank_values(acc_order)
+    score_rank = _rank_values(score_order)
+    x = np.asarray([acc_rank[m] for m in common], dtype=np.float64)
+    y = np.asarray([score_rank[m] for m in common], dtype=np.float64)
+    x = x - np.mean(x)
+    y = y - np.mean(y)
+    denom = float(np.sqrt(np.sum(x * x) * np.sum(y * y)))
+    if denom <= 0:
+        return float("nan")
+    return float(np.sum(x * y) / denom)
+
+
+def kendall_tau(acc_vals: dict[str, float], score_vals: dict[str, float]) -> float:
+    common = [m for m in METHODS if m in acc_vals and m in score_vals]
+    if len(common) < 2:
+        return float("nan")
+    concordant = 0
+    discordant = 0
+    for i in range(len(common)):
+        for j in range(i + 1, len(common)):
+            mi, mj = common[i], common[j]
+            da = acc_vals[mi] - acc_vals[mj]
+            ds = score_vals[mi] - score_vals[mj]
+            if da == 0 or ds == 0:
+                continue
+            if da * ds > 0:
+                concordant += 1
+            else:
+                discordant += 1
+    total = concordant + discordant
+    if total == 0:
+        return float("nan")
+    return float((concordant - discordant) / total)
+
+
+def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def safe_mean(values: list[float]) -> float:
+    if not values:
+        return float("nan")
+    arr = np.asarray(values, dtype=np.float64)
+    if np.all(np.isnan(arr)):
+        return float("nan")
+    return float(np.nanmean(arr))
+
+
+def pairwise_threshold(row1: dict[str, float], row2: dict[str, float]) -> tuple[float, str]:
+    den = float(row1["mean_base"] - row2["mean_base"])
+    if abs(den) <= 1e-12:
+        return float("nan"), "unsolved(mean_base equal)"
+    num = float((row1["raw_score"] - row1["class_base"]) - (row2["raw_score"] - row2["class_base"]))
+    return float(num / den), "ok"
+
+
 def main() -> None:
     args = parse_args()
     keep_ratios = parse_csv_ints(args.krs)
     seeds = parse_csv_ints(args.seeds)
     if not keep_ratios or not seeds:
         raise ValueError("krs and seeds must be non-empty")
+
+    scan_a_values = parse_csv_floats(args.scan_a) if args.scan_a.strip() else []
+    scan_b_values = parse_csv_floats(args.scan_b) if args.scan_b.strip() else []
+    do_scan = bool(scan_a_values and scan_b_values)
+
+    acc_data = load_acc_source(args.acc_source)
 
     device = torch.device(args.device) if args.device else CONFIG.global_device
     set_seed(int(seeds[0]))
@@ -435,11 +614,13 @@ def main() -> None:
     class_indices_list = [np.flatnonzero(labels_np == class_id).astype(np.int64) for class_id in range(num_classes)]
     class_features_list = [div_features_np[idx] for idx in class_indices_list]
 
-    methods = ["random", "herding", "learned_topk", "learned_group"]
     output_dir = PROJECT_ROOT / args.output_dir
+    diagnostics_rows: list[dict[str, object]] = []
+    summary_rows: list[dict[str, object]] = []
+    threshold_rows: list[dict[str, object]] = []
 
     for kr in tqdm(keep_ratios, desc="KR loop", unit="kr"):
-        method_results: dict[str, list[dict[str, float]]] = {m: [] for m in methods}
+        method_results: dict[str, list[dict[str, float]]] = {m: [] for m in METHODS}
         seed_iter = tqdm(seeds, desc=f"Seed loop (kr={kr})", unit="seed", leave=False)
         for seed in seed_iter:
             target_size = max(1, min(n_samples, int(round(n_samples * kr / 100.0))))
@@ -448,47 +629,46 @@ def main() -> None:
             except Exception as exc:
                 print(f"[Warning] skip seed={seed}, kr={kr}, missing learned weights: {exc}")
                 continue
-            lambda_pair = load_lambda_scaled(args.dataset, seed, kr)
+            lambda_pair = load_lambda_std(args.dataset, seed, kr)
             if lambda_pair is None:
                 print(f"[Warning] skip seed={seed}, kr={kr}, missing lambda std cache")
                 continue
-            lambda_cls, lambda_mean = lambda_pair
+            lambda_std_cls, lambda_std_mean = lambda_pair
 
             rng = np.random.default_rng(int(seed))
             random_idx = rng.choice(n_samples, size=target_size, replace=False)
             random_mask = np.zeros(n_samples, dtype=np.uint8)
             random_mask[random_idx] = 1
-            method_results["random"].append(
-                compute_subset_scores(
-                    random_mask,
-                    sa_scores=sa_scores,
-                    weights=weights,
-                    div_metric=div_metric,
-                    dds_metric=dds_metric,
-                    div_loader=div_loader,
-                    dds_loader=dds_loader,
-                    image_adapter=image_adapter,
-                    div_features=div_features,
-                    dds_features=dds_features,
-                    labels_t=labels_t,
-                    labels_np=labels_np,
-                    num_classes=num_classes,
-                    target_size=target_size,
-                    class_indices_list=class_indices_list,
-                    class_features_list=class_features_list,
-                    full_class_mean=full_class_mean,
-                    full_class_var=full_class_var,
-                    lambda_cls=lambda_cls,
-                    lambda_mean=lambda_mean,
-                )
+            random_base = compute_subset_base(
+                random_mask,
+                sa_scores=sa_scores,
+                weights=weights,
+                div_metric=div_metric,
+                dds_metric=dds_metric,
+                div_loader=div_loader,
+                dds_loader=dds_loader,
+                image_adapter=image_adapter,
+                div_features=div_features,
+                dds_features=dds_features,
+                labels_t=labels_t,
+                labels_np=labels_np,
+                num_classes=num_classes,
+                target_size=target_size,
+                class_indices_list=class_indices_list,
+                class_features_list=class_features_list,
+                full_class_mean=full_class_mean,
+                full_class_var=full_class_var,
+                lambda_std_cls=lambda_std_cls,
+                lambda_std_mean=lambda_std_mean,
             )
+            random_base["seed"] = float(seed)
+            method_results["random"].append(random_base)
 
             for method in ("herding", "learned_topk", "learned_group"):
                 mask = load_mask_for_method(method, args.dataset, args.model_name, seed, kr, n_samples)
                 if mask is None:
                     continue
-                method_results[method].append(
-                    compute_subset_scores(
+                method_base = compute_subset_base(
                         mask,
                         sa_scores=sa_scores,
                         weights=weights,
@@ -507,31 +687,241 @@ def main() -> None:
                         class_features_list=class_features_list,
                         full_class_mean=full_class_mean,
                         full_class_var=full_class_var,
-                        lambda_cls=lambda_cls,
-                        lambda_mean=lambda_mean,
+                        lambda_std_cls=lambda_std_cls,
+                        lambda_std_mean=lambda_std_mean,
                     )
-                )
+                method_base["seed"] = float(seed)
+                method_results[method].append(method_base)
 
+        mean_scale = mean_scale_from_linear(args.mean_linear_a, args.mean_linear_b, kr)
         table_rows: list[tuple[str, dict[str, float]]] = []
-        for method in methods:
+        per_method_agg: dict[str, dict[str, float]] = {}
+        for method in METHODS:
             vals = method_results[method]
             if not vals:
                 print(f"[Warning] empty result for method={method}, kr={kr}")
-                avg = {"raw_score": np.nan, "class_correction": np.nan, "mean_correction": np.nan, "adjusted_score": np.nan}
-            else:
-                avg = {
-                    "raw_score": float(np.mean([v["raw_score"] for v in vals])),
-                    "class_correction": float(np.mean([v["class_correction"] for v in vals])),
-                    "mean_correction": float(np.mean([v["mean_correction"] for v in vals])),
-                    "adjusted_score": float(np.mean([v["adjusted_score"] for v in vals])),
+                base_avg = {
+                    "raw_score": float("nan"),
+                    "class_penalty_raw": float("nan"),
+                    "mean_penalty_raw": float("nan"),
+                    "lambda_std_cls": float("nan"),
+                    "lambda_std_mean": float("nan"),
+                    "class_base": float("nan"),
+                    "mean_base": float("nan"),
                 }
-            table_rows.append((method, avg))
+            else:
+                base_avg = {
+                    k: safe_mean([float(v[k]) for v in vals])
+                    for k in vals[0].keys()
+                    if k != "seed"
+                }
+
+            finalized = finalize_scores(base_avg, mean_scale)
+            table_rows.append((method, finalized))
+            per_method_agg[method] = finalized
+            summary_rows.append(
+                {
+                    "dataset": args.dataset,
+                    "kr": kr,
+                    "method": method,
+                    **{k: finalized[k] for k in finalized},
+                }
+            )
+
+            for per_seed_base in vals:
+                seed_value = int(per_seed_base.get("seed", -1))
+                per_seed_core = {k: v for k, v in per_seed_base.items() if k != "seed"}
+                final_seed = finalize_scores(per_seed_core, mean_scale)
+                diagnostics_rows.append(
+                    {
+                        "dataset": args.dataset,
+                        "kr": kr,
+                        "seed": seed_value,
+                        "method": method,
+                        **{k: final_seed[k] for k in final_seed},
+                    }
+                )
 
         print_table(kr, table_rows)
         save_plot(args.dataset, kr, table_rows, output_dir)
 
-    print("\nExample command:")
-    print("python test.py --dataset cifar10 --krs 20,30,40,50,60 --seeds 22,42,96")
+        pairs = [
+            ("random", "learned_group"),
+            ("herding", "learned_group"),
+            ("random", "learned_topk"),
+            ("herding", "learned_topk"),
+        ]
+        print(f"\n[Pairwise thresholds] kr={kr}")
+        for m1, m2 in pairs:
+            t, status = pairwise_threshold(per_method_agg[m1], per_method_agg[m2])
+            print(f"  {m1} vs {m2}: A*={t:.4f} ({status})")
+            threshold_rows.append(
+                {
+                    "dataset": args.dataset,
+                    "kr": kr,
+                    "pair": f"{m1}_vs_{m2}",
+                    "method_1": m1,
+                    "method_2": m2,
+                    "A_star": t,
+                    "status": status,
+                }
+            )
+
+    if args.save_diagnostics:
+        diag_json_path = output_dir / f"diagnostics_{args.dataset}.json"
+        diag_csv_path = output_dir / f"diagnostics_{args.dataset}.csv"
+        summary_csv_path = output_dir / f"summary_{args.dataset}.csv"
+        thresholds_csv_path = output_dir / f"thresholds_{args.dataset}.csv"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        diag_json_path.write_text(json.dumps(diagnostics_rows, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_csv(
+            diag_csv_path,
+            diagnostics_rows,
+            [
+                "dataset",
+                "kr",
+                "seed",
+                "method",
+                "raw_score",
+                "class_penalty_raw",
+                "mean_penalty_raw",
+                "lambda_std_cls",
+                "lambda_std_mean",
+                "class_base",
+                "mean_base",
+                "mean_scale",
+                "class_correction",
+                "mean_correction",
+                "adjusted_score",
+            ],
+        )
+        write_csv(
+            summary_csv_path,
+            summary_rows,
+            [
+                "dataset",
+                "kr",
+                "method",
+                "raw_score",
+                "class_penalty_raw",
+                "mean_penalty_raw",
+                "lambda_std_cls",
+                "lambda_std_mean",
+                "class_base",
+                "mean_base",
+                "mean_scale",
+                "class_correction",
+                "mean_correction",
+                "adjusted_score",
+            ],
+        )
+        write_csv(
+            thresholds_csv_path,
+            threshold_rows,
+            ["dataset", "kr", "pair", "method_1", "method_2", "A_star", "status"],
+        )
+
+    save_mean_scale_curve(args.dataset, keep_ratios, args.mean_linear_a, args.mean_linear_b, output_dir)
+
+    summary_by_kr_method: dict[int, dict[str, dict[str, float]]] = {}
+    for row in summary_rows:
+        kr = int(row["kr"])
+        summary_by_kr_method.setdefault(kr, {})[str(row["method"])] = {k: float(row[k]) for k in row if k not in {"dataset", "kr", "method"}}
+
+    if acc_data:
+        print("\n=== Rank consistency analysis (current a,b) ===")
+        spearmans: list[float] = []
+        top1_matches = 0
+        for kr in keep_ratios:
+            kr_key = str(kr)
+            if kr_key not in acc_data:
+                print(f"[Warning] acc-source missing kr={kr}")
+                continue
+            if kr not in summary_by_kr_method:
+                continue
+            acc_vals = acc_data[kr_key]
+            score_vals = {m: summary_by_kr_method[kr][m]["adjusted_score"] for m in METHODS if m in summary_by_kr_method[kr]}
+            acc_rank = rank_from_scores(acc_vals, descending=True)
+            score_rank = rank_from_scores(score_vals, descending=True)
+            sp = spearman_corr(acc_vals, score_vals)
+            kd = kendall_tau(acc_vals, score_vals)
+            top1_ok = bool(acc_rank and score_rank and acc_rank[0] == score_rank[0])
+            spearmans.append(sp)
+            top1_matches += int(top1_ok)
+            print(f"kr={kr} | acc_rank={acc_rank} | score_rank={score_rank} | spearman={sp:.4f} | kendall={kd:.4f} | top1={top1_ok}")
+
+        mean_s = safe_mean(spearmans)
+        print(f"[Global] mean_spearman={mean_s:.4f}, top1_match_count={top1_matches}/{len(keep_ratios)}")
+    else:
+        print("[Info] --acc-source empty, skip rank consistency analysis.")
+
+    if do_scan:
+        print("\n=== Linear scan over (a,b) ===")
+        scan_rows: list[dict[str, float]] = []
+        scan_iter = tqdm([(a, b) for a in scan_a_values for b in scan_b_values], desc="Scan (a,b)", unit="pair")
+        for a, b in scan_iter:
+            spearmans: list[float] = []
+            top1_matches = 0
+            for kr in keep_ratios:
+                if kr not in summary_by_kr_method:
+                    continue
+                score_vals: dict[str, float] = {}
+                mean_scale_scan = mean_scale_from_linear(a, b, kr)
+                for method in METHODS:
+                    if method not in summary_by_kr_method[kr]:
+                        continue
+                    base = summary_by_kr_method[kr][method]
+                    score_vals[method] = float(base["raw_score"] - base["class_base"] - mean_scale_scan * base["mean_base"])
+                if acc_data and str(kr) in acc_data:
+                    acc_vals = acc_data[str(kr)]
+                    sp = spearman_corr(acc_vals, score_vals)
+                    spearmans.append(sp)
+                    acc_rank = rank_from_scores(acc_vals, descending=True)
+                    score_rank = rank_from_scores(score_vals, descending=True)
+                    if acc_rank and score_rank and acc_rank[0] == score_rank[0]:
+                        top1_matches += 1
+            mean_s = safe_mean(spearmans) if acc_data else float("nan")
+            scan_rows.append(
+                {
+                    "a": float(a),
+                    "b": float(b),
+                    "mean_spearman": float(mean_s),
+                    "top1_match_count": float(top1_matches),
+                }
+            )
+
+        scan_rows_sorted = sorted(
+            scan_rows,
+            key=lambda r: (
+                -1e9 if math.isnan(float(r["mean_spearman"])) else float(r["mean_spearman"]),
+                float(r["top1_match_count"]),
+            ),
+            reverse=True,
+        )
+        print("a,b,mean_spearman,top1_match_count")
+        for row in scan_rows_sorted[: min(20, len(scan_rows_sorted))]:
+            print(f"{row['a']:.4f},{row['b']:.4f},{row['mean_spearman']:.4f},{int(row['top1_match_count'])}")
+
+        if scan_rows_sorted:
+            best = scan_rows_sorted[0]
+            print(
+                f"best linear formula: scale_mean(kr) = {best['a']:.4f} - {best['b']:.4f} * kr "
+                f"(mean_spearman={best['mean_spearman']:.4f}, top1_match_count={int(best['top1_match_count'])})"
+            )
+
+        scan_csv_path = output_dir / f"scan_{args.dataset}.csv"
+        write_csv(scan_csv_path, scan_rows_sorted, ["a", "b", "mean_spearman", "top1_match_count"])
+        save_scan_heatmap(args.dataset, scan_rows, scan_a_values, scan_b_values, output_dir)
+
+    print("\nExample commands:")
+    print(
+        "python test.py --dataset cifar100 --mean-linear-a 3.0 --mean-linear-b 0.03 "
+        "--acc-source test/cifar100_acc.json --save-diagnostics"
+    )
+    print(
+        "python test.py --dataset cifar100 --scan-a 1.0,2.0,3.0,4.0 --scan-b 0.0,0.01,0.02,0.03,0.04 "
+        "--acc-source test/cifar100_acc.json --save-diagnostics"
+    )
 
 
 if __name__ == "__main__":

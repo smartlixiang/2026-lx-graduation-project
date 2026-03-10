@@ -1,0 +1,10 @@
+{
+  "20": {"random": 0.8318, "herding": 0.8295, "learned_topk": 0.8294, "learned_group": 0.8177},
+  "30": {"random": 0.8702, "herding": 0.8781, "learned_topk": 0.8761, "learned_group": 0.8879},
+  "40": {"random": 0.9022, "herding": 0.9086, "learned_topk": 0.9062, "learned_group": 0.9097},
+  "50": {"random": 0.9202, "herding": 0.9219, "learned_topk": 0.9218, "learned_group": 0.9234},
+  "60": {"random": 0.9298, "herding": 0.9296, "learned_topk": 0.9333, "learned_group": 0.9277},
+  "70": {"random": 0.9380, "herding": 0.9365, "learned_topk": 0.9402, "learned_group": 0.9389},
+  "80": {"random": 0.9412, "herding": 0.9430, "learned_topk": 0.9421, "learned_group": 0.9425},
+  "90": {"random": 0.9476, "herding": 0.9466, "learned_topk": 0.9492, "learned_group": 0.9487}
+}

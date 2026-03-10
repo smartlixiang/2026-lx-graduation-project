@@ -215,6 +215,14 @@ def load_mask_for_method(method: str, dataset: str, model_name: str, seed: int, 
     return None
 
 
+def select_random_mask(n_samples: int, keep_ratio: int) -> np.ndarray:
+    k = max(1, min(n_samples, int(round(n_samples * keep_ratio / 100.0))))
+    idx = np.random.choice(n_samples, size=k, replace=False)
+    mask = np.zeros(n_samples, dtype=np.uint8)
+    mask[idx] = 1
+    return mask
+
+
 def compute_mean_penalty(
     selected_mask: np.ndarray,
     *,
@@ -658,25 +666,25 @@ def main() -> None:
                 if mask is None:
                     continue
                 method_base = compute_subset_base(
-                        mask,
-                        sa_scores=sa_scores,
-                        weights=weights,
-                        dds_scores=dds_scores,
-                        div_metric=div_metric,
-                        div_loader=div_loader,
-                        image_adapter=image_adapter,
-                        div_features=div_features,
-                        labels_t=labels_t,
-                        labels_np=labels_np,
-                        num_classes=num_classes,
-                        target_size=int(mask.sum()),
-                        class_indices_list=class_indices_list,
-                        class_features_list=class_features_list,
-                        full_class_mean=full_class_mean,
-                        full_class_var=full_class_var,
-                        lambda_std_cls=lambda_std_cls,
-                        lambda_std_mean=lambda_std_mean,
-                    )
+                    mask,
+                    sa_scores=sa_scores,
+                    weights=weights,
+                    dds_scores=dds_scores,
+                    div_metric=div_metric,
+                    div_loader=div_loader,
+                    image_adapter=image_adapter,
+                    div_features=div_features,
+                    labels_t=labels_t,
+                    labels_np=labels_np,
+                    num_classes=num_classes,
+                    target_size=int(mask.sum()),
+                    class_indices_list=class_indices_list,
+                    class_features_list=class_features_list,
+                    full_class_mean=full_class_mean,
+                    full_class_var=full_class_var,
+                    lambda_std_cls=lambda_std_cls,
+                    lambda_std_mean=lambda_std_mean,
+                )
                 method_base["seed"] = float(seed)
                 method_results[method].append(method_base)
 

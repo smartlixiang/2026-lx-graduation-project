@@ -364,24 +364,25 @@ def select_group_mask(
         raise ValueError("sa_scores 与 labels 的样本数不一致。")
 
     sr = float(keep_ratio) / 100.0
+    labels_np = np.asarray(labels, dtype=np.int64)
     sa_scores_np = np.asarray(sa_scores, dtype=np.float32)
     if div_static_scores is not None:
         div_static_np = np.asarray(div_static_scores, dtype=np.float32)
-        if div_static_np.shape[0] != num_samples:
-            raise ValueError("div_static_scores 与 sa_scores 的样本数不一致。")
     else:
         div_static_np = np.zeros(num_samples, dtype=np.float32)
-
     if dds_static_scores is not None:
         dds_static_np = np.asarray(dds_static_scores, dtype=np.float32)
-        if dds_static_np.shape[0] != num_samples:
-            raise ValueError("dds_static_scores 与 sa_scores 的样本数不一致。")
     else:
         dds_static_np = np.zeros(num_samples, dtype=np.float32)
 
-    labels_np = np.asarray(labels, dtype=np.int64)
+    if div_static_np.shape[0] != num_samples or dds_static_np.shape[0] != num_samples:
+        raise ValueError("静态分数与样本数不一致。")
+
+    target_size = int(round(sr * num_samples))
+    target_size = min(num_samples, max(1, target_size)) if num_samples > 0 else 0
     all_indices = np.arange(num_samples, dtype=np.int64)
-    class_indices_list = [np.flatnonzero(labels_np == class_id).astype(np.int64) for class_id in range(num_classes)]
+    class_indices_list = [np.flatnonzero(labels_np == c).astype(np.int64) for c in range(num_classes)]
+
     labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
     div_features_np = (
@@ -395,19 +396,12 @@ def select_group_mask(
         clip_model=clip_model,
         adapter_image_path=adapter_image_path,
     )
-    full_class_mean, full_class_var = _get_or_compute_group_mean_stats(
+    full_class_mean, _ = _get_or_compute_group_mean_stats(
         cache_path=mean_stats_cache_path,
         image_features=div_features_np,
         labels=labels_np,
         num_classes=num_classes,
     )
-    class_features_list = [div_features_np[class_indices] for class_indices in class_indices_list]
-
-    target_size = int(round(sr * num_samples))
-    if num_samples > 0:
-        target_size = min(num_samples, max(1, target_size))
-    else:
-        target_size = 0
 
     lambda_sample_M = DEFAULT_M
     lambda_ratio_r = DEFAULT_R
@@ -415,21 +409,17 @@ def select_group_mask(
 
     cached_real_stats: dict[bytes, tuple[float, np.ndarray, np.ndarray]] = {}
     membership_buffer = np.zeros(num_samples, dtype=bool)
+    sum_features = np.zeros((num_classes, div_features_np.shape[1]), dtype=np.float64)
+    cnt_features = np.zeros(num_classes, dtype=np.int64)
 
-    def _mask_cache_key(cur_mask: np.ndarray) -> bytes:
-        return np.asarray(cur_mask, dtype=np.uint8).tobytes()
+    static_part = (weights["sa"] * sa_scores_np + weights["dds"] * dds_static_np).astype(np.float32)
+    guide_score_np = static_part
 
     def _indices_to_mask(indices: np.ndarray) -> np.ndarray:
         mask = np.zeros(num_samples, dtype=np.uint8)
         if indices.size > 0:
             mask[np.asarray(indices, dtype=np.int64)] = 1
         return mask
-
-    def _pick_top_by_score(candidate_idx: np.ndarray, k: int, score_np: np.ndarray) -> np.ndarray:
-        if k <= 0 or candidate_idx.size == 0:
-            return np.empty(0, dtype=np.int64)
-        order = np.argsort(-score_np[candidate_idx], kind="mergesort")
-        return candidate_idx[order[: min(k, candidate_idx.size)]].astype(np.int64)
 
     def _build_membership(indices: np.ndarray) -> np.ndarray:
         membership_buffer.fill(False)
@@ -438,12 +428,31 @@ def select_group_mask(
         return membership_buffer
 
     def _complement_indices(indices: np.ndarray) -> np.ndarray:
-        member = _build_membership(indices)
-        return all_indices[~member]
+        return all_indices[~_build_membership(indices)]
+
+    def _mask_cache_key(cur_mask: np.ndarray) -> bytes:
+        return np.asarray(cur_mask, dtype=np.uint8).tobytes()
+
+    def _compute_mean_penalty(cur_mask: np.ndarray) -> float:
+        selected = np.flatnonzero(cur_mask > 0).astype(np.int64)
+        if selected.size == 0:
+            return 0.0
+        sum_features.fill(0.0)
+        cnt_features.fill(0)
+        sel_labels = labels_np[selected]
+        np.add.at(sum_features, sel_labels, div_features_np[selected].astype(np.float64))
+        np.add.at(cnt_features, sel_labels, 1)
+        active = cnt_features > 0
+        if not np.any(active):
+            return 0.0
+        selected_mean = np.zeros_like(full_class_mean, dtype=np.float64)
+        selected_mean[active] = sum_features[active] / cnt_features[active, None]
+        diff = selected_mean[active] - full_class_mean[active].astype(np.float64)
+        return float(np.sum(np.linalg.norm(diff, axis=1)))
 
     def _real_stats_cached(cur_mask: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
-        cur_key = _mask_cache_key(cur_mask)
-        cached = cached_real_stats.get(cur_key)
+        key = _mask_cache_key(cur_mask)
+        cached = cached_real_stats.get(key)
         if cached is not None:
             return cached
         selected = cur_mask.astype(bool)
@@ -457,32 +466,13 @@ def select_group_mask(
             ).scores,
             dtype=np.float32,
         )
-        s_ref = weights["sa"] * sa_scores_np + weights["div"] * div_scores + weights["dds"] * dds_static_np
+        s_ref = static_part + weights["div"] * div_scores
         counts = np.bincount(labels_np[selected], minlength=num_classes).astype(np.int64)
         s_val = float(np.sum(s_ref[selected]))
-        cached_real_stats[cur_key] = (s_val, s_ref, counts)
-        return cached_real_stats[cur_key]
+        cached_real_stats[key] = (s_val, s_ref, counts)
+        return cached_real_stats[key]
 
-    guide_score_np = (sa_scores_np + dds_static_np).astype(np.float32)
-
-    def _compute_mean_penalty(cur_mask: np.ndarray) -> float:
-        selected = cur_mask.astype(bool)
-        penalty_sum = 0.0
-        for class_id in range(num_classes):
-            class_indices = class_indices_list[class_id]
-            if class_indices.size == 0:
-                continue
-            class_selected = selected[class_indices]
-            count = int(np.sum(class_selected))
-            if count <= 0:
-                continue
-            subset_sum = np.sum(class_features_list[class_id][class_selected], axis=0, dtype=np.float32)
-            subset_mean = subset_sum / float(count)
-            diff = subset_mean - full_class_mean[class_id]
-            penalty_sum += float(np.dot(diff, diff)) / (float(full_class_var[class_id]) + lambda_eps)
-        return float(penalty_sum)
-
-    lambda_info = get_or_estimate_lambda(
+    lambda_record = get_or_estimate_lambda(
         cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
         dataset=dataset_name,
         seed=seed,
@@ -490,306 +480,184 @@ def select_group_mask(
         weight_group=weight_group,
         n_samples=num_samples,
         target_size=target_size,
-        eval_score_fn=lambda mask: _real_stats_cached(mask)[0],
-        penalty_fn=lambda mask: compute_balance_penalty(mask, labels_np, num_classes, target_size),
-        mean_penalty_fn=_compute_mean_penalty,
-        M=max(10, min(lambda_sample_M, num_samples)),
+        eval_score_fn=lambda cur_mask: _real_stats_cached(cur_mask)[0],
+        penalty_fn=lambda cur_mask: compute_balance_penalty(cur_mask, labels_np, num_classes, target_size),
+        mean_penalty_fn=lambda cur_mask: _compute_mean_penalty(cur_mask),
+        M=lambda_sample_M,
         r=lambda_ratio_r,
         eps=lambda_eps,
         tqdm_desc=f"Estimating lambdas (seed={seed}, kr={keep_ratio}, wg={weight_group})",
     )
-    if "lambda_std_cls" not in lambda_info or "lambda_std_mean" not in lambda_info:
-        raise KeyError(
+
+    required_lambda_keys = {"lambda_std_cls", "lambda_std_mean", "lambda_cls", "lambda_mean"}
+    if not required_lambda_keys.issubset(lambda_record.keys()):
+        raise RuntimeError(
             "group_lambda cache missing required fields: lambda_std_cls/lambda_std_mean; "
             "please regenerate utils/group_lambda.json with current format."
         )
-    scale_cls, scale_mean = _get_group_penalty_scales(dataset_name, keep_ratio)
-    lambda_std_cls = float(lambda_info["lambda_std_cls"])
-    lambda_std_mean = float(lambda_info["lambda_std_mean"])
-    lambda_cls = float(scale_cls * lambda_std_cls)
-    lambda_mean = float(scale_mean * lambda_std_mean)
 
-    def _evaluate_indices(indices: np.ndarray) -> dict[str, object]:
-        unique_indices = np.unique(np.asarray(indices, dtype=np.int64))
-        if unique_indices.size == 0:
-            raise ValueError("_evaluate_indices expects non-empty indices")
-        mask = _indices_to_mask(unique_indices)
-        raw_score, s_ref, counts = _real_stats_cached(mask)
+    scale_cls, scale_mean = _get_group_penalty_scales(dataset_name, keep_ratio)
+    lambda_cls = float(lambda_record["lambda_cls"]) * float(scale_cls)
+    lambda_mean = float(lambda_record["lambda_mean"]) * float(scale_mean)
+    lambda_std_cls = float(lambda_record["lambda_std_cls"])
+    lambda_std_mean = float(lambda_record["lambda_std_mean"])
+
+    def _evaluate(indices: np.ndarray) -> dict[str, object]:
+        unique = np.unique(np.asarray(indices, dtype=np.int64))
+        if unique.size == 0:
+            raise ValueError("_evaluate expects non-empty indices")
+        if unique.size != target_size:
+            raise ValueError(f"_evaluate expects fixed-cardinality subset, got {unique.size} != {target_size}")
+        mask = _indices_to_mask(unique)
+        raw_score, _, counts = _real_stats_cached(mask)
         class_penalty = compute_balance_penalty(mask, labels_np, num_classes, target_size)
         mean_penalty = _compute_mean_penalty(mask)
-        fitness = raw_score - lambda_cls * class_penalty - lambda_mean * mean_penalty
+        class_corr = float(lambda_cls * class_penalty)
+        mean_corr = float(lambda_mean * mean_penalty)
+        fitness = float(raw_score - class_corr - mean_corr)
         return {
-            "indices": unique_indices,
+            "indices": unique,
             "mask": mask,
-            "fitness": float(fitness),
             "raw_score": float(raw_score),
             "penalty": float(class_penalty),
             "mean_penalty": float(mean_penalty),
-            "s_ref": s_ref,
+            "class_corr": class_corr,
+            "mean_corr": mean_corr,
+            "fitness": fitness,
             "counts": counts,
         }
 
-    def _build_candidate_pool(
-        guide_score: np.ndarray,
-        div_static: np.ndarray,
-        labels_arr: np.ndarray,
-        target_k: int,
-        n_classes: int,
-    ) -> np.ndarray:
-        pool_by_static = min(num_samples, max(3 * target_k, 512))
-        pool_by_div = min(num_samples, max(1 * target_k, 256))
-        static_head = _pick_top_by_score(all_indices, pool_by_static, guide_score)
-        div_head = _pick_top_by_score(all_indices, pool_by_div, div_static)
+    def _approx_gain_add(current_indices: np.ndarray, candidate_idx: int) -> float:
+        del current_indices
+        return float(guide_score_np[int(candidate_idx)])
 
-        per_class_take = max(1, int(np.ceil(target_k / max(1, n_classes))))
-        class_cover = []
-        for class_id in range(n_classes):
-            cls_idx = np.flatnonzero(labels_arr == class_id).astype(np.int64)
-            if cls_idx.size == 0:
-                continue
-            class_cover.append(_pick_top_by_score(cls_idx, per_class_take, guide_score))
-        class_cover_arr = np.concatenate(class_cover).astype(np.int64) if class_cover else np.empty(0, dtype=np.int64)
+    def _approx_loss_remove(current_indices: np.ndarray, remove_idx: int) -> float:
+        del current_indices
+        return float(-guide_score_np[int(remove_idx)])
 
-        candidate_pool = np.unique(np.concatenate([static_head, div_head, class_cover_arr]).astype(np.int64))
-        min_pool = min(num_samples, max(4 * target_k, 512))
-        max_pool = min(num_samples, max(4 * target_k, 1024))
-        if candidate_pool.size < min_pool:
-            fill = _pick_top_by_score(all_indices, min_pool, guide_score)
-            candidate_pool = np.unique(np.concatenate([candidate_pool, fill]).astype(np.int64))
-        if candidate_pool.size > max_pool:
-            candidate_pool = _pick_top_by_score(candidate_pool, max_pool, guide_score)
-        return np.sort(candidate_pool.astype(np.int64))
+    def _repair_size(indices: np.ndarray) -> np.ndarray:
+        current = np.unique(np.asarray(indices, dtype=np.int64))
+        if current.size < target_size:
+            available = _complement_indices(current)
+            need = target_size - current.size
+            if available.size > 0 and need > 0:
+                order = np.argsort(-guide_score_np[available], kind="mergesort")
+                take = available[order[: min(need, available.size)]]
+                current = np.unique(np.concatenate([current, take]))
 
-    def _fast_initialize_subset(
-        sa_scores_np: np.ndarray,
-        dds_static_np: np.ndarray,
-        div_static_np: np.ndarray,
-        labels_np: np.ndarray,
-        num_classes: int,
-        target_size: int,
-        weights: dict[str, float],
-    ) -> tuple[dict[str, object], np.ndarray]:
-        alpha_div_init = 0.5
-        base_score_np = (
-            weights["sa"] * sa_scores_np
-            + weights["dds"] * dds_static_np
-            + alpha_div_init * div_static_np
-        ).astype(np.float32)
+        if current.size > target_size:
+            order = np.argsort(guide_score_np[current], kind="mergesort")
+            drop = current[order[: current.size - target_size]]
+            keep_mask = np.isin(current, drop, invert=True)
+            current = current[keep_mask]
 
-        selected_parts: list[np.ndarray] = []
-        for class_id in range(num_classes):
-            cls_idx = np.flatnonzero(labels_np == class_id).astype(np.int64)
-            if cls_idx.size == 0:
-                continue
-            base_take = int(round(float(cls_idx.size) * sr))
-            if target_size > 0:
-                base_take = max(1, base_take)
-            take = min(base_take, cls_idx.size)
-            if take > 0:
-                selected_parts.append(_pick_top_by_score(cls_idx, take, base_score_np))
+        if current.size < target_size:
+            available = _complement_indices(current)
+            if available.size > 0:
+                rng_fill = np.random.default_rng(seed + int(current.size) + int(target_size))
+                add = rng_fill.choice(available, size=min(target_size - current.size, available.size), replace=False)
+                current = np.unique(np.concatenate([current, add.astype(np.int64)]))
 
-        selected = np.unique(np.concatenate(selected_parts).astype(np.int64)) if selected_parts else np.empty(0, dtype=np.int64)
+        return np.sort(current[:target_size].astype(np.int64))
 
-        if selected.size < target_size:
-            remain = _complement_indices(selected)
-            fill = _pick_top_by_score(remain, target_size - selected.size, base_score_np)
-            selected = np.unique(np.concatenate([selected, fill]).astype(np.int64))
-        elif selected.size > target_size:
-            order = np.argsort(base_score_np[selected], kind="mergesort")
-            drop_n = selected.size - target_size
-            keep_mask = np.ones(selected.size, dtype=bool)
-            keep_mask[order[:drop_n]] = False
-            selected = np.sort(selected[keep_mask].astype(np.int64))
+    def _random_init_population(pop_size: int, target_size_local: int, num_samples_local: int, base_seed: int) -> list[np.ndarray]:
+        population: list[np.ndarray] = []
+        for idx in range(pop_size):
+            rng = np.random.default_rng(base_seed * (idx + 1))
+            indiv = np.sort(rng.choice(num_samples_local, size=target_size_local, replace=False).astype(np.int64))
+            population.append(indiv)
+        return population
 
-        init_item = _evaluate_indices(selected)
-        return init_item, base_score_np
+    def _tournament_select(pop_items: list[dict[str, object]], rng: np.random.Generator) -> np.ndarray:
+        i1 = int(rng.integers(0, len(pop_items)))
+        i2 = int(rng.integers(0, len(pop_items)))
+        a = pop_items[i1]
+        b = pop_items[i2]
+        return np.asarray(a["indices"] if float(a["fitness"]) >= float(b["fitness"]) else b["indices"], dtype=np.int64)
 
-    def _block_refine(
-        current_item: dict[str, object],
-        candidate_pool: np.ndarray,
-        base_score_np: np.ndarray,
-        target_size: int,
-        keep_ratio: int,
-    ) -> tuple[dict[str, object], int, int, int, list[float], list[float], list[float], list[float]]:
-        if keep_ratio <= 30:
-            block_size = max(64, target_size // 40)
-        elif keep_ratio <= 60:
-            block_size = max(128, target_size // 30)
-        else:
-            block_size = max(256, target_size // 25)
-        block_size = max(1, min(block_size, target_size))
+    def _crossover(parent_a: np.ndarray, parent_b: np.ndarray) -> np.ndarray:
+        common = np.intersect1d(parent_a, parent_b, assume_unique=False)
+        child = np.unique(common)
+        needed = max(0, target_size - child.size)
+        if needed > 0:
+            union_only = np.setdiff1d(np.union1d(parent_a, parent_b), child, assume_unique=False)
+            if union_only.size > 0:
+                order = np.argsort(-guide_score_np[union_only], kind="mergesort")
+                take = union_only[order[: min(needed, union_only.size)]]
+                child = np.unique(np.concatenate([child, take]))
+        return _repair_size(child)
 
-        max_block_rounds = 30
-        num_block_trials = 12
-        rounds_used = 0
-        accepted = 0
-        cur_item = current_item
-
-        score_hist: list[float] = []
-        class_corr_hist: list[float] = []
-        mean_corr_hist: list[float] = []
-        fitness_hist: list[float] = []
-
-        block_bar = tqdm(
-            range(max_block_rounds),
-            desc=f"[group-block] seed={seed} kr={keep_ratio}",
-            unit="round",
-            leave=False,
-        )
-        for _ in block_bar:
-            rounds_used += 1
-            current = np.asarray(cur_item["indices"], dtype=np.int64)
+    def _mutate_swap(indices: np.ndarray, num_swaps: int, rng: np.random.Generator) -> np.ndarray:
+        current = np.asarray(indices, dtype=np.int64)
+        for _ in range(max(1, num_swaps)):
             if current.size == 0:
                 break
-            pool_minus = candidate_pool[np.isin(candidate_pool, current, invert=True, assume_unique=False)]
-            if pool_minus.size == 0:
+            available = _complement_indices(current)
+            if available.size == 0:
                 break
-
-            cur_bs = min(block_size, current.size, pool_minus.size)
-            if cur_bs <= 0:
+            drop = int(rng.choice(current))
+            remain = current[current != drop]
+            pool_size = min(32, available.size)
+            add_pool = available[np.argsort(-guide_score_np[available], kind="mergesort")[:pool_size]]
+            add = int(rng.choice(add_pool)) if add_pool.size > 0 else int(rng.choice(available))
+            current = np.sort(np.concatenate([remain, np.asarray([add], dtype=np.int64)]))
+            current = _repair_size(current)
+            if rng.random() < 0.35:
                 break
+        return current
 
-            drop_pool_k = min(max(4 * cur_bs, 64), current.size)
-            add_pool_k = min(max(8 * cur_bs, 128), pool_minus.size)
+    def _local_search_swap(indices: np.ndarray, max_steps: int, rng: np.random.Generator) -> np.ndarray:
+        current = np.asarray(indices, dtype=np.int64)
+        if max_steps <= 0 or current.size == 0:
+            return current
+        available = _complement_indices(current)
+        if available.size == 0:
+            return current
 
-            drop_order = np.argsort(base_score_np[current], kind="mergesort")
-            drop_pool = current[drop_order[:drop_pool_k]]
-            add_pool = _pick_top_by_score(pool_minus, add_pool_k, base_score_np)
-            if drop_pool.size < cur_bs or add_pool.size < cur_bs:
+        drop_pool = current[np.argsort(guide_score_np[current], kind="mergesort")[: min(8, current.size)]]
+        add_pool = available[np.argsort(-guide_score_np[available], kind="mergesort")[: min(16, available.size)]]
+        if drop_pool.size == 0 or add_pool.size == 0:
+            return current
+
+        drop = int(rng.choice(drop_pool))
+        add = int(rng.choice(add_pool))
+        if guide_score_np[add] <= guide_score_np[drop]:
+            return current
+        remain = current[current != drop]
+        trial = np.sort(np.concatenate([remain, np.asarray([add], dtype=np.int64)]))
+        return _repair_size(trial)
+
+    def _jaccard_similarity(a: np.ndarray, b: np.ndarray) -> float:
+        inter = np.intersect1d(a, b).size
+        union = np.union1d(a, b).size
+        return float(inter / max(1, union))
+
+    def _population_diversity(items: list[dict[str, object]]) -> float:
+        if len(items) <= 1:
+            return 0.0
+        sims = []
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                sims.append(_jaccard_similarity(np.asarray(items[i]["indices"]), np.asarray(items[j]["indices"])))
+        return float(1.0 - np.mean(np.asarray(sims, dtype=np.float64))) if sims else 0.0
+
+    def _survivor_selection(candidates: list[dict[str, object]], pop_size: int, sim_thr: float) -> list[dict[str, object]]:
+        sorted_items = sorted(candidates, key=lambda x: float(x["fitness"]), reverse=True)
+        survivors: list[dict[str, object]] = []
+        for item in sorted_items:
+            if len(survivors) >= pop_size:
                 break
-
-            best_item = cur_item
-            best_fit = float(cur_item["fitness"])
-
-            drop_head_k = max(cur_bs, int(0.7 * cur_bs))
-            add_head_k = max(cur_bs, int(0.7 * cur_bs))
-            for _trial in range(num_block_trials):
-                d_head = drop_pool[: min(drop_head_k, drop_pool.size)]
-                a_head = add_pool[: min(add_head_k, add_pool.size)]
-
-                d_need_rand = max(0, cur_bs - d_head.size)
-                a_need_rand = max(0, cur_bs - a_head.size)
-
-                d_rand_src = drop_pool[d_head.size :]
-                a_rand_src = add_pool[a_head.size :]
-
-                if d_need_rand > 0 and d_rand_src.size > 0:
-                    d_rand = np.random.choice(d_rand_src, size=min(d_need_rand, d_rand_src.size), replace=False)
-                    drop_block = np.unique(np.concatenate([d_head, d_rand]).astype(np.int64))
-                else:
-                    drop_block = np.asarray(d_head, dtype=np.int64)
-
-                if a_need_rand > 0 and a_rand_src.size > 0:
-                    a_rand = np.random.choice(a_rand_src, size=min(a_need_rand, a_rand_src.size), replace=False)
-                    add_block = np.unique(np.concatenate([a_head, a_rand]).astype(np.int64))
-                else:
-                    add_block = np.asarray(a_head, dtype=np.int64)
-
-                if drop_block.size < cur_bs:
-                    extra_d = np.setdiff1d(drop_pool, drop_block, assume_unique=False)
-                    drop_block = np.unique(
-                        np.concatenate([drop_block, extra_d[: max(0, cur_bs - drop_block.size)]]).astype(np.int64)
-                    )
-                if add_block.size < cur_bs:
-                    extra_a = np.setdiff1d(add_pool, add_block, assume_unique=False)
-                    add_block = np.unique(
-                        np.concatenate([add_block, extra_a[: max(0, cur_bs - add_block.size)]]).astype(np.int64)
-                    )
-
-                drop_block = drop_block[:cur_bs]
-                add_block = add_block[:cur_bs]
-                remain = current[np.isin(current, drop_block, invert=True, assume_unique=False)]
-                trial = np.unique(np.concatenate([remain, add_block]).astype(np.int64))
-                if trial.size != target_size:
-                    continue
-                item = _evaluate_indices(trial)
-                fit = float(item["fitness"])
-                if fit > best_fit:
-                    best_fit = fit
-                    best_item = item
-
-            if best_fit > float(cur_item["fitness"]) + 1e-8:
-                cur_item = best_item
-                accepted += 1
-                score_hist.append(float(cur_item["raw_score"]))
-                class_corr_hist.append(float(lambda_cls * float(cur_item["penalty"])))
-                mean_corr_hist.append(float(lambda_mean * float(cur_item["mean_penalty"])))
-                fitness_hist.append(float(cur_item["fitness"]))
-                block_bar.set_postfix(best_fitness=f"{float(cur_item['fitness']):.4f}", accepted=accepted)
-            else:
-                break
-
-        return cur_item, block_size, rounds_used, accepted, score_hist, class_corr_hist, mean_corr_hist, fitness_hist
-
-    def _swap_refine(
-        current_item: dict[str, object],
-        candidate_pool: np.ndarray,
-        guide_score_np: np.ndarray,
-        drop_k: int,
-        add_k: int,
-        max_rounds: int,
-    ) -> tuple[dict[str, object], int, int, list[float], list[float], list[float], list[float]]:
-        swap_eps = 1e-8
-        max_swap_pairs = 128
-        rounds_used = 0
-        accepted = 0
-        score_hist: list[float] = []
-        class_corr_hist: list[float] = []
-        mean_corr_hist: list[float] = []
-        fitness_hist: list[float] = []
-        cur_item = current_item
-        swap_bar = tqdm(
-            range(max_rounds),
-            desc=f"[group-swap] seed={seed} kr={keep_ratio}",
-            unit="round",
-            leave=False,
-        )
-        for _ in swap_bar:
-            rounds_used += 1
-            current = np.asarray(cur_item["indices"], dtype=np.int64)
-            pool_minus = candidate_pool[np.isin(candidate_pool, current, invert=True, assume_unique=False)]
-            if pool_minus.size == 0:
-                break
-            drop_order = np.argsort(guide_score_np[current], kind="mergesort")
-            drop_cands = current[drop_order[: min(drop_k, current.size)]]
-            add_cands = _pick_top_by_score(pool_minus, min(add_k, pool_minus.size), guide_score_np)
-
-            if drop_cands.size == 0 or add_cands.size == 0:
-                break
-
-            drop_limit = min(drop_cands.size, max(1, int(np.sqrt(max_swap_pairs))))
-            add_limit = min(add_cands.size, max(1, max_swap_pairs // drop_limit))
-            drop_cands = drop_cands[:drop_limit]
-            add_cands = add_cands[:add_limit]
-
-            best_item = cur_item
-            best_fit = float(cur_item["fitness"])
-            pair_count = 0
-            for d in drop_cands:
-                remain = current[current != d]
-                for a in add_cands:
-                    pair_count += 1
-                    if pair_count > max_swap_pairs:
-                        break
-                    trial = np.concatenate([remain, np.asarray([a], dtype=np.int64)])
-                    item = _evaluate_indices(trial)
-                    fit = float(item["fitness"])
-                    if fit > best_fit:
-                        best_fit = fit
-                        best_item = item
-                if pair_count > max_swap_pairs:
+            idx = np.asarray(item["indices"], dtype=np.int64)
+            if any(_jaccard_similarity(idx, np.asarray(s["indices"], dtype=np.int64)) > sim_thr for s in survivors):
+                continue
+            survivors.append(item)
+        if len(survivors) < pop_size:
+            for item in sorted_items:
+                if len(survivors) >= pop_size:
                     break
-            if best_fit > float(cur_item["fitness"]) + swap_eps:
-                cur_item = best_item
-                accepted += 1
-                score_hist.append(float(cur_item["raw_score"]))
-                class_corr_hist.append(float(lambda_cls * float(cur_item["penalty"])))
-                mean_corr_hist.append(float(lambda_mean * float(cur_item["mean_penalty"])))
-                fitness_hist.append(float(cur_item["fitness"]))
-                swap_bar.set_postfix(best_fitness=f"{float(cur_item['fitness']):.4f}", accepted=accepted)
-            else:
-                break
-        return cur_item, rounds_used, accepted, score_hist, class_corr_hist, mean_corr_hist, fitness_hist
+                if all(id(item) != id(s) for s in survivors):
+                    survivors.append(item)
+        return survivors
 
     print(
         f"[GroupLambda] dataset={dataset_name} kr={keep_ratio} "
@@ -798,51 +666,89 @@ def select_group_mask(
         f"lambda_cls={lambda_cls:.8f} lambda_mean={lambda_mean:.8f}"
     )
 
-    candidate_pool = _build_candidate_pool(guide_score_np, div_static_np, labels_np, target_size, num_classes)
-    init_item, base_score_np = _fast_initialize_subset(
-        sa_scores_np,
-        dds_static_np,
-        div_static_np,
-        labels_np,
-        num_classes,
-        target_size,
-        weights,
+    ga_population_size = int(np.clip(16 + keep_ratio // 5, 16, 36))
+    ga_generations = int(np.clip(8 + keep_ratio // 10, 8, 18))
+    mutation_ratio = float(np.clip(0.45 - 0.0025 * keep_ratio, 0.18, 0.40))
+    mutation_strength = int(np.clip(1 + (60 - keep_ratio) // 20, 1, 3))
+    local_search_steps = int(np.clip(1 + (70 - keep_ratio) // 25, 1, 3))
+    crossover_children = max(2, int(ga_population_size * 0.75))
+    elite_count = max(1, ga_population_size // 8)
+    similarity_thr = 0.85 if keep_ratio <= 50 else 0.90
+
+    population = _random_init_population(ga_population_size, target_size, num_samples, seed)
+    population_items = [_evaluate(ind) for ind in population]
+    best_item = max(population_items, key=lambda x: float(x["fitness"]))
+
+    score_history = [float(best_item["raw_score"])]
+    class_correction_history = [float(best_item["class_corr"])]
+    mean_correction_history = [float(best_item["mean_corr"])]
+    fitness_history = [float(best_item["fitness"])]
+    unique_population_count_per_gen = [len({tuple(np.asarray(x["indices"], dtype=np.int64).tolist()) for x in population_items})]
+    best_overlap_with_prev_gen = [1.0]
+    best_gen = 0
+
+    rng = np.random.default_rng(seed * 9973 + keep_ratio)
+    prev_best_indices = np.asarray(best_item["indices"], dtype=np.int64)
+
+    gen_bar = tqdm(
+        range(ga_generations),
+        desc=f"[group-ea] seed={seed} kr={keep_ratio}",
+        unit="gen",
+        leave=False,
     )
+    for gen in gen_bar:
+        sorted_pop = sorted(population_items, key=lambda x: float(x["fitness"]), reverse=True)
+        elites = sorted_pop[:elite_count]
+        children: list[dict[str, object]] = []
 
-    score_history = [float(init_item["raw_score"])]
-    class_correction_history = [float(lambda_cls * float(init_item["penalty"]))]
-    mean_correction_history = [float(lambda_mean * float(init_item["mean_penalty"]))]
-    fitness_history = [float(init_item["fitness"])]
+        while len(children) < crossover_children:
+            p1 = _tournament_select(population_items, rng)
+            p2 = _tournament_select(population_items, rng)
+            child = _crossover(p1, p2)
+            if rng.random() < mutation_ratio:
+                child = _mutate_swap(child, mutation_strength, rng)
+            child = _local_search_swap(child, local_search_steps, rng)
+            children.append(_evaluate(child))
 
-    block_item, block_size, block_rounds_used, accepted_block_moves, sb, cb, mb, fb = _block_refine(
-        init_item,
-        candidate_pool,
-        base_score_np,
-        target_size,
-        keep_ratio,
-    )
-    score_history.extend(sb)
-    class_correction_history.extend(cb)
-    mean_correction_history.extend(mb)
-    fitness_history.extend(fb)
+        merged = population_items + children
+        population_items = _survivor_selection(merged, ga_population_size, similarity_thr)
+        if len(elites) > 0:
+            for elite in elites:
+                if all(id(elite) != id(p) for p in population_items):
+                    population_items[-1] = elite
 
-    drop_k = min(12, target_size)
-    pool_minus_size = int(candidate_pool.size - np.asarray(block_item["indices"], dtype=np.int64).size)
-    add_k = min(24, max(0, pool_minus_size))
-    max_swap_rounds = 6
+        cur_best = max(population_items, key=lambda x: float(x["fitness"]))
+        improved = float(cur_best["fitness"]) > float(best_item["fitness"])
+        if improved:
+            best_item = cur_best
+            best_gen = gen + 1
 
-    best_item, swap_rounds_used, accepted_swaps, ss, cs, ms, fs = _swap_refine(
-        block_item,
-        candidate_pool,
-        base_score_np,
-        drop_k,
-        add_k,
-        max_swap_rounds,
-    )
-    score_history.extend(ss)
-    class_correction_history.extend(cs)
-    mean_correction_history.extend(ms)
-    fitness_history.extend(fs)
+        cur_best_indices = np.asarray(cur_best["indices"], dtype=np.int64)
+        overlap = _jaccard_similarity(prev_best_indices, cur_best_indices)
+        prev_best_indices = cur_best_indices
+
+        score_history.append(float(cur_best["raw_score"]))
+        class_correction_history.append(float(cur_best["class_corr"]))
+        mean_correction_history.append(float(cur_best["mean_corr"]))
+        fitness_history.append(float(cur_best["fitness"]))
+        unique_population_count_per_gen.append(len({tuple(np.asarray(x["indices"], dtype=np.int64).tolist()) for x in population_items}))
+        best_overlap_with_prev_gen.append(float(overlap))
+
+        pop_diversity = _population_diversity(population_items)
+        gen_bar.set_postfix(
+            best_fitness=f"{float(cur_best['fitness']):.4f}",
+            raw=f"{float(cur_best['raw_score']):.4f}",
+            cls=f"{float(cur_best['class_corr']):.4f}",
+            mean=f"{float(cur_best['mean_corr']):.4f}",
+            diversity=f"{pop_diversity:.4f}",
+            improved=improved,
+        )
+        print(
+            f"[group-ea] gen={gen + 1}/{ga_generations} best_fitness={float(cur_best['fitness']):.6f} "
+            f"best_raw_score={float(cur_best['raw_score']):.6f} best_class_corr={float(cur_best['class_corr']):.6f} "
+            f"best_mean_corr={float(cur_best['mean_corr']):.6f} population_diversity={pop_diversity:.6f} "
+            f"improved_this_gen={improved}"
+        )
 
     final_mask = np.asarray(best_item["mask"], dtype=np.uint8)
     selected_by_class: dict[int, int] = {}
@@ -852,19 +758,18 @@ def select_group_mask(
 
     final_rate = float(final_mask.mean())
     stats: dict[str, object] = {
-        "solver": "fast_greedy_block_swap",
+        "solver": "fixed_cardinality_memetic_ea",
         "sr": float(sr),
         "final_rate": final_rate,
-        "candidate_pool_size": int(candidate_pool.size),
-        "block_size": int(block_size),
-        "max_block_rounds": 30,
-        "num_block_rounds_used": int(block_rounds_used),
-        "num_accepted_block_moves": int(accepted_block_moves),
-        "max_swap_rounds": int(max_swap_rounds),
-        "num_swap_rounds_used": int(swap_rounds_used),
-        "num_accepted_swaps": int(accepted_swaps),
-        "init_fitness": float(init_item["fitness"]),
-        "post_block_fitness": float(block_item["fitness"]),
+        "init_best_fitness": float(fitness_history[0]),
+        "final_best_fitness": float(best_item["fitness"]),
+        "best_gen": int(best_gen),
+        "unique_population_count_per_gen": unique_population_count_per_gen,
+        "best_overlap_with_prev_gen": best_overlap_with_prev_gen,
+        "ga_population_size": int(ga_population_size),
+        "ga_generations": int(ga_generations),
+        "elite_count": int(elite_count),
+        "init_fitness": float(fitness_history[0]),
         "final_fitness": float(best_item["fitness"]),
         "raw_score": float(best_item["raw_score"]),
         "penalty": float(best_item["penalty"]),

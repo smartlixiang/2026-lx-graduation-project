@@ -524,9 +524,9 @@ def main() -> None:
         )
         lambda_topk_cls = 5.0 * float(lambda_info_topk["lambda_std_cls"])
         if args.dataset == CIFAR10:
-            mean_scale_topk = max(0.0, 1.6 - 0.015 * float(kr))
+            mean_scale_topk = max(0.0, 4.5 - 0.05 * float(kr))
         else:
-            mean_scale_topk = max(0.0, 2.5 - 0.02 * float(kr))
+            mean_scale_topk = max(0.0, 7.5 - 0.05 * float(kr))
         lambda_topk_mean = mean_scale_topk * float(lambda_info_topk["lambda_std_mean"])
         print(
             f"[Lambda] dataset={args.dataset} | seed={FIXED_SEED} | kr={kr} "

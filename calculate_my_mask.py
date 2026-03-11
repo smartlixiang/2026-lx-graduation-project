@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--group-iterations", type=int, default=500)
+    parser.add_argument("--group-iterations", type=int, default=200)
     parser.add_argument(
         "--group-batch-size",
         type=int,
@@ -86,10 +86,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-min-batch-size",
         type=int,
-        default=2,
+        default=4,
         help="kr<=50 时的最小 batch_size；kr>50 时自动减半",
     )
-    parser.add_argument("--group-eval-interval", type=int, default=2)
+    parser.add_argument("--group-eval-interval", type=int, default=4)
     parser.add_argument(
         "--group-candidate-pool-multiplier",
         type=float,
@@ -129,9 +129,9 @@ def _get_group_penalty_scales(dataset_name: str, keep_ratio: int) -> tuple[float
     """Return fixed penalty scales used by group mode."""
     dataset_key = dataset_name.strip().lower()
     if dataset_key == CIFAR10:
-        scale_mean = max(0.0, 3.5 - 0.03 * float(keep_ratio))
+        scale_mean = max(0.0, 4.5 - 0.05 * float(keep_ratio))
     elif dataset_key == CIFAR100:
-        scale_mean = max(0.0, 5 - 0.04 * float(keep_ratio))
+        scale_mean = max(0.0, 7.5 - 0.05 * float(keep_ratio))
     else:
         raise ValueError(f"Unsupported dataset for group penalty scaling: {dataset_name}")
     scale_cls = 5.0
@@ -402,13 +402,14 @@ def select_group_mask(
         clip_model=clip_model,
         adapter_image_path=adapter_image_path,
     )
-    full_class_mean, _ = _get_or_compute_group_mean_stats(
+    full_class_mean, full_class_var = _get_or_compute_group_mean_stats(
         cache_path=mean_stats_cache_path,
         image_features=div_features_np,
         labels=labels_np,
         num_classes=num_classes,
     )
     full_class_mean_f32 = full_class_mean.astype(np.float32, copy=False)
+    full_class_var_f32 = full_class_var.astype(np.float32, copy=False)
 
     static_part = (weights["sa"] * sa_scores_np + weights["dds"] * dds_static_np).astype(np.float32)
     static_quality = (sa_scores_np + dds_static_np).astype(np.float32)
@@ -422,6 +423,8 @@ def select_group_mask(
         return mask
 
     def _compute_mean_penalty(cur_mask: np.ndarray) -> float:
+        # Keep definition aligned with x.py: average over active classes of
+        # variance-normalized squared distance between subset/full class means.
         selected = np.flatnonzero(cur_mask > 0).astype(np.int64)
         if selected.size == 0:
             return 0.0
@@ -436,7 +439,12 @@ def select_group_mask(
         selected_mean = np.zeros_like(full_class_mean_f32, dtype=np.float32)
         selected_mean[active] = sum_features[active] / cnt_features[active, None].astype(np.float32)
         diff = selected_mean[active] - full_class_mean_f32[active]
-        return float(np.sum(np.linalg.norm(diff, axis=1)))
+        dist2 = np.sum(diff * diff, axis=1, dtype=np.float32)
+        normalized = dist2 / (full_class_var_f32[active] + float(DEFAULT_EPS))
+        active_count = int(np.count_nonzero(active))
+        if active_count == 0:
+            return 0.0
+        return float(np.sum(normalized, dtype=np.float32) / float(active_count))
 
     def _evaluate(indices: np.ndarray) -> dict[str, object]:
         unique = np.unique(np.asarray(indices, dtype=np.int64))

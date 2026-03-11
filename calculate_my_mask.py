@@ -76,10 +76,22 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--exchange-iterations", type=int, default=300)
-    parser.add_argument("--exchange-batch-size", type=int, default=128)
-    parser.add_argument("--exchange-min-batch-size", type=int, default=6)
-    parser.add_argument("--exchange-eval-interval", type=int, default=2)
+    parser.add_argument("--exchange-iterations", type=int, default=400)
+    parser.add_argument("--exchange-batch-size", type=int, default=64)
+    parser.add_argument("--exchange-min-batch-size", type=int, default=2)
+    parser.add_argument("--exchange-eval-interval", type=int, default=3)
+    parser.add_argument(
+        "--exchange-candidate-pool-multiplier",
+        type=float,
+        default=1.5,
+        help="候选池大小倍率，按当前 batch_size 的倍率分别构造子集内外候选池",
+    )
+    parser.add_argument(
+        "--exchange-batch-adjust-patience",
+        type=int,
+        default=5,
+        help="连续多少次 eval 最优解不提升后才调整 batch_size",
+    )
     return parser.parse_args()
 
 
@@ -344,6 +356,8 @@ def select_exchange_mask(
     exchange_batch_size: int = 64,
     exchange_min_batch_size: int = 4,
     exchange_eval_interval: int = 10,
+    exchange_candidate_pool_multiplier: float = 3.0,
+    exchange_batch_adjust_patience: int = 3,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
         raise ValueError("kr 必须在 1-100 之间。")
@@ -513,6 +527,8 @@ def select_exchange_mask(
     eval_every = max(1, int(exchange_eval_interval))
     cur_batch_size = max(1, int(exchange_batch_size))
     min_batch_size = max(1, int(exchange_min_batch_size))
+    candidate_pool_multiplier = max(1.0, float(exchange_candidate_pool_multiplier))
+    batch_adjust_patience = max(1, int(exchange_batch_adjust_patience))
     if cur_batch_size < min_batch_size:
         cur_batch_size = min_batch_size
     stale_eval_count = 0
@@ -526,6 +542,7 @@ def select_exchange_mask(
         k = min(int(cur_batch_size), in_indices.size, out_indices.size)
         if k <= 0:
             break
+        candidate_pool_size = max(1, int(np.ceil(float(cur_batch_size) * candidate_pool_multiplier)))
 
         mu_sub = np.zeros_like(class_sums, dtype=np.float32)
         active = class_counts > 0
@@ -570,8 +587,16 @@ def select_exchange_mask(
             + _rank_points(out_mean_add, descending=True)
         )
 
-        drop_idx = in_indices[np.argsort(-score_in, kind="mergesort")[:k]]
-        add_idx = out_indices[np.argsort(-score_out, kind="mergesort")[:k]]
+        in_candidate_size = min(candidate_pool_size, in_indices.size)
+        out_candidate_size = min(candidate_pool_size, out_indices.size)
+        in_candidate_pool = in_indices[np.argsort(-score_in, kind="mergesort")[:in_candidate_size]]
+        out_candidate_pool = out_indices[np.argsort(-score_out, kind="mergesort")[:out_candidate_size]]
+
+        k = min(int(cur_batch_size), in_candidate_pool.size, out_candidate_pool.size)
+        if k <= 0:
+            break
+        drop_idx = rng.choice(in_candidate_pool, size=k, replace=False).astype(np.int64)
+        add_idx = rng.choice(out_candidate_pool, size=k, replace=False).astype(np.int64)
 
         membership[drop_idx] = False
         membership[add_idx] = True
@@ -609,7 +634,7 @@ def select_exchange_mask(
             else:
                 stale_eval_count += 1
 
-            if stale_eval_count >= 2 and cur_batch_size > min_batch_size:
+            if stale_eval_count >= batch_adjust_patience and cur_batch_size > min_batch_size:
                 cur_batch_size = max(min_batch_size, cur_batch_size // 2)
                 stale_eval_count = 0
 
@@ -654,6 +679,8 @@ def select_exchange_mask(
         "exchange_batch_size_init": int(exchange_batch_size),
         "exchange_min_batch_size": int(min_batch_size),
         "exchange_eval_interval": int(eval_every),
+        "exchange_candidate_pool_multiplier": float(candidate_pool_multiplier),
+        "exchange_batch_adjust_patience": int(batch_adjust_patience),
     }
     return final_mask, selected_by_class, stats
 
@@ -900,6 +927,8 @@ def main() -> None:
                     exchange_batch_size=args.exchange_batch_size,
                     exchange_min_batch_size=args.exchange_min_batch_size,
                     exchange_eval_interval=args.exchange_eval_interval,
+                    exchange_candidate_pool_multiplier=args.exchange_candidate_pool_multiplier,
+                    exchange_batch_adjust_patience=args.exchange_batch_adjust_patience,
                 )
                 debug_curve = save_score_curve_plot(
                     group_stats.get("score_history", []),

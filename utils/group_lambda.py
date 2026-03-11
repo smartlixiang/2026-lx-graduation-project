@@ -5,14 +5,24 @@ import os
 from pathlib import Path
 from typing import Callable
 
+from dataset.dataset_config import CIFAR10, CIFAR100
+
 import numpy as np
 from tqdm import tqdm
 
 
 DEFAULT_M = 100
 DEFAULT_EPS = 1e-8
-DEFAULT_MEAN_LAMBDA_BASE = 0.02
+DEFAULT_MEAN_LAMBDA_BASE_BY_DATASET = {
+    CIFAR10: 0.0015,
+    CIFAR100: 0.03,
+}
+DEFAULT_MEAN_LAMBDA_BASE = DEFAULT_MEAN_LAMBDA_BASE_BY_DATASET[CIFAR100]
 DEFAULT_CLS_LAMBDA_BASE = 0.001
+
+
+def get_default_mean_lambda_base(dataset: str) -> float:
+    return float(DEFAULT_MEAN_LAMBDA_BASE_BY_DATASET.get(dataset, DEFAULT_MEAN_LAMBDA_BASE))
 
 
 def compute_balance_penalty(

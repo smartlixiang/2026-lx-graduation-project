@@ -33,6 +33,7 @@ from utils.group_lambda import (  # noqa: E402
     DEFAULT_MEAN_LAMBDA_BASE,
     compute_balance_penalty,
     get_or_estimate_lambda,
+    get_default_mean_lambda_base,
 )
 
 
@@ -81,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-batch-size",
         type=int,
-        default=64,
+        default=32,
         help="kr<=50 时的初始 batch_size；kr>50 时自动减半",
     )
     parser.add_argument(
@@ -103,7 +104,7 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="连续多少次 eval 最优解不提升后才调整 batch_size",
     )
-    parser.add_argument("--mean-lambda-base", type=float, default=DEFAULT_MEAN_LAMBDA_BASE, help="kr=20 时 mean 修正项目标占比")
+    parser.add_argument("--mean-lambda-base", type=float, default=None, help="kr=20 时 mean 修正项目标占比（默认随数据集变化）")
     parser.add_argument("--cls-lambda-base", type=float, default=DEFAULT_CLS_LAMBDA_BASE, help="kr=20 时 class 修正项目标占比")
     return parser.parse_args()
 
@@ -126,7 +127,6 @@ def parse_ratio_list(ratio_text: str) -> list[int]:
     else:
         items = [cleaned]
     return [int(item) for item in items]
-
 
 
 def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str, object]]:
@@ -761,6 +761,8 @@ def main() -> None:
     total_start = time.perf_counter()
     args = parse_args()
     dataset_name = args.dataset.strip().lower()
+    if args.mean_lambda_base is None:
+        args.mean_lambda_base = get_default_mean_lambda_base(dataset_name)
 
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
     method = args.method.strip().lower()

@@ -27,6 +27,7 @@ from utils.group_lambda import (
     DEFAULT_MEAN_LAMBDA_BASE,
     compute_balance_penalty,
     get_or_estimate_lambda,
+    get_default_mean_lambda_base,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -50,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--output", type=Path, default=None, help="可选输出路径；默认保存到 group_baseline/<dataset>/<weight-group>.csv")
-    parser.add_argument("--mean-lambda-base", type=float, default=DEFAULT_MEAN_LAMBDA_BASE)
+    parser.add_argument("--mean-lambda-base", type=float, default=None)
     parser.add_argument("--cls-lambda-base", type=float, default=DEFAULT_CLS_LAMBDA_BASE)
     return parser.parse_args()
 
@@ -385,6 +386,9 @@ def select_group_old_best(
 def main() -> None:
     args = parse_args()
     set_seed(FIXED_SEED)
+
+    if args.mean_lambda_base is None:
+        args.mean_lambda_base = get_default_mean_lambda_base(args.dataset)
 
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
     dataset_for_names = _build_dataset(args.dataset, transform=None)

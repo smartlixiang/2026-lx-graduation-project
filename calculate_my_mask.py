@@ -76,20 +76,30 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--exchange-iterations", type=int, default=400)
-    parser.add_argument("--exchange-batch-size", type=int, default=64)
-    parser.add_argument("--exchange-min-batch-size", type=int, default=2)
-    parser.add_argument("--exchange-eval-interval", type=int, default=3)
+    parser.add_argument("--exchange-iterations", type=int, default=500)
+    parser.add_argument(
+        "--exchange-batch-size",
+        type=int,
+        default=64,
+        help="kr<=50 时的初始 batch_size；kr>50 时自动减半",
+    )
+    parser.add_argument(
+        "--exchange-min-batch-size",
+        type=int,
+        default=2,
+        help="kr<=50 时的最小 batch_size；kr>50 时自动减半",
+    )
+    parser.add_argument("--exchange-eval-interval", type=int, default=2)
     parser.add_argument(
         "--exchange-candidate-pool-multiplier",
         type=float,
-        default=1.5,
+        default=2,
         help="候选池大小倍率，按当前 batch_size 的倍率分别构造子集内外候选池",
     )
     parser.add_argument(
         "--exchange-batch-adjust-patience",
         type=int,
-        default=5,
+        default=8,
         help="连续多少次 eval 最优解不提升后才调整 batch_size",
     )
     return parser.parse_args()
@@ -354,7 +364,7 @@ def select_exchange_mask(
     dds_static_scores: np.ndarray | None = None,
     exchange_iterations: int = 200,
     exchange_batch_size: int = 64,
-    exchange_min_batch_size: int = 4,
+    exchange_min_batch_size: int = 2,
     exchange_eval_interval: int = 10,
     exchange_candidate_pool_multiplier: float = 3.0,
     exchange_batch_adjust_patience: int = 3,
@@ -525,8 +535,9 @@ def select_exchange_mask(
     eval_steps = [0]
 
     eval_every = max(1, int(exchange_eval_interval))
-    cur_batch_size = max(1, int(exchange_batch_size))
-    min_batch_size = max(1, int(exchange_min_batch_size))
+    batch_scale = 1.0 if keep_ratio <= 50 else 0.5
+    cur_batch_size = max(1, int(exchange_batch_size * batch_scale))
+    min_batch_size = max(1, int(exchange_min_batch_size * batch_scale))
     candidate_pool_multiplier = max(1.0, float(exchange_candidate_pool_multiplier))
     batch_adjust_patience = max(1, int(exchange_batch_adjust_patience))
     if cur_batch_size < min_batch_size:
@@ -639,12 +650,8 @@ def select_exchange_mask(
                 stale_eval_count = 0
 
         iter_bar.set_postfix(
-            iter=int(step + 1),
             best_fit=f"{float(best_item['fitness']):.4f}",
-            last_eval_fit=f"{last_eval_fit:.4f}",
-            approx_rank=f"{approx_total_rank:.2f}",
             batch_size=int(cur_batch_size),
-            eval_every=eval_every,
         )
 
     final_mask = np.asarray(best_item["mask"], dtype=np.uint8)
@@ -676,8 +683,8 @@ def select_exchange_mask(
         "lambda_mean": float(lambda_mean),
         "exchange_iterations": int(exchange_iterations),
         "exchange_batch_size": int(cur_batch_size),
-        "exchange_batch_size_init": int(exchange_batch_size),
-        "exchange_min_batch_size": int(min_batch_size),
+        "exchange_batch_size_init": int(max(1, int(exchange_batch_size * batch_scale))),
+        "exchange_min_batch_size": int(max(1, int(exchange_min_batch_size * batch_scale))),
         "exchange_eval_interval": int(eval_every),
         "exchange_candidate_pool_multiplier": float(candidate_pool_multiplier),
         "exchange_batch_adjust_patience": int(batch_adjust_patience),

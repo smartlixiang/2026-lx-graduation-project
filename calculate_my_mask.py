@@ -76,8 +76,9 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--exchange-iterations", type=int, default=200)
-    parser.add_argument("--exchange-batch-size", type=int, default=4)
+    parser.add_argument("--exchange-iterations", type=int, default=300)
+    parser.add_argument("--exchange-batch-size", type=int, default=128)
+    parser.add_argument("--exchange-min-batch-size", type=int, default=6)
     parser.add_argument("--exchange-eval-interval", type=int, default=2)
     return parser.parse_args()
 
@@ -341,6 +342,7 @@ def select_exchange_mask(
     dds_static_scores: np.ndarray | None = None,
     exchange_iterations: int = 200,
     exchange_batch_size: int = 64,
+    exchange_min_batch_size: int = 4,
     exchange_eval_interval: int = 10,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
@@ -509,13 +511,19 @@ def select_exchange_mask(
     eval_steps = [0]
 
     eval_every = max(1, int(exchange_eval_interval))
+    cur_batch_size = max(1, int(exchange_batch_size))
+    min_batch_size = max(1, int(exchange_min_batch_size))
+    if cur_batch_size < min_batch_size:
+        cur_batch_size = min_batch_size
+    stale_eval_count = 0
+
     iter_bar = tqdm(range(max(0, int(exchange_iterations))), desc="[exchange] iterations", unit="iter")
     for step in iter_bar:
         membership = np.zeros(num_samples, dtype=bool)
         membership[current_indices] = True
         in_indices = current_indices
         out_indices = all_indices[~membership]
-        k = min(int(exchange_batch_size), in_indices.size, out_indices.size)
+        k = min(int(cur_batch_size), in_indices.size, out_indices.size)
         if k <= 0:
             break
 
@@ -592,16 +600,25 @@ def select_exchange_mask(
             class_correction_history.append(float(current_item["class_corr"]))
             mean_correction_history.append(float(current_item["mean_corr"]))
             fitness_history.append(float(current_item["fitness"]))
-            if float(current_item["fitness"]) > float(best_item["fitness"]):
+            improved = float(current_item["fitness"]) > float(best_item["fitness"])
+            if improved:
                 best_item = dict(current_item)
                 best_item["indices"] = np.asarray(current_item["indices"], dtype=np.int64).copy()
                 best_item["mask"] = np.asarray(current_item["mask"], dtype=np.uint8).copy()
+                stale_eval_count = 0
+            else:
+                stale_eval_count += 1
+
+            if stale_eval_count >= 2 and cur_batch_size > min_batch_size:
+                cur_batch_size = max(min_batch_size, cur_batch_size // 2)
+                stale_eval_count = 0
 
         iter_bar.set_postfix(
             iter=int(step + 1),
             best_fit=f"{float(best_item['fitness']):.4f}",
             last_eval_fit=f"{last_eval_fit:.4f}",
             approx_rank=f"{approx_total_rank:.2f}",
+            batch_size=int(cur_batch_size),
             eval_every=eval_every,
         )
 
@@ -633,7 +650,9 @@ def select_exchange_mask(
         "lambda_cls": float(lambda_cls),
         "lambda_mean": float(lambda_mean),
         "exchange_iterations": int(exchange_iterations),
-        "exchange_batch_size": int(exchange_batch_size),
+        "exchange_batch_size": int(cur_batch_size),
+        "exchange_batch_size_init": int(exchange_batch_size),
+        "exchange_min_batch_size": int(min_batch_size),
         "exchange_eval_interval": int(eval_every),
     }
     return final_mask, selected_by_class, stats
@@ -675,12 +694,21 @@ def save_score_curve_plot(
         x = np.asarray(eval_steps, dtype=np.int32)
     else:
         x = np.arange(fit_arr.shape[0], dtype=np.int32)
+    herding_corr_arr = np.asarray(mean_correction_history, dtype=np.float64)
+
     ax.plot(x, fit_arr, linewidth=1.8, color="#d62728", label="S'(D)")
     ax.set_title("Group optimization trajectory")
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Comprehensive score S'(D)")
     ax.grid(alpha=0.25)
-    ax.legend(loc="best")
+
+    ax2 = ax.twinx()
+    ax2.plot(x, herding_corr_arr, linewidth=1.5, color="#1f77b4", linestyle="--", label="Herding correction")
+    ax2.set_ylabel("Herding correction")
+
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="best")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -870,6 +898,7 @@ def main() -> None:
                     dds_static_scores=dds_scores_np,
                     exchange_iterations=args.exchange_iterations,
                     exchange_batch_size=args.exchange_batch_size,
+                    exchange_min_batch_size=args.exchange_min_batch_size,
                     exchange_eval_interval=args.exchange_eval_interval,
                 )
                 debug_curve = save_score_curve_plot(

@@ -524,9 +524,9 @@ def main() -> None:
         )
         lambda_topk_cls = 5.0 * float(lambda_info_topk["lambda_std_cls"])
         if args.dataset == CIFAR10:
-            mean_scale_topk = max(0.0, 4.6 - 0.04 * float(kr))
+            mean_scale_topk = max(0.0, 1.6 - 0.015 * float(kr))
         else:
-            mean_scale_topk = max(0.0, 7.5 - 0.05 * float(kr))
+            mean_scale_topk = max(0.0, 2.5 - 0.02 * float(kr))
         lambda_topk_mean = mean_scale_topk * float(lambda_info_topk["lambda_std_mean"])
         print(
             f"[Lambda] dataset={args.dataset} | seed={FIXED_SEED} | kr={kr} "
@@ -672,7 +672,8 @@ def main() -> None:
                             herding_mask = np.asarray(loaded_mask["mask"], dtype=np.uint8)
                         else:
                             first_key = next(iter(loaded_mask.files), None)
-                            herding_mask = np.asarray(loaded_mask[first_key], dtype=np.uint8) if first_key else np.zeros(len(dataset_for_names), dtype=np.uint8)
+                            herding_mask = np.asarray(loaded_mask[first_key], dtype=np.uint8) if first_key else np.zeros(
+                                len(dataset_for_names), dtype=np.uint8)
                     if herding_mask.shape[0] == len(dataset_for_names):
                         _, _, _, _, _, herding_total = compute_subset_score(
                             herding_mask,

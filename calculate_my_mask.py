@@ -527,29 +527,170 @@ def select_group_mask(
             "counts": counts,
         }
 
-    def _approx_gain_add(current_indices: np.ndarray, candidate_idx: int) -> float:
-        del current_indices
-        return float(guide_score_np[int(candidate_idx)])
+    full_class_counts = np.bincount(labels_np, minlength=num_classes).astype(np.int64)
+    class_priors = full_class_counts.astype(np.float64) / max(1, int(num_samples))
+    target_class_counts = np.rint(class_priors * float(target_size)).astype(np.int64)
 
-    def _approx_loss_remove(current_indices: np.ndarray, remove_idx: int) -> float:
-        del current_indices
-        return float(-guide_score_np[int(remove_idx)])
+    def _build_subset_class_stats(indices: np.ndarray) -> dict[str, np.ndarray]:
+        indices = np.asarray(indices, dtype=np.int64)
+        class_counts = np.bincount(labels_np[indices], minlength=num_classes).astype(np.int64)
+        class_feature_sums = np.zeros((num_classes, div_features_np.shape[1]), dtype=np.float64)
+        if indices.size > 0:
+            np.add.at(class_feature_sums, labels_np[indices], div_features_np[indices].astype(np.float64))
+        class_means = np.zeros((num_classes, div_features_np.shape[1]), dtype=np.float64)
+        active = class_counts > 0
+        if np.any(active):
+            class_means[active] = class_feature_sums[active] / class_counts[active, None]
+        return {
+            "class_counts": class_counts,
+            "class_feature_sums": class_feature_sums,
+            "class_means": class_means,
+        }
+
+    def _rank_normalize(scores_np: np.ndarray, descending: bool = True) -> np.ndarray:
+        scores = np.asarray(scores_np, dtype=np.float64)
+        n = int(scores.size)
+        if n == 0:
+            return np.zeros(0, dtype=np.float32)
+        if n == 1:
+            return np.ones(1, dtype=np.float32)
+        if descending:
+            order = np.argsort(-scores, kind="mergesort")
+        else:
+            order = np.argsort(scores, kind="mergesort")
+        ranks = np.empty(n, dtype=np.float64)
+        ranks[order] = np.arange(n, 0, -1, dtype=np.float64)
+        return ((ranks - 1.0) / float(n - 1)).astype(np.float32)
+
+    def _score_add_candidates_by_ranks(
+        current_indices: np.ndarray,
+        candidate_indices: np.ndarray,
+        *,
+        weak_class_bias: bool = False,
+    ) -> dict[str, np.ndarray]:
+        candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+        if candidate_indices.size == 0:
+            return {
+                "candidate_indices": candidate_indices,
+                "total_add_rank": np.zeros(0, dtype=np.float32),
+                "rank_static": np.zeros(0, dtype=np.float32),
+                "rank_spread": np.zeros(0, dtype=np.float32),
+                "rank_herd": np.zeros(0, dtype=np.float32),
+            }
+        stats = _build_subset_class_stats(current_indices)
+        class_counts = stats["class_counts"]
+        class_sums = stats["class_feature_sums"]
+        class_means = stats["class_means"]
+
+        static_raw = guide_score_np[candidate_indices].astype(np.float64)
+        spread_raw = np.zeros(candidate_indices.size, dtype=np.float64)
+        herd_raw = np.zeros(candidate_indices.size, dtype=np.float64)
+        for i, cand_idx in enumerate(candidate_indices.tolist()):
+            c = int(labels_np[cand_idx])
+            feat = div_features_np[cand_idx].astype(np.float64)
+            base_mean = class_means[c] if class_counts[c] > 0 else full_class_mean[c].astype(np.float64)
+            spread_raw[i] = float(np.linalg.norm(feat - base_mean))
+            old_dist = float(np.linalg.norm(base_mean - full_class_mean[c].astype(np.float64)))
+            new_mean = (class_sums[c] + feat) / float(class_counts[c] + 1)
+            new_dist = float(np.linalg.norm(new_mean - full_class_mean[c].astype(np.float64)))
+            herd_raw[i] = old_dist - new_dist
+
+        rank_static = _rank_normalize(static_raw, descending=True)
+        rank_spread = _rank_normalize(spread_raw, descending=True)
+        rank_herd = _rank_normalize(herd_raw, descending=True)
+        total_add_rank = rank_static + rank_spread + rank_herd
+        if weak_class_bias:
+            deficits = target_class_counts - class_counts
+            weak_bonus = np.clip(deficits[labels_np[candidate_indices]], 0, None).astype(np.float32)
+            if weak_bonus.size > 0 and float(np.max(weak_bonus)) > 0:
+                total_add_rank = total_add_rank + 0.25 * (weak_bonus / (float(np.max(weak_bonus)) + 1e-8))
+        return {
+            "candidate_indices": candidate_indices,
+            "total_add_rank": total_add_rank.astype(np.float32),
+            "rank_static": rank_static,
+            "rank_spread": rank_spread,
+            "rank_herd": rank_herd,
+        }
+
+    def _score_drop_candidates_by_ranks(
+        current_indices: np.ndarray,
+        candidate_indices: np.ndarray,
+        *,
+        weak_class_bias: bool = False,
+    ) -> dict[str, np.ndarray]:
+        candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+        if candidate_indices.size == 0:
+            return {
+                "candidate_indices": candidate_indices,
+                "total_drop_rank": np.zeros(0, dtype=np.float32),
+                "rank_static_drop": np.zeros(0, dtype=np.float32),
+                "rank_spread_drop": np.zeros(0, dtype=np.float32),
+                "rank_herd_drop": np.zeros(0, dtype=np.float32),
+            }
+        stats = _build_subset_class_stats(current_indices)
+        class_counts = stats["class_counts"]
+        class_sums = stats["class_feature_sums"]
+        class_means = stats["class_means"]
+
+        static_drop_raw = -guide_score_np[candidate_indices].astype(np.float64)
+        spread_drop_raw = np.zeros(candidate_indices.size, dtype=np.float64)
+        herd_drop_raw = np.zeros(candidate_indices.size, dtype=np.float64)
+        for i, cand_idx in enumerate(candidate_indices.tolist()):
+            c = int(labels_np[cand_idx])
+            feat = div_features_np[cand_idx].astype(np.float64)
+            base_mean = class_means[c] if class_counts[c] > 0 else full_class_mean[c].astype(np.float64)
+            spread_drop_raw[i] = -float(np.linalg.norm(feat - base_mean))
+            old_dist = float(np.linalg.norm(base_mean - full_class_mean[c].astype(np.float64)))
+            if class_counts[c] <= 1:
+                new_dist = 0.0
+            else:
+                new_mean = (class_sums[c] - feat) / float(class_counts[c] - 1)
+                new_dist = float(np.linalg.norm(new_mean - full_class_mean[c].astype(np.float64)))
+            herd_drop_raw[i] = old_dist - new_dist
+
+        rank_static_drop = _rank_normalize(static_drop_raw, descending=True)
+        rank_spread_drop = _rank_normalize(spread_drop_raw, descending=True)
+        rank_herd_drop = _rank_normalize(herd_drop_raw, descending=True)
+        total_drop_rank = rank_static_drop + rank_spread_drop + rank_herd_drop
+        if weak_class_bias:
+            surplus = _build_subset_class_stats(current_indices)["class_counts"] - target_class_counts
+            weak_bonus = np.clip(surplus[labels_np[candidate_indices]], 0, None).astype(np.float32)
+            if weak_bonus.size > 0 and float(np.max(weak_bonus)) > 0:
+                total_drop_rank = total_drop_rank + 0.25 * (weak_bonus / (float(np.max(weak_bonus)) + 1e-8))
+        return {
+            "candidate_indices": candidate_indices,
+            "total_drop_rank": total_drop_rank.astype(np.float32),
+            "rank_static_drop": rank_static_drop,
+            "rank_spread_drop": rank_spread_drop,
+            "rank_herd_drop": rank_herd_drop,
+        }
 
     def _repair_size(indices: np.ndarray) -> np.ndarray:
         current = np.unique(np.asarray(indices, dtype=np.int64))
         if current.size < target_size:
-            available = _complement_indices(current)
             need = target_size - current.size
-            if available.size > 0 and need > 0:
-                order = np.argsort(-guide_score_np[available], kind="mergesort")
-                take = available[order[: min(need, available.size)]]
-                current = np.unique(np.concatenate([current, take]))
+            while need > 0:
+                available = _complement_indices(current)
+                if available.size == 0:
+                    break
+                add_scores = _score_add_candidates_by_ranks(current, available, weak_class_bias=True)
+                order = np.argsort(-add_scores["total_add_rank"], kind="mergesort")
+                top_k = min(max(8, need * 3), order.size)
+                chosen_pos = int(np.random.choice(order[:top_k]))
+                chosen = int(add_scores["candidate_indices"][chosen_pos])
+                current = np.unique(np.concatenate([current, np.asarray([chosen], dtype=np.int64)]))
+                need = target_size - current.size
 
         if current.size > target_size:
-            order = np.argsort(guide_score_np[current], kind="mergesort")
-            drop = current[order[: current.size - target_size]]
-            keep_mask = np.isin(current, drop, invert=True)
-            current = current[keep_mask]
+            over = current.size - target_size
+            while over > 0 and current.size > 0:
+                drop_scores = _score_drop_candidates_by_ranks(current, current, weak_class_bias=True)
+                order = np.argsort(-drop_scores["total_drop_rank"], kind="mergesort")
+                top_k = min(max(8, over * 3), order.size)
+                chosen_pos = int(np.random.choice(order[:top_k]))
+                drop = int(drop_scores["candidate_indices"][chosen_pos])
+                current = current[current != drop]
+                over = current.size - target_size
 
         if current.size < target_size:
             available = _complement_indices(current)
@@ -582,50 +723,51 @@ def select_group_mask(
         if needed > 0:
             union_only = np.setdiff1d(np.union1d(parent_a, parent_b), child, assume_unique=False)
             if union_only.size > 0:
-                order = np.argsort(-guide_score_np[union_only], kind="mergesort")
-                take = union_only[order[: min(needed, union_only.size)]]
+                add_scores = _score_add_candidates_by_ranks(child, union_only, weak_class_bias=True)
+                order = np.argsort(-add_scores["total_add_rank"], kind="mergesort")
+                take = add_scores["candidate_indices"][order[: min(needed, union_only.size)]]
                 child = np.unique(np.concatenate([child, take]))
         return _repair_size(child)
 
-    def _mutate_swap(indices: np.ndarray, num_swaps: int, rng: np.random.Generator) -> np.ndarray:
+    def _mutate_swap(indices: np.ndarray, replace_count: int, rng: np.random.Generator) -> np.ndarray:
         current = np.asarray(indices, dtype=np.int64)
-        for _ in range(max(1, num_swaps)):
-            if current.size == 0:
-                break
+        if current.size == 0:
+            return current
+        for _ in range(max(1, replace_count)):
             available = _complement_indices(current)
-            if available.size == 0:
+            if available.size == 0 or current.size == 0:
                 break
-            drop = int(rng.choice(current))
-            remain = current[current != drop]
-            pool_size = min(32, available.size)
-            add_pool = available[np.argsort(-guide_score_np[available], kind="mergesort")[:pool_size]]
-            add = int(rng.choice(add_pool)) if add_pool.size > 0 else int(rng.choice(available))
-            current = np.sort(np.concatenate([remain, np.asarray([add], dtype=np.int64)]))
-            current = _repair_size(current)
-            if rng.random() < 0.35:
-                break
-        return current
+            drop_scores = _score_drop_candidates_by_ranks(current, current, weak_class_bias=True)
+            add_scores = _score_add_candidates_by_ranks(current, available, weak_class_bias=True)
+            drop_order = np.argsort(-drop_scores["total_drop_rank"], kind="mergesort")
+            add_order = np.argsort(-add_scores["total_add_rank"], kind="mergesort")
+            drop_pool_k = min(max(12, replace_count * 3), drop_order.size)
+            add_pool_k = min(max(24, replace_count * 4), add_order.size)
+            drop = int(drop_scores["candidate_indices"][int(rng.choice(drop_order[:drop_pool_k]))])
+            add = int(add_scores["candidate_indices"][int(rng.choice(add_order[:add_pool_k]))])
+            current = current[current != drop]
+            current = np.unique(np.concatenate([current, np.asarray([add], dtype=np.int64)]))
+        return _repair_size(current)
 
-    def _local_search_swap(indices: np.ndarray, max_steps: int, rng: np.random.Generator) -> np.ndarray:
+    def _local_search_swap(indices: np.ndarray, num_steps: int, rng: np.random.Generator) -> np.ndarray:
         current = np.asarray(indices, dtype=np.int64)
-        if max_steps <= 0 or current.size == 0:
+        if num_steps <= 0 or current.size == 0:
             return current
-        available = _complement_indices(current)
-        if available.size == 0:
-            return current
-
-        drop_pool = current[np.argsort(guide_score_np[current], kind="mergesort")[: min(8, current.size)]]
-        add_pool = available[np.argsort(-guide_score_np[available], kind="mergesort")[: min(16, available.size)]]
-        if drop_pool.size == 0 or add_pool.size == 0:
-            return current
-
-        drop = int(rng.choice(drop_pool))
-        add = int(rng.choice(add_pool))
-        if guide_score_np[add] <= guide_score_np[drop]:
-            return current
-        remain = current[current != drop]
-        trial = np.sort(np.concatenate([remain, np.asarray([add], dtype=np.int64)]))
-        return _repair_size(trial)
+        for _ in range(num_steps):
+            available = _complement_indices(current)
+            if available.size == 0 or current.size == 0:
+                break
+            drop_scores = _score_drop_candidates_by_ranks(current, current, weak_class_bias=True)
+            add_scores = _score_add_candidates_by_ranks(current, available, weak_class_bias=True)
+            drop_order = np.argsort(-drop_scores["total_drop_rank"], kind="mergesort")
+            add_order = np.argsort(-add_scores["total_add_rank"], kind="mergesort")
+            drop_pool_k = min(max(6, 2 * num_steps), drop_order.size)
+            add_pool_k = min(max(12, 3 * num_steps), add_order.size)
+            drop = int(drop_scores["candidate_indices"][int(rng.choice(drop_order[:drop_pool_k]))])
+            add = int(add_scores["candidate_indices"][int(rng.choice(add_order[:add_pool_k]))])
+            current = current[current != drop]
+            current = np.unique(np.concatenate([current, np.asarray([add], dtype=np.int64)]))
+        return _repair_size(current)
 
     def _jaccard_similarity(a: np.ndarray, b: np.ndarray) -> float:
         inter = np.intersect1d(a, b).size
@@ -668,9 +810,9 @@ def select_group_mask(
 
     ga_population_size = int(np.clip(16 + keep_ratio // 5, 16, 36))
     ga_generations = int(np.clip(8 + keep_ratio // 10, 8, 18))
-    mutation_ratio = float(np.clip(0.45 - 0.0025 * keep_ratio, 0.18, 0.40))
-    mutation_strength = int(np.clip(1 + (60 - keep_ratio) // 20, 1, 3))
-    local_search_steps = int(np.clip(1 + (70 - keep_ratio) // 25, 1, 3))
+    mutation_ratio_eff = float(np.clip(0.18 - 0.0010 * keep_ratio, 0.03, 0.10))
+    mutation_strength = int(np.clip(max(2, round(target_size * mutation_ratio_eff)), 2, max(2, target_size // 2)))
+    local_search_steps = int(np.clip(5 - keep_ratio // 25, 2, 5))
     crossover_children = max(2, int(ga_population_size * 0.75))
     elite_count = max(1, ga_population_size // 8)
     similarity_thr = 0.85 if keep_ratio <= 50 else 0.90
@@ -705,7 +847,7 @@ def select_group_mask(
             p1 = _tournament_select(population_items, rng)
             p2 = _tournament_select(population_items, rng)
             child = _crossover(p1, p2)
-            if rng.random() < mutation_ratio:
+            if rng.random() < 0.95:
                 child = _mutate_swap(child, mutation_strength, rng)
             child = _local_search_swap(child, local_search_steps, rng)
             children.append(_evaluate(child))

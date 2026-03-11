@@ -79,25 +79,43 @@ def _random_mask(n_samples: int, keep_ratio: int, rng: np.random.Generator) -> n
     return mask
 
 
-def _compute_herding_penalty_class_avg(mask: np.ndarray, labels: np.ndarray, feats: np.ndarray, full_mean: np.ndarray) -> float:
+def _compute_herding_penalty_sum(
+    mask: np.ndarray,
+    labels: np.ndarray,
+    feats: np.ndarray,
+    full_mean: np.ndarray,
+    full_var: np.ndarray,
+    eps: float,
+) -> float:
     selected = mask.astype(bool)
-    class_values: list[float] = []
+    penalty_sum = 0.0
     num_classes = full_mean.shape[0]
     for class_id in range(num_classes):
         cls_sel = selected & (labels == class_id)
-        n = int(np.sum(cls_sel))
-        if n <= 0:
+        if int(np.sum(cls_sel)) <= 0:
             continue
         subset_mean = np.mean(feats[cls_sel], axis=0, dtype=np.float32)
         diff = subset_mean - full_mean[class_id]
-        class_values.append(float(np.linalg.norm(diff)))
-    if not class_values:
-        return 0.0
-    return float(np.mean(np.asarray(class_values, dtype=np.float64)))
+        dist2 = float(np.dot(diff, diff))
+        penalty_sum += dist2 / (float(full_var[class_id]) + eps)
+    return float(penalty_sum)
 
 
-def _format_table(dataset_name: str, krs: list[int], values: dict[str, dict[int, float]]) -> str:
-    methods = ["random", "herding", "learned_topk", "naive_topk"]
+def _compute_herding_penalty_avg(
+    mask: np.ndarray,
+    labels: np.ndarray,
+    feats: np.ndarray,
+    full_mean: np.ndarray,
+    full_var: np.ndarray,
+    eps: float,
+) -> float:
+    num_classes = full_mean.shape[0]
+    penalty_sum = _compute_herding_penalty_sum(mask, labels, feats, full_mean, full_var, eps)
+    return float(penalty_sum / float(num_classes))
+
+
+def _format_table(title: str, dataset_name: str, krs: list[int], values: dict[str, dict[int, float]]) -> str:
+    methods = ["random", "herding", "learned_topk", "learned_group", "naive_topk"]
     rows = []
     for kr in krs:
         rows.append([
@@ -115,7 +133,7 @@ def _format_table(dataset_name: str, krs: list[int], values: dict[str, dict[int,
         return " | ".join(cell.rjust(widths[i]) for i, cell in enumerate(cells))
 
     sep = "-+-".join("-" * w for w in widths)
-    lines = [f"\nDataset: {dataset_name}", fmt_row(headers), sep]
+    lines = [f"\nDataset: {dataset_name} | {title}", fmt_row(headers), sep]
     lines.extend(fmt_row(r) for r in rows)
     return "\n".join(lines)
 
@@ -159,29 +177,41 @@ def main() -> None:
 
         num_classes = len(class_names)
         full_mean = np.zeros((num_classes, feats_np.shape[1]), dtype=np.float32)
+        full_var = np.zeros((num_classes,), dtype=np.float32)
+        eps = 1e-8
         for class_id in range(num_classes):
             class_feats = feats_np[labels == class_id]
             if class_feats.shape[0] == 0:
                 continue
-            full_mean[class_id] = np.mean(class_feats, axis=0, dtype=np.float32)
+            class_mean = np.mean(class_feats, axis=0, dtype=np.float32)
+            diff = class_feats - class_mean
+            sigma2 = float(np.mean(np.sum(diff * diff, axis=1)))
+            full_mean[class_id] = class_mean
+            full_var[class_id] = np.float32(max(sigma2, 0.0))
 
-        values: dict[str, dict[int, float]] = {m: {} for m in ["random", "herding", "learned_topk", "naive_topk"]}
+        methods = ["random", "herding", "learned_topk", "learned_group", "naive_topk"]
+        values_class_avg: dict[str, dict[int, float]] = {m: {} for m in methods}
+        values_no_class_avg: dict[str, dict[int, float]] = {m: {} for m in methods}
         rng = np.random.default_rng(args.random_seed)
 
         for kr in krs:
-            values["random"][kr] = _compute_herding_penalty_class_avg(
-                _random_mask(n_samples, kr, rng), labels, feats_np, full_mean
-            )
-            for mode in ["herding", "learned_topk", "naive_topk"]:
+            random_mask = _random_mask(n_samples, kr, rng)
+            values_class_avg["random"][kr] = _compute_herding_penalty_avg(random_mask, labels, feats_np, full_mean, full_var, eps)
+            values_no_class_avg["random"][kr] = _compute_herding_penalty_sum(random_mask, labels, feats_np, full_mean, full_var, eps)
+
+            for mode in methods[1:]:
                 mask_path = resolve_mask_path(mode, dataset_name, args.model_name, args.seed, kr)
                 try:
                     mask = _load_mask(mask_path, n_samples)
-                    values[mode][kr] = _compute_herding_penalty_class_avg(mask, labels, feats_np, full_mean)
+                    values_class_avg[mode][kr] = _compute_herding_penalty_avg(mask, labels, feats_np, full_mean, full_var, eps)
+                    values_no_class_avg[mode][kr] = _compute_herding_penalty_sum(mask, labels, feats_np, full_mean, full_var, eps)
                 except Exception as exc:
                     print(f"[WARN] {dataset_name} kr={kr} mode={mode}: {exc}")
-                    values[mode][kr] = float("nan")
+                    values_class_avg[mode][kr] = float("nan")
+                    values_no_class_avg[mode][kr] = float("nan")
 
-        print(_format_table(dataset_name, krs, values))
+        print(_format_table("按类别取均值", dataset_name, krs, values_class_avg))
+        print(_format_table("不按类别取均值", dataset_name, krs, values_no_class_avg))
 
 
 if __name__ == "__main__":

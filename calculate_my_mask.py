@@ -27,9 +27,10 @@ from utils.path_rules import resolve_mask_path  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 from utils.group_lambda import (  # noqa: E402
+    DEFAULT_CLS_LAMBDA_BASE,
     DEFAULT_EPS,
     DEFAULT_M,
-    DEFAULT_R,
+    DEFAULT_MEAN_LAMBDA_BASE,
     compute_balance_penalty,
     get_or_estimate_lambda,
 )
@@ -102,6 +103,8 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="连续多少次 eval 最优解不提升后才调整 batch_size",
     )
+    parser.add_argument("--mean-lambda-base", type=float, default=DEFAULT_MEAN_LAMBDA_BASE, help="kr=20 时 mean 修正项目标占比")
+    parser.add_argument("--cls-lambda-base", type=float, default=DEFAULT_CLS_LAMBDA_BASE, help="kr=20 时 class 修正项目标占比")
     return parser.parse_args()
 
 
@@ -124,18 +127,6 @@ def parse_ratio_list(ratio_text: str) -> list[int]:
         items = [cleaned]
     return [int(item) for item in items]
 
-
-def _get_group_penalty_scales(dataset_name: str, keep_ratio: int) -> tuple[float, float]:
-    """Return fixed penalty scales used by group mode."""
-    dataset_key = dataset_name.strip().lower()
-    if dataset_key == CIFAR10:
-        scale_mean = max(0.0, 4.5 - 0.05 * float(keep_ratio))
-    elif dataset_key == CIFAR100:
-        scale_mean = max(0.0, 7.5 - 0.05 * float(keep_ratio))
-    else:
-        raise ValueError(f"Unsupported dataset for group penalty scaling: {dataset_name}")
-    scale_cls = 5.0
-    return float(scale_cls), float(scale_mean)
 
 
 def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str, object]]:
@@ -368,6 +359,8 @@ def select_group_mask(
     group_eval_interval: int = 10,
     group_candidate_pool_multiplier: float = 3.0,
     group_batch_adjust_patience: int = 3,
+    cls_lambda_base: float = DEFAULT_CLS_LAMBDA_BASE,
+    mean_lambda_base: float = DEFAULT_MEAN_LAMBDA_BASE,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
         raise ValueError("kr 必须在 1-100 之间。")
@@ -423,8 +416,8 @@ def select_group_mask(
         return mask
 
     def _compute_mean_penalty(cur_mask: np.ndarray) -> float:
-        # Keep definition aligned with x.py: average over active classes of
-        # variance-normalized squared distance between subset/full class means.
+        # mean penalty uses class-averaged variance-normalized centroid shift
+        # so lambda calibration from random baseline is directly comparable across datasets.
         selected = np.flatnonzero(cur_mask > 0).astype(np.int64)
         if selected.size == 0:
             return 0.0
@@ -441,10 +434,9 @@ def select_group_mask(
         diff = selected_mean[active] - full_class_mean_f32[active]
         dist2 = np.sum(diff * diff, axis=1, dtype=np.float32)
         normalized = dist2 / (full_class_var_f32[active] + float(DEFAULT_EPS))
-        active_count = int(np.count_nonzero(active))
-        if active_count == 0:
+        if num_classes <= 0:
             return 0.0
-        return float(np.sum(normalized, dtype=np.float32) / float(active_count))
+        return float(np.sum(normalized, dtype=np.float32) / float(num_classes))
 
     def _evaluate(indices: np.ndarray) -> dict[str, object]:
         unique = np.unique(np.asarray(indices, dtype=np.int64))
@@ -506,13 +498,21 @@ def select_group_mask(
         penalty_fn=lambda cur_mask: compute_balance_penalty(cur_mask, labels_np, num_classes, target_size),
         mean_penalty_fn=lambda cur_mask: _compute_mean_penalty(cur_mask),
         M=DEFAULT_M,
-        r=DEFAULT_R,
         eps=DEFAULT_EPS,
+        cls_lambda_base=cls_lambda_base,
+        mean_lambda_base=mean_lambda_base,
         tqdm_desc=f"Estimating lambdas (seed={seed}, kr={keep_ratio}, wg={weight_group})",
     )
-    scale_cls, scale_mean = _get_group_penalty_scales(dataset_name, keep_ratio)
-    lambda_cls = float(lambda_record["lambda_cls"]) * float(scale_cls)
-    lambda_mean = float(lambda_record["lambda_mean"]) * float(scale_mean)
+    lambda_cls = float(lambda_record["lambda_cls"])
+    lambda_mean = float(lambda_record["lambda_mean"])
+    print(
+        f"[Lambda] dataset={dataset_name} | seed={seed} | kr={keep_ratio} "
+        f"| raw_mean={float(lambda_record['raw_mean']):.8f} "
+        f"| class_penalty_mean={float(lambda_record['class_penalty_mean']):.8f} "
+        f"| mean_penalty_mean={float(lambda_record['mean_penalty_mean']):.8f} "
+        f"| lambda_cls={lambda_cls:.8f} | lambda_mean={lambda_mean:.8f} "
+        f"| cls_lambda_base={float(cls_lambda_base):.6f} | mean_lambda_base={float(mean_lambda_base):.6f}"
+    )
 
     def _rank_points(scores_np: np.ndarray, descending: bool) -> np.ndarray:
         n = int(scores_np.size)
@@ -944,6 +944,8 @@ def main() -> None:
                     group_eval_interval=args.group_eval_interval,
                     group_candidate_pool_multiplier=args.group_candidate_pool_multiplier,
                     group_batch_adjust_patience=args.group_batch_adjust_patience,
+                    cls_lambda_base=args.cls_lambda_base,
+                    mean_lambda_base=args.mean_lambda_base,
                 )
                 debug_curve = save_score_curve_plot(
                     group_stats.get("score_history", []),

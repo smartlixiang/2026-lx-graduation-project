@@ -21,9 +21,10 @@ from torch.utils.data import DataLoader
 from torchvision import datasets
 from tqdm import tqdm
 from utils.group_lambda import (
+    DEFAULT_CLS_LAMBDA_BASE,
     DEFAULT_EPS,
     DEFAULT_M,
-    DEFAULT_R,
+    DEFAULT_MEAN_LAMBDA_BASE,
     compute_balance_penalty,
     get_or_estimate_lambda,
 )
@@ -49,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--output", type=Path, default=None, help="可选输出路径；默认保存到 group_baseline/<dataset>/<weight-group>.csv")
+    parser.add_argument("--mean-lambda-base", type=float, default=DEFAULT_MEAN_LAMBDA_BASE)
+    parser.add_argument("--cls-lambda-base", type=float, default=DEFAULT_CLS_LAMBDA_BASE)
     return parser.parse_args()
 
 
@@ -211,7 +214,9 @@ def compute_mean_penalty(
         diff = subset_mean - full_class_mean[class_id]
         dist2 = float(np.dot(diff, diff))
         penalty_sum += dist2 / (float(full_class_var[class_id]) + eps)
-    return float(penalty_sum)
+    if num_classes <= 0:
+        return 0.0
+    return float(penalty_sum / float(num_classes))
 
 
 def select_global_topk(scores: np.ndarray, keep_ratio: int) -> np.ndarray:
@@ -472,7 +477,6 @@ def main() -> None:
     keep_ratios = list(range(20, 91, 10))
     eval_seeds = [22, 42, 96]
     lambda_sample_M = DEFAULT_M
-    lambda_ratio_r = DEFAULT_R
     lambda_eps = DEFAULT_EPS
     rows: list[dict[str, object]] = []
 
@@ -518,18 +522,18 @@ def main() -> None:
                 eps=lambda_eps,
             ),
             M=lambda_sample_M,
-            r=lambda_ratio_r,
             eps=lambda_eps,
+            cls_lambda_base=args.cls_lambda_base,
+            mean_lambda_base=args.mean_lambda_base,
             tqdm_desc=f"Estimating lambda (seed={FIXED_SEED}, kr={kr})",
         )
-        lambda_topk_cls = 5.0 * float(lambda_info_topk["lambda_std_cls"])
-        if args.dataset == CIFAR10:
-            mean_scale_topk = max(0.0, 4.5 - 0.05 * float(kr))
-        else:
-            mean_scale_topk = max(0.0, 7.5 - 0.05 * float(kr))
-        lambda_topk_mean = mean_scale_topk * float(lambda_info_topk["lambda_std_mean"])
+        lambda_topk_cls = float(lambda_info_topk["lambda_cls"])
+        lambda_topk_mean = float(lambda_info_topk["lambda_mean"])
         print(
             f"[Lambda] dataset={args.dataset} | seed={FIXED_SEED} | kr={kr} "
+            f"| raw_mean={float(lambda_info_topk['raw_mean']):.8f} "
+            f"| class_penalty_mean={float(lambda_info_topk['class_penalty_mean']):.8f} "
+            f"| mean_penalty_mean={float(lambda_info_topk['mean_penalty_mean']):.8f} "
             f"| lambda_cls={lambda_topk_cls:.8f} | lambda_mean={lambda_topk_mean:.8f}"
         )
         topk_mask = select_global_topk(total_static, keep_ratio=kr)
@@ -599,16 +603,20 @@ def main() -> None:
                     eps=lambda_eps,
                 ),
                 M=lambda_sample_M,
-                r=lambda_ratio_r,
                 eps=lambda_eps,
+                cls_lambda_base=args.cls_lambda_base,
+                mean_lambda_base=args.mean_lambda_base,
                 tqdm_desc=f"Estimating lambda (seed={seed}, kr={kr})",
             )
-            lambda_seed_cls = 5.0 * float(lambda_info_seed["lambda_std_cls"])
-            if args.dataset == CIFAR10:
-                mean_scale_seed = max(0.0, 4.6 - 0.04 * float(kr))
-            else:
-                mean_scale_seed = max(0.0, 7.5 - 0.05 * float(kr))
-            lambda_seed_mean = mean_scale_seed * float(lambda_info_seed["lambda_std_mean"])
+            lambda_seed_cls = float(lambda_info_seed["lambda_cls"])
+            lambda_seed_mean = float(lambda_info_seed["lambda_mean"])
+            print(
+                f"[Lambda] dataset={args.dataset} | seed={seed} | kr={kr} "
+                f"| raw_mean={float(lambda_info_seed['raw_mean']):.8f} "
+                f"| class_penalty_mean={float(lambda_info_seed['class_penalty_mean']):.8f} "
+                f"| mean_penalty_mean={float(lambda_info_seed['mean_penalty_mean']):.8f} "
+                f"| lambda_cls={lambda_seed_cls:.8f} | lambda_mean={lambda_seed_mean:.8f}"
+            )
 
             random_repeat = 2
             for rep_idx in range(random_repeat):

@@ -23,11 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=["random", "naive_topk", "learned_topk", "herding", "naive_group", "learned_group"],
+        default=["random", "naive_topk", "learned_topk", "herding", "learned_group"],
         help="Selection methods to compare",
     )
     parser.add_argument(
-        "--krs",
+        "--kr",
         default="20,30,40,50,60,70,80,90",
         help="Keep ratio list, e.g. '20,30,40,50,60,70,80,90'",
     )
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
 def parse_kr_list(raw: str) -> list[int]:
     values = [item.strip() for item in raw.split(",") if item.strip()]
     if not values:
-        raise ValueError("--krs cannot be empty")
+        raise ValueError("--kr cannot be empty")
     return sorted({int(v) for v in values})
 
 
@@ -62,7 +62,7 @@ def load_seed_results(seed_dir: Path) -> dict[int, float]:
 
 def main() -> None:
     args = parse_args()
-    keep_ratios = parse_kr_list(args.krs)
+    keep_ratios = parse_kr_list(args.kr)
     result_root = Path(args.result_dir)
     methods = args.methods
     color_map = {

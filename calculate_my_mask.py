@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         "--method",
         type=str,
         default="topk",
-        help="数据选择方式，可选 {topk, exchange}",
+        help="数据选择方式，可选 {topk, group}",
     )
     parser.add_argument(
         "--model-name",
@@ -76,28 +76,28 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--exchange-iterations", type=int, default=500)
+    parser.add_argument("--group-iterations", type=int, default=500)
     parser.add_argument(
-        "--exchange-batch-size",
+        "--group-batch-size",
         type=int,
         default=64,
         help="kr<=50 时的初始 batch_size；kr>50 时自动减半",
     )
     parser.add_argument(
-        "--exchange-min-batch-size",
+        "--group-min-batch-size",
         type=int,
         default=2,
         help="kr<=50 时的最小 batch_size；kr>50 时自动减半",
     )
-    parser.add_argument("--exchange-eval-interval", type=int, default=2)
+    parser.add_argument("--group-eval-interval", type=int, default=2)
     parser.add_argument(
-        "--exchange-candidate-pool-multiplier",
+        "--group-candidate-pool-multiplier",
         type=float,
         default=2,
         help="候选池大小倍率，按当前 batch_size 的倍率分别构造子集内外候选池",
     )
     parser.add_argument(
-        "--exchange-batch-adjust-patience",
+        "--group-batch-adjust-patience",
         type=int,
         default=8,
         help="连续多少次 eval 最优解不提升后才调整 batch_size",
@@ -129,9 +129,9 @@ def _get_group_penalty_scales(dataset_name: str, keep_ratio: int) -> tuple[float
     """Return fixed penalty scales used by group mode."""
     dataset_key = dataset_name.strip().lower()
     if dataset_key == CIFAR10:
-        scale_mean = max(0.0, 1.6 - 0.015 * float(keep_ratio))
+        scale_mean = max(0.0, 3.5 - 0.03 * float(keep_ratio))
     elif dataset_key == CIFAR100:
-        scale_mean = max(0.0, 2.5 - 0.02 * float(keep_ratio))
+        scale_mean = max(0.0, 5 - 0.04 * float(keep_ratio))
     else:
         raise ValueError(f"Unsupported dataset for group penalty scaling: {dataset_name}")
     scale_cls = 5.0
@@ -345,7 +345,7 @@ def select_topk_mask(
     return mask, selected_by_class
 
 
-def select_exchange_mask(
+def select_group_mask(
     sa_scores: np.ndarray,
     div_metric: Div,
     div_loader: DataLoader,
@@ -362,12 +362,12 @@ def select_exchange_mask(
     adapter_image_path: str,
     div_static_scores: np.ndarray | None = None,
     dds_static_scores: np.ndarray | None = None,
-    exchange_iterations: int = 200,
-    exchange_batch_size: int = 64,
-    exchange_min_batch_size: int = 2,
-    exchange_eval_interval: int = 10,
-    exchange_candidate_pool_multiplier: float = 3.0,
-    exchange_batch_adjust_patience: int = 3,
+    group_iterations: int = 200,
+    group_batch_size: int = 64,
+    group_min_batch_size: int = 2,
+    group_eval_interval: int = 10,
+    group_candidate_pool_multiplier: float = 3.0,
+    group_batch_adjust_patience: int = 3,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
         raise ValueError("kr 必须在 1-100 之间。")
@@ -378,7 +378,7 @@ def select_exchange_mask(
     div_static_np = np.asarray(div_static_scores, dtype=np.float32) if div_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
     dds_static_np = np.asarray(dds_static_scores, dtype=np.float32) if dds_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
     if labels_np.shape[0] != num_samples or div_static_np.shape[0] != num_samples or dds_static_np.shape[0] != num_samples:
-        raise ValueError("样本数不一致，无法执行 exchange。")
+        raise ValueError("样本数不一致，无法执行 group。")
 
     sr = float(keep_ratio) / 100.0
     target_size = int(round(sr * num_samples))
@@ -534,17 +534,17 @@ def select_exchange_mask(
     fitness_history = [float(current_item["fitness"])]
     eval_steps = [0]
 
-    eval_every = max(1, int(exchange_eval_interval))
+    eval_every = max(1, int(group_eval_interval))
     batch_scale = 1.0 if keep_ratio <= 50 else 0.5
-    cur_batch_size = max(1, int(exchange_batch_size * batch_scale))
-    min_batch_size = max(1, int(exchange_min_batch_size * batch_scale))
-    candidate_pool_multiplier = max(1.0, float(exchange_candidate_pool_multiplier))
-    batch_adjust_patience = max(1, int(exchange_batch_adjust_patience))
+    cur_batch_size = max(1, int(group_batch_size * batch_scale))
+    min_batch_size = max(1, int(group_min_batch_size * batch_scale))
+    candidate_pool_multiplier = max(1.0, float(group_candidate_pool_multiplier))
+    batch_adjust_patience = max(1, int(group_batch_adjust_patience))
     if cur_batch_size < min_batch_size:
         cur_batch_size = min_batch_size
     stale_eval_count = 0
 
-    iter_bar = tqdm(range(max(0, int(exchange_iterations))), desc="[exchange] iterations", unit="iter")
+    iter_bar = tqdm(range(max(0, int(group_iterations))), desc="[group] iterations", unit="iter")
     for step in iter_bar:
         membership = np.zeros(num_samples, dtype=bool)
         membership[current_indices] = True
@@ -613,7 +613,7 @@ def select_exchange_mask(
         membership[add_idx] = True
         current_indices = np.flatnonzero(membership).astype(np.int64)
         if current_indices.size != target_size:
-            raise RuntimeError("exchange swap 后子集大小异常。")
+            raise RuntimeError("group swap 后子集大小异常。")
 
         # 增量更新 class_sums/class_counts
         drop_labels = labels_np[drop_idx]
@@ -626,7 +626,7 @@ def select_exchange_mask(
         approx_total_rank = float(np.mean(score_out[np.argsort(-score_out, kind="mergesort")[:k]]) -
                                   np.mean(score_in[np.argsort(-score_in, kind="mergesort")[:k]]))
 
-        is_last_iter = step == max(0, int(exchange_iterations)) - 1
+        is_last_iter = step == max(0, int(group_iterations)) - 1
         should_eval = ((step + 1) % eval_every == 0) or is_last_iter
         if should_eval:
             current_item = _evaluate(current_indices)
@@ -661,7 +661,7 @@ def select_exchange_mask(
         selected_by_class[class_id] = int(final_mask[class_indices].sum()) if class_indices.size > 0 else 0
 
     stats: dict[str, object] = {
-        "solver": "exchange_batch_swap",
+        "solver": "group_batch_swap",
         "sr": float(sr),
         "final_rate": float(final_mask.mean()),
         "init_fitness": float(fitness_history[0]),
@@ -681,13 +681,13 @@ def select_exchange_mask(
         "eval_steps": eval_steps,
         "lambda_cls": float(lambda_cls),
         "lambda_mean": float(lambda_mean),
-        "exchange_iterations": int(exchange_iterations),
-        "exchange_batch_size": int(cur_batch_size),
-        "exchange_batch_size_init": int(max(1, int(exchange_batch_size * batch_scale))),
-        "exchange_min_batch_size": int(max(1, int(exchange_min_batch_size * batch_scale))),
-        "exchange_eval_interval": int(eval_every),
-        "exchange_candidate_pool_multiplier": float(candidate_pool_multiplier),
-        "exchange_batch_adjust_patience": int(batch_adjust_patience),
+        "group_iterations": int(group_iterations),
+        "group_batch_size": int(cur_batch_size),
+        "group_batch_size_init": int(max(1, int(group_batch_size * batch_scale))),
+        "group_min_batch_size": int(max(1, int(group_min_batch_size * batch_scale))),
+        "group_eval_interval": int(eval_every),
+        "group_candidate_pool_multiplier": float(candidate_pool_multiplier),
+        "group_batch_adjust_patience": int(batch_adjust_patience),
     }
     return final_mask, selected_by_class, stats
 
@@ -756,8 +756,8 @@ def main() -> None:
 
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
     method = args.method.strip().lower()
-    if method not in {"topk", "exchange"}:
-        raise ValueError(f"未知 method={method}，应为 {{'topk','exchange'}}")
+    if method not in {"topk", "group"}:
+        raise ValueError(f"未知 method={method}，应为 {{'topk','group'}}")
 
     weight_group = args.weight_group.strip().lower()
     if weight_group not in {"naive", "learned"}:
@@ -913,7 +913,7 @@ def main() -> None:
                     keep_ratio=keep_ratio,
                 )
             else:
-                mask, selected_by_class, group_stats = select_exchange_mask(
+                mask, selected_by_class, group_stats = select_group_mask(
                     sa_scores_np,
                     div_metric=div_metric,
                     div_loader=div_loader,
@@ -930,12 +930,12 @@ def main() -> None:
                     adapter_image_path=str(adapter_paths["image_path"]),
                     div_static_scores=div_scores_np,
                     dds_static_scores=dds_scores_np,
-                    exchange_iterations=args.exchange_iterations,
-                    exchange_batch_size=args.exchange_batch_size,
-                    exchange_min_batch_size=args.exchange_min_batch_size,
-                    exchange_eval_interval=args.exchange_eval_interval,
-                    exchange_candidate_pool_multiplier=args.exchange_candidate_pool_multiplier,
-                    exchange_batch_adjust_patience=args.exchange_batch_adjust_patience,
+                    group_iterations=args.group_iterations,
+                    group_batch_size=args.group_batch_size,
+                    group_min_batch_size=args.group_min_batch_size,
+                    group_eval_interval=args.group_eval_interval,
+                    group_candidate_pool_multiplier=args.group_candidate_pool_multiplier,
+                    group_batch_adjust_patience=args.group_batch_adjust_patience,
                 )
                 debug_curve = save_score_curve_plot(
                     group_stats.get("score_history", []),

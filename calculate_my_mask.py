@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-batch-size",
         type=int,
-        default=32,
+        default=16,
         help="kr<=50 时的初始 batch_size；kr>50 时自动减半",
     )
     parser.add_argument(
@@ -531,9 +531,17 @@ def select_group_mask(
 
     # 初始真实评估
     current_item = _evaluate(current_indices)
+    init_item = dict(current_item)
+
+    def _selection_metric(item: dict[str, object]) -> float:
+        corr_sum = float(item["class_corr"]) + float(item["mean_corr"])
+        delta = float(item["fitness"]) - float(init_item["fitness"])
+        return float(delta / (corr_sum + float(DEFAULT_EPS)))
+
     best_item = dict(current_item)
     best_item["indices"] = np.asarray(current_item["indices"], dtype=np.int64).copy()
     best_item["mask"] = np.asarray(current_item["mask"], dtype=np.uint8).copy()
+    best_metric_value = _selection_metric(best_item)
     last_eval_fit = float(current_item["fitness"])
 
     score_history = [float(current_item["raw_score"])]
@@ -644,11 +652,13 @@ def select_group_mask(
             class_correction_history.append(float(current_item["class_corr"]))
             mean_correction_history.append(float(current_item["mean_corr"]))
             fitness_history.append(float(current_item["fitness"]))
-            improved = float(current_item["fitness"]) > float(best_item["fitness"])
+            cur_metric_value = _selection_metric(current_item)
+            improved = cur_metric_value > best_metric_value
             if improved:
                 best_item = dict(current_item)
                 best_item["indices"] = np.asarray(current_item["indices"], dtype=np.int64).copy()
                 best_item["mask"] = np.asarray(current_item["mask"], dtype=np.uint8).copy()
+                best_metric_value = cur_metric_value
                 stale_eval_count = 0
             else:
                 stale_eval_count += 1
@@ -658,7 +668,9 @@ def select_group_mask(
                 stale_eval_count = 0
 
         iter_bar.set_postfix(
-            best_fit=f"{float(best_item['fitness']):.4f}",
+            best_metric=f"{best_metric_value:.4f}",
+            cur_sprime=f"{last_eval_fit:.4f}",
+            cur_herd=f"{float(current_item['mean_corr']):.4f}",
             batch_size=int(cur_batch_size),
         )
 
@@ -681,6 +693,17 @@ def select_group_mask(
         "S_prime": float(best_item["fitness"]),
         "selected_by_class": selected_by_class,
         "best_iter": int(eval_steps[int(np.argmax(np.asarray(fitness_history, dtype=np.float32)))]) if fitness_history else 0,
+        "selected_best_iter": int(eval_steps[int(np.argmax(np.asarray([
+            (f - float(init_item['fitness'])) / (c + m + float(DEFAULT_EPS))
+            for f, c, m in zip(fitness_history, class_correction_history, mean_correction_history)
+        ], dtype=np.float32)))]) if fitness_history else 0,
+        "selection_metric": float(best_metric_value),
+        "init_S_prime": float(init_item["fitness"]),
+        "init_herding_corr": float(init_item["mean_corr"]),
+        "init_class_corr": float(init_item["class_corr"]),
+        "best_herding_corr": float(best_item["mean_corr"]),
+        "best_class_corr": float(best_item["class_corr"]),
+        "best_sprime_over_herding": float(best_item["fitness"] / (float(best_item["mean_corr"]) + float(DEFAULT_EPS))),
         "score_history": score_history,
         "fitness_history": fitness_history,
         "correction_history": [float(c) + float(m) for c, m in zip(class_correction_history, mean_correction_history)],
@@ -718,6 +741,7 @@ def save_score_curve_plot(
     seed: int,
     keep_ratio: int,
     clip_model: str,
+    selected_eval_step: int | None = None,
 ) -> Path:
     out_dir = PROJECT_ROOT / "mask_debug"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -747,6 +771,14 @@ def save_score_curve_plot(
     ax2 = ax.twinx()
     ax2.plot(x, herding_corr_arr, linewidth=1.5, color="#1f77b4", linestyle="--", label="Herding correction")
     ax2.set_ylabel("Herding correction")
+
+    if selected_eval_step is not None and fit_arr.size > 0:
+        selected_x = int(selected_eval_step)
+        fit_y = float(np.interp(selected_x, x, fit_arr))
+        herd_y = float(np.interp(selected_x, x, herding_corr_arr))
+        ax.axvline(selected_x, color="green", linestyle="--", linewidth=1.6, alpha=0.9, label="Selected subset")
+        ax.plot(selected_x, fit_y, marker=(5, 1), color="green", markersize=10, linestyle="None")
+        ax2.plot(selected_x, herd_y, marker=(5, 1), color="green", markersize=10, linestyle="None")
 
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
@@ -955,6 +987,7 @@ def main() -> None:
                     group_stats.get("mean_correction_history", []),
                     fitness_history=group_stats.get("fitness_history", []),
                     eval_steps=group_stats.get("eval_steps"),
+                    selected_eval_step=int(group_stats.get("selected_best_iter", 0)),
                     dataset=dataset_name,
                     method=method,
                     weight_group=weight_group,
@@ -987,9 +1020,23 @@ def main() -> None:
                     f"sr={group_stats['sr']:.6f} | rate={group_stats['final_rate']:.6f} | "
                     f"m_c={group_stats['selected_by_class']} | "
                     f"best_iter={group_stats['best_iter']} | "
+                    f"selected_best_iter={group_stats['selected_best_iter']} | "
                     f"S(D)={group_stats['S']:.6f} | pen(D)={group_stats['penalty']:.6f} | "
                     f"mean_pen(D)={group_stats['final_mean_penalty']:.6f} | "
-                    f"lambda_mean={group_stats['lambda_mean']:.6f} | S'(D)={group_stats['S_prime']:.6f}"
+                    f"lambda_mean={group_stats['lambda_mean']:.6f} | S'(D)={group_stats['S_prime']:.6f} | "
+                    f"metric={group_stats['selection_metric']:.6f}"
+                )
+                print(
+                    "best_ratio: "
+                    f"{group_stats['S_prime']:.2f}/{group_stats['best_herding_corr']:.2f}="
+                    f"{group_stats['best_sprime_over_herding']:.2f} | "
+                    f"class_corr={group_stats['best_class_corr']:.2f}"
+                )
+                print(
+                    "random_init_stats: "
+                    f"score={group_stats['init_S_prime']:.2f} | "
+                    f"herding_corr={group_stats['init_herding_corr']:.2f} | "
+                    f"class_corr={group_stats['init_class_corr']:.2f}"
                 )
             print(f"mask saved to: {mask_path}")
 

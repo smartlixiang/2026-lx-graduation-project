@@ -19,6 +19,7 @@ from scoring import Div  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
 from utils.seed import set_seed  # noqa: E402
+from utils.group_lambda import compute_balance_penalty  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,26 +193,43 @@ def main() -> None:
         methods = ["random", "herding", "learned_topk", "learned_group", "naive_topk"]
         values_class_avg: dict[str, dict[int, float]] = {m: {} for m in methods}
         values_no_class_avg: dict[str, dict[int, float]] = {m: {} for m in methods}
+        values_class_balance_raw: dict[str, dict[int, float]] = {m: {} for m in methods}
         rng = np.random.default_rng(args.random_seed)
 
         for kr in krs:
             random_mask = _random_mask(n_samples, kr, rng)
+            random_target_size = int(np.sum(random_mask))
             values_class_avg["random"][kr] = _compute_herding_penalty_avg(random_mask, labels, feats_np, full_mean, full_var, eps)
             values_no_class_avg["random"][kr] = _compute_herding_penalty_sum(random_mask, labels, feats_np, full_mean, full_var, eps)
+            values_class_balance_raw["random"][kr] = compute_balance_penalty(
+                random_mask,
+                labels,
+                num_classes,
+                random_target_size,
+            )
 
             for mode in methods[1:]:
                 mask_path = resolve_mask_path(mode, dataset_name, args.model_name, args.seed, kr)
                 try:
                     mask = _load_mask(mask_path, n_samples)
+                    target_size = int(np.sum(mask))
                     values_class_avg[mode][kr] = _compute_herding_penalty_avg(mask, labels, feats_np, full_mean, full_var, eps)
                     values_no_class_avg[mode][kr] = _compute_herding_penalty_sum(mask, labels, feats_np, full_mean, full_var, eps)
+                    values_class_balance_raw[mode][kr] = compute_balance_penalty(
+                        mask,
+                        labels,
+                        num_classes,
+                        target_size,
+                    )
                 except Exception as exc:
                     print(f"[WARN] {dataset_name} kr={kr} mode={mode}: {exc}")
                     values_class_avg[mode][kr] = float("nan")
                     values_no_class_avg[mode][kr] = float("nan")
+                    values_class_balance_raw[mode][kr] = float("nan")
 
         print(_format_table("按类别取均值", dataset_name, krs, values_class_avg))
         print(_format_table("不按类别取均值", dataset_name, krs, values_no_class_avg))
+        print(_format_table("类别平衡修正项原始值", dataset_name, krs, values_class_balance_raw))
 
 
 if __name__ == "__main__":

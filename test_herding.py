@@ -116,7 +116,7 @@ def _compute_herding_penalty_avg(
 
 
 def _format_table(title: str, dataset_name: str, krs: list[int], values: dict[str, dict[int, float]]) -> str:
-    methods = ["random", "herding", "learned_topk", "learned_group", "naive_topk"]
+    methods = ["random", "herding", "learned_topk", "learned_group", "naive_topk", "E2LN", "GraNd", "Forgetting"]
     rows = []
     for kr in krs:
         rows.append([
@@ -190,7 +190,7 @@ def main() -> None:
             full_mean[class_id] = class_mean
             full_var[class_id] = np.float32(max(sigma2, 0.0))
 
-        methods = ["random", "herding", "learned_topk", "learned_group", "naive_topk"]
+        methods = ["random", "herding", "learned_topk", "learned_group", "naive_topk", "E2LN", "GraNd", "Forgetting"]
         values_class_avg: dict[str, dict[int, float]] = {m: {} for m in methods}
         values_no_class_avg: dict[str, dict[int, float]] = {m: {} for m in methods}
         values_class_balance_raw: dict[str, dict[int, float]] = {m: {} for m in methods}

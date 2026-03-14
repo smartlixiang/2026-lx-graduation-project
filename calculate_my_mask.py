@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         default="resnet50",
         help="mask 保存路径中的模型名称",
     )
-    parser.add_argument("--group-iterations", type=int, default=200)
+    parser.add_argument("--group-iterations", type=int, default=500)
     parser.add_argument(
         "--group-batch-size",
         type=int,
@@ -88,20 +88,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-min-batch-size",
         type=int,
-        default=4,
+        default=2,
         help="kr<=50 时的最小 batch_size；kr>50 时自动减半",
     )
-    parser.add_argument("--group-eval-interval", type=int, default=4)
+    parser.add_argument("--group-eval-interval", type=int, default=2)
     parser.add_argument(
         "--group-candidate-pool-multiplier",
         type=float,
-        default=2,
+        default=4,
         help="候选池大小倍率，按当前 batch_size 的倍率分别构造子集内外候选池",
     )
     parser.add_argument(
         "--group-batch-adjust-patience",
         type=int,
-        default=8,
+        default=5,
         help="连续多少次 eval 最优解不提升后才调整 batch_size",
     )
     parser.add_argument("--mean-lambda-base", type=float, default=None, help="kr=20 时 mean 修正项目标占比（默认随数据集变化）")

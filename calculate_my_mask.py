@@ -100,14 +100,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-candidate-pool-multiplier",
         type=float,
-        default=5,
+        default=4,
         help="候选池大小倍率，按当前 batch_size 的倍率分别构造子集内外候选池",
     )
     parser.add_argument(
-        "--group-batch-adjust-patience",
+        "--score-patience",
         type=int,
-        default=10,
-        help="连续多少次 eval 最优解不提升后才调整 batch_size",
+        default=5,
+        help="连续多少次 eval 综合评分(S') 不上涨后才调整 batch_size",
+    )
+    parser.add_argument(
+        "--herding-patience",
+        type=int,
+        default=2,
+        help="herding 修正项连续上升多少次后才调整 batch_size",
+    )
+    parser.add_argument(
+        "--score-decay",
+        type=float,
+        default=0.8,
+        help="因综合评分不上涨触发 batch_size 衰减时的倍率",
+    )
+    parser.add_argument(
+        "--herding-decay",
+        type=float,
+        default=0.9,
+        help="因 herding 修正项连续上升触发 batch_size 衰减时的倍率",
     )
     parser.add_argument("--mean-lambda-base", type=float, default=None, help="kr=20 时 mean 修正项目标占比（默认随数据集变化）")
     parser.add_argument("--cls-lambda-base", type=float, default=DEFAULT_CLS_LAMBDA_BASE, help="kr=20 时 class 修正项目标占比")
@@ -369,7 +387,10 @@ def select_group_mask(
     group_min_batch_size: int = 2,
     group_eval_interval: int = 10,
     group_candidate_pool_multiplier: float = 3.0,
-    group_batch_adjust_patience: int = 3,
+    score_patience: int = 5,
+    herding_patience: int = 3,
+    score_decay: float = 0.8,
+    herding_decay: float = 0.9,
     cls_lambda_base: float = DEFAULT_CLS_LAMBDA_BASE,
     mean_lambda_base: float = DEFAULT_MEAN_LAMBDA_BASE,
     tolerance_ratio: float = 0.95,
@@ -537,6 +558,42 @@ def select_group_mask(
         points[order] = np.arange(n, 0, -1, dtype=np.int64)
         return points
 
+    def _candidate_sampling_probs(
+        candidate_indices: np.ndarray,
+        class_counts_cur: np.ndarray,
+        target_size_cur: int,
+        num_classes_cur: int,
+        labels_arr: np.ndarray,
+        mode: str,
+    ) -> np.ndarray:
+        n = int(candidate_indices.size)
+        if n <= 0:
+            return np.zeros(0, dtype=np.float64)
+        if target_size_cur <= 0 or num_classes_cur <= 0:
+            return np.full(n, 1.0 / float(n), dtype=np.float64)
+
+        target_per_class = float(target_size_cur) / float(num_classes_cur)
+        if target_per_class <= 0:
+            return np.full(n, 1.0 / float(n), dtype=np.float64)
+
+        cand_labels = labels_arr[candidate_indices]
+        a = (target_per_class - class_counts_cur[cand_labels].astype(np.float64)) / target_per_class
+        a = np.clip(a, -0.1, 0.1)
+
+        if mode == "in":
+            logits = 1.0 + a
+        elif mode == "out":
+            logits = 1.0 - a
+        else:
+            raise ValueError(f"Unsupported sampling mode: {mode}")
+
+        logits = logits - np.max(logits)
+        probs = np.exp(logits)
+        denom = float(np.sum(probs))
+        if not np.isfinite(denom) or denom <= 0.0:
+            return np.full(n, 1.0 / float(n), dtype=np.float64)
+        return probs / denom
+
     rng = np.random.default_rng(seed)
     current_indices = np.sort(rng.choice(num_samples, size=target_size, replace=False).astype(np.int64))
     class_counts = np.bincount(labels_np[current_indices], minlength=num_classes).astype(np.int64)
@@ -577,14 +634,19 @@ def select_group_mask(
     ]
 
     eval_every = max(1, int(group_eval_interval))
-    batch_scale = 1.0 if keep_ratio <= 50 else 0.5
-    cur_batch_size = max(1, int(group_batch_size * batch_scale))
-    min_batch_size = max(1, int(group_min_batch_size * batch_scale))
+    cur_batch_size = max(1, int(group_batch_size))
+    min_batch_size = max(1, int(group_min_batch_size))
     candidate_pool_multiplier = max(1.0, float(group_candidate_pool_multiplier))
-    batch_adjust_patience = max(1, int(group_batch_adjust_patience))
+    score_patience = max(1, int(score_patience))
+    herding_patience = max(1, int(herding_patience))
+    score_decay = float(np.clip(score_decay, 0.01, 0.999))
+    herding_decay = float(np.clip(herding_decay, 0.01, 0.999))
     if cur_batch_size < min_batch_size:
         cur_batch_size = min_batch_size
-    stale_eval_count = 0
+    stale_score_count = 0
+    herding_rise_count = 0
+    best_fitness_for_decay = float(current_item["fitness"])
+    prev_mean_corr = float(current_item["mean_corr"])
 
     iter_bar = tqdm(range(max(0, int(group_iterations))), desc="[group] iterations", unit="iter")
     for step in iter_bar:
@@ -648,8 +710,24 @@ def select_group_mask(
         k = min(int(cur_batch_size), in_candidate_pool.size, out_candidate_pool.size)
         if k <= 0:
             break
-        drop_idx = rng.choice(in_candidate_pool, size=k, replace=False).astype(np.int64)
-        add_idx = rng.choice(out_candidate_pool, size=k, replace=False).astype(np.int64)
+        drop_probs = _candidate_sampling_probs(
+            in_candidate_pool,
+            class_counts,
+            target_size,
+            num_classes,
+            labels_np,
+            mode="out",
+        )
+        add_probs = _candidate_sampling_probs(
+            out_candidate_pool,
+            class_counts,
+            target_size,
+            num_classes,
+            labels_np,
+            mode="in",
+        )
+        drop_idx = rng.choice(in_candidate_pool, size=k, replace=False, p=drop_probs).astype(np.int64)
+        add_idx = rng.choice(out_candidate_pool, size=k, replace=False, p=add_probs).astype(np.int64)
 
         membership[drop_idx] = False
         membership[add_idx] = True
@@ -697,13 +775,30 @@ def select_group_mask(
                 best_item["indices"] = np.asarray(current_item["indices"], dtype=np.int64).copy()
                 best_item["mask"] = np.asarray(current_item["mask"], dtype=np.uint8).copy()
                 best_metric_value = cur_metric_value
-                stale_eval_count = 0
-            else:
-                stale_eval_count += 1
 
-            if stale_eval_count >= batch_adjust_patience and cur_batch_size > min_batch_size:
-                cur_batch_size = max(min_batch_size, cur_batch_size // 2)
-                stale_eval_count = 0
+            cur_fitness = float(current_item["fitness"])
+            if cur_fitness > best_fitness_for_decay:
+                best_fitness_for_decay = cur_fitness
+                stale_score_count = 0
+            else:
+                stale_score_count += 1
+
+            cur_mean_corr = float(current_item["mean_corr"])
+            if cur_mean_corr > prev_mean_corr:
+                herding_rise_count += 1
+            else:
+                herding_rise_count = 0
+            prev_mean_corr = cur_mean_corr
+
+            if stale_score_count >= score_patience and cur_batch_size > min_batch_size:
+                new_batch_size = max(min_batch_size, int(np.floor(cur_batch_size * score_decay)))
+                cur_batch_size = max(min_batch_size, new_batch_size)
+                stale_score_count = 0
+
+            if herding_rise_count >= herding_patience and cur_batch_size > min_batch_size:
+                new_batch_size = max(min_batch_size, int(np.floor(cur_batch_size * herding_decay)))
+                cur_batch_size = max(min_batch_size, new_batch_size)
+                herding_rise_count = 0
 
         iter_bar.set_postfix(
             best_metric=f"{best_metric_value:.4f}",
@@ -773,11 +868,14 @@ def select_group_mask(
         "lambda_mean": float(lambda_mean),
         "group_iterations": int(group_iterations),
         "group_batch_size": int(cur_batch_size),
-        "group_batch_size_init": int(max(1, int(group_batch_size * batch_scale))),
-        "group_min_batch_size": int(max(1, int(group_min_batch_size * batch_scale))),
+        "group_batch_size_init": int(max(1, int(group_batch_size))),
+        "group_min_batch_size": int(max(1, int(group_min_batch_size))),
         "group_eval_interval": int(eval_every),
         "group_candidate_pool_multiplier": float(candidate_pool_multiplier),
-        "group_batch_adjust_patience": int(batch_adjust_patience),
+        "score_patience": int(score_patience),
+        "herding_patience": int(herding_patience),
+        "score_decay": float(score_decay),
+        "herding_decay": float(herding_decay),
     }
     return final_mask, selected_by_class, stats
 
@@ -1052,7 +1150,10 @@ def main() -> None:
                     group_min_batch_size=args.group_min_batch_size,
                     group_eval_interval=args.group_eval_interval,
                     group_candidate_pool_multiplier=args.group_candidate_pool_multiplier,
-                    group_batch_adjust_patience=args.group_batch_adjust_patience,
+                    score_patience=args.score_patience,
+                    herding_patience=args.herding_patience,
+                    score_decay=args.score_decay,
+                    herding_decay=args.herding_decay,
                     cls_lambda_base=args.cls_lambda_base,
                     mean_lambda_base=args.mean_lambda_base,
                     tolerance_ratio=args.group_tolerance_ratio,

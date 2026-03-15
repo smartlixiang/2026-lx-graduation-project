@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="仅在显式传入该参数时，若目标 mask 已存在则跳过重新生成",
     )
-    parser.add_argument("--group-iterations", type=int, default=500)
+    parser.add_argument("--group-iterations", type=int, default=600)
     parser.add_argument(
         "--group-batch-size",
         type=int,
@@ -96,23 +96,23 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="kr<=50 时的最小 batch_size；kr>50 时自动减半",
     )
-    parser.add_argument("--group-eval-interval", type=int, default=2)
+    parser.add_argument("--group-eval-interval", type=int, default=4)
     parser.add_argument(
         "--group-candidate-pool-multiplier",
         type=float,
-        default=4,
+        default=10,
         help="候选池大小倍率，按当前 batch_size 的倍率分别构造子集内外候选池",
     )
     parser.add_argument(
         "--score-patience",
         type=int,
-        default=5,
+        default=50,
         help="连续多少次 eval 综合评分(S') 不上涨后才调整 batch_size",
     )
     parser.add_argument(
         "--herding-patience",
         type=int,
-        default=2,
+        default=20,
         help="herding 修正项连续上升多少次后才调整 batch_size",
     )
     parser.add_argument(
@@ -132,7 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-tolerance-ratio",
         type=float,
-        default=0.95,
+        default=0.8,
         help="最终解容忍比例：选择比值>=最优比值*tolerance_ratio 的最晚轮次",
     )
     return parser.parse_args()

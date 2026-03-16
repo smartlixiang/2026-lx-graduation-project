@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim import SGD
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader, Subset
@@ -31,6 +32,10 @@ DATASET_DEFAULT_TRAINING_CONFIGS = {
         "weight_decay": 5e-4,
         "lr_milestones": [60, 120, 160],
         "lr_gamma": 0.2,
+        "execution": {
+            "use_amp": False,
+            "reference_effective_batch_size": None,
+        },
     },
     "cifar100": {
         "epochs": 200,
@@ -40,6 +45,10 @@ DATASET_DEFAULT_TRAINING_CONFIGS = {
         "weight_decay": 5e-4,
         "lr_milestones": [60, 120, 160],
         "lr_gamma": 0.2,
+        "execution": {
+            "use_amp": False,
+            "reference_effective_batch_size": None,
+        },
     },
     "tiny-imagenet": {
         "epochs": 90,
@@ -49,6 +58,11 @@ DATASET_DEFAULT_TRAINING_CONFIGS = {
         "weight_decay": 1e-4,
         "lr_milestones": [30, 60],
         "lr_gamma": 0.1,
+        "execution": {
+            "default_physical_batch_size": 64,
+            "use_amp": True,
+            "reference_effective_batch_size": 256,
+        },
     },
 }
 
@@ -71,10 +85,10 @@ def get_default_training_config(dataset_name: str) -> dict[str, int | float | li
 
 def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
     defaults = get_default_training_config(args.dataset)
+    batch_size_unspecified = args.batch_size is None
+
     if args.epochs is None:
         args.epochs = defaults["epochs"]
-    if args.batch_size is None:
-        args.batch_size = defaults["batch_size"]
     if args.init_lr is None:
         args.init_lr = defaults["init_lr"]
     if args.momentum is None:
@@ -85,6 +99,29 @@ def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.lr_milestones = defaults["lr_milestones"]
     if args.lr_gamma is None:
         args.lr_gamma = defaults["lr_gamma"]
+
+    execution_config = DATASET_DEFAULT_TRAINING_CONFIGS[args.dataset]["execution"]
+    if args.dataset == "tiny-imagenet":
+        if batch_size_unspecified:
+            args.batch_size = int(execution_config["default_physical_batch_size"])
+        args.use_amp = bool(execution_config["use_amp"])
+        args.reference_effective_batch_size = int(execution_config["reference_effective_batch_size"])
+        args.physical_batch_size = int(args.batch_size)
+        if args.physical_batch_size <= 64:
+            args.grad_accum_steps = 4
+        elif args.physical_batch_size <= 128:
+            args.grad_accum_steps = 2
+        else:
+            args.grad_accum_steps = 1
+        args.effective_batch_size = args.physical_batch_size * args.grad_accum_steps
+    else:
+        if batch_size_unspecified:
+            args.batch_size = defaults["batch_size"]
+        args.use_amp = bool(execution_config["use_amp"])
+        args.reference_effective_batch_size = args.batch_size
+        args.grad_accum_steps = 1
+        args.physical_batch_size = args.batch_size
+        args.effective_batch_size = args.batch_size
     return args
 
 
@@ -246,19 +283,37 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     total_epochs: int,
+    use_amp: bool,
+    grad_accum_steps: int,
+    scaler: GradScaler,
 ) -> float:
     model.train()
     running_loss = 0.0
     progress = tqdm(loader, desc=f"Epoch {epoch}/{total_epochs}", unit="batch")
-    for images, labels in progress:
+    optimizer.zero_grad(set_to_none=True)
+    total_batches = len(loader)
+    for batch_idx, (images, labels) in enumerate(progress, start=1):
         images = images.to(device)
         labels = labels.to(device)
 
-        optimizer.zero_grad(set_to_none=True)
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        with autocast(enabled=use_amp):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+        loss_for_backward = loss / grad_accum_steps
+        if scaler.is_enabled():
+            scaler.scale(loss_for_backward).backward()
+        else:
+            loss_for_backward.backward()
+
+        should_step = (batch_idx % grad_accum_steps == 0) or (batch_idx == total_batches)
+        if should_step:
+            if scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         running_loss += loss.item() * images.size(0)
         progress.set_postfix(loss=f"{loss.item():.4f}")
@@ -291,7 +346,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     data_loader = BaseDataLoader(
         args.dataset,
         data_path=Path(args.data_root),
-        batch_size=args.batch_size,
+        batch_size=args.physical_batch_size,
         num_workers=args.num_workers,
         val_split=0.0,
         seed=seed,
@@ -339,7 +394,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         generator = torch.Generator().manual_seed(seed)
         subset_loader = DataLoader(
             subset,
-            batch_size=args.batch_size,
+            batch_size=args.physical_batch_size,
             shuffle=True,
             generator=generator,
             num_workers=args.num_workers,
@@ -359,6 +414,8 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             milestones=args.lr_milestones,
             gamma=args.lr_gamma,
         )
+        runtime_use_amp = bool(args.use_amp and device.type == "cuda")
+        scaler = GradScaler(enabled=runtime_use_amp)
 
         accuracy_samples: list[float] = []
         start_eval_epoch = max(1, args.epochs - 9)
@@ -369,6 +426,8 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             scheduler.load_state_dict(checkpoint["scheduler_state"])
             accuracy_samples = list(checkpoint.get("accuracy_samples", []))
+            if checkpoint.get("scaler_state") is not None and scaler.is_enabled():
+                scaler.load_state_dict(checkpoint["scaler_state"])
             start_epoch = int(checkpoint["epoch"]) + 1
             elapsed_time = float(checkpoint.get("elapsed_time", 0.0))
             start_time = time.time() - elapsed_time
@@ -382,6 +441,9 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 device,
                 epoch,
                 args.epochs,
+                runtime_use_amp,
+                args.grad_accum_steps,
+                scaler,
             )
             scheduler.step()
             if epoch >= start_eval_epoch:
@@ -399,8 +461,13 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                         "model_state": model.state_dict(),
                         "optimizer_state": optimizer.state_dict(),
                         "scheduler_state": scheduler.state_dict(),
+                        "scaler_state": scaler.state_dict() if scaler.is_enabled() else None,
                         "accuracy_samples": accuracy_samples,
                         "elapsed_time": time.time() - start_time,
+                        "use_amp": runtime_use_amp,
+                        "grad_accum_steps": args.grad_accum_steps,
+                        "physical_batch_size": args.physical_batch_size,
+                        "effective_batch_size": args.effective_batch_size,
                     },
                     checkpoint_path,
                 )
@@ -420,11 +487,16 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 "selection_method": args.mode,
                 "seed": seed,
                 "epochs": args.epochs,
-                "batch_size": args.batch_size,
+                "batch_size": args.physical_batch_size,
+                "physical_batch_size": args.physical_batch_size,
+                "grad_accum_steps": args.grad_accum_steps,
+                "effective_batch_size": args.effective_batch_size,
+                "reference_effective_batch_size": args.reference_effective_batch_size,
                 "optimizer": "SGD",
                 "momentum": args.momentum,
                 "weight_decay": args.weight_decay,
                 "init_lr": args.init_lr,
+                "use_amp": runtime_use_amp,
                 "lr_schedule": {
                     "type": "MultiStepLR",
                     "milestones": args.lr_milestones,

@@ -235,7 +235,7 @@ class TinyImageNetDataset(BaseDataset):
         train_root = self._dataset_dir() / "train"
         if not train_root.exists():
             raise FileNotFoundError(
-                "tiny_imagenet train split not found. Expected directory: "
+                "tiny-imagenet train split not found. Expected directory: "
                 f"{train_root}. Please prepare tiny-imagenet-200 under data root."
             )
         return datasets.ImageFolder(root=str(train_root), transform=transform)
@@ -249,7 +249,7 @@ class TinyImageNetDataset(BaseDataset):
         val_root = self._dataset_dir() / "val"
         if not val_root.exists():
             raise FileNotFoundError(
-                "tiny_imagenet validation split not found. Expected directory: "
+                "tiny-imagenet validation split not found. Expected directory: "
                 f"{val_root}. Please prepare tiny-imagenet-200 under data root."
             )
         return datasets.ImageFolder(root=str(val_root), transform=transform)

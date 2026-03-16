@@ -34,7 +34,7 @@ class TinyImageNetTrain(datasets.ImageFolder):
         _ = (train, download)
         train_root = Path(root) / "tiny-imagenet-200" / "train"
         if not train_root.exists():
-            raise FileNotFoundError(f"tiny_imagenet train split not found: {train_root}")
+            raise FileNotFoundError(f"tiny-imagenet train split not found: {train_root}")
         super().__init__(root=str(train_root), transform=transform)
 
 

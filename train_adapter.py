@@ -53,7 +53,7 @@ def _build_dataset(dataset_name: str, data_root: str, transform) -> datasets.Vis
     if dataset_name == TINY_IMAGENET:
         train_root = Path(data_root) / "tiny-imagenet-200" / "train"
         if not train_root.exists():
-            raise FileNotFoundError(f"tiny_imagenet train split not found: {train_root}")
+            raise FileNotFoundError(f"tiny-imagenet train split not found: {train_root}")
         return datasets.ImageFolder(root=str(train_root), transform=transform)
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 

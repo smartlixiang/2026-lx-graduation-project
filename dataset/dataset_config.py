@@ -3,7 +3,7 @@ from __future__ import annotations
 
 CIFAR10 = "cifar10"
 CIFAR100 = "cifar100"
-TINY_IMAGENET = "tiny_imagenet"
+TINY_IMAGENET = "tiny-imagenet"
 
 AVAILABLE_DATASETS = (CIFAR10, CIFAR100, TINY_IMAGENET)
 

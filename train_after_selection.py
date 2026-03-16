@@ -22,6 +22,72 @@ from utils.path_rules import resolve_checkpoint_path, resolve_mask_path, resolve
 from utils.seed import parse_seed_list, set_seed
 
 
+DATASET_DEFAULT_TRAINING_CONFIGS = {
+    "cifar10": {
+        "epochs": 200,
+        "batch_size": 128,
+        "init_lr": 0.1,
+        "momentum": 0.9,
+        "weight_decay": 5e-4,
+        "lr_milestones": [60, 120, 160],
+        "lr_gamma": 0.2,
+    },
+    "cifar100": {
+        "epochs": 200,
+        "batch_size": 128,
+        "init_lr": 0.1,
+        "momentum": 0.9,
+        "weight_decay": 5e-4,
+        "lr_milestones": [60, 120, 160],
+        "lr_gamma": 0.2,
+    },
+    "tiny-imagenet": {
+        "epochs": 90,
+        "batch_size": 256,
+        "init_lr": 0.1,
+        "momentum": 0.9,
+        "weight_decay": 1e-4,
+        "lr_milestones": [30, 60],
+        "lr_gamma": 0.1,
+    },
+}
+
+
+def get_default_training_config(dataset_name: str) -> dict[str, int | float | list[int]]:
+    try:
+        config = DATASET_DEFAULT_TRAINING_CONFIGS[dataset_name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported dataset for training config: {dataset_name}") from exc
+    return {
+        "epochs": int(config["epochs"]),
+        "batch_size": int(config["batch_size"]),
+        "init_lr": float(config["init_lr"]),
+        "momentum": float(config["momentum"]),
+        "weight_decay": float(config["weight_decay"]),
+        "lr_milestones": list(config["lr_milestones"]),
+        "lr_gamma": float(config["lr_gamma"]),
+    }
+
+
+def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    defaults = get_default_training_config(args.dataset)
+    if args.epochs is None:
+        args.epochs = defaults["epochs"]
+    if args.batch_size is None:
+        args.batch_size = defaults["batch_size"]
+    if args.init_lr is None:
+        args.init_lr = defaults["init_lr"]
+    if args.momentum is None:
+        args.momentum = defaults["momentum"]
+    if args.weight_decay is None:
+        args.weight_decay = defaults["weight_decay"]
+    if args.lr_milestones is None:
+        args.lr_milestones = defaults["lr_milestones"]
+    if args.lr_gamma is None:
+        args.lr_gamma = defaults["lr_gamma"]
+    return args
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -44,12 +110,20 @@ def parse_args() -> argparse.Namespace:
         help="数据选择方法名称（random 为随机采样）",
     )
     parser.add_argument("--model", type=str, default="resnet50")
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--init_lr", type=float, default=0.1)
-    parser.add_argument("--momentum", type=float, default=0.9)
-    parser.add_argument("--weight_decay", type=float, default=5e-4)
+    parser.add_argument("--init_lr", type=float, default=None)
+    parser.add_argument("--momentum", type=float, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument(
+        "--lr_milestones",
+        type=int,
+        nargs="+",
+        default=None,
+        help="MultiStepLR milestones，例如: --lr_milestones 60 120 160",
+    )
+    parser.add_argument("--lr_gamma", type=float, default=None)
     parser.add_argument("--device", type=str, default="")
     parser.add_argument(
         "--seed",
@@ -280,7 +354,11 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             momentum=args.momentum,
             weight_decay=args.weight_decay,
         )
-        scheduler = MultiStepLR(optimizer, milestones=[60, 120, 160], gamma=0.2)
+        scheduler = MultiStepLR(
+            optimizer,
+            milestones=args.lr_milestones,
+            gamma=args.lr_gamma,
+        )
 
         accuracy_samples: list[float] = []
         start_eval_epoch = max(1, args.epochs - 9)
@@ -349,8 +427,8 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 "init_lr": args.init_lr,
                 "lr_schedule": {
                     "type": "MultiStepLR",
-                    "milestones": [60, 120, 160],
-                    "gamma": 0.2,
+                    "milestones": args.lr_milestones,
+                    "gamma": args.lr_gamma,
                 },
                 "num_selected": len(selected_indices),
                 "num_total": len(train_dataset),
@@ -371,6 +449,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
 def main() -> None:
     args = parse_args()
+    args = apply_dataset_defaults(args)
     seeds = parse_seed_list(args.seed)
     multi_seed = len(seeds) > 1
     for seed in seeds:

@@ -14,7 +14,7 @@ from torchvision import datasets
 import clip  # type: ignore
 from tqdm import tqdm
 
-from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100
+from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET
 from model.adapter import AdapterMLP, CLIPFeatureExtractor, resolve_adapter_dir
 from utils.global_config import CONFIG
 from utils.seed import parse_seed_list, set_seed
@@ -50,11 +50,16 @@ def _build_dataset(dataset_name: str, data_root: str, transform) -> datasets.Vis
         return datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform)
     if dataset_name == CIFAR100:
         return datasets.CIFAR100(root=data_root, train=True, download=True, transform=transform)
+    if dataset_name == TINY_IMAGENET:
+        train_root = Path(data_root) / "tiny-imagenet-200" / "train"
+        if not train_root.exists():
+            raise FileNotFoundError(f"tiny_imagenet train split not found: {train_root}")
+        return datasets.ImageFolder(root=str(train_root), transform=transform)
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
 def _default_batch_size(dataset_name: str) -> int:
-    if dataset_name in (CIFAR10, CIFAR100):
+    if dataset_name in (CIFAR10, CIFAR100, TINY_IMAGENET):
         return 256
     return 128
 

@@ -20,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.adapter import load_trained_adapters  # noqa: E402
-from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100  # noqa: E402
+from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
@@ -144,6 +144,11 @@ def _build_dataset(dataset_name: str, transform) -> datasets.VisionDataset:
         return datasets.CIFAR10(root=str(data_root), train=True, download=True, transform=transform)
     if dataset_name == CIFAR100:
         return datasets.CIFAR100(root=str(data_root), train=True, download=True, transform=transform)
+    if dataset_name == TINY_IMAGENET:
+        train_root = data_root / "tiny-imagenet-200" / "train"
+        if not train_root.exists():
+            raise FileNotFoundError(f"tiny_imagenet train split not found: {train_root}")
+        return datasets.ImageFolder(root=str(train_root), transform=transform)
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 

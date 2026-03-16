@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset.dataset_config import CIFAR10, CIFAR100  # noqa: E402
+from dataset.dataset_config import CIFAR10, CIFAR100, TINY_IMAGENET  # noqa: E402
 from model.adapter import load_trained_adapters  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
@@ -27,6 +27,18 @@ DATASET_REGISTRY = {
     CIFAR10: datasets.CIFAR10,
     CIFAR100: datasets.CIFAR100,
 }
+
+
+class TinyImageNetTrain(datasets.ImageFolder):
+    def __init__(self, root: str, train: bool, download: bool, transform):
+        _ = (train, download)
+        train_root = Path(root) / "tiny-imagenet-200" / "train"
+        if not train_root.exists():
+            raise FileNotFoundError(f"tiny_imagenet train split not found: {train_root}")
+        super().__init__(root=str(train_root), transform=transform)
+
+
+DATASET_REGISTRY[TINY_IMAGENET] = TinyImageNetTrain
 
 
 def parse_args() -> argparse.Namespace:

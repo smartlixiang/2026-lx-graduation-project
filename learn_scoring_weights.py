@@ -13,7 +13,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torchvision import datasets
 
-from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100
+from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET
 from model.adapter import AdapterMLP, load_trained_adapters
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.global_config import CONFIG
@@ -108,6 +108,11 @@ def _build_dataset(
         return datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform)
     if dataset_name == CIFAR100:
         return datasets.CIFAR100(root=data_root, train=True, download=True, transform=transform)
+    if dataset_name == TINY_IMAGENET:
+        train_root = Path(data_root) / "tiny-imagenet-200" / "train"
+        if not train_root.exists():
+            raise FileNotFoundError(f"tiny_imagenet train split not found: {train_root}")
+        return datasets.ImageFolder(root=str(train_root), transform=transform)
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 

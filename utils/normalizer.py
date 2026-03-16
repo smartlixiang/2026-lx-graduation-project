@@ -32,6 +32,10 @@ class Normalizer:
                 mean=[0.4914, 0.4822, 0.4465],
                 std=[0.2470, 0.2435, 0.2616],
             ),
+            DATASET_CONFIG.TINY_IMAGENET: DatasetStats(
+                mean=[0.4802, 0.4481, 0.3975],
+                std=[0.2302, 0.2265, 0.2262],
+            ),
         }
     )
 

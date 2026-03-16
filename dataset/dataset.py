@@ -24,7 +24,7 @@ if importlib.util.find_spec("torchvision") is None:
 
 from torchvision import datasets
 
-from dataset.dataset_config import CIFAR10, CIFAR100
+from dataset.dataset_config import CIFAR10, CIFAR100, TINY_IMAGENET
 from utils.global_config import CONFIG as GLOBAL_CFG
 from utils.normalizer import NORMALIZER
 
@@ -208,6 +208,53 @@ class Cifar100Dataset(BaseDataset):
         )
 
 
+@register_dataset(TINY_IMAGENET)
+class TinyImageNetDataset(BaseDataset):
+    _dataset_name = TINY_IMAGENET
+    _num_classes = 200
+    _image_size = 64
+
+    @property
+    def dataset_name(self) -> str:
+        return self._dataset_name
+
+    @property
+    def num_classes(self) -> int:
+        return self._num_classes
+
+    def _dataset_dir(self) -> Path:
+        return self.config.data_path / "tiny-imagenet-200"
+
+    def _build_train_set(self) -> Dataset:
+        transform = NORMALIZER.train_tfms(
+            self.dataset_name,
+            normalize=self.config.normalize,
+            augment=self.config.augment,
+            image_size=self._image_size,
+        )
+        train_root = self._dataset_dir() / "train"
+        if not train_root.exists():
+            raise FileNotFoundError(
+                "tiny_imagenet train split not found. Expected directory: "
+                f"{train_root}. Please prepare tiny-imagenet-200 under data root."
+            )
+        return datasets.ImageFolder(root=str(train_root), transform=transform)
+
+    def _build_test_set(self) -> Dataset:
+        transform = NORMALIZER.eval_tfms(
+            self.dataset_name,
+            normalize=self.config.normalize,
+            image_size=self._image_size,
+        )
+        val_root = self._dataset_dir() / "val"
+        if not val_root.exists():
+            raise FileNotFoundError(
+                "tiny_imagenet validation split not found. Expected directory: "
+                f"{val_root}. Please prepare tiny-imagenet-200 under data root."
+            )
+        return datasets.ImageFolder(root=str(val_root), transform=transform)
+
+
 class BaseDataLoader:
     """Factory-driven data loader for registered datasets.
 
@@ -267,6 +314,7 @@ __all__ = [
     "BaseDataLoader",
     "Cifar10Dataset",
     "Cifar100Dataset",
+    "TinyImageNetDataset",
     "DATASET_REGISTRY",
     "DatasetSubset",
     "register_dataset",

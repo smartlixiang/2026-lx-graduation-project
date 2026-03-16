@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-model", type=str, default="ViT-B/32", help="CLIP 模型规格")
     parser.add_argument("--device", type=str, default=None, help="设备，例如 cuda 或 cpu")
     parser.add_argument(
-        "--seeds",
+        "--seed",
         type=str,
         default=str(CONFIG.global_seed),
         help="随机种子列表，逗号分隔",
@@ -83,11 +83,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="仅在显式传入该参数时，若目标 mask 已存在则跳过重新生成",
     )
-    parser.add_argument("--group-iterations", type=int, default=600)
+    parser.add_argument("--group-iterations", type=int, default=800)
     parser.add_argument(
         "--group-batch-size",
         type=int,
-        default=32,
+        default=24,
         help="kr<=50 时的初始 batch_size；kr>50 时自动减半",
     )
     parser.add_argument(
@@ -106,13 +106,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--score-patience",
         type=int,
-        default=50,
+        default=5,
         help="连续多少次 eval 综合评分(S') 不上涨后才调整 batch_size",
     )
     parser.add_argument(
         "--herding-patience",
         type=int,
-        default=20,
+        default=3,
         help="herding 修正项连续上升多少次后才调整 batch_size",
     )
     parser.add_argument(
@@ -132,7 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-tolerance-ratio",
         type=float,
-        default=0.8,
+        default=0.85,
         help="最终解容忍比例：选择比值>=最优比值*tolerance_ratio 的最晚轮次",
     )
     return parser.parse_args()
@@ -1026,9 +1026,9 @@ def main() -> None:
     keep_ratios = parse_ratio_list(args.kr)
     if not keep_ratios:
         raise ValueError("kr 参数不能为空。")
-    seeds = parse_seed_list(args.seeds)
+    seeds = parse_seed_list(args.seed)
     if not seeds:
-        raise ValueError("seeds 参数不能为空。")
+        raise ValueError("seed 参数不能为空。")
 
     total_tasks = len(seeds) * len(keep_ratios)
     task_idx = 0

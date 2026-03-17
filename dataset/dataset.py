@@ -8,7 +8,10 @@ registering it with :func:`register_dataset`.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import csv
 import importlib.util
+import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Tuple, Type
@@ -240,6 +243,101 @@ class TinyImageNetDataset(BaseDataset):
             )
         return datasets.ImageFolder(root=str(train_root), transform=transform)
 
+    def _train_class_to_idx(self) -> Dict[str, int]:
+        train_root = self._dataset_dir() / "train"
+        train_folder = datasets.ImageFolder(root=str(train_root))
+        return train_folder.class_to_idx
+
+    def _is_reorganized_val_layout(self, val_root: Path, train_classes: set[str]) -> bool:
+        class_dirs = sorted(path.name for path in val_root.iterdir() if path.is_dir())
+        if len(class_dirs) != self._num_classes:
+            return False
+        return set(class_dirs) == train_classes
+
+    def _validate_imagefolder_readable(self, root: Path) -> None:
+        folder = datasets.ImageFolder(root=str(root))
+        if len(folder.classes) != self._num_classes:
+            raise RuntimeError(
+                f"tiny-imagenet 验证集类别数异常，期望 {self._num_classes}，实际 {len(folder.classes)}: {root}"
+            )
+
+    def _parse_val_annotations(self, annotations_path: Path) -> list[tuple[str, str]]:
+        mapping: list[tuple[str, str]] = []
+        with annotations_path.open("r", encoding="utf-8") as handle:
+            reader = csv.reader(handle, delimiter="\t")
+            for row_no, row in enumerate(reader, start=1):
+                if len(row) < 2:
+                    raise ValueError(
+                        f"val_annotations.txt 第 {row_no} 行格式错误（至少需要 image 与 wnid 两列）。"
+                    )
+                image_name, wnid = row[0].strip(), row[1].strip()
+                if not image_name or not wnid:
+                    raise ValueError(f"val_annotations.txt 第 {row_no} 行存在空字段。")
+                mapping.append((image_name, wnid))
+        if not mapping:
+            raise ValueError("val_annotations.txt 为空，无法构建 tiny-imagenet 验证集。")
+        return mapping
+
+    def _validate_raw_val_layout(
+        self,
+        val_root: Path,
+        train_class_to_idx: Dict[str, int],
+    ) -> list[tuple[str, str]]:
+        images_dir = val_root / "images"
+        annotations_path = val_root / "val_annotations.txt"
+        if not images_dir.is_dir() or not annotations_path.is_file():
+            raise RuntimeError(
+                "tiny-imagenet 的 val 既不是重排后的按类别目录结构，也不是合法 raw layout。"
+            )
+
+        annotations = self._parse_val_annotations(annotations_path)
+        unknown_classes = sorted({wnid for _, wnid in annotations if wnid not in train_class_to_idx})
+        if unknown_classes:
+            raise RuntimeError(
+                "val_annotations.txt 中存在无法与 train/class_to_idx 对齐的 wnid："
+                f"{unknown_classes[:5]}{'...' if len(unknown_classes) > 5 else ''}"
+            )
+
+        missing_images = [image for image, _ in annotations if not (images_dir / image).is_file()]
+        if missing_images:
+            raise RuntimeError(
+                "val/images 中缺少 val_annotations.txt 标注的图片，例如："
+                f"{missing_images[:5]}{'...' if len(missing_images) > 5 else ''}"
+            )
+        return annotations
+
+    def _reorganize_raw_val_layout(
+        self,
+        val_root: Path,
+        train_classes: set[str],
+        annotations: list[tuple[str, str]],
+    ) -> None:
+        images_dir = val_root / "images"
+        tmp_root = val_root / f".val_reorg_tmp_{uuid.uuid4().hex}"
+        tmp_root.mkdir(parents=True, exist_ok=False)
+
+        try:
+            for class_name in sorted(train_classes):
+                (tmp_root / class_name).mkdir(parents=True, exist_ok=False)
+
+            for image_name, wnid in annotations:
+                src = images_dir / image_name
+                dst = tmp_root / wnid / image_name
+                shutil.copy2(src, dst)
+
+            self._validate_imagefolder_readable(tmp_root)
+
+            for class_name in sorted(train_classes):
+                (tmp_root / class_name).replace(val_root / class_name)
+
+            shutil.rmtree(images_dir, ignore_errors=True)
+            if tmp_root.exists():
+                shutil.rmtree(tmp_root, ignore_errors=True)
+        except Exception:
+            if tmp_root.exists():
+                shutil.rmtree(tmp_root, ignore_errors=True)
+            raise
+
     def _build_test_set(self) -> Dataset:
         transform = NORMALIZER.eval_tfms(
             self.dataset_name,
@@ -252,6 +350,23 @@ class TinyImageNetDataset(BaseDataset):
                 "tiny-imagenet validation split not found. Expected directory: "
                 f"{val_root}. Please prepare tiny-imagenet-200 under data root."
             )
+        train_class_to_idx = self._train_class_to_idx()
+        train_classes = set(train_class_to_idx.keys())
+
+        if self._is_reorganized_val_layout(val_root, train_classes):
+            print("[info] tiny-imagenet val 已是与 train 对齐的重排结构，直接用于最终评估。")
+            self._validate_imagefolder_readable(val_root)
+            return datasets.ImageFolder(root=str(val_root), transform=transform)
+
+        annotations = self._validate_raw_val_layout(val_root, train_class_to_idx)
+        print("[info] tiny-imagenet val 当前为 raw layout，准备自动重排为按类别目录结构。")
+        self._reorganize_raw_val_layout(val_root, train_classes, annotations)
+
+        if not self._is_reorganized_val_layout(val_root, train_classes):
+            raise RuntimeError("tiny-imagenet val 自动重排后结构校验失败，请检查数据目录。")
+
+        self._validate_imagefolder_readable(val_root)
+        print("[info] tiny-imagenet val 自动重排完成并通过校验，将用于最终评估。")
         return datasets.ImageFolder(root=str(val_root), transform=transform)
 
 

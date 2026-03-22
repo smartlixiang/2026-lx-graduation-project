@@ -9,12 +9,11 @@ import numpy as np
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "比较同 dataset/model/seed/kr 下 group 与 topk mask 的重合度（仅统计两者都存在的 pair）。"
+            "比较同 dataset/seed/kr 下 group 与 topk mask 的重合度（仅统计两者都存在的 pair）。"
         )
     )
     parser.add_argument("--mask-root", type=str, default="mask", help="mask 根目录")
     parser.add_argument("--dataset", type=str, default="cifar10", help="数据集名")
-    parser.add_argument("--model", type=str, default="resnet50", help="模型名")
     parser.add_argument(
         "--weight-group",
         type=str,
@@ -110,8 +109,8 @@ def main() -> None:
     mode_group = f"{args.weight_group}_group"
     mode_topk = f"{args.weight_group}_topk"
 
-    group_base = mask_root / mode_group / args.dataset / args.model
-    topk_base = mask_root / mode_topk / args.dataset / args.model
+    group_base = mask_root / mode_group / args.dataset
+    topk_base = mask_root / mode_topk / args.dataset
 
     if not group_base.exists() or not topk_base.exists():
         raise FileNotFoundError(

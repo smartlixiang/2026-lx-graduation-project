@@ -42,7 +42,7 @@ def resolve_mask_path(
     root: Path | str | None = None,
 ) -> Path:
     base = Path(root) if root is not None else PROJECT_ROOT / "mask"
-    return base / mode / dataset / model / str(seed) / f"mask_{int(keep_ratio)}.npz"
+    return base / mode / dataset / str(seed) / f"mask_{int(keep_ratio)}.npz"
 
 
 def resolve_result_path(
@@ -55,4 +55,4 @@ def resolve_result_path(
     root: Path | str | None = None,
 ) -> Path:
     base = Path(root) if root is not None else PROJECT_ROOT / "result"
-    return base / mode / dataset / model / str(seed) / f"result_{int(keep_ratio)}.json"
+    return base / mode / dataset / str(seed) / f"result_{int(keep_ratio)}.json"

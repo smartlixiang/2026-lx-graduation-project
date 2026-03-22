@@ -10,14 +10,61 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim import SGD
+from torch.optim.lr_scheduler import MultiStepLR
 from tqdm import tqdm
 
 from dataset.dataset import BaseDataLoader
-from model.resnet import resnet18
+from dataset.dataset_config import AVAILABLE_DATASETS
+from model.model_config import get_model
 from utils.global_config import CONFIG
 from utils.path_rules import resolve_proxy_log_dir
 from utils.seed import parse_seed_list, set_seed
+
+
+DATASET_DEFAULT_TRAINING_CONFIGS = {
+    "cifar10": {
+        "epochs": 100,
+        "batch_size": 128,
+        "init_lr": 0.1,
+        "momentum": 0.9,
+        "weight_decay": 5e-4,
+        "lr_milestones": [60, 80],
+        "lr_gamma": 0.1,
+        "execution": {
+            "use_amp": False,
+            "reference_effective_batch_size": None,
+        },
+    },
+    "cifar100": {
+        "epochs": 100,
+        "batch_size": 128,
+        "init_lr": 0.1,
+        "momentum": 0.9,
+        "weight_decay": 5e-4,
+        "lr_milestones": [60, 80],
+        "lr_gamma": 0.1,
+        "execution": {
+            "use_amp": False,
+            "reference_effective_batch_size": None,
+        },
+    },
+    "tiny-imagenet": {
+        "epochs": 90,
+        "batch_size": 256,
+        "init_lr": 0.1,
+        "momentum": 0.9,
+        "weight_decay": 1e-4,
+        "lr_milestones": [30, 60],
+        "lr_gamma": 0.1,
+        "execution": {
+            "default_physical_batch_size": 64,
+            "use_amp": True,
+            "reference_effective_batch_size": 256,
+        },
+    },
+}
 
 
 class IndexedDataset(torch.utils.data.Dataset):
@@ -34,16 +81,83 @@ class IndexedDataset(torch.utils.data.Dataset):
         return image, label, idx
 
 
+def get_default_training_config(dataset_name: str) -> dict[str, int | float | list[int]]:
+    try:
+        config = DATASET_DEFAULT_TRAINING_CONFIGS[dataset_name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported dataset for training config: {dataset_name}") from exc
+    return {
+        "epochs": int(config["epochs"]),
+        "batch_size": int(config["batch_size"]),
+        "init_lr": float(config["init_lr"]),
+        "momentum": float(config["momentum"]),
+        "weight_decay": float(config["weight_decay"]),
+        "lr_milestones": list(config["lr_milestones"]),
+        "lr_gamma": float(config["lr_gamma"]),
+    }
+
+
+def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    defaults = get_default_training_config(args.dataset)
+    batch_size_unspecified = args.batch_size is None
+
+    if args.epochs is None:
+        args.epochs = defaults["epochs"]
+    if args.lr is None:
+        args.lr = defaults["init_lr"]
+    if args.momentum is None:
+        args.momentum = defaults["momentum"]
+    if args.weight_decay is None:
+        args.weight_decay = defaults["weight_decay"]
+    if args.lr_milestones is None:
+        args.lr_milestones = defaults["lr_milestones"]
+    if args.lr_gamma is None:
+        args.lr_gamma = defaults["lr_gamma"]
+
+    execution_config = DATASET_DEFAULT_TRAINING_CONFIGS[args.dataset]["execution"]
+    if args.dataset == "tiny-imagenet":
+        if batch_size_unspecified:
+            args.batch_size = int(execution_config["default_physical_batch_size"])
+        args.use_amp = bool(execution_config["use_amp"])
+        args.reference_effective_batch_size = int(execution_config["reference_effective_batch_size"])
+        args.physical_batch_size = int(args.batch_size)
+        if args.physical_batch_size <= 64:
+            args.grad_accum_steps = 4
+        elif args.physical_batch_size <= 128:
+            args.grad_accum_steps = 2
+        else:
+            args.grad_accum_steps = 1
+        args.effective_batch_size = args.physical_batch_size * args.grad_accum_steps
+    else:
+        if batch_size_unspecified:
+            args.batch_size = defaults["batch_size"]
+        args.use_amp = bool(execution_config["use_amp"])
+        args.reference_effective_batch_size = args.batch_size
+        args.grad_accum_steps = 1
+        args.physical_batch_size = args.batch_size
+        args.effective_batch_size = args.batch_size
+    return args
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"])
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=AVAILABLE_DATASETS)
     parser.add_argument("--data_root", type=str, default=str(Path("data")))
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--model", type=str, default="resnet18")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=0.1)
-    parser.add_argument("--momentum", type=float, default=0.9)
-    parser.add_argument("--weight_decay", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--momentum", type=float, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument(
+        "--lr_milestones",
+        type=int,
+        nargs="+",
+        default=None,
+        help="MultiStepLR milestones，例如: --lr_milestones 60 80",
+    )
+    parser.add_argument("--lr_gamma", type=float, default=None)
     parser.add_argument("--device", type=str, default="")
     parser.add_argument("--k_folds", type=int, default=5)
     parser.add_argument(
@@ -96,7 +210,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
     data_loader = BaseDataLoader(
         args.dataset,
         data_path=Path(args.data_root),
-        batch_size=args.batch_size,
+        batch_size=args.physical_batch_size,
         num_workers=args.num_workers,
         val_split=0.0,
         seed=seed,
@@ -111,7 +225,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
     labels = extract_labels(train_dataset)
     folds = build_stratified_folds(labels, args.k_folds, seed)
 
-    proxy_model_name = "resnet18"
+    proxy_model_name = args.model
     log_dir = resolve_proxy_log_dir(
         args.dataset,
         seed,
@@ -119,6 +233,8 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
         epochs=args.epochs,
     )
     log_dir.mkdir(parents=True, exist_ok=True)
+    model_factory = get_model(proxy_model_name)
+    runtime_use_amp = bool(args.use_amp and device.type == "cuda")
 
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
     val_indices_list = [fold.tolist() for fold in folds]
@@ -128,9 +244,17 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
         "epochs": args.epochs,
         "num_classes": num_classes,
         "dataset": args.dataset,
+        "model": proxy_model_name,
         "seed": seed,
         "timestamp": timestamp,
         "val_indices": val_indices_list,
+        "physical_batch_size": args.physical_batch_size,
+        "grad_accum_steps": args.grad_accum_steps,
+        "effective_batch_size": args.effective_batch_size,
+        "lr": args.lr,
+        "lr_milestones": args.lr_milestones,
+        "lr_gamma": args.lr_gamma,
+        "use_amp": runtime_use_amp,
     }
     meta_path = log_dir / "meta.json"
     meta_path.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -152,7 +276,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
         generator = torch.Generator().manual_seed(seed_fold)
         train_loader = torch.utils.data.DataLoader(
             train_subset,
-            batch_size=args.batch_size,
+            batch_size=args.physical_batch_size,
             shuffle=True,
             generator=generator,
             num_workers=args.num_workers,
@@ -160,13 +284,13 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
         )
         val_loader = torch.utils.data.DataLoader(
             val_subset,
-            batch_size=args.batch_size,
+            batch_size=args.physical_batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             drop_last=False,
         )
 
-        model = resnet18(num_classes=num_classes).to(device)
+        model = model_factory(num_classes=num_classes).to(device)
         criterion = nn.CrossEntropyLoss(reduction="none")
         optimizer = SGD(
             model.parameters(),
@@ -174,6 +298,12 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
             momentum=args.momentum,
             weight_decay=args.weight_decay,
         )
+        scheduler = MultiStepLR(
+            optimizer,
+            milestones=args.lr_milestones,
+            gamma=args.lr_gamma,
+        )
+        scaler = GradScaler(enabled=runtime_use_amp)
 
         train_logits_path = log_dir / f"fold_{fold_id}_train_logits.dat"
         val_logits_path = log_dir / f"fold_{fold_id}_val_logits.dat"
@@ -204,17 +334,32 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
                 unit="batch",
             )
             epoch_idx = epoch - 1
+            total_batches = len(train_loader)
+            optimizer.zero_grad(set_to_none=True)
 
-            for images, labels, indices in train_progress:
+            for batch_idx, (images, labels, indices) in enumerate(train_progress, start=1):
                 images = images.to(device)
                 labels = labels.to(device)
 
-                optimizer.zero_grad(set_to_none=True)
-                outputs = model(images)
-                per_sample_loss = criterion(outputs, labels)
-                loss = per_sample_loss.mean()
-                loss.backward()
-                optimizer.step()
+                with autocast(enabled=runtime_use_amp):
+                    outputs = model(images)
+                    per_sample_loss = criterion(outputs, labels)
+                    loss = per_sample_loss.mean()
+
+                loss_for_backward = loss / args.grad_accum_steps
+                if scaler.is_enabled():
+                    scaler.scale(loss_for_backward).backward()
+                else:
+                    loss_for_backward.backward()
+
+                should_step = (batch_idx % args.grad_accum_steps == 0) or (batch_idx == total_batches)
+                if should_step:
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
                 batch_indices = indices.detach().cpu().numpy().astype(np.int64)
                 positions = train_pos_map[batch_indices]
@@ -222,8 +367,10 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
                     raise ValueError("Train batch contains indices outside current fold.")
                 running_loss += per_sample_loss.sum().item()
 
-                train_logits_memmap[epoch_idx, positions, :] = outputs.detach().cpu().numpy()
+                train_logits_memmap[epoch_idx, positions, :] = outputs.detach().float().cpu().numpy()
+                train_progress.set_postfix(loss=f"{loss.item():.4f}")
 
+            scheduler.step()
             epoch_loss = running_loss / len(train_loader.dataset) if len(train_loader.dataset) else 0.0
             print(f"Fold {fold_id} Epoch {epoch}: train_loss={epoch_loss:.4f}")
 
@@ -237,14 +384,15 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
                 for images, labels, indices in val_progress:
                     images = images.to(device)
                     labels = labels.to(device)
-                    outputs = model(images)
+                    with autocast(enabled=runtime_use_amp):
+                        outputs = model(images)
 
                     batch_indices = indices.detach().cpu().numpy().astype(np.int64)
                     positions = val_pos_map[batch_indices]
                     if np.any(positions < 0):
                         raise ValueError("Val batch contains indices outside current fold.")
 
-                    val_logits_memmap[epoch_idx, positions, :] = outputs.detach().cpu().numpy()
+                    val_logits_memmap[epoch_idx, positions, :] = outputs.detach().float().cpu().numpy()
 
             train_logits_memmap.flush()
             val_logits_memmap.flush()
@@ -269,7 +417,15 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
             "fold_id": fold_id,
             "k_folds": args.k_folds,
             "dataset_name": args.dataset,
+            "model": proxy_model_name,
             "seed": seed,
+            "physical_batch_size": args.physical_batch_size,
+            "grad_accum_steps": args.grad_accum_steps,
+            "effective_batch_size": args.effective_batch_size,
+            "lr": args.lr,
+            "lr_milestones": args.lr_milestones,
+            "lr_gamma": args.lr_gamma,
+            "use_amp": runtime_use_amp,
         }
         out_path = log_dir / f"fold_{fold_id}.npz"
         np.savez(
@@ -302,6 +458,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
 
 def main() -> None:
     args = parse_args()
+    args = apply_dataset_defaults(args)
     seeds = parse_seed_list(args.seed)
     for seed in seeds:
         run_for_seed(args, seed)

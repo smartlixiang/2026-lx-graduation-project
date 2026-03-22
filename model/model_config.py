@@ -5,9 +5,11 @@ from collections.abc import Callable
 
 from torch import nn
 
+from model.densenet import densenet121
 from model.resnet import resnet18, resnet50
 
 MODEL_REGISTRY: dict[str, Callable[..., nn.Module]] = {
+    "densenet121": densenet121,
     "resnet18": resnet18,
     "resnet50": resnet50,
 }

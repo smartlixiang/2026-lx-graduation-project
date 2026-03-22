@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--result-dir",
         default="result",
-        help="Root directory that stores result/<method>/<dataset>/<seed>/result_*.json",
+        help="Root directory that stores result/<method>/<dataset>/<model>/<seed>/result_*.json",
     )
     parser.add_argument("--dataset", default="cifar10", help="Dataset name")
     parser.add_argument("--model", default="resnet50", help="Model name")
@@ -79,7 +79,7 @@ def main() -> None:
     method_to_mean: dict[str, dict[int, float]] = {}
 
     for method in methods:
-        method_root = result_root / method / args.dataset
+        method_root = result_root / method / args.dataset / args.model
         if not method_root.exists():
             raise FileNotFoundError(f"Missing method directory: {method_root}")
         seed_dirs = sorted(path for path in method_root.iterdir() if path.is_dir())

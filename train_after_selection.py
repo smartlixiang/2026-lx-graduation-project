@@ -237,6 +237,10 @@ def load_selection_mask(
 ) -> np.ndarray:
     """Load a 0/1 mask for a selection method.
 
+    Note that the stored mask path intentionally does not depend on
+    ``model_name``: selection is model-agnostic for this stage, while the
+    downstream train/test results are saved under a model-aware path.
+
     The mask should have shape (N,) and values in {0, 1}, where 1 indicates
     the sample is selected.
     """
@@ -359,6 +363,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     model_factory = get_model(model_name)
 
     for keep_ratio in keep_ratios:
+        # Result files are model-sensitive and therefore include the model name.
         result_path = resolve_result_path(
             mode=args.mode,
             dataset=args.dataset,

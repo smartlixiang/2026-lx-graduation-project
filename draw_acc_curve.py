@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=["random", "naive_topk", "learned_topk", "herding", "learned_group"],
+        default=["random", "herding", "E2LN", "GraNd", "Forgetting", "MoSo", "naive_topk", "learned_topk", "naive_group", "learned_group"],
         help="Selection methods to compare",
     )
     parser.add_argument(
@@ -74,17 +74,19 @@ def main() -> None:
     output_name = args.output or f"{args.dataset}_{args.model}.png"
 
     plt.figure(figsize=(8, 5))
-    ranking_sum = {method: 0.0 for method in methods}
-    ranking_count = {method: 0 for method in methods}
+    missing_methods: list[str] = []
+    valid_methods: list[str] = []
     method_to_mean: dict[str, dict[int, float]] = {}
 
     for method in methods:
         method_root = result_root / method / args.dataset / args.model
         if not method_root.exists():
-            raise FileNotFoundError(f"Missing method directory: {method_root}")
+            missing_methods.append(method)
+            continue
         seed_dirs = sorted(path for path in method_root.iterdir() if path.is_dir())
         if not seed_dirs:
-            raise FileNotFoundError(f"No seed directories under: {method_root}")
+            missing_methods.append(method)
+            continue
         seed_results = []
         for seed_dir in seed_dirs:
             seed_results.append(load_seed_results(seed_dir))
@@ -95,6 +97,7 @@ def main() -> None:
             if values:
                 avg_by_kr[keep_ratio] = mean(values)
         method_to_mean[method] = avg_by_kr
+        valid_methods.append(method)
 
         x_values = [kr for kr in keep_ratios if kr in avg_by_kr]
         y_values = [avg_by_kr[kr] for kr in x_values]
@@ -115,7 +118,7 @@ def main() -> None:
     header = ["method"] + [str(kr) for kr in keep_ratios]
     # build table rows as strings
     table_rows = []
-    for method in methods:
+    for method in valid_methods:
         kr_to_value = method_to_mean.get(method, {})
         row = [method] + [f"{kr_to_value.get(kr):.4f}" if kr in kr_to_value else "-" for kr in keep_ratios]
         table_rows.append(row)
@@ -139,8 +142,10 @@ def main() -> None:
         line = f"{row[0].ljust(widths[0])}  " + "  ".join(row[i].rjust(widths[i]) for i in range(1, col_count))
         print(line)
 
+    ranking_sum = {method: 0.0 for method in valid_methods}
+    ranking_count = {method: 0 for method in valid_methods}
     for kr in keep_ratios:
-        present = [(method, method_to_mean.get(method, {}).get(kr)) for method in methods]
+        present = [(method, method_to_mean.get(method, {}).get(kr)) for method in valid_methods]
         present = [(m, v) for m, v in present if v is not None]
         present.sort(key=lambda item: item[1], reverse=True)
         for rank, (method, _) in enumerate(present, start=1):
@@ -150,28 +155,34 @@ def main() -> None:
     print("\naverage_rank (lower is better):")
     # print average ranks in aligned two-column form
     ar_rows = []
-    for method in methods:
+    for method in valid_methods:
         if ranking_count[method] > 0:
             val = f"{(ranking_sum[method] / ranking_count[method]):.4f}"
         else:
             val = "-"
         ar_rows.append((method, val))
-    name_w = max(len(m) for m, _ in ar_rows)
-    val_w = max(len(v) for _, v in ar_rows)
-    for m, v in ar_rows:
-        print(f"{m.ljust(name_w)}  {v.rjust(val_w)}")
+    if ar_rows:
+        name_w = max(len(m) for m, _ in ar_rows)
+        val_w = max(len(v) for _, v in ar_rows)
+        for m, v in ar_rows:
+            print(f"{m.ljust(name_w)}  {v.rjust(val_w)}")
+    else:
+        print("(no valid methods)")
 
     plt.xlabel("Keep Ratio (kr)")
     plt.ylabel("Accuracy (mean of last 10 epochs)")
     plt.title(f"{args.dataset.upper()} {args.model} - Mean Accuracy")
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.xticks(keep_ratios)
-    plt.legend()
+    if valid_methods:
+        plt.legend()
     output_path = Path(output_name)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(output_path, dpi=160)
     print(f"Saved figure to {output_path}")
+    if missing_methods:
+        print(f"未保存结果的方法（已忽略）: {', '.join(missing_methods)}")
 
 
 if __name__ == "__main__":

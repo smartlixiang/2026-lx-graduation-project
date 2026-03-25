@@ -406,7 +406,7 @@ def select_group_mask(
 
     class_budgets = _allocate_class_budgets()
     candidate_pool_size = max(1, int(group_candidate_pool_size))
-    dist_weight = 1.0
+    dist_weight = max(0.0, 1.0 - 0.01 * float(keep_ratio))
 
     selected_mask = np.zeros(num_samples, dtype=np.uint8)
     class_selected_counts = np.zeros(num_classes, dtype=np.int64)
@@ -543,6 +543,7 @@ def select_group_mask(
     stats: dict[str, object] = {
         "solver": "group_classwise_greedy_add",
         "sr": float(sr),
+        "dist_weight": float(dist_weight),
         "final_rate": float(final_mask.mean()),
         "selected_by_class": selected_by_class,
         "class_budgets": {int(c): int(v) for c, v in enumerate(class_budgets.tolist())},
@@ -762,7 +763,8 @@ def main() -> None:
             )
             if group_stats is not None:
                 print(
-                    f"group_summary: subset_score={group_stats['subset_comprehensive_score']:.6f} | "
+                    f"group_summary: dist_weight={group_stats['dist_weight']:.6f} | "
+                    f"subset_score={group_stats['subset_comprehensive_score']:.6f} | "
                     f"distribution_shift={group_stats['distribution_shift']:.6f}"
                 )
             print(f"mask saved to: {mask_path}")

@@ -5,10 +5,9 @@ import hashlib
 import json
 import sys
 import time
-from collections.abc import Sequence
+from math import ceil
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -26,15 +25,6 @@ from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
-from utils.group_lambda import (  # noqa: E402
-    DEFAULT_CLS_LAMBDA_BASE,
-    DEFAULT_EPS,
-    DEFAULT_M,
-    DEFAULT_MEAN_LAMBDA_BASE,
-    compute_balance_penalty,
-    get_or_estimate_lambda,
-    get_default_mean_lambda_base,
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,57 +73,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="仅在显式传入该参数时，若目标 mask 已存在则跳过重新生成",
     )
-    parser.add_argument("--group-iterations", type=int, default=800)
     parser.add_argument(
-        "--group-batch-size",
+        "--group-candidate-pool-size",
         type=int,
-        default=24,
-        help="kr<=50 时的初始 batch_size；kr>50 时自动减半",
-    )
-    parser.add_argument(
-        "--group-min-batch-size",
-        type=int,
-        default=2,
-        help="kr<=50 时的最小 batch_size；kr>50 时自动减半",
-    )
-    parser.add_argument("--group-eval-interval", type=int, default=4)
-    parser.add_argument(
-        "--group-candidate-pool-multiplier",
-        type=float,
-        default=10,
-        help="候选池大小倍率，按当前 batch_size 的倍率分别构造子集内外候选池",
-    )
-    parser.add_argument(
-        "--score-patience",
-        type=int,
-        default=5,
-        help="连续多少次 eval 综合评分(S') 不上涨后才调整 batch_size",
-    )
-    parser.add_argument(
-        "--herding-patience",
-        type=int,
-        default=3,
-        help="herding 修正项连续上升多少次后才调整 batch_size",
-    )
-    parser.add_argument(
-        "--score-decay",
-        type=float,
-        default=0.8,
-        help="因综合评分不上涨触发 batch_size 衰减时的倍率",
-    )
-    parser.add_argument(
-        "--herding-decay",
-        type=float,
-        default=0.9,
-        help="因 herding 修正项连续上升触发 batch_size 衰减时的倍率",
-    )
-    parser.add_argument("--mean-lambda-base", type=float, default=None, help="kr=20 时 mean 修正项目标占比（默认随数据集变化）")
-    parser.add_argument("--cls-lambda-base", type=float, default=DEFAULT_CLS_LAMBDA_BASE, help="kr=20 时 class 修正项目标占比")
-    parser.add_argument(
-        "--group-tolerance-ratio",
-        type=float,
-        default=0.85,
-        help="最终解容忍比例：选择比值>=最优比值*tolerance_ratio 的最晚轮次",
+        default=1,
+        help="group 模式下类内贪心候选池大小，1 表示纯贪心。",
     )
     return parser.parse_args()
 
@@ -387,23 +331,10 @@ def select_group_mask(
     adapter_image_path: str,
     div_static_scores: np.ndarray | None = None,
     dds_static_scores: np.ndarray | None = None,
-    group_iterations: int = 200,
-    group_batch_size: int = 64,
-    group_min_batch_size: int = 2,
-    group_eval_interval: int = 10,
-    group_candidate_pool_multiplier: float = 3.0,
-    score_patience: int = 5,
-    herding_patience: int = 3,
-    score_decay: float = 0.8,
-    herding_decay: float = 0.9,
-    cls_lambda_base: float = DEFAULT_CLS_LAMBDA_BASE,
-    mean_lambda_base: float = DEFAULT_MEAN_LAMBDA_BASE,
-    tolerance_ratio: float = 0.95,
+    group_candidate_pool_size: int = 1,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
         raise ValueError("kr 必须在 1-100 之间。")
-    if tolerance_ratio <= 0:
-        raise ValueError("tolerance_ratio 必须大于 0。")
 
     num_samples = sa_scores.shape[0]
     labels_np = np.asarray(labels, dtype=np.int64)
@@ -419,8 +350,8 @@ def select_group_mask(
     if target_size <= 0:
         raise ValueError("target_size 必须大于 0。")
 
-    all_indices = np.arange(num_samples, dtype=np.int64)
     class_indices_list = [np.flatnonzero(labels_np == c).astype(np.int64) for c in range(num_classes)]
+    rng = np.random.default_rng(seed)
     labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
 
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
@@ -435,533 +366,200 @@ def select_group_mask(
         clip_model=clip_model,
         adapter_image_path=adapter_image_path,
     )
-    full_class_mean, full_class_var = _get_or_compute_group_mean_stats(
+    full_class_mean, _ = _get_or_compute_group_mean_stats(
         cache_path=mean_stats_cache_path,
         image_features=div_features_np,
         labels=labels_np,
         num_classes=num_classes,
     )
     full_class_mean_f32 = full_class_mean.astype(np.float32, copy=False)
-    full_class_var_f32 = full_class_var.astype(np.float32, copy=False)
+    def _quantile_minmax(values: np.ndarray, low_q: float = 0.002, high_q: float = 0.998) -> np.ndarray:
+        if values.size == 0:
+            return np.zeros(0, dtype=np.float32)
+        low = float(np.quantile(values, low_q))
+        high = float(np.quantile(values, high_q))
+        if abs(high - low) <= 1e-12:
+            return np.full(values.shape, 0.5, dtype=np.float32)
+        return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)
 
-    static_part = (weights["sa"] * sa_scores_np + weights["dds"] * dds_static_np).astype(np.float32)
-    static_quality = (sa_scores_np + dds_static_np).astype(np.float32)
+    def _allocate_class_budgets() -> np.ndarray:
+        class_sizes = np.asarray([idx.size for idx in class_indices_list], dtype=np.int64)
+        raw = class_sizes.astype(np.float64) * sr
+        floor_budget = np.floor(raw).astype(np.int64)
+        floor_budget = np.minimum(floor_budget, class_sizes)
+        need = int(target_size - np.sum(floor_budget))
+        if need <= 0:
+            return floor_budget
+        frac = raw - floor_budget.astype(np.float64)
+        order = np.lexsort((np.arange(num_classes, dtype=np.int64), -frac))
+        budgets = floor_budget.copy()
+        for class_id in order:
+            if need <= 0:
+                break
+            if budgets[class_id] >= class_sizes[class_id]:
+                continue
+            budgets[class_id] += 1
+            need -= 1
+        if need != 0:
+            raise RuntimeError("类别预算分配失败，无法满足目标总样本数。")
+        return budgets
 
-    sum_features = np.zeros((num_classes, div_features_np.shape[1]), dtype=np.float32)
-    cnt_features = np.zeros(num_classes, dtype=np.int64)
+    class_budgets = _allocate_class_budgets()
+    candidate_pool_size = max(1, int(group_candidate_pool_size))
+    dist_weight = 1.0
 
-    def _indices_to_mask(indices: np.ndarray) -> np.ndarray:
-        mask = np.zeros(num_samples, dtype=np.uint8)
-        mask[np.asarray(indices, dtype=np.int64)] = 1
-        return mask
+    selected_mask = np.zeros(num_samples, dtype=np.uint8)
+    class_selected_counts = np.zeros(num_classes, dtype=np.int64)
+    class_selected_sum = np.zeros((num_classes, div_features_np.shape[1]), dtype=np.float32)
+    init_per_class = np.zeros(num_classes, dtype=np.int64)
+    static_init_score = (weights["sa"] * sa_scores_np + weights["dds"] * dds_static_np).astype(np.float32)
 
-    def _compute_mean_penalty(cur_mask: np.ndarray) -> float:
-        # mean penalty uses class-averaged variance-normalized centroid shift
-        # so lambda calibration from random baseline is directly comparable across datasets.
-        selected = np.flatnonzero(cur_mask > 0).astype(np.int64)
-        if selected.size == 0:
-            return 0.0
-        sum_features.fill(0.0)
-        cnt_features.fill(0)
-        sel_labels = labels_np[selected]
-        np.add.at(sum_features, sel_labels, div_features_np[selected])
-        np.add.at(cnt_features, sel_labels, 1)
-        active = cnt_features > 0
-        if not np.any(active):
-            return 0.0
-        selected_mean = np.zeros_like(full_class_mean_f32, dtype=np.float32)
-        selected_mean[active] = sum_features[active] / cnt_features[active, None].astype(np.float32)
-        diff = selected_mean[active] - full_class_mean_f32[active]
-        dist2 = np.sum(diff * diff, axis=1, dtype=np.float32)
-        normalized = dist2 / (full_class_var_f32[active] + float(DEFAULT_EPS))
-        if num_classes <= 0:
-            return 0.0
-        return float(np.sum(normalized, dtype=np.float32) / float(num_classes))
+    for class_id, class_indices in enumerate(class_indices_list):
+        budget = int(class_budgets[class_id])
+        if class_indices.size == 0 or budget <= 0:
+            continue
+        init_count = min(3, budget, int(class_indices.size))
+        init_per_class[class_id] = init_count
+        class_static = static_init_score[class_indices]
+        ranked_local = np.argsort(-class_static, kind="mergesort")[:init_count]
+        init_indices = class_indices[ranked_local]
+        selected_mask[init_indices] = 1
+        class_selected_counts[class_id] = init_count
+        class_selected_sum[class_id] = np.sum(div_features_np[init_indices], axis=0, dtype=np.float32)
 
-    def _evaluate(indices: np.ndarray) -> dict[str, object]:
-        unique = np.unique(np.asarray(indices, dtype=np.int64))
-        if unique.size != target_size:
-            raise ValueError(f"_evaluate expects fixed-cardinality subset, got {unique.size} != {target_size}")
-        mask = _indices_to_mask(unique)
-        div_scores = np.asarray(
-            div_metric.score_dataset_dynamic(
-                div_loader,
-                adapter=image_adapter,
-                selected_mask=mask,
-                image_features=div_features,
-                labels=labels_t,
-            ).scores,
-            dtype=np.float32,
-        )
-        s_ref = static_part + weights["div"] * div_scores
-        selected = mask.astype(bool)
-        raw_score = float(np.sum(s_ref[selected]))
-        class_penalty = compute_balance_penalty(mask, labels_np, num_classes, target_size)
-        mean_penalty = _compute_mean_penalty(mask)
-        class_corr = float(lambda_cls * class_penalty)
-        mean_corr = float(lambda_mean * mean_penalty)
-        return {
-            "indices": unique,
-            "mask": mask,
-            "raw_score": raw_score,
-            "penalty": float(class_penalty),
-            "mean_penalty": float(mean_penalty),
-            "class_corr": class_corr,
-            "mean_corr": mean_corr,
-            "fitness": float(raw_score - class_corr - mean_corr),
-            "counts": np.bincount(labels_np[selected], minlength=num_classes).astype(np.int64),
-        }
+    selected_count_history: list[int] = [int(np.sum(selected_mask))]
+    total_to_add = int(np.sum(class_budgets) - np.sum(init_per_class))
+    pbar = tqdm(total=total_to_add, desc="[group] classwise greedy add", unit="sample")
+    round_id = 0
+    total_score_acc = 0.0
 
-    def _eval_raw_score_mask(cur_mask: np.ndarray) -> float:
-        div_scores = np.asarray(
-            div_metric.score_dataset_dynamic(
-                div_loader,
-                adapter=image_adapter,
-                selected_mask=cur_mask,
-                image_features=div_features,
-                labels=labels_t,
-            ).scores,
-            dtype=np.float32,
-        )
-        s_ref = static_part + weights["div"] * div_scores
-        return float(np.sum(s_ref[cur_mask.astype(bool)]))
-
-    lambda_record = get_or_estimate_lambda(
-        cache_path=PROJECT_ROOT / "utils" / "group_lambda.json",
-        dataset=dataset_name,
-        seed=seed,
-        kr=keep_ratio,
-        weight_group=weight_group,
-        n_samples=num_samples,
-        target_size=target_size,
-        eval_score_fn=_eval_raw_score_mask,
-        penalty_fn=lambda cur_mask: compute_balance_penalty(cur_mask, labels_np, num_classes, target_size),
-        mean_penalty_fn=lambda cur_mask: _compute_mean_penalty(cur_mask),
-        M=DEFAULT_M,
-        eps=DEFAULT_EPS,
-        cls_lambda_base=cls_lambda_base,
-        mean_lambda_base=mean_lambda_base,
-        tqdm_desc=f"Estimating lambdas (seed={seed}, kr={keep_ratio}, wg={weight_group})",
-    )
-    lambda_cls = float(lambda_record["lambda_cls"])
-    lambda_mean = float(lambda_record["lambda_mean"])
-    print(
-        f"[Lambda] dataset={dataset_name} | seed={seed} | kr={keep_ratio} "
-        f"| raw_mean={float(lambda_record['raw_mean']):.8f} "
-        f"| class_penalty_mean={float(lambda_record['class_penalty_mean']):.8f} "
-        f"| mean_penalty_mean={float(lambda_record['mean_penalty_mean']):.8f} "
-        f"| lambda_cls={lambda_cls:.8f} | lambda_mean={lambda_mean:.8f} "
-        f"| cls_lambda_base={float(cls_lambda_base):.6f} | mean_lambda_base={float(mean_lambda_base):.6f}"
-    )
-
-    def _rank_points(scores_np: np.ndarray, descending: bool) -> np.ndarray:
-        n = int(scores_np.size)
-        if n == 0:
-            return np.zeros(0, dtype=np.int64)
-        order = np.argsort(-scores_np if descending else scores_np, kind="mergesort")
-        points = np.zeros(n, dtype=np.int64)
-        points[order] = np.arange(n, 0, -1, dtype=np.int64)
-        return points
-
-    def _candidate_sampling_probs(
-        candidate_indices: np.ndarray,
-        class_counts_cur: np.ndarray,
-        target_size_cur: int,
-        num_classes_cur: int,
-        labels_arr: np.ndarray,
-        mode: str,
-    ) -> np.ndarray:
-        n = int(candidate_indices.size)
-        if n <= 0:
-            return np.zeros(0, dtype=np.float64)
-        if target_size_cur <= 0 or num_classes_cur <= 0:
-            return np.full(n, 1.0 / float(n), dtype=np.float64)
-
-        target_per_class = float(target_size_cur) / float(num_classes_cur)
-        if target_per_class <= 0:
-            return np.full(n, 1.0 / float(n), dtype=np.float64)
-
-        cand_labels = labels_arr[candidate_indices]
-        a = (target_per_class - class_counts_cur[cand_labels].astype(np.float64)) / target_per_class
-        a = np.clip(a, -0.1, 0.1)
-
-        if mode == "in":
-            logits = 1.0 + a
-        elif mode == "out":
-            logits = 1.0 - a
+    while True:
+        remaining_by_class = class_budgets - class_selected_counts
+        active_classes = np.flatnonzero(remaining_by_class > 0).astype(np.int64)
+        if active_classes.size == 0:
+            break
+        round_id += 1
+        remain_total = int(np.sum(remaining_by_class))
+        if remain_total < active_classes.size:
+            chosen_classes = np.sort(rng.choice(active_classes, size=remain_total, replace=False).astype(np.int64))
         else:
-            raise ValueError(f"Unsupported sampling mode: {mode}")
+            chosen_classes = active_classes
 
-        logits = logits - np.max(logits)
-        probs = np.exp(logits)
-        denom = float(np.sum(probs))
-        if not np.isfinite(denom) or denom <= 0.0:
-            return np.full(n, 1.0 / float(n), dtype=np.float64)
-        return probs / denom
+        for class_id in chosen_classes:
+            class_indices = class_indices_list[int(class_id)]
+            unselected_mask = selected_mask[class_indices] == 0
+            candidate_indices = class_indices[unselected_mask]
+            if candidate_indices.size == 0:
+                continue
 
-    rng = np.random.default_rng(seed)
-    current_indices = np.sort(rng.choice(num_samples, size=target_size, replace=False).astype(np.int64))
-    class_counts = np.bincount(labels_np[current_indices], minlength=num_classes).astype(np.int64)
-    class_sums = np.zeros((num_classes, div_features_np.shape[1]), dtype=np.float32)
-    np.add.at(class_sums, labels_np[current_indices], div_features_np[current_indices])
+            current_count = int(class_selected_counts[class_id])
+            if current_count <= 0:
+                continue
+            current_sum = class_selected_sum[class_id]
+            mu_full = full_class_mean_f32[class_id]
+            mu_sub = current_sum / float(current_count)
+            old_dist = float(np.linalg.norm(mu_sub - mu_full))
 
-    # 初始真实评估
-    current_item = _evaluate(current_indices)
-    init_item = dict(current_item)
+            dynamic_k = max(3, int(ceil(0.05 * current_count)))
 
-    def _selection_metric(item: dict[str, object]) -> float:
-        delta = float(item["fitness"]) - float(init_item["fitness"])
-        herding_corr = float(item["mean_corr"])
-        return float(delta / (herding_corr + float(DEFAULT_EPS)))
+            candidate_features_t = torch.as_tensor(div_features_np[candidate_indices], dtype=torch.float32, device=device)
+            reference_indices = class_indices[selected_mask[class_indices] > 0]
+            reference_features_t = torch.as_tensor(div_features_np[reference_indices], dtype=torch.float32, device=device)
+            div_raw = div_metric._knn_mean_distance_to_reference(
+                query_features=candidate_features_t,
+                reference_features=reference_features_t,
+                k=float(dynamic_k),
+                query_indices=torch.as_tensor(candidate_indices, dtype=torch.long, device=device),
+                reference_indices=torch.as_tensor(reference_indices, dtype=torch.long, device=device),
+            ).detach().cpu().numpy().astype(np.float32)
+            div_scores = _quantile_minmax(div_raw)
 
-    best_item = dict(current_item)
-    best_item["indices"] = np.asarray(current_item["indices"], dtype=np.int64).copy()
-    best_item["mask"] = np.asarray(current_item["mask"], dtype=np.uint8).copy()
-    best_metric_value = _selection_metric(best_item)
-    last_eval_fit = float(current_item["fitness"])
+            candidate_features_np = div_features_np[candidate_indices]
+            mu_new = (current_sum[None, :] + candidate_features_np) / float(current_count + 1)
+            new_dist = np.linalg.norm(mu_new - mu_full[None, :], axis=1)
+            dist_improve = (old_dist - new_dist).astype(np.float32)
+            dist_scores = _quantile_minmax(dist_improve)
 
-    score_history = [float(current_item["raw_score"])]
-    class_correction_history = [float(current_item["class_corr"])]
-    mean_correction_history = [float(current_item["mean_corr"])]
-    fitness_history = [float(current_item["fitness"])]
-    eval_steps = [0]
-    eval_items: list[dict[str, object]] = [
-        {
-            "indices": np.asarray(current_item["indices"], dtype=np.int64).copy(),
-            "mask": np.asarray(current_item["mask"], dtype=np.uint8).copy(),
-            "raw_score": float(current_item["raw_score"]),
-            "penalty": float(current_item["penalty"]),
-            "mean_penalty": float(current_item["mean_penalty"]),
-            "class_corr": float(current_item["class_corr"]),
-            "mean_corr": float(current_item["mean_corr"]),
-            "fitness": float(current_item["fitness"]),
-        }
-    ]
-
-    eval_every = max(1, int(group_eval_interval))
-    cur_batch_size = max(1, int(group_batch_size))
-    min_batch_size = max(1, int(group_min_batch_size))
-    candidate_pool_multiplier = max(1.0, float(group_candidate_pool_multiplier))
-    score_patience = max(1, int(score_patience))
-    herding_patience = max(1, int(herding_patience))
-    score_decay = float(np.clip(score_decay, 0.01, 0.999))
-    herding_decay = float(np.clip(herding_decay, 0.01, 0.999))
-    if cur_batch_size < min_batch_size:
-        cur_batch_size = min_batch_size
-    stale_score_count = 0
-    herding_rise_count = 0
-    best_fitness_for_decay = float(current_item["fitness"])
-    prev_mean_corr = float(current_item["mean_corr"])
-
-    iter_bar = tqdm(range(max(0, int(group_iterations))), desc="[group] iterations", unit="iter")
-    for step in iter_bar:
-        membership = np.zeros(num_samples, dtype=bool)
-        membership[current_indices] = True
-        in_indices = current_indices
-        out_indices = all_indices[~membership]
-        k = min(int(cur_batch_size), in_indices.size, out_indices.size)
-        if k <= 0:
-            break
-        candidate_pool_size = max(1, int(np.ceil(float(cur_batch_size) * candidate_pool_multiplier)))
-
-        mu_sub = np.zeros_like(class_sums, dtype=np.float32)
-        active = class_counts > 0
-        mu_sub[active] = class_sums[active] / class_counts[active, None].astype(np.float32)
-
-        in_labels = labels_np[in_indices]
-        out_labels = labels_np[out_indices]
-        in_feats = div_features_np[in_indices]
-        out_feats = div_features_np[out_indices]
-
-        in_static_drop = -static_quality[in_indices].astype(np.float32)
-        out_static_add = static_quality[out_indices].astype(np.float32)
-
-        in_div_dist = np.linalg.norm(in_feats - mu_sub[in_labels], axis=1)
-        in_div_drop = -in_div_dist
-        out_div_add = np.linalg.norm(out_feats - mu_sub[out_labels], axis=1)
-        empty_cls_mask = class_counts[out_labels] == 0
-        out_div_add[empty_cls_mask] = 1e6
-
-        in_old_dist = np.linalg.norm(mu_sub[in_labels] - full_class_mean_f32[in_labels], axis=1)
-        cnt_in = class_counts[in_labels].astype(np.float32)
-        safe_denom_drop = np.maximum(cnt_in - 1.0, 1.0)
-        in_new_mean = (class_sums[in_labels] - in_feats) / safe_denom_drop[:, None]
-        in_new_dist = np.linalg.norm(in_new_mean - full_class_mean_f32[in_labels], axis=1)
-        in_new_dist[cnt_in <= 1.0] = 0.0
-        in_mean_drop = in_old_dist - in_new_dist
-
-        out_old_dist = np.linalg.norm(mu_sub[out_labels] - full_class_mean_f32[out_labels], axis=1)
-        cnt_out = class_counts[out_labels].astype(np.float32)
-        out_new_mean = (class_sums[out_labels] + out_feats) / (cnt_out[:, None] + 1.0)
-        out_new_dist = np.linalg.norm(out_new_mean - full_class_mean_f32[out_labels], axis=1)
-        out_mean_add = out_old_dist - out_new_dist
-
-        score_in = (
-            _rank_points(in_static_drop, descending=True)
-            + _rank_points(in_div_drop, descending=True)
-            + _rank_points(in_mean_drop, descending=True)
-        )
-        score_out = (
-            _rank_points(out_static_add, descending=True)
-            + _rank_points(out_div_add, descending=True)
-            + _rank_points(out_mean_add, descending=True)
-        )
-
-        in_candidate_size = min(candidate_pool_size, in_indices.size)
-        out_candidate_size = min(candidate_pool_size, out_indices.size)
-        in_candidate_pool = in_indices[np.argsort(-score_in, kind="mergesort")[:in_candidate_size]]
-        out_candidate_pool = out_indices[np.argsort(-score_out, kind="mergesort")[:out_candidate_size]]
-
-        k = min(int(cur_batch_size), in_candidate_pool.size, out_candidate_pool.size)
-        if k <= 0:
-            break
-        drop_probs = _candidate_sampling_probs(
-            in_candidate_pool,
-            class_counts,
-            target_size,
-            num_classes,
-            labels_np,
-            mode="out",
-        )
-        add_probs = _candidate_sampling_probs(
-            out_candidate_pool,
-            class_counts,
-            target_size,
-            num_classes,
-            labels_np,
-            mode="in",
-        )
-        drop_idx = rng.choice(in_candidate_pool, size=k, replace=False, p=drop_probs).astype(np.int64)
-        add_idx = rng.choice(out_candidate_pool, size=k, replace=False, p=add_probs).astype(np.int64)
-
-        membership[drop_idx] = False
-        membership[add_idx] = True
-        current_indices = np.flatnonzero(membership).astype(np.int64)
-        if current_indices.size != target_size:
-            raise RuntimeError("group swap 后子集大小异常。")
-
-        # 增量更新 class_sums/class_counts
-        drop_labels = labels_np[drop_idx]
-        add_labels = labels_np[add_idx]
-        np.add.at(class_sums, drop_labels, -div_features_np[drop_idx])
-        np.add.at(class_sums, add_labels, div_features_np[add_idx])
-        np.add.at(class_counts, drop_labels, -1)
-        np.add.at(class_counts, add_labels, 1)
-
-        approx_total_rank = float(np.mean(score_out[np.argsort(-score_out, kind="mergesort")[:k]]) -
-                                  np.mean(score_in[np.argsort(-score_in, kind="mergesort")[:k]]))
-
-        is_last_iter = step == max(0, int(group_iterations)) - 1
-        should_eval = ((step + 1) % eval_every == 0) or is_last_iter
-        if should_eval:
-            current_item = _evaluate(current_indices)
-            last_eval_fit = float(current_item["fitness"])
-            eval_steps.append(int(step + 1))
-            score_history.append(float(current_item["raw_score"]))
-            class_correction_history.append(float(current_item["class_corr"]))
-            mean_correction_history.append(float(current_item["mean_corr"]))
-            fitness_history.append(float(current_item["fitness"]))
-            eval_items.append(
-                {
-                    "indices": np.asarray(current_item["indices"], dtype=np.int64).copy(),
-                    "mask": np.asarray(current_item["mask"], dtype=np.uint8).copy(),
-                    "raw_score": float(current_item["raw_score"]),
-                    "penalty": float(current_item["penalty"]),
-                    "mean_penalty": float(current_item["mean_penalty"]),
-                    "class_corr": float(current_item["class_corr"]),
-                    "mean_corr": float(current_item["mean_corr"]),
-                    "fitness": float(current_item["fitness"]),
-                }
-            )
-            cur_metric_value = _selection_metric(current_item)
-            improved = cur_metric_value > best_metric_value
-            if improved:
-                best_item = dict(current_item)
-                best_item["indices"] = np.asarray(current_item["indices"], dtype=np.int64).copy()
-                best_item["mask"] = np.asarray(current_item["mask"], dtype=np.uint8).copy()
-                best_metric_value = cur_metric_value
-
-            cur_fitness = float(current_item["fitness"])
-            if cur_fitness > best_fitness_for_decay:
-                best_fitness_for_decay = cur_fitness
-                stale_score_count = 0
+            combined_scores = (
+                weights["sa"] * sa_scores_np[candidate_indices]
+                + weights["dds"] * dds_static_np[candidate_indices]
+                + weights["div"] * div_scores
+                + dist_weight * dist_scores
+            ).astype(np.float32)
+            rank = np.argsort(-combined_scores, kind="mergesort")
+            pool_n = min(candidate_pool_size, candidate_indices.size)
+            pool_indices = candidate_indices[rank[:pool_n]]
+            if pool_n == 1:
+                picked_idx = int(pool_indices[0])
             else:
-                stale_score_count += 1
+                picked_idx = int(rng.choice(pool_indices, size=1, replace=False)[0])
 
-            cur_mean_corr = float(current_item["mean_corr"])
-            if cur_mean_corr > prev_mean_corr:
-                herding_rise_count += 1
-            else:
-                herding_rise_count = 0
-            prev_mean_corr = cur_mean_corr
+            selected_mask[picked_idx] = 1
+            class_selected_counts[class_id] += 1
+            class_selected_sum[class_id] += div_features_np[picked_idx]
+            total_score_acc += float(np.max(combined_scores))
+            selected_count_history.append(int(np.sum(selected_mask)))
+            pbar.update(1)
+            pbar.set_postfix(active_classes=int(active_classes.size))
+    pbar.close()
 
-            if stale_score_count >= score_patience and cur_batch_size > min_batch_size:
-                new_batch_size = max(min_batch_size, int(np.floor(cur_batch_size * score_decay)))
-                cur_batch_size = max(min_batch_size, new_batch_size)
-                stale_score_count = 0
-
-            if herding_rise_count >= herding_patience and cur_batch_size > min_batch_size:
-                new_batch_size = max(min_batch_size, int(np.floor(cur_batch_size * herding_decay)))
-                cur_batch_size = max(min_batch_size, new_batch_size)
-                herding_rise_count = 0
-
-        iter_bar.set_postfix(
-            best_metric=f"{best_metric_value:.4f}",
-            cur_sprime=f"{last_eval_fit:.4f}",
-            cur_herd=f"{float(current_item['mean_corr']):.4f}",
-            batch_size=int(cur_batch_size),
-        )
-
-    metric_history = np.asarray([
-        (f - float(init_item["fitness"])) / (m + float(DEFAULT_EPS))
-        for f, m in zip(fitness_history, mean_correction_history)
-    ], dtype=np.float64)
-    best_metric_history_value = float(np.max(metric_history)) if metric_history.size > 0 else float(best_metric_value)
-    metric_threshold = float(best_metric_history_value * float(tolerance_ratio))
-    qualified_indices = np.flatnonzero(metric_history >= metric_threshold)
-    if qualified_indices.size > 0:
-        final_eval_pos = int(qualified_indices[-1])
-    else:
-        final_eval_pos = int(np.argmax(metric_history)) if metric_history.size > 0 else 0
-    final_item = dict(eval_items[final_eval_pos]) if eval_items else dict(best_item)
-    final_eval_step = int(eval_steps[final_eval_pos]) if eval_steps else 0
-
-    final_mask = np.asarray(final_item["mask"], dtype=np.uint8)
+    final_mask = selected_mask.astype(np.uint8)
     selected_by_class: dict[int, int] = {}
     for class_id in range(num_classes):
         class_indices = class_indices_list[class_id]
         selected_by_class[class_id] = int(final_mask[class_indices].sum()) if class_indices.size > 0 else 0
 
+    final_div_scores = np.asarray(
+        div_metric.score_dataset_dynamic(
+            div_loader,
+            adapter=image_adapter,
+            selected_mask=final_mask,
+            image_features=div_features,
+            labels=labels_t,
+        ).scores,
+        dtype=np.float32,
+    )
+    selected_bool = final_mask.astype(bool)
+    subset_comprehensive_score = float(
+        np.sum(
+            (
+                weights["sa"] * sa_scores_np
+                + weights["dds"] * dds_static_np
+                + weights["div"] * final_div_scores
+            )[selected_bool],
+            dtype=np.float64,
+        )
+    )
+
+    class_shift_values: list[float] = []
+    for class_id in range(num_classes):
+        if class_selected_counts[class_id] <= 0:
+            continue
+        mu_sub = class_selected_sum[class_id] / float(class_selected_counts[class_id])
+        mu_full = full_class_mean_f32[class_id]
+        class_shift_values.append(float(np.linalg.norm(mu_sub - mu_full)))
+    distribution_shift = float(np.mean(class_shift_values)) if class_shift_values else 0.0
+
     stats: dict[str, object] = {
-        "solver": "group_batch_swap",
+        "solver": "group_classwise_greedy_add",
         "sr": float(sr),
         "final_rate": float(final_mask.mean()),
-        "init_fitness": float(fitness_history[0]),
-        "final_fitness": float(final_item["fitness"]),
-        "raw_score": float(final_item["raw_score"]),
-        "penalty": float(final_item["penalty"]),
-        "final_mean_penalty": float(final_item["mean_penalty"]),
-        "S": float(final_item["raw_score"]),
-        "S_prime": float(final_item["fitness"]),
         "selected_by_class": selected_by_class,
-        "best_iter": int(eval_steps[int(np.argmax(np.asarray(fitness_history, dtype=np.float32)))]) if fitness_history else 0,
-        "selected_best_iter": int(eval_steps[int(np.argmax(np.asarray([
-            (f - float(init_item['fitness'])) / (m + float(DEFAULT_EPS))
-            for f, _c, m in zip(fitness_history, class_correction_history, mean_correction_history)
-        ], dtype=np.float32)))]) if fitness_history else 0,
-        "final_selected_iter": int(final_eval_step),
-        "selection_metric": float(best_metric_history_value),
-        "selection_metric_threshold": float(metric_threshold),
-        "selection_tolerance_ratio": float(tolerance_ratio),
-        "init_S_prime": float(init_item["fitness"]),
-        "init_herding_corr": float(init_item["mean_corr"]),
-        "init_class_corr": float(init_item["class_corr"]),
-        "best_S_prime": float(best_item["fitness"]),
-        "best_herding_corr": float(best_item["mean_corr"]),
-        "best_class_corr": float(best_item["class_corr"]),
-        "final_herding_corr": float(final_item["mean_corr"]),
-        "final_class_corr": float(final_item["class_corr"]),
-        "best_sprime_over_herding": float(best_item["fitness"] / (float(best_item["mean_corr"]) + float(DEFAULT_EPS))),
-        "final_sprime_over_herding": float(final_item["fitness"] / (float(final_item["mean_corr"]) + float(DEFAULT_EPS))),
-        "score_history": score_history,
-        "fitness_history": fitness_history,
-        "correction_history": [float(c) + float(m) for c, m in zip(class_correction_history, mean_correction_history)],
-        "class_correction_history": class_correction_history,
-        "mean_correction_history": mean_correction_history,
-        "eval_steps": eval_steps,
-        "lambda_cls": float(lambda_cls),
-        "lambda_mean": float(lambda_mean),
-        "group_iterations": int(group_iterations),
-        "group_batch_size": int(cur_batch_size),
-        "group_batch_size_init": int(max(1, int(group_batch_size))),
-        "group_min_batch_size": int(max(1, int(group_min_batch_size))),
-        "group_eval_interval": int(eval_every),
-        "group_candidate_pool_multiplier": float(candidate_pool_multiplier),
-        "score_patience": int(score_patience),
-        "herding_patience": int(herding_patience),
-        "score_decay": float(score_decay),
-        "herding_decay": float(herding_decay),
+        "class_budgets": {int(c): int(v) for c, v in enumerate(class_budgets.tolist())},
+        "init_per_class": {int(c): int(v) for c, v in enumerate(init_per_class.tolist())},
+        "candidate_pool_size": int(candidate_pool_size),
+        "selected_count_history": selected_count_history,
+        "accumulated_greedy_score": float(total_score_acc),
+        "subset_comprehensive_score": subset_comprehensive_score,
+        "distribution_shift": distribution_shift,
     }
     return final_mask, selected_by_class, stats
-
-
-def _sanitize_for_filename(text: str) -> str:
-    return text.replace("/", "-").replace(" ", "_")
-
-
-def save_score_curve_plot(
-    score_history: Sequence[float],
-    class_correction_history: Sequence[float],
-    mean_correction_history: Sequence[float],
-    fitness_history: Sequence[float] | None = None,
-    eval_steps: Sequence[int] | None = None,
-    *,
-    dataset: str,
-    method: str,
-    weight_group: str,
-    model_name: str,
-    seed: int,
-    keep_ratio: int,
-    clip_model: str,
-    selected_eval_step: int | None = None,
-    final_eval_step: int | None = None,
-) -> Path:
-    out_dir = PROJECT_ROOT / "mask_debug"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{_sanitize_for_filename(dataset)}_{keep_ratio}_{seed}.png"
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    if fitness_history is not None and len(fitness_history) > 0:
-        fit_arr = np.asarray(fitness_history, dtype=np.float64)
-    else:
-        score_arr = np.asarray(score_history, dtype=np.float64)
-        class_corr_arr = np.asarray(class_correction_history, dtype=np.float64)
-        mean_corr_arr = np.asarray(mean_correction_history, dtype=np.float64)
-        fit_arr = score_arr - class_corr_arr - mean_corr_arr
-
-    if eval_steps is not None and len(eval_steps) == fit_arr.shape[0]:
-        x = np.asarray(eval_steps, dtype=np.int32)
-    else:
-        x = np.arange(fit_arr.shape[0], dtype=np.int32)
-    herding_corr_arr = np.asarray(mean_correction_history, dtype=np.float64)
-
-    ax.plot(x, fit_arr, linewidth=1.8, color="#d62728", label="S'(D)")
-    ax.set_title("Group optimization trajectory")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Comprehensive score S'(D)")
-    ax.grid(alpha=0.25)
-
-    ax2 = ax.twinx()
-    ax2.plot(x, herding_corr_arr, linewidth=1.5, color="#1f77b4", linestyle="--", label="Herding correction")
-    ax2.set_ylabel("Herding correction")
-
-    if selected_eval_step is not None and fit_arr.size > 0:
-        selected_x = int(selected_eval_step)
-        fit_y = float(np.interp(selected_x, x, fit_arr))
-        herd_y = float(np.interp(selected_x, x, herding_corr_arr))
-        ax.axvline(selected_x, color="green", linestyle="--", linewidth=1.6, alpha=0.9, label="Best ratio subset")
-        ax.plot(selected_x, fit_y, marker=(5, 1), color="green", markersize=10, linestyle="None")
-        ax2.plot(selected_x, herd_y, marker=(5, 1), color="green", markersize=10, linestyle="None")
-
-    if final_eval_step is not None and fit_arr.size > 0:
-        final_x = int(final_eval_step)
-        ax.axvline(final_x, color="orange", linestyle="--", linewidth=1.6, alpha=0.9, label="Final selected subset")
-
-    lines1, labels1 = ax.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2, loc="best")
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    return out_path
 
 
 def main() -> None:
     total_start = time.perf_counter()
     args = parse_args()
     dataset_name = args.dataset.strip().lower()
-    if args.mean_lambda_base is None:
-        args.mean_lambda_base = get_default_mean_lambda_base(dataset_name)
 
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
     method = args.method.strip().lower()
@@ -1150,36 +748,8 @@ def main() -> None:
                     adapter_image_path=str(adapter_paths["image_path"]),
                     div_static_scores=div_scores_np,
                     dds_static_scores=dds_scores_np,
-                    group_iterations=args.group_iterations,
-                    group_batch_size=args.group_batch_size,
-                    group_min_batch_size=args.group_min_batch_size,
-                    group_eval_interval=args.group_eval_interval,
-                    group_candidate_pool_multiplier=args.group_candidate_pool_multiplier,
-                    score_patience=args.score_patience,
-                    herding_patience=args.herding_patience,
-                    score_decay=args.score_decay,
-                    herding_decay=args.herding_decay,
-                    cls_lambda_base=args.cls_lambda_base,
-                    mean_lambda_base=args.mean_lambda_base,
-                    tolerance_ratio=args.group_tolerance_ratio,
+                    group_candidate_pool_size=args.group_candidate_pool_size,
                 )
-                debug_curve = save_score_curve_plot(
-                    group_stats.get("score_history", []),
-                    group_stats.get("class_correction_history", []),
-                    group_stats.get("mean_correction_history", []),
-                    fitness_history=group_stats.get("fitness_history", []),
-                    eval_steps=group_stats.get("eval_steps"),
-                    selected_eval_step=int(group_stats.get("selected_best_iter", 0)),
-                    final_eval_step=int(group_stats.get("final_selected_iter", 0)),
-                    dataset=dataset_name,
-                    method=method,
-                    weight_group=weight_group,
-                    model_name=args.model_name,
-                    seed=seed,
-                    keep_ratio=keep_ratio,
-                    clip_model=args.clip_model,
-                )
-                print(f"[Debug] score curve saved to: {debug_curve}")
 
             total_time = time.perf_counter() - total_start
             mask_dir = mask_path.parent
@@ -1192,36 +762,8 @@ def main() -> None:
             )
             if group_stats is not None:
                 print(
-                    "group_stats: "
-                    f"sr={group_stats['sr']:.6f} | rate={group_stats['final_rate']:.6f} | "
-                    f"m_c={group_stats['selected_by_class']} | "
-                    f"best_iter={group_stats['best_iter']} | "
-                    f"selected_best_iter={group_stats['selected_best_iter']} | "
-                    f"final_selected_iter={group_stats['final_selected_iter']} | "
-                    f"S(D)={group_stats['S']:.6f} | pen(D)={group_stats['penalty']:.6f} | "
-                    f"mean_pen(D)={group_stats['final_mean_penalty']:.6f} | "
-                    f"lambda_mean={group_stats['lambda_mean']:.6f} | S'(D)={group_stats['S_prime']:.6f} | "
-                    f"metric={group_stats['selection_metric']:.6f} | "
-                    f"metric_th={group_stats['selection_metric_threshold']:.6f} | "
-                    f"tol={group_stats['selection_tolerance_ratio']:.3f}"
-                )
-                print(
-                    "best_ratio: "
-                    f"{group_stats['best_S_prime']:.2f}/{group_stats['best_herding_corr']:.2f}="
-                    f"{group_stats['best_sprime_over_herding']:.2f} | "
-                    f"class_corr={group_stats['best_class_corr']:.2f}"
-                )
-                print(
-                    "final_ratio: "
-                    f"{group_stats['S_prime']:.2f}/{group_stats['final_herding_corr']:.2f}="
-                    f"{group_stats['final_sprime_over_herding']:.2f} | "
-                    f"class_corr={group_stats['final_class_corr']:.2f}"
-                )
-                print(
-                    "random_init_stats: "
-                    f"score={group_stats['init_S_prime']:.2f} | "
-                    f"herding_corr={group_stats['init_herding_corr']:.2f} | "
-                    f"class_corr={group_stats['init_class_corr']:.2f}"
+                    f"group_summary: subset_score={group_stats['subset_comprehensive_score']:.6f} | "
+                    f"distribution_shift={group_stats['distribution_shift']:.6f}"
                 )
             print(f"mask saved to: {mask_path}")
 

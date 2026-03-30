@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from model.adapter import load_trained_adapters  # noqa: E402
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
+from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
@@ -78,6 +79,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="group 模式下类内贪心候选池大小，1 表示纯贪心。",
+    )
+    parser.add_argument(
+        "--debug-prompts",
+        action="store_true",
+        help="打印 tiny-imagenet 前几个最终英文 prompt（调试用）。",
     )
     return parser.parse_args()
 
@@ -576,7 +582,11 @@ def main() -> None:
 
     data_load_start = time.perf_counter()
     dataset_for_names = _build_dataset(dataset_name, transform=None)
-    class_names = dataset_for_names.classes  # type: ignore[attr-defined]
+    class_names = resolve_class_names_for_prompts(
+        dataset_name=dataset_name,
+        data_root=PROJECT_ROOT / "data",
+        class_names=dataset_for_names.classes,  # type: ignore[attr-defined]
+    )
     print(
         f"[Init] {dataset_name} data ready | samples={len(dataset_for_names)} | elapsed={time.perf_counter() - data_load_start:.2f}s"
     )
@@ -591,7 +601,12 @@ def main() -> None:
         device=device,
     )
     sa_metric = SemanticAlignment(
-        class_names=class_names, clip_model=args.clip_model, device=device
+        class_names=class_names,
+        clip_model=args.clip_model,
+        device=device,
+        dataset_name=dataset_name,
+        data_root=str(PROJECT_ROOT / "data"),
+        debug_prompts=args.debug_prompts,
     )
     print(
         f"[Init] Metrics ready (DDS/Div/SA) | elapsed={time.perf_counter() - metric_init_start:.2f}s"

@@ -12,6 +12,7 @@ from tqdm import tqdm
 import calculate_my_mask as cmm
 from model.adapter import load_trained_adapters
 from scoring import DifficultyDirection, Div, SemanticAlignment
+from utils.class_name_utils import resolve_class_names_for_prompts
 from utils.global_config import CONFIG
 from utils.static_score_cache import get_or_compute_static_scores
 from utils.seed import set_seed
@@ -45,6 +46,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="group 模式类内贪心候选池大小，默认 1。",
+    )
+    parser.add_argument(
+        "--debug-prompts",
+        action="store_true",
+        help="打印 tiny-imagenet 前几个最终英文 prompt（调试用）。",
     )
     return parser.parse_args()
 
@@ -335,12 +341,23 @@ def main() -> None:
     all_weights = cmm.ensure_scoring_weights(weights_path, dataset_name)
 
     dataset_for_names = cmm._build_dataset(dataset_name, transform=None)
-    class_names = dataset_for_names.classes  # type: ignore[attr-defined]
+    class_names = resolve_class_names_for_prompts(
+        dataset_name=dataset_name,
+        data_root=str(cmm.PROJECT_ROOT / "data"),
+        class_names=dataset_for_names.classes,  # type: ignore[attr-defined]
+    )
     labels = np.asarray(dataset_for_names.targets)
 
     dds_metric = DifficultyDirection(class_names=class_names, clip_model=args.clip_model, device=device)
     div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
-    sa_metric = SemanticAlignment(class_names=class_names, clip_model=args.clip_model, device=device)
+    sa_metric = SemanticAlignment(
+        class_names=class_names,
+        clip_model=args.clip_model,
+        device=device,
+        dataset_name=dataset_name,
+        data_root=str(cmm.PROJECT_ROOT / "data"),
+        debug_prompts=args.debug_prompts,
+    )
 
     batch_size = 128
     num_workers = 4

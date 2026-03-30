@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET
 from model.adapter import AdapterMLP, CLIPFeatureExtractor, resolve_adapter_dir
+from utils.class_name_utils import build_class_prompts
 from utils.global_config import CONFIG
 from utils.seed import parse_seed_list, set_seed
 
@@ -41,6 +42,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=",".join(str(s) for s in CONFIG.exp_seeds),
         help="随机种子，支持单个整数或逗号分隔列表",
+    )
+    parser.add_argument(
+        "--debug-prompts",
+        action="store_true",
+        help="打印 tiny-imagenet 前几个最终英文 prompt（调试用）。",
     )
     return parser.parse_args()
 
@@ -71,7 +77,13 @@ def train_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> Non
     extractor = CLIPFeatureExtractor(model_name=args.clip_model, device=device)
     dataset = _build_dataset(args.dataset, args.data_root, extractor.preprocess)
     class_names = dataset.classes  # type: ignore[attr-defined]
-    prompts = [args.prompt_template.format(name) for name in class_names]
+    resolved_class_names, prompts = build_class_prompts(
+        dataset_name=args.dataset,
+        data_root=args.data_root,
+        class_names=class_names,
+        prompt_template=args.prompt_template,
+        debug=args.debug_prompts,
+    )
 
     batch_size = args.batch_size or _default_batch_size(args.dataset)
     loader = DataLoader(
@@ -149,7 +161,7 @@ def train_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> Non
         "clip_version": getattr(clip, "__version__", "unknown"),
         "torch_version": torch.__version__,
         "prompt_template": args.prompt_template,
-        "num_classes": len(class_names),
+        "num_classes": len(resolved_class_names),
         "num_samples": len(dataset),
         "hidden_dim": args.hidden_dim,
         "epochs": args.epochs,

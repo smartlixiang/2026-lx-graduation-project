@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from model.adapter import AdapterMLP, CLIPFeatureExtractor
+from utils.class_name_utils import build_class_prompts
 from utils.global_config import CONFIG
 
 
@@ -47,14 +48,39 @@ class SemanticAlignment:
         clip_model: str = "ViT-B/32",
         prompt_template: str = "a photo of a {}",
         device: torch.device | None = None,
+        dataset_name: str | None = None,
+        data_root: str | None = None,
+        debug_prompts: bool = False,
     ) -> None:
-        self.class_names = [str(name) for name in class_names]
+        self.raw_class_names = [str(name) for name in class_names]
+        self.dataset_name = dataset_name
+        self.data_root = data_root
         self.prompt_template = prompt_template
+        self.debug_prompts = debug_prompts
         self.device = torch.device(device) if device is not None else CONFIG.global_device
         self.extractor = CLIPFeatureExtractor(model_name=clip_model, device=self.device)
+        if self.dataset_name is not None and self.data_root is not None:
+            self.class_names, _ = build_class_prompts(
+                dataset_name=self.dataset_name,
+                data_root=self.data_root,
+                class_names=self.raw_class_names,
+                prompt_template=self.prompt_template,
+                debug=self.debug_prompts,
+            )
+        else:
+            self.class_names = self.raw_class_names
 
     def _build_text_features(self, adapter_text: AdapterMLP | None = None) -> torch.Tensor:
-        prompts = [self.prompt_template.format(name) for name in self.class_names]
+        if self.dataset_name is not None and self.data_root is not None:
+            _, prompts = build_class_prompts(
+                dataset_name=self.dataset_name,
+                data_root=self.data_root,
+                class_names=self.raw_class_names,
+                prompt_template=self.prompt_template,
+                debug=self.debug_prompts,
+            )
+        else:
+            prompts = [self.prompt_template.format(name) for name in self.class_names]
         text_features = self.extractor.encode_text(prompts)
         if adapter_text is not None:
             adapter_text.eval()

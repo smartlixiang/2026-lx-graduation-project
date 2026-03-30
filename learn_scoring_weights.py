@@ -16,6 +16,7 @@ from torchvision import datasets
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET
 from model.adapter import AdapterMLP, load_trained_adapters
 from scoring import DifficultyDirection, Div, SemanticAlignment
+from utils.class_name_utils import resolve_class_names_for_prompts
 from utils.global_config import CONFIG
 from utils.proxy_log_utils import load_proxy_log, resolve_proxy_log_path
 from utils.seed import parse_seed_list, set_seed
@@ -93,6 +94,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
+        "--debug-prompts",
+        action="store_true",
+        help="打印 tiny-imagenet 前几个最终英文 prompt（调试用）。",
+    )
+    parser.add_argument(
         "--seed",
         type=str,
         default=",".join(str(s) for s in CONFIG.exp_seeds),
@@ -131,7 +137,11 @@ def build_score_loader(
 
 def load_class_names(dataset_name: str, data_root: str) -> Iterable[str]:
     dataset = _build_dataset(dataset_name, data_root, transform=None)
-    return dataset.classes  # type: ignore[attr-defined]
+    return resolve_class_names_for_prompts(
+        dataset_name=dataset_name,
+        data_root=data_root,
+        class_names=dataset.classes,  # type: ignore[attr-defined]
+    )
 
 
 def load_adapters_for_seed(
@@ -341,7 +351,12 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         k=args.div_k,
     )
     sa_metric = SemanticAlignment(
-        class_names=class_names, clip_model=args.clip_model, device=device
+        class_names=class_names,
+        clip_model=args.clip_model,
+        device=device,
+        dataset_name=args.dataset,
+        data_root=args.data_root,
+        debug_prompts=args.debug_prompts,
     )
 
     image_adapter, text_adapter, adapter_paths = load_adapters_for_seed(

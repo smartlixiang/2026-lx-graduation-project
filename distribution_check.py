@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from dataset.dataset_config import CIFAR10, CIFAR100, TINY_IMAGENET  # noqa: E402
 from model.adapter import load_trained_adapters  # noqa: E402
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
+from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.seed import set_seed  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
@@ -57,6 +58,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=str, default=None, help="设备，例如 cuda 或 cpu")
     parser.add_argument("--bins", type=int, default=80, help="直方图 bins 数量")
+    parser.add_argument(
+        "--debug-prompts",
+        action="store_true",
+        help="打印 tiny-imagenet 前几个最终英文 prompt（调试用）。",
+    )
     return parser.parse_args()
 
 
@@ -151,11 +157,22 @@ def _compute_dataset_scores(
 ) -> None:
     dataset_cls = DATASET_REGISTRY[dataset_name]
     dataset_for_names = dataset_cls(root=args.data_root, train=True, download=True, transform=None)
-    class_names = dataset_for_names.classes  # type: ignore[attr-defined]
+    class_names = resolve_class_names_for_prompts(
+        dataset_name=dataset_name,
+        data_root=args.data_root,
+        class_names=dataset_for_names.classes,  # type: ignore[attr-defined]
+    )
 
     dds_metric = DifficultyDirection(class_names=class_names, clip_model=args.clip_model, device=device)
     div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
-    sa_metric = SemanticAlignment(class_names=class_names, clip_model=args.clip_model, device=device)
+    sa_metric = SemanticAlignment(
+        class_names=class_names,
+        clip_model=args.clip_model,
+        device=device,
+        dataset_name=dataset_name,
+        data_root=args.data_root,
+        debug_prompts=args.debug_prompts,
+    )
 
     image_adapter, text_adapter, adapter_paths = load_trained_adapters(
         dataset_name=dataset_name,

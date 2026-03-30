@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import torch
-from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets
 
@@ -94,8 +94,14 @@ def train_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> Non
         pin_memory=device.type == "cuda",
     )
 
+    # AdapterMLP keeps its old name for compatibility, but is now a YangCLIP-style
+    # dimension-preserving single linear layer.
     image_adapter = AdapterMLP(input_dim=extractor.embed_dim, hidden_dim=args.hidden_dim).to(device)
     text_adapter = AdapterMLP(input_dim=extractor.embed_dim, hidden_dim=args.hidden_dim).to(device)
+    if args.hidden_dim != 256:
+        print(
+            f"[seed={seed}] adapter_type=linear, --hidden-dim={args.hidden_dim} 已忽略（仅保留兼容参数）。"
+        )
 
     optimizer = torch.optim.Adam(
         list(image_adapter.parameters()) + list(text_adapter.parameters()),
@@ -106,8 +112,10 @@ def train_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> Non
         optimizer, step_size=args.step_size, gamma=args.gamma
     )
 
-    base_text_features = extractor.encode_text(prompts).to(device)
-    loss_fn = nn.CrossEntropyLoss()
+    # Pre-encode class text features once with frozen CLIP; Tiny-ImageNet prompt
+    # processing still relies on build_class_prompts()' English WNID mapping.
+    with torch.no_grad():
+        base_text_features = extractor.encode_text(prompts).to(device)
 
     image_adapter.train()
     text_adapter.train()
@@ -124,11 +132,22 @@ def train_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> Non
         running_loss = 0.0
         for images, labels in loader:
             optimizer.zero_grad()
-            image_features = extractor.encode_image(images)
-            image_features = image_adapter(image_features.to(device))
-            text_features = text_adapter(base_text_features)
-            logits = (image_features @ text_features.T) / args.temperature
-            loss = loss_fn(logits, labels.to(device))
+            labels = labels.to(device)
+            with torch.no_grad():
+                image_features = extractor.encode_image(images).to(device)
+
+            # Switch objective from class-prototype classification CE to
+            # batch-wise bidirectional image-text InfoNCE contrastive learning.
+            batch_text_features = base_text_features[labels]
+            img_proj = image_adapter(image_features)
+            txt_proj = text_adapter(batch_text_features)
+            img_proj = F.normalize(img_proj, dim=-1)
+            txt_proj = F.normalize(txt_proj, dim=-1)
+            logits = (img_proj @ txt_proj.T) / args.temperature
+            targets = torch.arange(logits.shape[0], device=device)
+            loss_i = F.cross_entropy(logits, targets)
+            loss_t = F.cross_entropy(logits.T, targets)
+            loss = 0.5 * (loss_i + loss_t)
             loss.backward()
             optimizer.step()
             running_loss += loss.item() * images.size(0)
@@ -161,9 +180,12 @@ def train_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> Non
         "clip_version": getattr(clip, "__version__", "unknown"),
         "torch_version": torch.__version__,
         "prompt_template": args.prompt_template,
+        "adapter_type": "linear",
+        "training_objective": "InfoNCE",
         "num_classes": len(resolved_class_names),
         "num_samples": len(dataset),
         "hidden_dim": args.hidden_dim,
+        "hidden_dim_used": False,
         "epochs": args.epochs,
         "batch_size": batch_size,
         "optimizer": "Adam",

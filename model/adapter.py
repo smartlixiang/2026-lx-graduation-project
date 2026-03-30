@@ -1,4 +1,4 @@
-"""Adapter MLP for CLIP feature alignment and a lightweight CLIP wrapper."""
+"""Adapters for CLIP feature alignment and a lightweight CLIP wrapper."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,8 +14,8 @@ import clip  # type: ignore
 from utils.global_config import CONFIG
 
 
-class AdapterMLP(nn.Module):
-    """Two-layer MLP adapter with output L2 normalization."""
+class LegacyAdapterMLP(nn.Module):
+    """Legacy two-layer MLP adapter (for backward-compatible loading only)."""
 
     def __init__(self, input_dim: int, hidden_dim: int = 256):
         super().__init__()
@@ -25,8 +25,26 @@ class AdapterMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover - simple math
         x = self.activation(self.fc1(x))
-        x = self.fc2(x)
-        return F.normalize(x, dim=-1)
+        return self.fc2(x)
+
+
+class LinearAdapter(nn.Module):
+    """YangCLIP-style dimension-preserving single linear adapter."""
+
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, input_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover - simple math
+        return self.linear(x)
+
+
+class AdapterMLP(LinearAdapter):
+    """Backward-compatible name: default adapter is now a single linear layer."""
+
+    def __init__(self, input_dim: int, hidden_dim: int = 256):
+        # hidden_dim is intentionally ignored to preserve old constructor signature.
+        super().__init__(input_dim=input_dim)
 
 
 @dataclass
@@ -117,23 +135,38 @@ def _load_adapter_from_path(
     input_dim: int,
     hidden_dim: int | None = None,
     map_location: torch.device | str | None = None,
-) -> AdapterMLP:
-    if hidden_dim is None:
-        meta_path = path.parent / "meta.json"
-        if meta_path.exists():
-            try:
-                import json
-
-                with meta_path.open("r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                hidden_dim = int(meta.get("hidden_dim", 256))
-            except (ValueError, TypeError, json.JSONDecodeError):  # pragma: no cover - best effort
-                hidden_dim = 256
-        else:
-            hidden_dim = 256
-
-    adapter = AdapterMLP(input_dim=input_dim, hidden_dim=hidden_dim)
+) -> nn.Module:
     state_dict = torch.load(path, map_location=map_location)
+    meta_path = path.parent / "meta.json"
+    meta: dict[str, object] = {}
+    if meta_path.exists():
+        try:
+            import json
+
+            with meta_path.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                meta = loaded
+        except json.JSONDecodeError:  # pragma: no cover - optional metadata
+            meta = {}
+
+    adapter_type = str(meta.get("adapter_type", "")).lower()
+    if adapter_type == "linear":
+        adapter: nn.Module = LinearAdapter(input_dim=input_dim)
+    elif adapter_type in {"mlp", "two_layer_mlp"}:
+        resolved_hidden = int(meta.get("hidden_dim", hidden_dim or 256))
+        adapter = LegacyAdapterMLP(input_dim=input_dim, hidden_dim=resolved_hidden)
+    else:
+        # Backward compatibility when meta is absent:
+        # - old checkpoints contain fc1/fc2 (2-layer MLP)
+        # - new checkpoints contain linear.* (single linear adapter)
+        if any(k.startswith("fc1.") or k.startswith("fc2.") for k in state_dict.keys()):
+            adapter = LegacyAdapterMLP(input_dim=input_dim, hidden_dim=hidden_dim or 256)
+        elif any(k.startswith("linear.") for k in state_dict.keys()):
+            adapter = LinearAdapter(input_dim=input_dim)
+        else:  # fallback for unforeseen historical naming
+            adapter = AdapterMLP(input_dim=input_dim, hidden_dim=hidden_dim or 256)
+
     adapter.load_state_dict(state_dict)
     return adapter
 
@@ -147,7 +180,7 @@ def load_trained_adapters(
     map_location: torch.device | str | None = None,
     adapter_image_path: str | Path | None = None,
     adapter_text_path: str | Path | None = None,
-) -> tuple[AdapterMLP, AdapterMLP, dict[str, Path]]:
+) -> tuple[nn.Module, nn.Module, dict[str, Path]]:
     """根据数据集名称/随机种子加载图像与文本 Adapter。"""
 
     image_path, text_path = resolve_adapter_paths(
@@ -188,6 +221,8 @@ def load_trained_adapters(
 
 __all__ = [
     "AdapterMLP",
+    "LegacyAdapterMLP",
+    "LinearAdapter",
     "CLIPFeatureExtractor",
     "load_trained_adapters",
     "resolve_adapter_dir",

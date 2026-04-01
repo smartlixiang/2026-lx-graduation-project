@@ -1,0 +1,45 @@
+{
+  "metadata": {
+    "dataset": "tiny-imagenet",
+    "data_root": "data",
+    "model": "resnet50",
+    "keep_ratio": 50,
+    "selection_method": "yangclip",
+    "seed": 42,
+    "epochs": 90,
+    "batch_size": 64,
+    "physical_batch_size": 64,
+    "grad_accum_steps": 4,
+    "effective_batch_size": 256,
+    "reference_effective_batch_size": 256,
+    "optimizer": "SGD",
+    "momentum": 0.9,
+    "weight_decay": 0.0001,
+    "init_lr": 0.1,
+    "use_amp": true,
+    "lr_schedule": {
+      "type": "MultiStepLR",
+      "milestones": [
+        30,
+        60
+      ],
+      "gamma": 0.1
+    },
+    "num_selected": 49808,
+    "num_total": 100000
+  },
+  "accuracy": 0.5256,
+  "accuracy_samples": [
+    0.5243,
+    0.5238,
+    0.5251,
+    0.525,
+    0.5254,
+    0.5261,
+    0.5278,
+    0.5258,
+    0.5271,
+    0.5257
+  ],
+  "time_seconds": 3910.31654381752
+}

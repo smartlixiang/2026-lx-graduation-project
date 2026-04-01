@@ -3,8 +3,8 @@
     "dataset": "cifar10",
     "data_root": "data",
     "model": "resnet50",
-    "cut_ratio": 40,
-    "selection_method": "my_learned",
+    "keep_ratio": 40,
+    "selection_method": "learned_topk",
     "seed": 96,
     "epochs": 200,
     "batch_size": 128,
@@ -24,18 +24,18 @@
     "num_selected": 20000,
     "num_total": 50000
   },
-  "accuracy": 0.9086,
+  "accuracy": 0.9114,
   "accuracy_samples": [
-    0.9085,
-    0.9078,
-    0.9115,
-    0.9068,
-    0.9094,
-    0.9091,
-    0.9092,
-    0.9083,
-    0.9073,
-    0.9085
+    0.9122,
+    0.9114,
+    0.9118,
+    0.9119,
+    0.9105,
+    0.9116,
+    0.9117,
+    0.9113,
+    0.9098,
+    0.9119
   ],
-  "time_seconds": 5624.894423484802
+  "time_seconds": 1737.9433362483978
 }

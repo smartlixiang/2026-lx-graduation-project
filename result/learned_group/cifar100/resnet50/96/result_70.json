@@ -8,10 +8,15 @@
     "seed": 96,
     "epochs": 200,
     "batch_size": 128,
+    "physical_batch_size": 128,
+    "grad_accum_steps": 1,
+    "effective_batch_size": 128,
+    "reference_effective_batch_size": 128,
     "optimizer": "SGD",
     "momentum": 0.9,
     "weight_decay": 0.0005,
     "init_lr": 0.1,
+    "use_amp": false,
     "lr_schedule": {
       "type": "MultiStepLR",
       "milestones": [
@@ -24,18 +29,18 @@
     "num_selected": 35000,
     "num_total": 50000
   },
-  "accuracy": 0.7423,
+  "accuracy": 0.7303,
   "accuracy_samples": [
-    0.7424,
-    0.7409,
-    0.7437,
-    0.743,
-    0.7416,
-    0.7421,
-    0.7426,
-    0.7437,
-    0.7415,
-    0.7419
+    0.7304,
+    0.7308,
+    0.7298,
+    0.7286,
+    0.73,
+    0.73,
+    0.7309,
+    0.7313,
+    0.7314,
+    0.7296
   ],
-  "time_seconds": 2984.42152428627
+  "time_seconds": 2921.845944881439
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 from pathlib import Path
 from statistics import mean
 
@@ -23,7 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=["random", "herding", "E2LN", "GraNd", "Forgetting", "MoSo", "naive_topk", "learned_topk", "naive_group", "learned_group"],
+        default=["random", "herding", "E2LN", "GraNd", "Forgetting", "MoSo",
+                 "yangclip", "naive_topk", "learned_topk", "naive_group", "learned_group"],
         help="Selection methods to compare",
     )
     parser.add_argument(
@@ -72,6 +74,7 @@ def main() -> None:
     }
 
     output_name = args.output or f"{args.dataset}_{args.model}.png"
+    output_path = Path("picture") / Path(output_name).name
 
     plt.figure(figsize=(8, 5))
     missing_methods: list[str] = []
@@ -114,34 +117,6 @@ def main() -> None:
             label=method,
         )
 
-    print("\nMean accuracy by keep ratio (4 decimal places):")
-    header = ["method"] + [str(kr) for kr in keep_ratios]
-    # build table rows as strings
-    table_rows = []
-    for method in valid_methods:
-        kr_to_value = method_to_mean.get(method, {})
-        row = [method] + [f"{kr_to_value.get(kr):.4f}" if kr in kr_to_value else "-" for kr in keep_ratios]
-        table_rows.append(row)
-
-    # compute column widths
-    cols = [header] + table_rows
-    col_count = len(header)
-    widths = [0] * col_count
-    for r in cols:
-        for i, cell in enumerate(r):
-            widths[i] = max(widths[i], len(str(cell)))
-
-    # print header (method left-aligned, others right-aligned)
-    header_line = (
-        f"{header[0].ljust(widths[0])}  "
-        + "  ".join(header[i].rjust(widths[i]) for i in range(1, col_count))
-    )
-    print(header_line)
-
-    for row in table_rows:
-        line = f"{row[0].ljust(widths[0])}  " + "  ".join(row[i].rjust(widths[i]) for i in range(1, col_count))
-        print(line)
-
     ranking_sum = {method: 0.0 for method in valid_methods}
     ranking_count = {method: 0 for method in valid_methods}
     for kr in keep_ratios:
@@ -152,22 +127,60 @@ def main() -> None:
             ranking_sum[method] += rank
             ranking_count[method] += 1
 
-    print("\naverage_rank (lower is better):")
-    # print average ranks in aligned two-column form
-    ar_rows = []
+    avg_rank_map: dict[str, float] = {}
     for method in valid_methods:
         if ranking_count[method] > 0:
-            val = f"{(ranking_sum[method] / ranking_count[method]):.4f}"
+            avg_rank_map[method] = ranking_sum[method] / ranking_count[method]
+
+    print("\nMean accuracy by keep ratio (4 decimal places):")
+    header = ["method"] + [str(kr) for kr in keep_ratios] + ["avg_rank"]
+
+    best_by_kr: dict[int, float] = {}
+    for kr in keep_ratios:
+        vals = [method_to_mean.get(method, {}).get(kr) for method in valid_methods]
+        vals = [v for v in vals if v is not None]
+        if vals:
+            best_by_kr[kr] = max(vals)
+    best_avg_rank = min(avg_rank_map.values()) if avg_rank_map else None
+
+    table_rows = []
+    for method in valid_methods:
+        kr_to_value = method_to_mean.get(method, {})
+        row = [method]
+        for kr in keep_ratios:
+            val = kr_to_value.get(kr)
+            if val is None:
+                row.append("-")
+            else:
+                cell = f"{val:.4f}"
+                if kr in best_by_kr and math.isclose(val, best_by_kr[kr], rel_tol=1e-12, abs_tol=1e-12):
+                    cell = f"**{cell}**"
+                row.append(cell)
+        if method in avg_rank_map:
+            avg_rank_cell = f"{avg_rank_map[method]:.4f}"
+            if best_avg_rank is not None and math.isclose(avg_rank_map[method], best_avg_rank, rel_tol=1e-12, abs_tol=1e-12):
+                avg_rank_cell = f"**{avg_rank_cell}**"
+            row.append(avg_rank_cell)
         else:
-            val = "-"
-        ar_rows.append((method, val))
-    if ar_rows:
-        name_w = max(len(m) for m, _ in ar_rows)
-        val_w = max(len(v) for _, v in ar_rows)
-        for m, v in ar_rows:
-            print(f"{m.ljust(name_w)}  {v.rjust(val_w)}")
-    else:
-        print("(no valid methods)")
+            row.append("-")
+        table_rows.append(row)
+
+    cols = [header] + table_rows
+    col_count = len(header)
+    widths = [0] * col_count
+    for r in cols:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+
+    header_line = (
+        f"{header[0].ljust(widths[0])}  "
+        + "  ".join(header[i].rjust(widths[i]) for i in range(1, col_count))
+    )
+    print(header_line)
+
+    for row in table_rows:
+        line = f"{row[0].ljust(widths[0])}  " + "  ".join(row[i].rjust(widths[i]) for i in range(1, col_count))
+        print(line)
 
     plt.xlabel("Keep Ratio (kr)")
     plt.ylabel("Accuracy (mean of last 10 epochs)")
@@ -176,7 +189,6 @@ def main() -> None:
     plt.xticks(keep_ratios)
     if valid_methods:
         plt.legend()
-    output_path = Path(output_name)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(output_path, dpi=160)

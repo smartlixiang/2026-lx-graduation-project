@@ -60,5 +60,36 @@
       "ridge_lambda": 0.01,
       "proxy_log": "weights\\proxy_logs\\cifar100\\resnet18\\96\\100"
     }
+  },
+  "tiny-imagenet": {
+    "22": {
+      "sa": 0.22132137730208545,
+      "div": 0.40272782465449364,
+      "dds": 0.3759507980434209,
+      "bias": -0.014353466193466967,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/22/90"
+    },
+    "42": {
+      "sa": 0.21866537867240646,
+      "div": 0.40326444573687004,
+      "dds": 0.3780701755907235,
+      "bias": -0.009980476959981858,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/42/90"
+    },
+    "96": {
+      "sa": 0.21970611961953151,
+      "div": 0.4028094657224808,
+      "dds": 0.37748441465798765,
+      "bias": -0.01274506726246794,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/96/90"
+    },
+    "naive": {
+      "dds": 0.3333333333333333,
+      "div": 0.3333333333333333,
+      "sa": 0.3333333333333333
+    }
   }
 }

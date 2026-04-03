@@ -1,0 +1,45 @@
+{
+  "metadata": {
+    "dataset": "tiny-imagenet",
+    "data_root": "data",
+    "model": "densenet121",
+    "keep_ratio": 20,
+    "selection_method": "yangclip",
+    "seed": 42,
+    "epochs": 90,
+    "batch_size": 64,
+    "physical_batch_size": 64,
+    "grad_accum_steps": 4,
+    "effective_batch_size": 256,
+    "reference_effective_batch_size": 256,
+    "optimizer": "SGD",
+    "momentum": 0.9,
+    "weight_decay": 0.0001,
+    "init_lr": 0.1,
+    "use_amp": true,
+    "lr_schedule": {
+      "type": "MultiStepLR",
+      "milestones": [
+        30,
+        60
+      ],
+      "gamma": 0.1
+    },
+    "num_selected": 20112,
+    "num_total": 100000
+  },
+  "accuracy": 0.3797,
+  "accuracy_samples": [
+    0.3801,
+    0.38,
+    0.3794,
+    0.3801,
+    0.3814,
+    0.3809,
+    0.3785,
+    0.3801,
+    0.3791,
+    0.3773
+  ],
+  "time_seconds": 1992.3472764492035
+}

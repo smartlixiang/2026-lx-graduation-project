@@ -1,0 +1,46 @@
+{
+  "metadata": {
+    "dataset": "cifar100",
+    "data_root": "data",
+    "model": "densenet121",
+    "keep_ratio": 90,
+    "selection_method": "yangclip",
+    "seed": 22,
+    "epochs": 200,
+    "batch_size": 128,
+    "physical_batch_size": 128,
+    "grad_accum_steps": 1,
+    "effective_batch_size": 128,
+    "reference_effective_batch_size": 128,
+    "optimizer": "SGD",
+    "momentum": 0.9,
+    "weight_decay": 0.0005,
+    "init_lr": 0.1,
+    "use_amp": false,
+    "lr_schedule": {
+      "type": "MultiStepLR",
+      "milestones": [
+        60,
+        120,
+        160
+      ],
+      "gamma": 0.2
+    },
+    "num_selected": 44981,
+    "num_total": 50000
+  },
+  "accuracy": 0.7859,
+  "accuracy_samples": [
+    0.7857,
+    0.7889,
+    0.7846,
+    0.7868,
+    0.7849,
+    0.788,
+    0.7848,
+    0.7849,
+    0.7863,
+    0.7844
+  ],
+  "time_seconds": 4324.933169841766
+}

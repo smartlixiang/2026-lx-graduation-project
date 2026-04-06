@@ -24,18 +24,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        # default=[
-        #     "random", "herding", "E2LN", "GraNd", "Forgetting", "MoSo",
-        #     "yangclip", "learned_group"
-        # ],
         default=[
-            "random", "naive_topk", "learned_topk", "naive_group", "learned_group"
+            "random", "herding", "E2LN", "GraNd", "Forgetting", "MoSo",
+            "yangclip", "learned_group"
         ],
+        # default=[
+        #     "random", "naive_topk", "learned_topk", "naive_group", "learned_group"
+        # ],
         help="Selection methods to compare",
     )
     parser.add_argument(
         "--kr",
-        default="20,30,40,60,80",
+        default="20,30,40,50,60,70,80,90,100",
         help="Keep ratio list, e.g. '20,30,40,50,60,70,80,90,100'",
     )
     parser.add_argument("--output", default=None, help="Output image path")

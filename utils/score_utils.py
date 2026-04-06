@@ -91,7 +91,7 @@ def quantile_minmax_by_class(
     q_low: float = 0.01,
     q_high: float = 0.99,
     eps: float = 1e-8,
-    fallback_value: float = 0.0,
+    fallback_value: float = 0.5,
 ) -> np.ndarray:
     """Apply class-wise quantile min-max normalization to [0,1]."""
     if values.ndim != 1:
@@ -114,11 +114,12 @@ def quantile_minmax_by_class(
         class_vals = values[mask]
         lo = float(np.quantile(class_vals, q_low))
         hi = float(np.quantile(class_vals, q_high))
-        if hi <= lo:
+        if np.isclose(hi, lo, atol=eps, rtol=0.0) or hi < lo:
             output[mask] = float(fallback_value)
             continue
         clipped = np.clip(class_vals, lo, hi)
-        output[mask] = ((clipped - lo) / (hi - lo + eps)).astype(np.float32)
+        class_norm = ((clipped - lo) / (hi - lo + eps)).astype(np.float32)
+        output[mask] = np.nan_to_num(class_norm, nan=float(fallback_value), posinf=1.0, neginf=0.0)
     return output
 
 
@@ -127,7 +128,7 @@ def quantile_minmax(
     q_low: float = 0.01,
     q_high: float = 0.99,
     eps: float = 1e-8,
-    fallback_value: float = 0.0,
+    fallback_value: float = 0.5,
 ) -> np.ndarray:
     """Apply global quantile min-max normalization to [0,1]."""
     if values.ndim != 1:
@@ -139,7 +140,9 @@ def quantile_minmax(
 
     lo = float(np.quantile(values, q_low))
     hi = float(np.quantile(values, q_high))
-    if hi <= lo:
+    if np.isclose(hi, lo, atol=eps, rtol=0.0) or hi < lo:
         return np.full_like(values, float(fallback_value), dtype=np.float32)
     clipped = np.clip(values, lo, hi)
-    return ((clipped - lo) / (hi - lo + eps)).astype(np.float32)
+    normalized = ((clipped - lo) / (hi - lo + eps)).astype(np.float32)
+    normalized = np.nan_to_num(normalized, nan=float(fallback_value), posinf=1.0, neginf=0.0)
+    return normalized

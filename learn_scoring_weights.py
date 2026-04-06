@@ -18,18 +18,17 @@ from model.adapter import AdapterMLP, load_trained_adapters
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.class_name_utils import resolve_class_names_for_prompts
 from utils.global_config import CONFIG
-from utils.proxy_log_utils import load_proxy_log, resolve_proxy_log_path
+from utils.proxy_log_utils import resolve_proxy_log_path
 from utils.seed import parse_seed_list, set_seed
 from utils.score_utils import quantile_minmax
 from utils.static_score_cache import get_or_compute_static_scores
 from weights import (
-    AbsorptionEfficiencyScore,
-    CoverageGainScore,
-    InformativenessScore,
-    RiskScore,
-    PersistentDifficultyScore,
-    TransferGainScore,
+    DynamicClassComplementarityScore,
+    EarlyLearnabilityScore,
+    OOFPatternGapScore,
+    OOFSupportScore,
 )
+from weights.dynamic_v2_utils import default_dynamic_v2_cache_path, load_cv_fold_logs
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -72,13 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--div-k", type=float, default=0.05)
     parser.add_argument("--dds-k", type=int, default=5)
+    # Deprecated dynamic-v1 args are intentionally kept for CLI compatibility.
     parser.add_argument("--coverage-tau-g", type=float, default=0.15)
     parser.add_argument("--coverage-s-g", type=float, default=0.07)
     parser.add_argument(
         "--coverage-k-pct",
         type=float,
         default=0.05,
-        help="Class-wise k ratio for CoverageGainScore (fraction of class size).",
+        help="Deprecated: kept for compatibility, unused in dynamic v2.",
     )
     parser.add_argument("--coverage-q-low", type=float, default=0.002)
     parser.add_argument("--coverage-q-high", type=float, default=0.998)
@@ -239,19 +239,8 @@ def build_output_path(base_path: str) -> Path:
     return Path(base_path)
 
 
-def _align_scores(scores: np.ndarray, indices: np.ndarray, num_samples: int) -> np.ndarray:
-    if scores.shape[0] != indices.shape[0]:
-        raise ValueError("scores and indices length mismatch.")
-    full = np.full((num_samples,), np.nan, dtype=np.float32)
-    if np.min(indices) < 0 or np.max(indices) >= num_samples:
-        raise ValueError("indices out of range when aligning scores.")
-    full[indices.astype(np.int64)] = scores.astype(np.float32)
-    if np.any(~np.isfinite(full)):
-        raise ValueError("aligned scores contain NaN/inf values.")
-    return full
-
-
 def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
+    del multi_seed
     set_seed(seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
     proxy_log = resolve_proxy_log_path(
@@ -260,84 +249,61 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         seed,
         max_epoch=args.proxy_epochs,
     )
-    proxy_data = load_proxy_log(proxy_log, args.dataset, args.data_root)
 
-    absorption_result = AbsorptionEfficiencyScore(proxy_log).compute(proxy_logs=proxy_data)
-    informativeness_result = InformativenessScore(proxy_log).compute(proxy_logs=proxy_data)
-    coverage_result = CoverageGainScore(
-        proxy_log,
-        tau_g=args.coverage_tau_g,
-        s_g=args.coverage_s_g,
-        k_pct=args.coverage_k_pct,
-        q_low=args.coverage_q_low,
-        q_high=args.coverage_q_high,
-    ).compute(proxy_logs=proxy_data)
-    risk_result = RiskScore(proxy_log).compute(proxy_logs=proxy_data)
+    if not proxy_log.is_dir():
+        raise ValueError("Dynamic v2 requires proxy log directory containing fold_*.npz files.")
 
-    indices = absorption_result.indices
-    if (
-        not np.array_equal(indices, informativeness_result.indices)
-        or not np.array_equal(indices, coverage_result.indices)
-        or not np.array_equal(indices, risk_result.indices)
-    ):
-        raise ValueError("动态指标的 indices 不一致，无法对齐样本。")
-    if absorption_result.labels is None:
-        raise ValueError("代理训练日志缺少 labels，无法对齐动态分数。")
+    folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
+    num_samples = labels_all.shape[0]
 
-    num_samples = absorption_result.labels.shape[0]
-    if np.array_equal(indices, np.arange(num_samples)):
-        a_scores = absorption_result.scores.astype(np.float32)
-        b_scores = informativeness_result.scores.astype(np.float32)
-        c_scores = coverage_result.scores.astype(np.float32)
-        r_scores = risk_result.scores.astype(np.float32)
-    else:
-        a_scores = _align_scores(absorption_result.scores, absorption_result.indices, num_samples)
-        b_scores = _align_scores(informativeness_result.scores, informativeness_result.indices, num_samples)
-        c_scores = _align_scores(coverage_result.scores, coverage_result.indices, num_samples)
-        r_scores = _align_scores(risk_result.scores, risk_result.indices, num_samples)
-
-    cv_log_dir = Path(proxy_log)
-    if not cv_log_dir.exists():
-        raise FileNotFoundError(f"cv_log_dir not found: {cv_log_dir}")
-    if cv_log_dir.is_file():
-        raise ValueError("cv_log_dir must be a directory containing fold_*.npz files.")
-
-    dataset = _build_dataset(args.dataset, args.data_root, transform=None)
-    t_result = TransferGainScore().compute(cv_log_dir, dataset)
-    t_scores_raw = t_result["score"].astype(np.float32)
-    t_scores = quantile_minmax(t_scores_raw, q_low=0.002, q_high=0.998)
-    v_result = PersistentDifficultyScore().compute(cv_log_dir, dataset)
-    v_scores = v_result["score"].astype(np.float32)
+    a_result = EarlyLearnabilityScore().compute(folds=folds, labels_all=labels_all)
+    c_result = DynamicClassComplementarityScore().compute(folds=folds, labels_all=labels_all)
+    g_result = OOFSupportScore().compute(folds=folds, labels_all=labels_all)
+    d_result = OOFPatternGapScore().compute(folds=folds, labels_all=labels_all)
 
     for name, arr in {
-        "A": a_scores,
-        "B": b_scores,
-        "C": c_scores,
-        "R": r_scores,
-        "T": t_scores,
-        "V": v_scores,
+        "A_norm2": a_result.norm2,
+        "C_norm2": c_result.norm2,
+        "G_norm2": g_result.norm2,
+        "D_norm2": d_result.norm2,
     }.items():
         if arr.shape != (num_samples,):
-            raise ValueError(f"{name} score shape mismatch: {arr.shape}, expected ({num_samples},).")
+            raise ValueError(f"{name} shape mismatch: {arr.shape}")
         if not np.all(np.isfinite(arr)):
-            raise ValueError(f"{name} scores contain NaN/inf values.")
+            raise ValueError(f"{name} contains NaN/inf values.")
 
-    u_raw_base = a_scores + b_scores + c_scores - r_scores
-    u_raw = u_raw_base + t_scores + v_scores
+    u_raw = a_result.norm2 + c_result.norm2 + g_result.norm2 + d_result.norm2
     if not np.all(np.isfinite(u_raw)):
         raise ValueError("u_raw contains NaN/inf values.")
-    u_scores = quantile_minmax(u_raw.astype(np.float32), q_low=0.002, q_high=0.998)
+    u_scores = quantile_minmax(u_raw.astype(np.float32), q_low=0.002, q_high=0.998, fallback_value=0.5)
     if not np.all(np.isfinite(u_scores)):
         raise ValueError("u_norm contains NaN/inf values.")
 
-    base_mean = float(np.mean(u_raw_base))
-    base_var = float(np.var(u_raw_base))
-    tv_mean = float(np.mean(u_raw))
-    tv_var = float(np.var(u_raw))
-    print(
-        "Sanity check u_raw: "
-        f"base_mean={base_mean:.6f}, base_var={base_var:.6f}, "
-        f"tv_mean={tv_mean:.6f}, tv_var={tv_var:.6f}"
+    dynamic_cache_path = default_dynamic_v2_cache_path(args.dataset, seed)
+    dynamic_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        dynamic_cache_path,
+        version=np.array("dynamic_v2", dtype=object),
+        component_names=np.array(["A", "C", "G", "D"], dtype=object),
+        dataset=np.array(args.dataset, dtype=object),
+        seed=np.array(seed, dtype=np.int64),
+        proxy_log_path=np.array(str(proxy_log), dtype=object),
+        indices=np.arange(num_samples, dtype=np.int64),
+        labels=labels_all.astype(np.int64),
+        A_norm1_foldwise=a_result.foldwise_norm1.astype(np.float32),
+        C_norm1_foldwise=c_result.foldwise_norm1.astype(np.float32),
+        G_norm1_foldwise=g_result.foldwise_norm1.astype(np.float32),
+        D_norm1_foldwise=d_result.foldwise_norm1.astype(np.float32),
+        A_agg=a_result.agg.astype(np.float32),
+        A_norm2=a_result.norm2.astype(np.float32),
+        C_agg=c_result.agg.astype(np.float32),
+        C_norm2=c_result.norm2.astype(np.float32),
+        G_agg=g_result.agg.astype(np.float32),
+        G_norm2=g_result.norm2.astype(np.float32),
+        D_agg=d_result.agg.astype(np.float32),
+        D_norm2=d_result.norm2.astype(np.float32),
+        u_raw=u_raw.astype(np.float32),
+        u_norm=u_scores.astype(np.float32),
     )
 
     class_names = load_class_names(args.dataset, args.data_root)
@@ -389,7 +355,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     )
 
     dataset_for_labels = _build_dataset(args.dataset, args.data_root, transform=None)
-    num_samples = len(dataset_for_labels)
+    num_samples_static = len(dataset_for_labels)
 
     def _compute_scores() -> dict[str, np.ndarray]:
         dds_scores_local = dds_metric.score_dataset(
@@ -424,13 +390,14 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
         dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
         prompt_template=sa_metric.prompt_template,
-        num_samples=num_samples,
+        num_samples=num_samples_static,
         compute_fn=_compute_scores,
     )
 
-    if absorption_result.labels is not None:
-        if not np.array_equal(absorption_result.labels, static_scores["labels"]):
-            raise ValueError("代理训练日志的标签与评分数据集标签不一致。")
+    if num_samples != num_samples_static:
+        raise ValueError("Dynamic labels and static dataset sample count mismatch.")
+    if not np.array_equal(labels_all, static_scores["labels"]):
+        raise ValueError("代理训练日志的标签与评分数据集标签不一致。")
 
     static_features = np.stack(
         [
@@ -470,6 +437,9 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         "bias": float(bias),
         "ridge_lambda": float(args.ridge_lambda),
         "proxy_log": str(proxy_log),
+        "dynamic_version": "v2",
+        "dynamic_components": ["A", "C", "G", "D"],
+        "dynamic_cache_path": str(dynamic_cache_path),
     }
     data[args.dataset] = dataset_entry
 
@@ -478,6 +448,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
     print("Learned weights saved to", output_path)
     print("Learned weights:", dataset_entry[seed_key])
+    print("Dynamic v2 cache saved to", dynamic_cache_path)
 
 
 if __name__ == "__main__":

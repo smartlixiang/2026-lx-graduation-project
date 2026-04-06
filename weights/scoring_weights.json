@@ -6,28 +6,52 @@
       "sa": 0.3333333333333333
     },
     "22": {
-      "sa": 0.25966968813868485,
-      "div": 0.3814929026842234,
-      "dds": 0.35883740917709167,
-      "bias": 0.08933287044384261,
+      "sa": 0.44129851456841734,
+      "div": 0.2525033123254979,
+      "dds": 0.3061981731060849,
+      "bias": 0.18844525628235834,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar10\\resnet18\\22\\100"
+      "proxy_log": "weights\\proxy_logs\\cifar10\\resnet18\\22\\100",
+      "dynamic_version": "v2",
+      "dynamic_components": [
+        "A",
+        "C",
+        "G",
+        "D"
+      ],
+      "dynamic_cache_path": "weights\\dynamic_cache\\cifar10\\22\\dynamic_components_v2.npz"
     },
     "42": {
-      "sa": 0.26504678788807295,
-      "div": 0.3754471815723807,
-      "dds": 0.3595060305395464,
-      "bias": 0.07574615051284005,
+      "sa": 0.4435335972153464,
+      "div": 0.2511675242688885,
+      "dds": 0.30529887851576504,
+      "bias": 0.1900938184693321,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar10\\resnet18\\42\\100"
+      "proxy_log": "weights\\proxy_logs\\cifar10\\resnet18\\42\\100",
+      "dynamic_version": "v2",
+      "dynamic_components": [
+        "A",
+        "C",
+        "G",
+        "D"
+      ],
+      "dynamic_cache_path": "weights\\dynamic_cache\\cifar10\\42\\dynamic_components_v2.npz"
     },
     "96": {
-      "sa": 0.26114019779305914,
-      "div": 0.3800519036719936,
-      "dds": 0.3588078985349474,
-      "bias": 0.07232118861374849,
+      "sa": 0.4376275627551627,
+      "div": 0.25120444143179976,
+      "dds": 0.3111679958130376,
+      "bias": 0.19007865930176168,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar10\\resnet18\\96\\100"
+      "proxy_log": "weights\\proxy_logs\\cifar10\\resnet18\\96\\100",
+      "dynamic_version": "v2",
+      "dynamic_components": [
+        "A",
+        "C",
+        "G",
+        "D"
+      ],
+      "dynamic_cache_path": "weights\\dynamic_cache\\cifar10\\96\\dynamic_components_v2.npz"
     }
   },
   "cifar100": {
@@ -37,28 +61,52 @@
       "sa": 0.3333333333333333
     },
     "22": {
-      "sa": 0.2597541352512193,
-      "div": 0.38636395954613045,
-      "dds": 0.35388190520265034,
-      "bias": 0.07181236036302309,
+      "sa": 0.5277170291231564,
+      "div": 0.19769590386768043,
+      "dds": 0.2745870670091631,
+      "bias": 0.016750875269707567,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar100\\resnet18\\22\\100"
+      "proxy_log": "weights\\proxy_logs\\cifar100\\resnet18\\22\\100",
+      "dynamic_version": "v2",
+      "dynamic_components": [
+        "A",
+        "C",
+        "G",
+        "D"
+      ],
+      "dynamic_cache_path": "weights\\dynamic_cache\\cifar100\\22\\dynamic_components_v2.npz"
     },
     "42": {
-      "sa": 0.2598178177832074,
-      "div": 0.38593686889221457,
-      "dds": 0.3542453133245781,
-      "bias": 0.06954895084910222,
+      "sa": 0.5251260915722208,
+      "div": 0.19910879868525028,
+      "dds": 0.27576510974252894,
+      "bias": 0.021816537871338876,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar100\\resnet18\\42\\100"
+      "proxy_log": "weights\\proxy_logs\\cifar100\\resnet18\\42\\100",
+      "dynamic_version": "v2",
+      "dynamic_components": [
+        "A",
+        "C",
+        "G",
+        "D"
+      ],
+      "dynamic_cache_path": "weights\\dynamic_cache\\cifar100\\42\\dynamic_components_v2.npz"
     },
     "96": {
-      "sa": 0.25859299979351175,
-      "div": 0.38826388099108866,
-      "dds": 0.35314311921539954,
-      "bias": 0.06417918009709683,
+      "sa": 0.5273880137897904,
+      "div": 0.19746515011581334,
+      "dds": 0.27514683609439633,
+      "bias": 0.023888954840789716,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar100\\resnet18\\96\\100"
+      "proxy_log": "weights\\proxy_logs\\cifar100\\resnet18\\96\\100",
+      "dynamic_version": "v2",
+      "dynamic_components": [
+        "A",
+        "C",
+        "G",
+        "D"
+      ],
+      "dynamic_cache_path": "weights\\dynamic_cache\\cifar100\\96\\dynamic_components_v2.npz"
     }
   },
   "tiny-imagenet": {

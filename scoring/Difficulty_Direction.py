@@ -1,4 +1,4 @@
-"""类内难度方向得分（Difficulty Direction Score, DDS）评分实现。"""
+"""类内 DDS 评分实现（保留旧命名，内部已切换为主导方向定义）。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -39,7 +39,15 @@ class DDSResult:
 
 
 class DifficultyDirection:
-    """计算图像样本的类内难度方向得分 (DDS)。"""
+    """计算图像样本的类内 DDS 分数。
+
+    Notes:
+        保留 DifficultyDirection / DDS 的历史命名用于兼容；
+        实际实现已更新为“类内主导方向分数”：
+        - 按类别做 PCA；
+        - 选择累计特征值占比达到阈值（默认 0.5）的主方向；
+        - 以 ``sum_j sqrt(lambda_j) * |projection_j|`` 作为原始分数。
+    """
 
     def __init__(
         self,
@@ -50,21 +58,26 @@ class DifficultyDirection:
         eigval_lower_bound: float = 0.02,
         eigval_upper_bound: float = 0.2,
         pca_cov_reg: float = 1e-6,
+        important_eigval_ratio: float = 0.5,
     ) -> None:
         if k < 1:
-            raise ValueError("k 必须为正整数，用于控制最少选择方向数。")
+            raise ValueError("k 必须为正整数（兼容保留参数，当前主计算不再依赖）。")
         if not (0 <= eigval_lower_bound < eigval_upper_bound <= 1):
-            raise ValueError("需满足 0 <= eigval_lower_bound < eigval_upper_bound <= 1。")
+            raise ValueError("需满足 0 <= eigval_lower_bound < eigval_upper_bound <= 1（兼容保留参数）。")
         if pca_cov_reg < 0:
             raise ValueError("pca_cov_reg 需为非负数。")
+        if not (0 < important_eigval_ratio <= 1):
+            raise ValueError("important_eigval_ratio 需满足 0 < ratio <= 1。")
 
         self.class_names = [str(name) for name in class_names]
         self.k = int(k)
         self.device = torch.device(device) if device is not None else CONFIG.global_device
         self.extractor = CLIPFeatureExtractor(model_name=clip_model, device=self.device)
+        # Deprecated compatibility fields: kept for cache key / CLI backward compatibility.
         self.eigval_lower_bound = float(eigval_lower_bound)
         self.eigval_upper_bound = float(eigval_upper_bound)
         self.pca_cov_reg = float(pca_cov_reg)
+        self.important_eigval_ratio = float(important_eigval_ratio)
 
     def _encode_images(
         self, dataloader: DataLoader, adapter: AdapterMLP | None = None
@@ -89,56 +102,39 @@ class DifficultyDirection:
 
     def _select_difficulty_dirs(
         self, eigenvalues: torch.Tensor, eigenvectors: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select dominant PCA directions under cumulative eigval ratio.
+
+        Function name is intentionally preserved for compatibility, but the logic now
+        follows IDS-style dominant-direction selection.
+        """
         feat_dim = eigenvalues.shape[0]
         if feat_dim == 0:
-            return eigenvectors[:, :0]
+            return eigenvectors[:, :0], eigenvalues[:0]
 
-        eigvals = torch.clamp(eigenvalues, min=0.0)
+        # eigh gives ascending eigenvalues -> convert to descending dominant order.
+        eigvals = torch.clamp(eigenvalues, min=0.0).flip(0)
+        eigvecs = eigenvectors.flip(1)
         total = eigvals.sum()
         if total.item() <= 0:
-            return eigenvectors[:, : min(self.k, feat_dim)]
+            # Degenerate case: still return at least one valid direction.
+            return eigvecs[:, :1], eigvals[:1]
 
-        cumulative = torch.cumsum(eigvals, dim=0) / total
+        cumulative_ratio = torch.cumsum(eigvals, dim=0) / total
+        m = int(torch.searchsorted(cumulative_ratio, self.important_eigval_ratio).item()) + 1
+        m = max(1, min(m, feat_dim))
+        return eigvecs[:, :m], eigvals[:m]
 
-        if self.eigval_lower_bound > 0:
-            below_lower = torch.nonzero(cumulative < self.eigval_lower_bound, as_tuple=False).flatten()
-            if below_lower.numel() == 0:
-                start = 1 if feat_dim > 1 else 0
-            else:
-                start = int(below_lower[-1].item()) + 1
-        else:
-            start = 0
-
-        start = min(start, feat_dim - 1)
-        upper_budget = self.eigval_upper_bound * total
-
-        chosen_indices: list[int] = []
-        chosen_sum = torch.zeros((), dtype=eigvals.dtype, device=eigvals.device)
-
-        for idx in range(start, feat_dim):
-            next_sum = chosen_sum + eigvals[idx]
-            if next_sum <= upper_budget:
-                chosen_indices.append(idx)
-                chosen_sum = next_sum
-            else:
-                break
-
-        idx = start + len(chosen_indices)
-        while len(chosen_indices) < self.k and idx < feat_dim:
-            next_sum = chosen_sum + eigvals[idx]
-            if next_sum <= upper_budget:
-                chosen_indices.append(idx)
-                chosen_sum = next_sum
-                idx += 1
-                continue
-            break
-
-        if not chosen_indices:
-            return eigenvectors[:, :0]
-
-        index_tensor = torch.tensor(chosen_indices, device=eigenvectors.device)
-        return eigenvectors.index_select(dim=1, index=index_tensor)
+    @staticmethod
+    def _compute_weighted_abs_projection(
+        centered_features: torch.Tensor,
+        selected_dirs: torch.Tensor,
+        selected_eigvals: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute raw DDS as sum_j sqrt(lambda_j) * |projection_j|."""
+        projections = centered_features @ selected_dirs
+        eigval_weights = torch.sqrt(torch.clamp(selected_eigvals, min=0.0))
+        return (projections.abs() * eigval_weights.unsqueeze(0)).sum(dim=1)
 
     def _dds_from_pca(self, class_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_samples, feat_dim = class_features.shape
@@ -155,12 +151,11 @@ class DifficultyDirection:
         )
         eigenvalues, eigenvectors = torch.linalg.eigh(cov)
 
-        selected_dirs = self._select_difficulty_dirs(eigenvalues, eigenvectors)
+        selected_dirs, selected_eigvals = self._select_difficulty_dirs(eigenvalues, eigenvectors)
         if selected_dirs.shape[1] == 0:
             return torch.zeros(num_samples, device=class_features.device), mean
 
-        projections = centered @ selected_dirs
-        scores = projections.abs().sum(dim=1)
+        scores = self._compute_weighted_abs_projection(centered, selected_dirs, selected_eigvals)
         return scores, mean
 
     def _dds_from_reference_pca(
@@ -174,7 +169,11 @@ class DifficultyDirection:
         if num_samples == 0:
             return torch.zeros(0, device=class_features.device)
         if ref_num <= 1:
-            return torch.zeros(num_samples, device=class_features.device)
+            # Fallback to full-class PCA for robustness in dynamic/group mode.
+            if num_samples <= 1:
+                return torch.zeros(num_samples, device=class_features.device)
+            reference_features = class_features
+            ref_num = reference_features.shape[0]
 
         ref_mean = reference_features.mean(dim=0)
         ref_centered = reference_features - ref_mean
@@ -183,13 +182,54 @@ class DifficultyDirection:
             feat_dim, device=class_features.device, dtype=class_features.dtype
         )
         eigenvalues, eigenvectors = torch.linalg.eigh(cov)
-        selected_dirs = self._select_difficulty_dirs(eigenvalues, eigenvectors)
+        selected_dirs, selected_eigvals = self._select_difficulty_dirs(eigenvalues, eigenvectors)
         if selected_dirs.shape[1] == 0:
             return torch.zeros(num_samples, device=class_features.device)
 
         centered = class_features - ref_mean
-        projections = centered @ selected_dirs
-        return projections.abs().sum(dim=1)
+        return self._compute_weighted_abs_projection(centered, selected_dirs, selected_eigvals)
+
+    def analyze_principal_directions(self, class_features: torch.Tensor) -> dict[str, object]:
+        """Analyze dominant principal directions for one class feature matrix.
+
+        Legacy DDS naming is kept for compatibility, while analysis follows the
+        current dominant-direction IDS-style implementation.
+        """
+        if class_features.ndim != 2:
+            raise ValueError("class_features must be a 2D tensor [num_samples, feat_dim].")
+        num_samples, feat_dim = class_features.shape
+        if num_samples <= 1:
+            raise ValueError("Class must contain at least 2 samples for PCA analysis.")
+
+        mean = class_features.mean(dim=0)
+        centered = class_features - mean
+        cov = centered.T @ centered / (num_samples - 1)
+        cov = cov + self.pca_cov_reg * torch.eye(
+            feat_dim, device=class_features.device, dtype=class_features.dtype
+        )
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+        eigvals_desc = torch.clamp(eigenvalues, min=0.0).flip(0)
+        eigvecs_desc = eigenvectors.flip(1)
+        selected_dirs, selected_eigvals = self._select_difficulty_dirs(eigenvalues, eigenvectors)
+
+        total = eigvals_desc.sum()
+        if total.item() > 0:
+            selected_ratio = float((selected_eigvals.sum() / total).item())
+        else:
+            selected_ratio = 0.0
+
+        return {
+            "mean": mean,
+            "eigenvalues_desc": eigvals_desc,
+            "eigenvectors_desc": eigvecs_desc,
+            "selected_dirs": selected_dirs,
+            "selected_eigenvalues": selected_eigvals,
+            "total_directions": int(feat_dim),
+            "selected_directions": int(selected_dirs.shape[1]),
+            "important_eigval_ratio": float(self.important_eigval_ratio),
+            "selected_ratio": selected_ratio,
+            "total_eigval_sum": float(total.item()),
+        }
 
     @staticmethod
     def _quantile_normalize(

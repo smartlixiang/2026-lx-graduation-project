@@ -70,7 +70,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--div-k", type=float, default=0.05)
-    parser.add_argument("--dds-k", type=int, default=5)
+    parser.add_argument(
+        "--dds-k",
+        type=int,
+        default=5,
+        help="Deprecated compatibility arg. DDS legacy naming is kept, but direction count is now ratio-driven.",
+    )
+    parser.add_argument(
+        "--dds-important-eigval-ratio",
+        type=float,
+        default=0.5,
+        help=(
+            "Cumulative explained-variance ratio threshold for the third structural component "
+            "(legacy DDS name retained for compatibility). Default: 0.5."
+        ),
+    )
     # Deprecated dynamic-v1 args are intentionally kept for CLI compatibility.
     parser.add_argument("--coverage-tau-g", type=float, default=0.15)
     parser.add_argument("--coverage-s-g", type=float, default=0.07)
@@ -308,7 +322,11 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
     class_names = load_class_names(args.dataset, args.data_root)
     dds_metric = DifficultyDirection(
-        class_names=class_names, clip_model=args.clip_model, device=device, k=args.dds_k
+        class_names=class_names,
+        clip_model=args.clip_model,
+        device=device,
+        k=args.dds_k,
+        important_eigval_ratio=args.dds_important_eigval_ratio,
     )
     div_metric = Div(
         class_names=class_names,

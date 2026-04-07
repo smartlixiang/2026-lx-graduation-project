@@ -2,12 +2,12 @@
 
 from .AbsorptionGainScore import AbsorptionGainScore
 from .ConfusionComplementarityScore import ConfusionComplementarityScore
-from .ValidationCoverageDemandScore import ValidationCoverageDemandScore
-from .ValidationMarginGainScore import ValidationMarginGainScore
+from .PersistentDifficultyScore import PersistentDifficultyScore
+from .TransferabilityAlignmentScore import TransferabilityAlignmentScore
 
 __all__ = [
     "AbsorptionGainScore",
     "ConfusionComplementarityScore",
-    "ValidationMarginGainScore",
-    "ValidationCoverageDemandScore",
+    "TransferabilityAlignmentScore",
+    "PersistentDifficultyScore",
 ]

@@ -10,12 +10,20 @@ import numpy as np
 from weights.dynamic_utils import default_dynamic_cache_path
 
 
+COMPONENT_TITLES = {
+    "A": "A / Absorption Gain",
+    "C": "C / Confusion Complementarity",
+    "D": "D / Transferability Alignment",
+    "E": "E / Persistent Difficulty",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot A/C/D/E histograms from dynamic cache.")
     parser.add_argument("--cache", type=str, default=None, help="Path to dynamic_components.npz")
     parser.add_argument("--dataset", type=str, default="cifar10", help="Dataset name for default cache path")
     parser.add_argument("--proxy-model", type=str, default="resnet18", help="Proxy model for default cache path")
-    parser.add_argument("--epochs", type=int, default=None, help="Epoch tag for default cache path")
+    parser.add_argument("--epochs", type=int, default=200, help="Epoch tag for default cache path")
     parser.add_argument("--bins", type=int, default=60, help="Histogram bins")
     parser.add_argument(
         "--output",
@@ -28,13 +36,9 @@ def parse_args() -> argparse.Namespace:
 
 def _resolve_component(data: np.lib.npyio.NpzFile, name: str) -> np.ndarray:
     key = f"{name}_final_normalized"
-    if key in data:
-        values = data[key].astype(np.float32)
-    else:
-        legacy = f"{name}_norm2"
-        if legacy not in data:
-            raise KeyError(f"Neither '{key}' nor '{legacy}' found in cache.")
-        values = data[legacy].astype(np.float32)
+    if key not in data:
+        raise KeyError(f"Missing cache field: '{key}'.")
+    values = data[key].astype(np.float32)
     values = values[np.isfinite(values)]
     if values.size == 0:
         raise ValueError(f"Component {name} has no finite values.")
@@ -59,10 +63,11 @@ def main() -> None:
     axes = axes.ravel()
 
     for ax, name in zip(axes, components):
-        ax.hist(values[name], bins=args.bins, color="#4C78A8", alpha=0.85, edgecolor="white")
-        ax.set_title(f"{name} final_normalized")
-        ax.set_xlabel("score")
-        ax.set_ylabel("count")
+        ax.hist(values[name], bins=args.bins, color="#4C78A8", alpha=0.85, edgecolor="white", label=COMPONENT_TITLES[name])
+        ax.set_title(COMPONENT_TITLES[name])
+        ax.set_xlabel("Score")
+        ax.set_ylabel("Count")
+        ax.legend(loc="best")
         ax.grid(alpha=0.2, linestyle="--")
 
     fig.suptitle(f"Dynamic components before summation (cache: {cache_path.name})", fontsize=14)

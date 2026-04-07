@@ -25,8 +25,8 @@ from utils.static_score_cache import get_or_compute_static_scores
 from weights import (
     AbsorptionGainScore,
     ConfusionComplementarityScore,
-    ValidationCoverageDemandScore,
-    ValidationMarginGainScore,
+    PersistentDifficultyScore,
+    TransferabilityAlignmentScore,
 )
 from weights.dynamic_utils import default_dynamic_cache_path, load_cv_fold_logs
 
@@ -184,23 +184,6 @@ def load_adapters_for_seed(
     image_adapter.to(device).eval()
     text_adapter.to(device).eval()
     return image_adapter, text_adapter, adapter_paths
-
-
-def extract_static_image_features(
-    metric,
-    dataloader: DataLoader,
-    adapter: AdapterMLP,
-) -> np.ndarray:
-    """Extract the unified static feature representation g_i (adapter image features)."""
-    adapter.eval()
-    device = next(adapter.parameters()).device
-    feats: list[torch.Tensor] = []
-    with torch.no_grad():
-        for images, _ in tqdm(dataloader, desc="Extracting static g_i", unit="batch", leave=False):
-            image_features = metric.extractor.encode_image(images)
-            image_features = adapter(image_features.to(device))
-            feats.append(image_features.detach().cpu())
-    return torch.cat(feats, dim=0).numpy().astype(np.float32)
 
 
 def fit_ridge_regression_nonnegative(
@@ -410,12 +393,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     if not np.array_equal(labels_all, static_scores["labels"]):
         raise ValueError("代理训练日志的标签与评分数据集标签不一致。")
 
-    static_g = extract_static_image_features(dds_metric, dds_loader, image_adapter)
-    if static_g.shape[0] != num_samples:
-        raise ValueError(f"static g_i count mismatch: {static_g.shape[0]} vs dynamic {num_samples}")
-
-    d_result = ValidationMarginGainScore().compute(folds=folds, labels_all=labels_all, static_features=static_g)
-    e_result = ValidationCoverageDemandScore().compute(folds=folds, labels_all=labels_all, static_features=static_g)
+    d_result = TransferabilityAlignmentScore().compute(folds=folds, labels_all=labels_all)
+    e_result = PersistentDifficultyScore().compute(folds=folds, labels_all=labels_all)
 
     for name, arr in {
         "A_final_normalized": a_result.final_normalized,
@@ -431,8 +410,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     u_raw = (
         a_result.final_normalized
         + c_result.final_normalized
-        + d_result.final_normalized
-        + e_result.final_normalized
+        + 0.5 * d_result.final_normalized
+        + 0.5 * e_result.final_normalized
     )
     if not np.all(np.isfinite(u_raw)):
         raise ValueError("u_raw contains NaN/inf values.")

@@ -16,7 +16,7 @@ from .dynamic_utils import (
 
 
 class AbsorptionGainScore:
-    """A: training-view absorption gain with late-stage stability penalty."""
+    """A: absorption gain with late-stage fluctuation penalty."""
 
     def compute(self, folds: list[FoldLogData], labels_all: np.ndarray) -> DynamicComponentResult:
         num_samples = labels_all.shape[0]
@@ -37,7 +37,7 @@ class AbsorptionGainScore:
 
             gain_z = safe_standardize(mid_mean - early_mean)
             var_z = safe_standardize(late_var)
-            raw = gain_z - var_z
+            raw = gain_z - 0.5 * var_z
 
             raw_foldwise[f_idx, train_idx] = raw
             fold_normalized[f_idx, train_idx] = quantile_minmax_dynamic(raw)

@@ -204,4 +204,4 @@ def default_dynamic_v2_cache_path(
     epochs: int | None = None,
 ) -> Path:
     epoch_tag = str(int(epochs)) if epochs is not None else "latest"
-    return Path("weights") / "dynamic_cache" / dataset / proxy_model / epoch_tag / "dynamic_components_v2.npz"
+    return Path("weights") / "dynamic_cache" / dataset / proxy_model / epoch_tag / "dynamic_components_v3.npz"

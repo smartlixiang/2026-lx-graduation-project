@@ -26,7 +26,6 @@ from weights import (
     DynamicClassComplementarityScore,
     EarlyLearnabilityScore,
     OOFPatternGapScore,
-    OOFSupportScore,
 )
 from weights.dynamic_v2_utils import default_dynamic_v2_cache_path, load_cv_fold_logs
 
@@ -80,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dds-important-eigval-ratio",
         type=float,
-        default=0.5,
+        default=0.8,
         help=(
             "Cumulative explained-variance ratio threshold for the third structural component "
             "(legacy DDS name retained for compatibility). Default: 0.5."
@@ -186,6 +185,23 @@ def load_adapters_for_seed(
     return image_adapter, text_adapter, adapter_paths
 
 
+def extract_static_image_features(
+    metric,
+    dataloader: DataLoader,
+    adapter: AdapterMLP,
+) -> np.ndarray:
+    """Extract the unified static feature representation g_i (adapter image features)."""
+    adapter.eval()
+    device = next(adapter.parameters()).device
+    feats: list[torch.Tensor] = []
+    with torch.no_grad():
+        for images, _ in tqdm(dataloader, desc="Extracting static g_i", unit="batch", leave=False):
+            image_features = metric.extractor.encode_image(images)
+            image_features = adapter(image_features.to(device))
+            feats.append(image_features.detach().cpu())
+    return torch.cat(feats, dim=0).numpy().astype(np.float32)
+
+
 def fit_ridge_regression_nonnegative(
     features: np.ndarray,
     targets: np.ndarray,
@@ -274,7 +290,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     )
 
     if not proxy_log.is_dir():
-        raise ValueError("Dynamic v2 requires proxy log directory containing fold_*.npz files.")
+        raise ValueError("Dynamic A/C/D flow requires proxy log directory containing fold_*.npz files.")
 
     folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
     num_samples = labels_all.shape[0]
@@ -282,58 +298,6 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
 
     a_result = EarlyLearnabilityScore().compute(folds=folds, labels_all=labels_all)
     c_result = DynamicClassComplementarityScore().compute(folds=folds, labels_all=labels_all)
-    g_result = OOFSupportScore().compute(folds=folds, labels_all=labels_all)
-    d_result = OOFPatternGapScore().compute(folds=folds, labels_all=labels_all)
-
-    for name, arr in {
-        "A_norm2": a_result.norm2,
-        "C_norm2": c_result.norm2,
-        "G_norm2": g_result.norm2,
-        "D_norm2": d_result.norm2,
-    }.items():
-        if arr.shape != (num_samples,):
-            raise ValueError(f"{name} shape mismatch: {arr.shape}")
-        if not np.all(np.isfinite(arr)):
-            raise ValueError(f"{name} contains NaN/inf values.")
-
-    u_raw = a_result.norm2 + c_result.norm2 + g_result.norm2 + d_result.norm2
-    if not np.all(np.isfinite(u_raw)):
-        raise ValueError("u_raw contains NaN/inf values.")
-    u_scores = quantile_minmax(u_raw.astype(np.float32), q_low=0.002, q_high=0.998, fallback_value=0.5)
-    if not np.all(np.isfinite(u_scores)):
-        raise ValueError("u_norm contains NaN/inf values.")
-
-    dynamic_cache_path = default_dynamic_v2_cache_path(
-        args.dataset,
-        proxy_model=args.proxy_model,
-        epochs=actual_proxy_epochs,
-    )
-    dynamic_cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        dynamic_cache_path,
-        version=np.array("dynamic_v2", dtype=object),
-        component_names=np.array(["A", "C", "G", "D"], dtype=object),
-        dataset=np.array(args.dataset, dtype=object),
-        seed=np.array(proxy_training_seed, dtype=np.int64),
-        seed_free=np.array(True),
-        proxy_log_path=np.array(str(proxy_log), dtype=object),
-        indices=np.arange(num_samples, dtype=np.int64),
-        labels=labels_all.astype(np.int64),
-        A_norm1_foldwise=a_result.foldwise_norm1.astype(np.float32),
-        C_norm1_foldwise=c_result.foldwise_norm1.astype(np.float32),
-        G_norm1_foldwise=g_result.foldwise_norm1.astype(np.float32),
-        D_norm1_foldwise=d_result.foldwise_norm1.astype(np.float32),
-        A_agg=a_result.agg.astype(np.float32),
-        A_norm2=a_result.norm2.astype(np.float32),
-        C_agg=c_result.agg.astype(np.float32),
-        C_norm2=c_result.norm2.astype(np.float32),
-        G_agg=g_result.agg.astype(np.float32),
-        G_norm2=g_result.norm2.astype(np.float32),
-        D_agg=d_result.agg.astype(np.float32),
-        D_norm2=d_result.norm2.astype(np.float32),
-        u_raw=u_raw.astype(np.float32),
-        u_norm=u_scores.astype(np.float32),
-    )
 
     class_names = load_class_names(args.dataset, args.data_root)
     dds_metric = DifficultyDirection(
@@ -432,6 +396,58 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     if not np.array_equal(labels_all, static_scores["labels"]):
         raise ValueError("代理训练日志的标签与评分数据集标签不一致。")
 
+    static_g = extract_static_image_features(dds_metric, dds_loader, image_adapter)
+    if static_g.shape[0] != num_samples:
+        raise ValueError(f"static g_i count mismatch: {static_g.shape[0]} vs dynamic {num_samples}")
+
+    d_result = OOFPatternGapScore().compute(folds=folds, labels_all=labels_all, static_features=static_g)
+
+    for name, arr in {
+        "A_norm2": a_result.norm2,
+        "C_norm2": c_result.norm2,
+        "D_norm2": d_result.norm2,
+    }.items():
+        if arr.shape != (num_samples,):
+            raise ValueError(f"{name} shape mismatch: {arr.shape}")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"{name} contains NaN/inf values.")
+
+    u_raw = a_result.norm2 + c_result.norm2 + d_result.norm2
+    if not np.all(np.isfinite(u_raw)):
+        raise ValueError("u_raw contains NaN/inf values.")
+    u_scores = quantile_minmax(u_raw.astype(np.float32), q_low=0.002, q_high=0.998, fallback_value=0.5)
+    if not np.all(np.isfinite(u_scores)):
+        raise ValueError("u_norm contains NaN/inf values.")
+
+    dynamic_cache_path = default_dynamic_v2_cache_path(
+        args.dataset,
+        proxy_model=args.proxy_model,
+        epochs=actual_proxy_epochs,
+    )
+    dynamic_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        dynamic_cache_path,
+        version=np.array("dynamic_v3", dtype=object),
+        component_names=np.array(["A", "C", "D"], dtype=object),
+        dataset=np.array(args.dataset, dtype=object),
+        seed=np.array(proxy_training_seed, dtype=np.int64),
+        seed_free=np.array(True),
+        proxy_log_path=np.array(str(proxy_log), dtype=object),
+        indices=np.arange(num_samples, dtype=np.int64),
+        labels=labels_all.astype(np.int64),
+        A_norm1_foldwise=a_result.foldwise_norm1.astype(np.float32),
+        C_norm1_foldwise=c_result.foldwise_norm1.astype(np.float32),
+        D_norm1_foldwise=d_result.foldwise_norm1.astype(np.float32),
+        A_agg=a_result.agg.astype(np.float32),
+        A_norm2=a_result.norm2.astype(np.float32),
+        C_agg=c_result.agg.astype(np.float32),
+        C_norm2=c_result.norm2.astype(np.float32),
+        D_agg=d_result.agg.astype(np.float32),
+        D_norm2=d_result.norm2.astype(np.float32),
+        u_raw=u_raw.astype(np.float32),
+        u_norm=u_scores.astype(np.float32),
+    )
+
     static_features = np.stack(
         [
             static_scores["sa"],
@@ -471,8 +487,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "bias": float(bias),
             "ridge_lambda": float(args.ridge_lambda),
             "proxy_log": str(proxy_log),
-            "dynamic_version": "v2",
-            "dynamic_components": ["A", "C", "G", "D"],
+            "dynamic_version": "v3",
+            "dynamic_components": ["A", "C", "D"],
             "dynamic_cache_path": str(dynamic_cache_path),
             "proxy_training_seed": proxy_training_seed,
             "proxy_log_seed_free": True,
@@ -487,7 +503,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     print("Learned weights saved to", output_path)
     print("Applied output seeds:", output_seeds)
     print("Shared learned weights:", dataset_entry[str(output_seeds[0])])
-    print("Dynamic v2 cache saved to", dynamic_cache_path)
+    print("Dynamic v3 cache saved to", dynamic_cache_path)
 
 
 if __name__ == "__main__":

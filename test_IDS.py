@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--adapter-image-path", type=str, default=None)
     parser.add_argument("--adapter-text-path", type=str, default=None)
-    parser.add_argument("--dds-important-eigval-ratio", type=float, default=0.5)
+    parser.add_argument("--dds-important-eigval-ratio", type=float, default=0.8)
     return parser.parse_args()
 
 

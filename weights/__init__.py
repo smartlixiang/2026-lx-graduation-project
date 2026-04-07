@@ -11,7 +11,6 @@ from .DynamicClassComplementarityScore import (
     DynamicClassComplementarityResult,
     DynamicClassComplementarityScore,
 )
-from .OOFSupportScore import OOFSupportResult, OOFSupportScore
 from .OOFPatternGapScore import OOFPatternGapResult, OOFPatternGapScore
 
 __all__ = [
@@ -29,8 +28,6 @@ __all__ = [
     "EarlyLearnabilityScore",
     "DynamicClassComplementarityResult",
     "DynamicClassComplementarityScore",
-    "OOFSupportResult",
-    "OOFSupportScore",
     "OOFPatternGapResult",
     "OOFPatternGapScore",
 ]

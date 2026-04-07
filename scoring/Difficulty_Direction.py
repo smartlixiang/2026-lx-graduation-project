@@ -58,7 +58,7 @@ class DifficultyDirection:
         eigval_lower_bound: float = 0.02,
         eigval_upper_bound: float = 0.2,
         pca_cov_reg: float = 1e-6,
-        important_eigval_ratio: float = 0.5,
+        important_eigval_ratio: float = 0.8,
     ) -> None:
         if k < 1:
             raise ValueError("k 必须为正整数（兼容保留参数，当前主计算不再依赖）。")

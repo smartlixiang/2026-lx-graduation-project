@@ -16,7 +16,7 @@ from .dynamic_v2_utils import (
 
 @dataclass
 class DynamicClassComplementarityResult:
-    """Result for C (DynamicClassComplementarityScore).
+    """Result for C (training-view DynamicClassComplementarityScore).
 
     Inputs:
       - folds: CV fold logs with train_indices/train_logits.
@@ -54,7 +54,7 @@ class DynamicClassComplementarityScore:
             # Q_i^{(f)} = mean_t q_{i,t}^{(f)} over mid window
             q_proto = np.mean(q[mid_slice], axis=0).astype(np.float32)
 
-            # C_i^{(f),raw} = class-wise KNN average Euclidean distance on Q_i^{(f)}
+            # C_i^{(f),raw} = training-view class-wise KNN average Euclidean distance on Q_i^{(f)}
             raw = compute_class_knn_mean_distance(q_proto, y_train, k_ratio=0.05)
             norm1 = quantile_minmax_v2(raw)
 

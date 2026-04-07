@@ -1,11 +1,13 @@
 """Dynamic component extractors for scoring-weight learning."""
 
-from .DynamicClassComplementarityScore import DynamicClassComplementarityScore
-from .EarlyLearnabilityScore import EarlyLearnabilityScore
-from .OOFPatternGapScore import OOFPatternGapScore
+from .AbsorptionGainScore import AbsorptionGainScore
+from .ConfusionComplementarityScore import ConfusionComplementarityScore
+from .ValidationCoverageDemandScore import ValidationCoverageDemandScore
+from .ValidationMarginGainScore import ValidationMarginGainScore
 
 __all__ = [
-    "EarlyLearnabilityScore",
-    "DynamicClassComplementarityScore",
-    "OOFPatternGapScore",
+    "AbsorptionGainScore",
+    "ConfusionComplementarityScore",
+    "ValidationMarginGainScore",
+    "ValidationCoverageDemandScore",
 ]

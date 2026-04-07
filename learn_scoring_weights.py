@@ -23,9 +23,10 @@ from utils.seed import parse_seed_list, set_seed
 from utils.score_utils import quantile_minmax
 from utils.static_score_cache import get_or_compute_static_scores
 from weights import (
-    DynamicClassComplementarityScore,
-    EarlyLearnabilityScore,
-    OOFPatternGapScore,
+    AbsorptionGainScore,
+    ConfusionComplementarityScore,
+    ValidationCoverageDemandScore,
+    ValidationMarginGainScore,
 )
 from weights.dynamic_utils import default_dynamic_cache_path, load_cv_fold_logs
 
@@ -276,6 +277,19 @@ def build_output_path(base_path: str) -> Path:
     return Path(base_path)
 
 
+def safe_pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if finite.sum() < 2:
+        return 0.0
+    xx = x[finite]
+    yy = y[finite]
+    if float(np.std(xx)) < 1e-12 or float(np.std(yy)) < 1e-12:
+        return 0.0
+    return float(np.corrcoef(xx, yy)[0, 1])
+
+
 def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     proxy_training_seed = int(args.proxy_training_seed)
     set_seed(proxy_training_seed)
@@ -290,14 +304,14 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     )
 
     if not proxy_log.is_dir():
-        raise ValueError("Dynamic A/C/D flow requires proxy log directory containing fold_*.npz files.")
+        raise ValueError("Dynamic A/C/D/E flow requires proxy log directory containing fold_*.npz files.")
 
     folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
     num_samples = labels_all.shape[0]
     actual_proxy_epochs = int(folds[0].train_logits.shape[0])
 
-    a_result = EarlyLearnabilityScore().compute(folds=folds, labels_all=labels_all)
-    c_result = DynamicClassComplementarityScore().compute(folds=folds, labels_all=labels_all)
+    a_result = AbsorptionGainScore().compute(folds=folds, labels_all=labels_all)
+    c_result = ConfusionComplementarityScore().compute(folds=folds, labels_all=labels_all)
 
     class_names = load_class_names(args.dataset, args.data_root)
     dds_metric = DifficultyDirection(
@@ -400,19 +414,26 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     if static_g.shape[0] != num_samples:
         raise ValueError(f"static g_i count mismatch: {static_g.shape[0]} vs dynamic {num_samples}")
 
-    d_result = OOFPatternGapScore().compute(folds=folds, labels_all=labels_all, static_features=static_g)
+    d_result = ValidationMarginGainScore().compute(folds=folds, labels_all=labels_all, static_features=static_g)
+    e_result = ValidationCoverageDemandScore().compute(folds=folds, labels_all=labels_all, static_features=static_g)
 
     for name, arr in {
-        "A_norm2": a_result.norm2,
-        "C_norm2": c_result.norm2,
-        "D_norm2": d_result.norm2,
+        "A_final_normalized": a_result.final_normalized,
+        "C_final_normalized": c_result.final_normalized,
+        "D_final_normalized": d_result.final_normalized,
+        "E_final_normalized": e_result.final_normalized,
     }.items():
         if arr.shape != (num_samples,):
             raise ValueError(f"{name} shape mismatch: {arr.shape}")
         if not np.all(np.isfinite(arr)):
             raise ValueError(f"{name} contains NaN/inf values.")
 
-    u_raw = a_result.norm2 + c_result.norm2 + d_result.norm2
+    u_raw = (
+        a_result.final_normalized
+        + c_result.final_normalized
+        + d_result.final_normalized
+        + e_result.final_normalized
+    )
     if not np.all(np.isfinite(u_raw)):
         raise ValueError("u_raw contains NaN/inf values.")
     u_scores = quantile_minmax(u_raw.astype(np.float32), q_low=0.002, q_high=0.998, fallback_value=0.5)
@@ -427,22 +448,29 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     dynamic_cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         dynamic_cache_path,
-                component_names=np.array(["A", "C", "D"], dtype=object),
+        component_names=np.array(["A", "C", "D", "E"], dtype=object),
         dataset=np.array(args.dataset, dtype=object),
         seed=np.array(proxy_training_seed, dtype=np.int64),
         seed_free=np.array(True),
         proxy_log_path=np.array(str(proxy_log), dtype=object),
         indices=np.arange(num_samples, dtype=np.int64),
         labels=labels_all.astype(np.int64),
-        A_norm1_foldwise=a_result.foldwise_norm1.astype(np.float32),
-        C_norm1_foldwise=c_result.foldwise_norm1.astype(np.float32),
-        D_norm1_foldwise=d_result.foldwise_norm1.astype(np.float32),
-        A_agg=a_result.agg.astype(np.float32),
-        A_norm2=a_result.norm2.astype(np.float32),
-        C_agg=c_result.agg.astype(np.float32),
-        C_norm2=c_result.norm2.astype(np.float32),
-        D_agg=d_result.agg.astype(np.float32),
-        D_norm2=d_result.norm2.astype(np.float32),
+        A_raw_foldwise=a_result.raw_foldwise.astype(np.float32),
+        C_raw_foldwise=c_result.raw_foldwise.astype(np.float32),
+        D_raw_foldwise=d_result.raw_foldwise.astype(np.float32),
+        E_raw_foldwise=e_result.raw_foldwise.astype(np.float32),
+        A_fold_normalized=a_result.fold_normalized.astype(np.float32),
+        C_fold_normalized=c_result.fold_normalized.astype(np.float32),
+        D_fold_normalized=d_result.fold_normalized.astype(np.float32),
+        E_fold_normalized=e_result.fold_normalized.astype(np.float32),
+        A_aggregated=a_result.aggregated.astype(np.float32),
+        C_aggregated=c_result.aggregated.astype(np.float32),
+        D_aggregated=d_result.aggregated.astype(np.float32),
+        E_aggregated=e_result.aggregated.astype(np.float32),
+        A_final_normalized=a_result.final_normalized.astype(np.float32),
+        C_final_normalized=c_result.final_normalized.astype(np.float32),
+        D_final_normalized=d_result.final_normalized.astype(np.float32),
+        E_final_normalized=e_result.final_normalized.astype(np.float32),
         u_raw=u_raw.astype(np.float32),
         u_norm=u_scores.astype(np.float32),
     )
@@ -466,6 +494,39 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         args.tol,
     )
 
+    dynamic_component_values = {
+        "A": a_result.final_normalized,
+        "C": c_result.final_normalized,
+        "D": d_result.final_normalized,
+        "E": e_result.final_normalized,
+    }
+    static_component_values = {
+        "SA": static_scores["sa"],
+        "Div": static_scores["div"],
+        "DDS": static_scores["dds"],
+    }
+    correlation_matrix: dict[str, dict[str, float]] = {}
+    print("Dynamic-vs-static Pearson correlations:")
+    for d_name, d_values in dynamic_component_values.items():
+        correlation_matrix[d_name] = {}
+        row_str = []
+        for s_name, s_values in static_component_values.items():
+            corr = safe_pearson_corr(d_values, s_values)
+            correlation_matrix[d_name][s_name] = corr
+            row_str.append(f"{s_name}={corr:+.4f}")
+        print(f"  {d_name}: " + ", ".join(row_str))
+
+    print(
+        "Learned static weights:",
+        f"SA={weights[0]:.6f}, Div={weights[1]:.6f}, DDS={weights[2]:.6f}, bias={bias:.6f}",
+    )
+    sa_warning = bool(weights[0] > (1.0 / 3.0))
+    div_is_lowest = bool(weights[1] <= min(weights[0], weights[2]))
+    if sa_warning:
+        print("WARNING: learned SA weight is above 1/3.")
+    if div_is_lowest:
+        print("WARNING: learned Div weight is the lowest among SA/Div/DDS.")
+
     output_path = build_output_path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     data: dict[str, dict[str, dict[str, object]]] = {}
@@ -486,12 +547,17 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "bias": float(bias),
             "ridge_lambda": float(args.ridge_lambda),
             "proxy_log": str(proxy_log),
-            "dynamic_components": ["A", "C", "D"],
+            "dynamic_components": ["A", "C", "D", "E"],
             "dynamic_cache_path": str(dynamic_cache_path),
             "proxy_training_seed": proxy_training_seed,
             "proxy_log_seed_free": True,
             "dynamic_cache_seed_free": True,
             "output_seed": seed,
+            "diagnostics": {
+                "dynamic_static_pearson": correlation_matrix,
+                "sa_gt_one_third_warning": sa_warning,
+                "div_is_lowest_warning": div_is_lowest,
+            },
         }
     data[args.dataset] = dataset_entry
 

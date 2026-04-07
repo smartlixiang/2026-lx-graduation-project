@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
         default="weights/proxy_logs",
         help="Proxy log root path (or a specific log file/dir).",
     )
+    parser.add_argument("--proxy-model", type=str, default="resnet18", help="Proxy model name used in proxy log path.")
     parser.add_argument(
         "--proxy-epochs",
         type=int,
@@ -116,7 +117,13 @@ def parse_args() -> argparse.Namespace:
         "--seed",
         type=str,
         default=",".join(str(s) for s in CONFIG.exp_seeds),
-        help="随机种子，支持单个整数或逗号分隔列表",
+        help="输出兼容 seed 列表（用于在 scoring_weights.json 中写多条相同记录）",
+    )
+    parser.add_argument(
+        "--proxy-training-seed",
+        type=int,
+        default=CONFIG.global_seed,
+        help="代理模型真实训练 seed（用于读取 proxy logs / 计算动态分量）",
     )
     return parser.parse_args()
 
@@ -253,14 +260,16 @@ def build_output_path(base_path: str) -> Path:
     return Path(base_path)
 
 
-def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
-    del multi_seed
-    set_seed(seed)
+def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
+    proxy_training_seed = int(args.proxy_training_seed)
+    set_seed(proxy_training_seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
+
     proxy_log = resolve_proxy_log_path(
         args.proxy_log,
         args.dataset,
-        seed,
+        proxy_training_seed,
+        proxy_model=args.proxy_model,
         max_epoch=args.proxy_epochs,
     )
 
@@ -269,6 +278,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
     folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
     num_samples = labels_all.shape[0]
+    actual_proxy_epochs = int(folds[0].train_logits.shape[0])
 
     a_result = EarlyLearnabilityScore().compute(folds=folds, labels_all=labels_all)
     c_result = DynamicClassComplementarityScore().compute(folds=folds, labels_all=labels_all)
@@ -293,14 +303,19 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     if not np.all(np.isfinite(u_scores)):
         raise ValueError("u_norm contains NaN/inf values.")
 
-    dynamic_cache_path = default_dynamic_v2_cache_path(args.dataset, seed)
+    dynamic_cache_path = default_dynamic_v2_cache_path(
+        args.dataset,
+        proxy_model=args.proxy_model,
+        epochs=actual_proxy_epochs,
+    )
     dynamic_cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         dynamic_cache_path,
         version=np.array("dynamic_v2", dtype=object),
         component_names=np.array(["A", "C", "G", "D"], dtype=object),
         dataset=np.array(args.dataset, dtype=object),
-        seed=np.array(seed, dtype=np.int64),
+        seed=np.array(proxy_training_seed, dtype=np.int64),
+        seed_free=np.array(True),
         proxy_log_path=np.array(str(proxy_log), dtype=object),
         indices=np.arange(num_samples, dtype=np.int64),
         labels=labels_all.astype(np.int64),
@@ -344,7 +359,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     )
 
     image_adapter, text_adapter, adapter_paths = load_adapters_for_seed(
-        args, args.dataset, dds_metric.extractor.embed_dim, seed, device
+        args, args.dataset, dds_metric.extractor.embed_dim, proxy_training_seed, device
     )
 
     dds_loader = build_score_loader(
@@ -399,7 +414,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     static_scores = get_or_compute_static_scores(
         cache_root=PROJECT_ROOT / "static_scores",
         dataset=args.dataset,
-        seed=seed,
+        seed=proxy_training_seed,
         clip_model=args.clip_model,
         adapter_image_path=str(adapter_paths["image_path"]),
         adapter_text_path=str(adapter_paths["text_path"]),
@@ -446,32 +461,38 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 data = loaded
 
     dataset_entry = data.get(args.dataset, {})
-    seed_key = str(seed)
-    dataset_entry.pop(f"{seed_key}_meta", None)
-    dataset_entry[seed_key] = {
-        "sa": float(weights[0]),
-        "div": float(weights[1]),
-        "dds": float(weights[2]),
-        "bias": float(bias),
-        "ridge_lambda": float(args.ridge_lambda),
-        "proxy_log": str(proxy_log),
-        "dynamic_version": "v2",
-        "dynamic_components": ["A", "C", "G", "D"],
-        "dynamic_cache_path": str(dynamic_cache_path),
-    }
+    for seed in output_seeds:
+        seed_key = str(seed)
+        dataset_entry.pop(f"{seed_key}_meta", None)
+        dataset_entry[seed_key] = {
+            "sa": float(weights[0]),
+            "div": float(weights[1]),
+            "dds": float(weights[2]),
+            "bias": float(bias),
+            "ridge_lambda": float(args.ridge_lambda),
+            "proxy_log": str(proxy_log),
+            "dynamic_version": "v2",
+            "dynamic_components": ["A", "C", "G", "D"],
+            "dynamic_cache_path": str(dynamic_cache_path),
+            "proxy_training_seed": proxy_training_seed,
+            "proxy_log_seed_free": True,
+            "dynamic_cache_seed_free": True,
+            "output_seed": seed,
+        }
     data[args.dataset] = dataset_entry
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
     print("Learned weights saved to", output_path)
-    print("Learned weights:", dataset_entry[seed_key])
+    print("Applied output seeds:", output_seeds)
+    print("Shared learned weights:", dataset_entry[str(output_seeds[0])])
     print("Dynamic v2 cache saved to", dynamic_cache_path)
 
 
 if __name__ == "__main__":
     args = parse_args()
-    seeds = parse_seed_list(args.seed)
-    multi_seed = len(seeds) > 1
-    for seed in seeds:
-        run_for_seed(args, seed, multi_seed)
+    output_seeds = parse_seed_list(args.seed)
+    if not output_seeds:
+        raise ValueError("--seed 至少需要一个 seed（用于写入 scoring_weights.json）。")
+    run_once(args, output_seeds)

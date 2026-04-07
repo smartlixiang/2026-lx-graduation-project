@@ -30,9 +30,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_input_path(dataset: str, seed: int, input_path: str | None) -> Path:
+    del seed  # dynamic v2 cache is now seed-free.
     if input_path is not None:
         return Path(input_path)
-    return default_dynamic_v2_cache_path(dataset, seed)
+    return default_dynamic_v2_cache_path(dataset)
 
 
 def main() -> None:

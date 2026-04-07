@@ -9,14 +9,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def resolve_proxy_log_dir(
     dataset: str,
-    seed: int,
+    seed: int | None = None,
     *,
     proxy_model: str = "resnet18",
     epochs: int,
     root: Path | str | None = None,
 ) -> Path:
+    del seed  # deprecated: kept only for compatibility with old call sites.
     base = Path(root) if root is not None else PROJECT_ROOT / "weights" / "proxy_logs"
-    return base / dataset / proxy_model / str(seed) / str(int(epochs))
+    return base / dataset / proxy_model / str(int(epochs))
 
 
 def resolve_checkpoint_path(

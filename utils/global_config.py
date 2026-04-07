@@ -16,6 +16,8 @@ class GlobalConfig:
     pretrained_clip: Path = Path("./pretrained_clip")
     # 实验默认随机种子列表：exp_seeds=[22, 42, 96]
     exp_seeds: list[int] = field(default_factory=lambda: [22, 42, 96])
+    # 代理模型交叉验证唯一真实训练种子
+    proxy_seed: int = 22
     global_seed: int = 42
     default_batch_size: int = 128
     num_workers: int = 4

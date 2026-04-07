@@ -20,51 +20,12 @@ from dataset.dataset_config import AVAILABLE_DATASETS
 from model.model_config import get_model
 from utils.global_config import CONFIG
 from utils.path_rules import resolve_proxy_log_dir
-from utils.seed import parse_seed_list, set_seed
+from utils.seed import set_seed
+from utils.training_defaults import apply_dataset_training_defaults
 
 
-DATASET_DEFAULT_TRAINING_CONFIGS = {
-    "cifar10": {
-        "epochs": 100,
-        "batch_size": 128,
-        "init_lr": 0.1,
-        "momentum": 0.9,
-        "weight_decay": 5e-4,
-        "lr_milestones": [60, 80],
-        "lr_gamma": 0.1,
-        "execution": {
-            "use_amp": False,
-            "reference_effective_batch_size": None,
-        },
-    },
-    "cifar100": {
-        "epochs": 100,
-        "batch_size": 128,
-        "init_lr": 0.1,
-        "momentum": 0.9,
-        "weight_decay": 5e-4,
-        "lr_milestones": [60, 80],
-        "lr_gamma": 0.1,
-        "execution": {
-            "use_amp": False,
-            "reference_effective_batch_size": None,
-        },
-    },
-    "tiny-imagenet": {
-        "epochs": 90,
-        "batch_size": 256,
-        "init_lr": 0.1,
-        "momentum": 0.9,
-        "weight_decay": 1e-4,
-        "lr_milestones": [30, 60],
-        "lr_gamma": 0.1,
-        "execution": {
-            "default_physical_batch_size": 64,
-            "use_amp": True,
-            "reference_effective_batch_size": 256,
-        },
-    },
-}
+def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    return apply_dataset_training_defaults(args, lr_attr="lr")
 
 
 class IndexedDataset(torch.utils.data.Dataset):
@@ -79,64 +40,6 @@ class IndexedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int):
         image, label = self.dataset[idx]
         return image, label, idx
-
-
-def get_default_training_config(dataset_name: str) -> dict[str, int | float | list[int]]:
-    try:
-        config = DATASET_DEFAULT_TRAINING_CONFIGS[dataset_name]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported dataset for training config: {dataset_name}") from exc
-    return {
-        "epochs": int(config["epochs"]),
-        "batch_size": int(config["batch_size"]),
-        "init_lr": float(config["init_lr"]),
-        "momentum": float(config["momentum"]),
-        "weight_decay": float(config["weight_decay"]),
-        "lr_milestones": list(config["lr_milestones"]),
-        "lr_gamma": float(config["lr_gamma"]),
-    }
-
-
-def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
-    defaults = get_default_training_config(args.dataset)
-    batch_size_unspecified = args.batch_size is None
-
-    if args.epochs is None:
-        args.epochs = defaults["epochs"]
-    if args.lr is None:
-        args.lr = defaults["init_lr"]
-    if args.momentum is None:
-        args.momentum = defaults["momentum"]
-    if args.weight_decay is None:
-        args.weight_decay = defaults["weight_decay"]
-    if args.lr_milestones is None:
-        args.lr_milestones = defaults["lr_milestones"]
-    if args.lr_gamma is None:
-        args.lr_gamma = defaults["lr_gamma"]
-
-    execution_config = DATASET_DEFAULT_TRAINING_CONFIGS[args.dataset]["execution"]
-    if args.dataset == "tiny-imagenet":
-        if batch_size_unspecified:
-            args.batch_size = int(execution_config["default_physical_batch_size"])
-        args.use_amp = bool(execution_config["use_amp"])
-        args.reference_effective_batch_size = int(execution_config["reference_effective_batch_size"])
-        args.physical_batch_size = int(args.batch_size)
-        if args.physical_batch_size <= 64:
-            args.grad_accum_steps = 4
-        elif args.physical_batch_size <= 128:
-            args.grad_accum_steps = 2
-        else:
-            args.grad_accum_steps = 1
-        args.effective_batch_size = args.physical_batch_size * args.grad_accum_steps
-    else:
-        if batch_size_unspecified:
-            args.batch_size = defaults["batch_size"]
-        args.use_amp = bool(execution_config["use_amp"])
-        args.reference_effective_batch_size = args.batch_size
-        args.grad_accum_steps = 1
-        args.physical_batch_size = args.batch_size
-        args.effective_batch_size = args.batch_size
-    return args
 
 
 def parse_args() -> argparse.Namespace:
@@ -163,8 +66,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=str,
-        default=",".join(str(s) for s in CONFIG.exp_seeds),
-        help="随机种子，支持单个整数或逗号分隔列表",
+        default=str(CONFIG.global_seed),
+        help="代理模型交叉验证唯一真实训练种子（仅支持单个整数）",
     )
     return parser.parse_args()
 
@@ -228,7 +131,6 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
     proxy_model_name = args.model
     log_dir = resolve_proxy_log_dir(
         args.dataset,
-        seed,
         proxy_model=proxy_model_name,
         epochs=args.epochs,
     )
@@ -246,6 +148,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
         "dataset": args.dataset,
         "model": proxy_model_name,
         "seed": seed,
+        "proxy_log_seed_free": True,
         "timestamp": timestamp,
         "val_indices": val_indices_list,
         "physical_batch_size": args.physical_batch_size,
@@ -419,6 +322,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
             "dataset_name": args.dataset,
             "model": proxy_model_name,
             "seed": seed,
+            "proxy_training_seed": seed,
             "physical_batch_size": args.physical_batch_size,
             "grad_accum_steps": args.grad_accum_steps,
             "effective_batch_size": args.effective_batch_size,
@@ -459,9 +363,15 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
 def main() -> None:
     args = parse_args()
     args = apply_dataset_defaults(args)
-    seeds = parse_seed_list(args.seed)
-    for seed in seeds:
-        run_for_seed(args, seed)
+    seed_text = args.seed.strip()
+    if not seed_text:
+        raise ValueError("--seed 不能为空，且仅支持单个整数。")
+    if "," in seed_text or seed_text.startswith("[") or seed_text.startswith("("):
+        raise ValueError(
+            "train_proxy.py 现仅支持单个 seed。请传入单个整数（例如 --seed 22）。"
+        )
+    seed = int(seed_text)
+    run_for_seed(args, seed)
 
 
 if __name__ == "__main__":

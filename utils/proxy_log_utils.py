@@ -97,31 +97,41 @@ def _assemble_logits_from_folds(log_dir: Path, labels_all: np.ndarray) -> tuple[
 def resolve_proxy_log_path(
     proxy_log_root: str | Path,
     dataset_name: str,
-    seed: int,
+    seed: int | None = None,
     proxy_model: str = "resnet18",
     max_epoch: int | None = None,
 ) -> Path:
     candidate = Path(proxy_log_root)
+    proxy_training_seed = CONFIG.global_seed if seed is None else int(seed)
     if candidate.exists():
         if candidate.is_file():
             return candidate
         if candidate.is_dir() and any(candidate.glob("fold_*.npz")):
             return candidate
 
-    base_dir = candidate / dataset_name / proxy_model / str(seed)
+    seed_free_base_dir = candidate / dataset_name / proxy_model
+    legacy_seed_base_dir = seed_free_base_dir / str(proxy_training_seed)
     if max_epoch is not None:
-        epoch_dir = base_dir / str(max_epoch)
+        epoch_dir = seed_free_base_dir / str(max_epoch)
         if epoch_dir.exists():
             return epoch_dir
-        raise FileNotFoundError(f"未找到代理训练日志路径: {epoch_dir}")
+        legacy_epoch_dir = legacy_seed_base_dir / str(max_epoch)
+        if legacy_epoch_dir.exists():
+            return legacy_epoch_dir
+        raise FileNotFoundError(f"未找到代理训练日志路径: {epoch_dir} (legacy: {legacy_epoch_dir})")
 
-    if base_dir.exists() and base_dir.is_dir():
-        epoch_dirs = [p for p in base_dir.iterdir() if p.is_dir() and p.name.isdigit()]
+    if seed_free_base_dir.exists() and seed_free_base_dir.is_dir():
+        epoch_dirs = [p for p in seed_free_base_dir.iterdir() if p.is_dir() and p.name.isdigit()]
+        if epoch_dirs:
+            epoch_dirs.sort(key=lambda p: int(p.name))
+            return epoch_dirs[-1]
+    if legacy_seed_base_dir.exists() and legacy_seed_base_dir.is_dir():
+        epoch_dirs = [p for p in legacy_seed_base_dir.iterdir() if p.is_dir() and p.name.isdigit()]
         if epoch_dirs:
             epoch_dirs.sort(key=lambda p: int(p.name))
             return epoch_dirs[-1]
 
-    legacy_dir = candidate / str(seed)
+    legacy_dir = candidate / str(proxy_training_seed)
     if legacy_dir.exists() and legacy_dir.is_dir():
         matches = sorted(legacy_dir.glob("*.npz"))
         if matches:

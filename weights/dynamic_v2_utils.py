@@ -197,5 +197,11 @@ def load_cv_fold_logs(proxy_log_dir: str | Path, dataset_name: str, data_root: s
     return folds, labels_all.astype(np.int64)
 
 
-def default_dynamic_v2_cache_path(dataset: str, seed: int) -> Path:
-    return Path("weights") / "dynamic_cache" / dataset / str(seed) / "dynamic_components_v2.npz"
+def default_dynamic_v2_cache_path(
+    dataset: str,
+    *,
+    proxy_model: str = "resnet18",
+    epochs: int | None = None,
+) -> Path:
+    epoch_tag = str(int(epochs)) if epochs is not None else "latest"
+    return Path("weights") / "dynamic_cache" / dataset / proxy_model / epoch_tag / "dynamic_components_v2.npz"

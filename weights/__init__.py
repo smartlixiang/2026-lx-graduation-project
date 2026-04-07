@@ -1,33 +1,11 @@
-"""Scoring weight utilities."""
+"""Dynamic component extractors for scoring-weight learning."""
 
-from .AbsorptionEfficiencyScore import AbsorptionEfficiencyResult, AbsorptionEfficiencyScore
-from .CoverageGainScore import CoverageGainResult, CoverageGainScore
-from .InformativenessScore import InformativenessResult, InformativenessScore
-from .PersistentDifficultyScore import PersistentDifficultyScore
-from .RiskScore import RiskResult, RiskScore
-from .TransferGainScore import TransferGainScore
-from .EarlyLearnabilityScore import EarlyLearnabilityResult, EarlyLearnabilityScore
-from .DynamicClassComplementarityScore import (
-    DynamicClassComplementarityResult,
-    DynamicClassComplementarityScore,
-)
-from .OOFPatternGapScore import OOFPatternGapResult, OOFPatternGapScore
+from .DynamicClassComplementarityScore import DynamicClassComplementarityScore
+from .EarlyLearnabilityScore import EarlyLearnabilityScore
+from .OOFPatternGapScore import OOFPatternGapScore
 
 __all__ = [
-    "AbsorptionEfficiencyResult",
-    "AbsorptionEfficiencyScore",
-    "CoverageGainResult",
-    "CoverageGainScore",
-    "InformativenessResult",
-    "InformativenessScore",
-    "PersistentDifficultyScore",
-    "RiskResult",
-    "RiskScore",
-    "TransferGainScore",
-    "EarlyLearnabilityResult",
     "EarlyLearnabilityScore",
-    "DynamicClassComplementarityResult",
     "DynamicClassComplementarityScore",
-    "OOFPatternGapResult",
     "OOFPatternGapScore",
 ]

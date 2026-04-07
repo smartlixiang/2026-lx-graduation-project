@@ -11,14 +11,13 @@
       "dds": 0.30108516498575827,
       "bias": 0.1827932190889812,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar10\\resnet18\\22\\100",
-      "dynamic_version": "v3",
+      "proxy_log": "weights/proxy_logs/cifar10/resnet18/22/100",
       "dynamic_components": [
         "A",
         "C",
         "D"
       ],
-      "dynamic_cache_path": "weights\\dynamic_cache\\cifar10\\22\\dynamic_components_v3.npz"
+      "dynamic_cache_path": "weights/dynamic_cache/cifar10/22/dynamic_components.npz"
     },
     "42": {
       "sa": 0.444858874021801,
@@ -26,14 +25,13 @@
       "dds": 0.30490119860156584,
       "bias": 0.1930079440374521,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar10\\resnet18\\42\\100",
-      "dynamic_version": "v3",
+      "proxy_log": "weights/proxy_logs/cifar10/resnet18/42/100",
       "dynamic_components": [
         "A",
         "C",
         "D"
       ],
-      "dynamic_cache_path": "weights\\dynamic_cache\\cifar10\\42\\dynamic_components_v3.npz"
+      "dynamic_cache_path": "weights/dynamic_cache/cifar10/42/dynamic_components.npz"
     },
     "96": {
       "sa": 0.4376275627551627,
@@ -41,14 +39,13 @@
       "dds": 0.3111679958130376,
       "bias": 0.19007865930176168,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar10\\resnet18\\96\\100",
-      "dynamic_version": "v3",
+      "proxy_log": "weights/proxy_logs/cifar10/resnet18/96/100",
       "dynamic_components": [
         "A",
         "C",
         "D"
       ],
-      "dynamic_cache_path": "weights\\dynamic_cache\\cifar10\\96\\dynamic_components_v3.npz"
+      "dynamic_cache_path": "weights/dynamic_cache/cifar10/96/dynamic_components.npz"
     }
   },
   "cifar100": {
@@ -63,14 +60,13 @@
       "dds": 0.33298153656364055,
       "bias": 0.02647635230492457,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar100\\resnet18\\22\\100",
-      "dynamic_version": "v3",
+      "proxy_log": "weights/proxy_logs/cifar100/resnet18/22/100",
       "dynamic_components": [
         "A",
         "C",
         "D"
       ],
-      "dynamic_cache_path": "weights\\dynamic_cache\\cifar100\\22\\dynamic_components_v3.npz"
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/22/dynamic_components.npz"
     },
     "42": {
       "sa": 0.5261427676832899,
@@ -78,14 +74,13 @@
       "dds": 0.27552405042375416,
       "bias": 0.02410592901503803,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar100\\resnet18\\42\\100",
-      "dynamic_version": "v3",
+      "proxy_log": "weights/proxy_logs/cifar100/resnet18/42/100",
       "dynamic_components": [
         "A",
         "C",
         "D"
       ],
-      "dynamic_cache_path": "weights\\dynamic_cache\\cifar100\\42\\dynamic_components_v3.npz"
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/42/dynamic_components.npz"
     },
     "96": {
       "sa": 0.5273880137897904,
@@ -93,14 +88,13 @@
       "dds": 0.27514683609439633,
       "bias": 0.023888954840789716,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights\\proxy_logs\\cifar100\\resnet18\\96\\100",
-      "dynamic_version": "v3",
+      "proxy_log": "weights/proxy_logs/cifar100/resnet18/96/100",
       "dynamic_components": [
         "A",
         "C",
         "D"
       ],
-      "dynamic_cache_path": "weights\\dynamic_cache\\cifar100\\96\\dynamic_components_v3.npz"
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/96/dynamic_components.npz"
     }
   },
   "tiny-imagenet": {

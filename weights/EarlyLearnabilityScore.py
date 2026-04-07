@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from tqdm import tqdm
 
-from .dynamic_v2_utils import (
+from .dynamic_utils import (
     FoldLogData,
-    quantile_minmax_v2,
+    quantile_minmax_dynamic,
     resolve_epoch_windows,
     softmax,
     true_class_probabilities,
@@ -15,16 +16,11 @@ from .dynamic_v2_utils import (
 
 @dataclass
 class EarlyLearnabilityResult:
-    """Result for A (Absorbable Stability in training view).
+    """Result for A (training-view absorbable stability).
 
-    Inputs:
-      - folds: CV fold logs with train_indices/train_logits.
-      - labels_all: labels aligned to global sample indices [0, num_samples).
-
-    Returns (all aligned to global indices):
-      - agg: mean of fold-internal norm1 values over folds where sample is in train set.
-      - norm2: global second quantile-minmax normalization of agg.
-      - foldwise_norm1: matrix (num_folds, num_samples), NaN where sample not in train for a fold.
+    A_raw_i(f) = z(early true-class probability mean) - z(late true-class probability variance)
+    Then fold-internal quantile min-max -> A_norm1, cross-fold train mean -> A_agg,
+    and global quantile min-max -> A_norm2.
     """
 
     agg: np.ndarray
@@ -33,7 +29,7 @@ class EarlyLearnabilityResult:
 
 
 class EarlyLearnabilityScore:
-    """A: training-view absorbable stability = z(early true prob mean) - z(late true prob variance)."""
+    """A: absorbable stability from training dynamics."""
 
     def compute(self, folds: list[FoldLogData], labels_all: np.ndarray) -> EarlyLearnabilityResult:
         num_samples = labels_all.shape[0]
@@ -44,7 +40,7 @@ class EarlyLearnabilityScore:
         agg_count = np.zeros(num_samples, dtype=np.int64)
         eps = 1e-8
 
-        for f_idx, fold in enumerate(folds):
+        for f_idx, fold in enumerate(tqdm(folds, desc="Extracting A", unit="fold")):
             train_idx = fold.train_indices
             y_train = labels_all[train_idx]
 
@@ -54,14 +50,14 @@ class EarlyLearnabilityScore:
             num_epochs = fold.train_logits.shape[0]
             early_slice, _, late_slice = resolve_epoch_windows(num_epochs)
 
-            a1 = np.mean(r[early_slice], axis=0).astype(np.float64)
-            a2 = np.var(r[late_slice], axis=0).astype(np.float64)
+            early_mean = np.mean(r[early_slice], axis=0).astype(np.float64)
+            late_var = np.var(r[late_slice], axis=0).astype(np.float64)
 
-            z1 = (a1 - a1.mean()) / (a1.std() + eps)
-            z2 = (a2 - a2.mean()) / (a2.std() + eps)
-            raw = (z1 - z2).astype(np.float32)
+            z_early_mean = (early_mean - early_mean.mean()) / (early_mean.std() + eps)
+            z_late_var = (late_var - late_var.mean()) / (late_var.std() + eps)
+            a_raw = (z_early_mean - z_late_var).astype(np.float32)
 
-            norm1 = quantile_minmax_v2(raw)
+            norm1 = quantile_minmax_dynamic(a_raw)
             foldwise_norm1[f_idx, train_idx] = norm1
             agg_sum[train_idx] += norm1.astype(np.float64)
             agg_count[train_idx] += 1
@@ -70,5 +66,5 @@ class EarlyLearnabilityScore:
             raise ValueError("Some samples never appeared in train folds when computing A.")
 
         agg = (agg_sum / agg_count).astype(np.float32)
-        norm2 = quantile_minmax_v2(agg)
+        norm2 = quantile_minmax_dynamic(agg)
         return EarlyLearnabilityResult(agg=agg, norm2=norm2, foldwise_norm1=foldwise_norm1)

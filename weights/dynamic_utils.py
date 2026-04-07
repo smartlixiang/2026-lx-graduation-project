@@ -16,15 +16,7 @@ K_RATIO_DEFAULT = 0.05
 
 @dataclass
 class FoldLogData:
-    """One CV fold log with train/val indices and logits.
-
-    Attributes:
-        fold_id: Fold index parsed from filename order.
-        train_indices: Global sample indices used for training in this fold.
-        val_indices: Global sample indices used for validation in this fold.
-        train_logits: Shape (E, N_train, C), proxy logits for train subset.
-        val_logits: Shape (E, N_val, C), proxy logits for validation subset.
-    """
+    """One CV fold log with train/val indices and logits."""
 
     fold_id: int
     train_indices: np.ndarray
@@ -116,9 +108,9 @@ def compute_class_knn_mean_distance(features: np.ndarray, labels: np.ndarray, k_
     return out
 
 
-def quantile_minmax_v2(values: np.ndarray, q_low: float = Q_LOW_DEFAULT, q_high: float = Q_HIGH_DEFAULT) -> np.ndarray:
+def quantile_minmax_dynamic(values: np.ndarray, q_low: float = Q_LOW_DEFAULT, q_high: float = Q_HIGH_DEFAULT) -> np.ndarray:
     normalized = quantile_minmax(values.astype(np.float32), q_low=q_low, q_high=q_high, fallback_value=0.5)
-    assert_finite("quantile_minmax_v2", normalized)
+    assert_finite("quantile_minmax_dynamic", normalized)
     return normalized.astype(np.float32)
 
 
@@ -131,7 +123,6 @@ def resolve_epoch_windows(num_epochs: int) -> tuple[slice, slice, slice]:
     mid_end = max(mid_start, int(math.floor(0.7 * num_epochs)))
     late_start = int(math.floor(0.7 * num_epochs)) + 1
 
-    # convert 1-based inclusive ranges to 0-based python slices
     early_slice = slice(0, early_end)
     mid_slice = slice(mid_start - 1, mid_end)
     late_slice = slice(late_start - 1, num_epochs)
@@ -170,7 +161,6 @@ def load_cv_fold_logs(proxy_log_dir: str | Path, dataset_name: str, data_root: s
             raise ValueError(f"train_indices out of range in {fold_path}")
         if np.any(val_indices < 0) or np.any(val_indices >= num_samples):
             raise ValueError(f"val_indices out of range in {fold_path}")
-
         if train_logits.ndim != 3 or val_logits.ndim != 3:
             raise ValueError(f"train_logits/val_logits must be 3D in {fold_path}")
         if train_logits.shape[1] != train_indices.shape[0]:
@@ -197,11 +187,11 @@ def load_cv_fold_logs(proxy_log_dir: str | Path, dataset_name: str, data_root: s
     return folds, labels_all.astype(np.int64)
 
 
-def default_dynamic_v2_cache_path(
+def default_dynamic_cache_path(
     dataset: str,
     *,
     proxy_model: str = "resnet18",
     epochs: int | None = None,
 ) -> Path:
     epoch_tag = str(int(epochs)) if epochs is not None else "latest"
-    return Path("weights") / "dynamic_cache" / dataset / proxy_model / epoch_tag / "dynamic_components_v3.npz"
+    return Path("weights") / "dynamic_cache" / dataset / proxy_model / epoch_tag / "dynamic_components.npz"

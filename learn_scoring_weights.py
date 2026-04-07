@@ -27,7 +27,7 @@ from weights import (
     EarlyLearnabilityScore,
     OOFPatternGapScore,
 )
-from weights.dynamic_v2_utils import default_dynamic_v2_cache_path, load_cv_fold_logs
+from weights.dynamic_utils import default_dynamic_cache_path, load_cv_fold_logs
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -85,14 +85,14 @@ def parse_args() -> argparse.Namespace:
             "(legacy DDS name retained for compatibility). Default: 0.5."
         ),
     )
-    # Deprecated dynamic-v1 args are intentionally kept for CLI compatibility.
+    # Deprecated dynamic args are intentionally kept for CLI compatibility.
     parser.add_argument("--coverage-tau-g", type=float, default=0.15)
     parser.add_argument("--coverage-s-g", type=float, default=0.07)
     parser.add_argument(
         "--coverage-k-pct",
         type=float,
         default=0.05,
-        help="Deprecated: kept for compatibility, unused in dynamic v2.",
+        help="Deprecated: kept for compatibility, unused in current dynamic flow.",
     )
     parser.add_argument("--coverage-q-low", type=float, default=0.002)
     parser.add_argument("--coverage-q-high", type=float, default=0.998)
@@ -419,7 +419,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     if not np.all(np.isfinite(u_scores)):
         raise ValueError("u_norm contains NaN/inf values.")
 
-    dynamic_cache_path = default_dynamic_v2_cache_path(
+    dynamic_cache_path = default_dynamic_cache_path(
         args.dataset,
         proxy_model=args.proxy_model,
         epochs=actual_proxy_epochs,
@@ -427,8 +427,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     dynamic_cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         dynamic_cache_path,
-        version=np.array("dynamic_v3", dtype=object),
-        component_names=np.array(["A", "C", "D"], dtype=object),
+                component_names=np.array(["A", "C", "D"], dtype=object),
         dataset=np.array(args.dataset, dtype=object),
         seed=np.array(proxy_training_seed, dtype=np.int64),
         seed_free=np.array(True),
@@ -487,7 +486,6 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "bias": float(bias),
             "ridge_lambda": float(args.ridge_lambda),
             "proxy_log": str(proxy_log),
-            "dynamic_version": "v3",
             "dynamic_components": ["A", "C", "D"],
             "dynamic_cache_path": str(dynamic_cache_path),
             "proxy_training_seed": proxy_training_seed,
@@ -503,7 +501,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     print("Learned weights saved to", output_path)
     print("Applied output seeds:", output_seeds)
     print("Shared learned weights:", dataset_entry[str(output_seeds[0])])
-    print("Dynamic v3 cache saved to", dynamic_cache_path)
+    print("Dynamic cache saved to", dynamic_cache_path)
 
 
 if __name__ == "__main__":

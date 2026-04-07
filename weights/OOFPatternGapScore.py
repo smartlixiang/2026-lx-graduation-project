@@ -4,11 +4,12 @@ from dataclasses import dataclass
 import math
 
 import numpy as np
+from tqdm import tqdm
 
-from .dynamic_v2_utils import (
+from .dynamic_utils import (
     FoldLogData,
     confusion_distribution_wo_true,
-    quantile_minmax_v2,
+    quantile_minmax_dynamic,
     resolve_epoch_windows,
     softmax,
     true_class_probabilities,
@@ -17,7 +18,7 @@ from .dynamic_v2_utils import (
 
 @dataclass
 class OOFPatternGapResult:
-    """Result for D, aligned to global sample indices."""
+    """Result for D (validation-view learnable boundary value), aligned to global sample indices."""
 
     agg: np.ndarray
     norm2: np.ndarray
@@ -25,10 +26,10 @@ class OOFPatternGapResult:
 
 
 class OOFPatternGapScore:
-    """Legacy file/class name retained; now computes validation learnable boundary value.
+    """Compute D from OOF dynamics + unified static feature space.
 
-    D_raw = b(i,f) * max(delta_r(i,f), 0), where b is same/rival cosine-distance ratio
-    in static feature space from training fold structure, and delta_r is OOF learnability gain.
+    D_raw_i(f) = b_i(f) * max(delta_r_i(f), 0),
+    where b_i(f) = d_same(i,f) / (d_rival(i,f) + eps) under cosine distance.
     """
 
     def compute(
@@ -53,7 +54,7 @@ class OOFPatternGapScore:
         foldwise_norm1 = np.full((num_folds, num_samples), np.nan, dtype=np.float32)
         agg = np.full(num_samples, np.nan, dtype=np.float32)
 
-        for f_idx, fold in enumerate(folds):
+        for f_idx, fold in enumerate(tqdm(folds, desc="Extracting D", unit="fold")):
             train_idx = fold.train_indices
             val_idx = fold.val_indices
             y_train = labels_all[train_idx]
@@ -72,13 +73,19 @@ class OOFPatternGapScore:
             c_star = np.argmax(qbar, axis=1).astype(np.int64)
 
             raw = np.zeros(val_idx.shape[0], dtype=np.float32)
-            for local_i, global_i in enumerate(val_idx):
+            sample_iter = tqdm(
+                enumerate(val_idx),
+                total=val_idx.shape[0],
+                desc=f"Extracting D fold {f_idx} samples",
+                unit="sample",
+                leave=False,
+            )
+            for local_i, global_i in sample_iter:
                 yi = int(y_val[local_i])
                 rival = int(c_star[local_i])
 
                 same_train_mask = y_train == yi
                 rival_train_mask = y_train == rival
-
                 same_feats = g[train_idx[same_train_mask]]
                 rival_feats = g[train_idx[rival_train_mask]]
 
@@ -86,7 +93,6 @@ class OOFPatternGapScore:
                     same_feats = g[train_idx]
                 if rival_feats.shape[0] == 0:
                     rival_feats = g[train_idx]
-
                 if same_feats.shape[0] == 0 or rival_feats.shape[0] == 0:
                     raise ValueError(f"Fold {f_idx}: empty training features prevent D computation for sample {global_i}.")
 
@@ -103,7 +109,7 @@ class OOFPatternGapScore:
                 b = d_same / (d_rival + eps)
                 raw[local_i] = np.float32(b * delta_r[local_i])
 
-            norm1 = quantile_minmax_v2(raw)
+            norm1 = quantile_minmax_dynamic(raw)
             foldwise_norm1[f_idx, val_idx] = norm1
             agg[val_idx] = norm1
 
@@ -111,5 +117,5 @@ class OOFPatternGapScore:
             missing = np.where(~np.isfinite(agg))[0]
             raise ValueError(f"Some samples missing D assignment in validation folds: {missing[:10]}.")
 
-        norm2 = quantile_minmax_v2(agg)
+        norm2 = quantile_minmax_dynamic(agg)
         return OOFPatternGapResult(agg=agg.astype(np.float32), norm2=norm2, foldwise_norm1=foldwise_norm1)

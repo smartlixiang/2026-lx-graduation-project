@@ -45,6 +45,21 @@ def _resolve_component(data: np.lib.npyio.NpzFile, name: str) -> np.ndarray:
     return values
 
 
+def _resolve_final_utility(data: np.lib.npyio.NpzFile) -> tuple[np.ndarray, str]:
+    if "u_norm" in data:
+        values = data["u_norm"].astype(np.float32)
+        title = "Final utility label used for regression"
+    elif "u_raw" in data:
+        values = data["u_raw"].astype(np.float32)
+        title = "Final utility label before normalization"
+    else:
+        raise KeyError("Missing cache field: 'u_norm' or 'u_raw'.")
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        raise ValueError("Final utility label has no finite values.")
+    return values, title
+
+
 def main() -> None:
     args = parse_args()
     cache_path = Path(args.cache) if args.cache else default_dynamic_cache_path(
@@ -76,6 +91,18 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180)
     print(f"Saved histogram figure to: {output_path}")
+
+    final_values, final_title = _resolve_final_utility(data)
+    fig_final, ax_final = plt.subplots(1, 1, figsize=(8, 6), constrained_layout=True)
+    ax_final.hist(final_values, bins=args.bins, color="#4C78A8", alpha=0.85, edgecolor="white")
+    ax_final.set_title(final_title)
+    ax_final.set_xlabel("Score")
+    ax_final.set_ylabel("Count")
+    ax_final.grid(alpha=0.2, linestyle="--")
+
+    final_output_path = output_path.with_name(f"{output_path.stem}_final_utility_hist{output_path.suffix}")
+    fig_final.savefig(final_output_path, dpi=180)
+    print(f"Saved final utility histogram figure to: {final_output_path}")
 
 
 if __name__ == "__main__":

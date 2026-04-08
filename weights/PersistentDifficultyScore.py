@@ -4,7 +4,6 @@ import numpy as np
 from tqdm import tqdm
 
 from .dynamic_utils import (
-    EPS,
     DynamicComponentResult,
     FoldLogData,
     aggregate_val_fold_component,
@@ -15,7 +14,7 @@ from .dynamic_utils import (
 
 
 class PersistentDifficultyScore:
-    """E: late-stage persistent difficulty on OOF validation trajectories."""
+    """E: persistent validation difficulty over mid+late after discounting early baseline."""
 
     def __init__(self, tau_e: float = 1.0) -> None:
         if tau_e <= 0:
@@ -34,25 +33,20 @@ class PersistentDifficultyScore:
             logits_val = np.nan_to_num(fold.val_logits.astype(np.float64), nan=0.0, posinf=50.0, neginf=-50.0)
             probs_val = softmax(logits_val.astype(np.float32)).astype(np.float64)
 
-            epoch_ids = np.arange(logits_val.shape[0])[:, None]
-            sample_ids = np.arange(logits_val.shape[1])[None, :]
-            true_logits = logits_val[epoch_ids, sample_ids, y_val[None, :]]
-            masked = logits_val.copy()
-            masked[epoch_ids, sample_ids, y_val[None, :]] = -np.inf
-            rival_logits = np.max(masked, axis=2)
-            margin = true_logits - rival_logits
+            epoch_ids = np.arange(probs_val.shape[0])[:, None]
+            sample_ids = np.arange(probs_val.shape[1])[None, :]
+            true_class_probs = probs_val[epoch_ids, sample_ids, y_val[None, :]]
 
-            _, _, late_idx = resolve_epoch_windows(logits_val.shape[0])
+            early_idx, mid_idx, late_idx = resolve_epoch_windows(logits_val.shape[0])
+            hard_idx = np.concatenate([mid_idx, late_idx])
 
-            margin_term = 1.0 / (1.0 + np.exp(margin[late_idx] / self.tau_e))
-            e_margin = np.mean(margin_term, axis=0)
+            early_true_prob_mean = np.mean(true_class_probs[early_idx], axis=0)
+            hard_true_prob_mean = np.mean(true_class_probs[hard_idx], axis=0)
 
-            entropy = -np.sum(probs_val * np.log(np.clip(probs_val, EPS, 1.0)), axis=2)
-            num_classes = probs_val.shape[2]
-            entropy_norm = entropy / np.log(max(num_classes, 2))
-            e_entropy = np.mean(entropy_norm[late_idx], axis=0)
+            early_difficulty_baseline = 1.0 - early_true_prob_mean
+            hard_difficulty_residual = 1.0 - hard_true_prob_mean
 
-            raw = (e_margin + e_entropy).astype(np.float32)
+            raw = (hard_difficulty_residual - 0.5 * early_difficulty_baseline).astype(np.float32)
             raw_foldwise[f_idx, val_idx] = raw
             fold_normalized[f_idx, val_idx] = quantile_minmax_dynamic(raw)
 

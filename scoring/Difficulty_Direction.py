@@ -1,4 +1,4 @@
-"""类内 DDS 评分实现（保留旧命名，内部已切换为主导方向定义）。"""
+"""类内 DDS 评分实现（保留旧命名，内部为 IDS 风格主方向定义）。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -46,7 +46,7 @@ class DifficultyDirection:
         实际实现已更新为“类内主导方向分数”：
         - 按类别做 PCA；
         - 选择累计特征值占比达到阈值（默认 0.5）的主方向；
-        - 以 ``sum_j sqrt(lambda_j) * |projection_j|`` 作为原始分数。
+        - 以“选中主方向上的平均绝对投影”作为原始分数。
     """
 
     def __init__(
@@ -126,15 +126,13 @@ class DifficultyDirection:
         return eigvecs[:, :m], eigvals[:m]
 
     @staticmethod
-    def _compute_weighted_abs_projection(
+    def _compute_mean_abs_projection(
         centered_features: torch.Tensor,
         selected_dirs: torch.Tensor,
-        selected_eigvals: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute raw DDS as sum_j sqrt(lambda_j) * |projection_j|."""
+        """Compute raw DDS as mean_j |projection_j| on selected dominant directions."""
         projections = centered_features @ selected_dirs
-        eigval_weights = torch.sqrt(torch.clamp(selected_eigvals, min=0.0))
-        return (projections.abs() * eigval_weights.unsqueeze(0)).sum(dim=1)
+        return projections.abs().mean(dim=1)
 
     def _dds_from_pca(self, class_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_samples, feat_dim = class_features.shape
@@ -151,11 +149,11 @@ class DifficultyDirection:
         )
         eigenvalues, eigenvectors = torch.linalg.eigh(cov)
 
-        selected_dirs, selected_eigvals = self._select_difficulty_dirs(eigenvalues, eigenvectors)
+        selected_dirs, _ = self._select_difficulty_dirs(eigenvalues, eigenvectors)
         if selected_dirs.shape[1] == 0:
             return torch.zeros(num_samples, device=class_features.device), mean
 
-        scores = self._compute_weighted_abs_projection(centered, selected_dirs, selected_eigvals)
+        scores = self._compute_mean_abs_projection(centered, selected_dirs)
         return scores, mean
 
     def _dds_from_reference_pca(
@@ -182,12 +180,12 @@ class DifficultyDirection:
             feat_dim, device=class_features.device, dtype=class_features.dtype
         )
         eigenvalues, eigenvectors = torch.linalg.eigh(cov)
-        selected_dirs, selected_eigvals = self._select_difficulty_dirs(eigenvalues, eigenvectors)
+        selected_dirs, _ = self._select_difficulty_dirs(eigenvalues, eigenvectors)
         if selected_dirs.shape[1] == 0:
             return torch.zeros(num_samples, device=class_features.device)
 
         centered = class_features - ref_mean
-        return self._compute_weighted_abs_projection(centered, selected_dirs, selected_eigvals)
+        return self._compute_mean_abs_projection(centered, selected_dirs)
 
     def analyze_principal_directions(self, class_features: torch.Tensor) -> dict[str, object]:
         """Analyze dominant principal directions for one class feature matrix.

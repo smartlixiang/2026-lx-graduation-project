@@ -20,7 +20,6 @@ from utils.class_name_utils import resolve_class_names_for_prompts
 from utils.global_config import CONFIG
 from utils.proxy_log_utils import resolve_proxy_log_path
 from utils.seed import parse_seed_list, set_seed
-from utils.score_utils import quantile_minmax
 from utils.static_score_cache import get_or_compute_static_scores
 from weights import (
     AbsorptionGainScore,
@@ -364,17 +363,29 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         if not np.all(np.isfinite(arr)):
             raise ValueError(f"{name} contains NaN/inf values.")
 
+    # All dynamic components are already normalized to [0, 1]. Keep the original
+    # component weights and aggregate via weighted average so final utility remains
+    # in [0, 1] without an extra normalization pass.
+    total_weight = 1.0 + 1.0 + 0.5 + 0.5
     u_raw = (
-        a_result.final_normalized
-        + c_result.final_normalized
+        1.0 * a_result.final_normalized
+        + 1.0 * c_result.final_normalized
         + 0.5 * d_result.final_normalized
         + 0.5 * e_result.final_normalized
     )
     if not np.all(np.isfinite(u_raw)):
         raise ValueError("u_raw contains NaN/inf values.")
-    u_scores = quantile_minmax(u_raw.astype(np.float32), q_low=0.002, q_high=0.998, fallback_value=0.5)
+    u_scores = (u_raw / total_weight).astype(np.float32)
+    if u_scores.shape != (num_samples,):
+        raise ValueError(f"u_scores shape mismatch: {u_scores.shape}")
     if not np.all(np.isfinite(u_scores)):
-        raise ValueError("u_norm contains NaN/inf values.")
+        raise ValueError("u_scores contains NaN/inf values.")
+    u_min = float(np.min(u_scores))
+    u_max = float(np.max(u_scores))
+    if u_min < -1e-6 or u_max > 1.0 + 1e-6:
+        raise ValueError(f"u_scores out of [0,1] tolerance range: min={u_min:.8f}, max={u_max:.8f}")
+    # Defensive clip against tiny floating-point drift while preserving semantics.
+    u_scores = np.clip(u_scores, 0.0, 1.0)
 
     dynamic_cache_path = default_dynamic_cache_path(
         args.dataset,
@@ -407,7 +418,10 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         C_final_normalized=c_result.final_normalized.astype(np.float32),
         D_final_normalized=d_result.final_normalized.astype(np.float32),
         E_final_normalized=e_result.final_normalized.astype(np.float32),
+        # For compatibility with existing readers, keep u_raw key as the weighted
+        # sum before dividing by total_weight; final utility is stored in u_scores/u_norm.
         u_raw=u_raw.astype(np.float32),
+        u_scores=u_scores.astype(np.float32),
         u_norm=u_scores.astype(np.float32),
     )
 

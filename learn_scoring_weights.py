@@ -117,7 +117,10 @@ def parse_args() -> argparse.Namespace:
         "--seed",
         type=str,
         default=",".join(str(s) for s in CONFIG.exp_seeds),
-        help="输出兼容 seed 列表（用于在 scoring_weights.json 中写多条相同记录）",
+        help=(
+            "输出 seed 列表：会分别加载各自 adapter、分别计算 SA/Div/DDS、分别学习权重；"
+            "仅共享 proxy 动态监督标签。"
+        ),
     )
     parser.add_argument(
         "--proxy-training-seed",
@@ -319,10 +322,6 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         debug_prompts=args.debug_prompts,
     )
 
-    image_adapter, text_adapter, adapter_paths = load_adapters_for_seed(
-        args, args.dataset, dds_metric.extractor.embed_dim, proxy_training_seed, device
-    )
-
     dds_loader = build_score_loader(
         dds_metric.extractor.preprocess,
         args.data_root,
@@ -350,48 +349,6 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
 
     dataset_for_labels = _build_dataset(args.dataset, args.data_root, transform=None)
     num_samples_static = len(dataset_for_labels)
-
-    def _compute_scores() -> dict[str, np.ndarray]:
-        dds_scores_local = dds_metric.score_dataset(
-            tqdm(dds_loader, desc="Scoring DDS", unit="batch"),
-            adapter=image_adapter,
-        )
-        div_scores_local = div_metric.score_dataset(
-            tqdm(div_loader, desc="Scoring Div", unit="batch"),
-            adapter=image_adapter,
-        )
-        sa_scores_local = sa_metric.score_dataset(
-            tqdm(sa_loader, desc="Scoring SA", unit="batch"),
-            adapter_image=image_adapter,
-            adapter_text=text_adapter,
-        )
-        return {
-            "sa": sa_scores_local.scores.numpy(),
-            "div": div_scores_local.scores.numpy(),
-            "dds": dds_scores_local.scores.numpy(),
-            "labels": np.asarray(dataset_for_labels.targets),
-        }
-
-    static_scores = get_or_compute_static_scores(
-        cache_root=PROJECT_ROOT / "static_scores",
-        dataset=args.dataset,
-        seed=proxy_training_seed,
-        clip_model=args.clip_model,
-        adapter_image_path=str(adapter_paths["image_path"]),
-        adapter_text_path=str(adapter_paths["text_path"]),
-        div_k=div_metric.k,
-        dds_k=dds_metric.k,
-        dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
-        dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
-        prompt_template=sa_metric.prompt_template,
-        num_samples=num_samples_static,
-        compute_fn=_compute_scores,
-    )
-
-    if num_samples != num_samples_static:
-        raise ValueError("Dynamic labels and static dataset sample count mismatch.")
-    if not np.array_equal(labels_all, static_scores["labels"]):
-        raise ValueError("代理训练日志的标签与评分数据集标签不一致。")
 
     d_result = TransferabilityAlignmentScore().compute(folds=folds, labels_all=labels_all)
     e_result = PersistentDifficultyScore().compute(folds=folds, labels_all=labels_all)
@@ -454,58 +411,13 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         u_norm=u_scores.astype(np.float32),
     )
 
-    static_features = np.stack(
-        [
-            static_scores["sa"],
-            static_scores["div"],
-            static_scores["dds"],
-        ],
-        axis=1,
-    ).astype(np.float64)
-    dynamic_scores = u_scores.astype(np.float64)
-
-    weights, bias = fit_ridge_regression_nonnegative(
-        static_features,
-        dynamic_scores,
-        args.ridge_lambda,
-        args.learning_rate,
-        args.max_iter,
-        args.tol,
-    )
-
     dynamic_component_values = {
         "A": a_result.final_normalized,
         "C": c_result.final_normalized,
         "D": d_result.final_normalized,
         "E": e_result.final_normalized,
     }
-    static_component_values = {
-        "SA": static_scores["sa"],
-        "Div": static_scores["div"],
-        "DDS": static_scores["dds"],
-    }
-    correlation_matrix: dict[str, dict[str, float]] = {}
-    print("Dynamic-vs-static Pearson correlations:")
-    for d_name, d_values in dynamic_component_values.items():
-        correlation_matrix[d_name] = {}
-        row_str = []
-        for s_name, s_values in static_component_values.items():
-            corr = safe_pearson_corr(d_values, s_values)
-            correlation_matrix[d_name][s_name] = corr
-            row_str.append(f"{s_name}={corr:+.4f}")
-        print(f"  {d_name}: " + ", ".join(row_str))
-
-    print(
-        "Learned static weights:",
-        f"SA={weights[0]:.6f}, Div={weights[1]:.6f}, DDS={weights[2]:.6f}, bias={bias:.6f}",
-    )
-    sa_warning = bool(weights[0] > (1.0 / 3.0))
-    div_is_lowest = bool(weights[1] <= min(weights[0], weights[2]))
-    if sa_warning:
-        print("WARNING: learned SA weight is above 1/3.")
-    if div_is_lowest:
-        print("WARNING: learned Div weight is the lowest among SA/Div/DDS.")
-
+    dynamic_scores = u_scores.astype(np.float64)
     output_path = build_output_path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     data: dict[str, dict[str, dict[str, object]]] = {}
@@ -517,6 +429,97 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
 
     dataset_entry = data.get(args.dataset, {})
     for seed in output_seeds:
+        image_adapter, text_adapter, adapter_paths = load_adapters_for_seed(
+            args, args.dataset, dds_metric.extractor.embed_dim, seed, device
+        )
+
+        def _compute_scores() -> dict[str, np.ndarray]:
+            dds_scores_local = dds_metric.score_dataset(
+                tqdm(dds_loader, desc=f"Scoring DDS (seed={seed})", unit="batch"),
+                adapter=image_adapter,
+            )
+            div_scores_local = div_metric.score_dataset(
+                tqdm(div_loader, desc=f"Scoring Div (seed={seed})", unit="batch"),
+                adapter=image_adapter,
+            )
+            sa_scores_local = sa_metric.score_dataset(
+                tqdm(sa_loader, desc=f"Scoring SA (seed={seed})", unit="batch"),
+                adapter_image=image_adapter,
+                adapter_text=text_adapter,
+            )
+            return {
+                "sa": sa_scores_local.scores.numpy(),
+                "div": div_scores_local.scores.numpy(),
+                "dds": dds_scores_local.scores.numpy(),
+                "labels": np.asarray(dataset_for_labels.targets),
+            }
+
+        static_scores = get_or_compute_static_scores(
+            cache_root=PROJECT_ROOT / "static_scores",
+            dataset=args.dataset,
+            seed=seed,
+            clip_model=args.clip_model,
+            adapter_image_path=str(adapter_paths["image_path"]),
+            adapter_text_path=str(adapter_paths["text_path"]),
+            div_k=div_metric.k,
+            dds_k=dds_metric.k,
+            dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
+            dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
+            prompt_template=sa_metric.prompt_template,
+            num_samples=num_samples_static,
+            compute_fn=_compute_scores,
+        )
+
+        if num_samples != num_samples_static:
+            raise ValueError("Dynamic labels and static dataset sample count mismatch.")
+        if not np.array_equal(labels_all, static_scores["labels"]):
+            raise ValueError("代理训练日志的标签与评分数据集标签不一致。")
+
+        static_features = np.stack(
+            [
+                static_scores["sa"],
+                static_scores["div"],
+                static_scores["dds"],
+            ],
+            axis=1,
+        ).astype(np.float64)
+
+        weights, bias = fit_ridge_regression_nonnegative(
+            static_features,
+            dynamic_scores,
+            args.ridge_lambda,
+            args.learning_rate,
+            args.max_iter,
+            args.tol,
+        )
+
+        static_component_values = {
+            "SA": static_scores["sa"],
+            "Div": static_scores["div"],
+            "DDS": static_scores["dds"],
+        }
+        correlation_matrix: dict[str, dict[str, float]] = {}
+        print(f"Dynamic-vs-static Pearson correlations (seed={seed}):")
+        for d_name, d_values in dynamic_component_values.items():
+            correlation_matrix[d_name] = {}
+            row_str = []
+            for s_name, s_values in static_component_values.items():
+                corr = safe_pearson_corr(d_values, s_values)
+                correlation_matrix[d_name][s_name] = corr
+                row_str.append(f"{s_name}={corr:+.4f}")
+            print(f"  {d_name}: " + ", ".join(row_str))
+
+        print(
+            f"Learned weights for seed {seed}:",
+            f"SA={weights[0]:.6f}, Div={weights[1]:.6f}, DDS={weights[2]:.6f}, bias={bias:.6f}",
+        )
+        sa_warning = bool(weights[0] > (1.0 / 3.0))
+        div_is_lowest = bool(weights[1] <= min(weights[0], weights[2]))
+        if sa_warning:
+            print(f"WARNING (seed={seed}): learned SA weight is above 1/3.")
+        if div_is_lowest:
+            print(f"WARNING (seed={seed}): learned Div weight is the lowest among SA/Div/DDS.")
+
         seed_key = str(seed)
         dataset_entry.pop(f"{seed_key}_meta", None)
         dataset_entry[seed_key] = {
@@ -545,7 +548,6 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
 
     print("Learned weights saved to", output_path)
     print("Applied output seeds:", output_seeds)
-    print("Shared learned weights:", dataset_entry[str(output_seeds[0])])
     print("Dynamic cache saved to", dynamic_cache_path)
 
 

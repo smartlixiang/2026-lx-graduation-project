@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import torch
@@ -27,9 +27,29 @@ from weights import (
     PersistentDifficultyScore,
     TransferabilityAlignmentScore,
 )
-from weights.dynamic_utils import default_dynamic_cache_path, load_cv_fold_logs
+from weights.dynamic_utils import DynamicComponentResult, load_cv_fold_logs
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def resolve_default_proxy_epochs(dataset_name: str) -> int:
+    mapping = {
+        CIFAR10: 200,
+        CIFAR100: 200,
+        TINY_IMAGENET: 90,
+    }
+    if dataset_name not in mapping:
+        raise ValueError(f"Unsupported dataset for default proxy epochs: {dataset_name}")
+    return mapping[dataset_name]
+
+
+def resolve_dynamic_component_cache_dir(dataset: str, proxy_model: str, epochs: int) -> Path:
+    return Path("weights") / "dynamic_cache" / dataset / proxy_model / str(int(epochs))
+
+
+def resolve_dynamic_component_cache_path(dataset: str, proxy_model: str, epochs: int, component_name: str) -> Path:
+    normalized_component = component_name.strip().upper()
+    return resolve_dynamic_component_cache_dir(dataset, proxy_model, epochs) / f"{normalized_component}.npz"
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,7 +72,11 @@ def parse_args() -> argparse.Namespace:
         "--proxy-epochs",
         type=int,
         default=None,
-        help="Max epochs for proxy log directory name. Defaults to latest epoch folder.",
+        help=(
+            "Proxy epochs for locating proxy logs/cache. "
+            "Default is auto-resolved by dataset (cifar10/cifar100->200, tiny-imagenet->90); "
+            "manual override is not recommended unless logs use custom epochs."
+        ),
     )
     parser.add_argument(
         "--adapter-image-path",
@@ -275,17 +299,167 @@ def safe_pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(xx, yy)[0, 1])
 
 
+def save_dynamic_component_cache(
+    *,
+    cache_path: Path,
+    component_name: str,
+    dataset: str,
+    proxy_model: str,
+    proxy_training_seed: int,
+    epochs: int,
+    proxy_log_path: Path,
+    labels: np.ndarray,
+    result: DynamicComponentResult,
+) -> None:
+    labels_i64 = labels.astype(np.int64, copy=False)
+    num_samples = int(labels_i64.shape[0])
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        component_name=np.array(component_name, dtype=np.str_),
+        dataset=np.array(dataset, dtype=np.str_),
+        proxy_model=np.array(proxy_model, dtype=np.str_),
+        proxy_training_seed=np.array(proxy_training_seed, dtype=np.int64),
+        seed_free=np.array(True),
+        epochs=np.array(epochs, dtype=np.int64),
+        proxy_log_path=np.array(str(proxy_log_path), dtype=np.str_),
+        num_samples=np.array(num_samples, dtype=np.int64),
+        labels=labels_i64,
+        raw_foldwise=result.raw_foldwise.astype(np.float32),
+        fold_normalized=result.fold_normalized.astype(np.float32),
+        aggregated=result.aggregated.astype(np.float32),
+        final_normalized=result.final_normalized.astype(np.float32),
+    )
+
+
+def load_dynamic_component_cache_if_valid(
+    *,
+    cache_path: Path,
+    component_name: str,
+    dataset: str,
+    proxy_model: str,
+    proxy_training_seed: int,
+    epochs: int,
+    proxy_log_path: Path,
+    labels_all: np.ndarray,
+) -> DynamicComponentResult | None:
+    if not cache_path.is_file():
+        return None
+
+    required_keys = {
+        "component_name",
+        "dataset",
+        "proxy_model",
+        "proxy_training_seed",
+        "epochs",
+        "proxy_log_path",
+        "num_samples",
+        "labels",
+        "raw_foldwise",
+        "fold_normalized",
+        "aggregated",
+        "final_normalized",
+    }
+    try:
+        with np.load(cache_path, allow_pickle=False) as data:
+            if not required_keys.issubset(set(data.files)):
+                return None
+            if str(data["component_name"].item()) != component_name:
+                return None
+            if str(data["dataset"].item()) != dataset:
+                return None
+            if str(data["proxy_model"].item()) != proxy_model:
+                return None
+            if int(data["proxy_training_seed"].item()) != int(proxy_training_seed):
+                return None
+            if int(data["epochs"].item()) != int(epochs):
+                return None
+            if str(data["proxy_log_path"].item()) != str(proxy_log_path):
+                return None
+            if int(data["num_samples"].item()) != int(labels_all.shape[0]):
+                return None
+            labels_cached = data["labels"].astype(np.int64, copy=False)
+            if not np.array_equal(labels_cached, labels_all.astype(np.int64, copy=False)):
+                return None
+            raw_foldwise = data["raw_foldwise"].astype(np.float32, copy=False)
+            fold_normalized = data["fold_normalized"].astype(np.float32, copy=False)
+            aggregated = data["aggregated"].astype(np.float32, copy=False)
+            final_normalized = data["final_normalized"].astype(np.float32, copy=False)
+    except Exception:
+        return None
+
+    num_samples = int(labels_all.shape[0])
+    if aggregated.shape != (num_samples,) or final_normalized.shape != (num_samples,):
+        return None
+    if raw_foldwise.ndim != 2 or fold_normalized.ndim != 2:
+        return None
+    if raw_foldwise.shape != fold_normalized.shape or raw_foldwise.shape[1] != num_samples:
+        return None
+    if not np.all(np.isfinite(aggregated)) or not np.all(np.isfinite(final_normalized)):
+        return None
+    if not np.all(np.isfinite(raw_foldwise)) or not np.all(np.isfinite(fold_normalized)):
+        return None
+
+    return DynamicComponentResult(
+        raw_foldwise=raw_foldwise,
+        fold_normalized=fold_normalized,
+        aggregated=aggregated,
+        final_normalized=final_normalized,
+    )
+
+
+def get_or_compute_dynamic_component(
+    *,
+    component_name: str,
+    dataset: str,
+    proxy_model: str,
+    proxy_training_seed: int,
+    epochs: int,
+    proxy_log_path: Path,
+    labels_all: np.ndarray,
+    compute_fn: Callable[[], DynamicComponentResult],
+) -> tuple[DynamicComponentResult, bool, Path]:
+    cache_path = resolve_dynamic_component_cache_path(dataset, proxy_model, epochs, component_name)
+    cached = load_dynamic_component_cache_if_valid(
+        cache_path=cache_path,
+        component_name=component_name,
+        dataset=dataset,
+        proxy_model=proxy_model,
+        proxy_training_seed=proxy_training_seed,
+        epochs=epochs,
+        proxy_log_path=proxy_log_path,
+        labels_all=labels_all,
+    )
+    if cached is not None:
+        return cached, True, cache_path
+
+    computed = compute_fn()
+    save_dynamic_component_cache(
+        cache_path=cache_path,
+        component_name=component_name,
+        dataset=dataset,
+        proxy_model=proxy_model,
+        proxy_training_seed=proxy_training_seed,
+        epochs=epochs,
+        proxy_log_path=proxy_log_path,
+        labels=labels_all,
+        result=computed,
+    )
+    return computed, False, cache_path
+
+
 def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     proxy_training_seed = int(args.proxy_training_seed)
     set_seed(proxy_training_seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
 
+    resolved_proxy_epochs = int(args.proxy_epochs) if args.proxy_epochs is not None else resolve_default_proxy_epochs(args.dataset)
     proxy_log = resolve_proxy_log_path(
         args.proxy_log,
         args.dataset,
         proxy_training_seed,
         proxy_model=args.proxy_model,
-        max_epoch=args.proxy_epochs,
+        max_epoch=resolved_proxy_epochs,
     )
 
     if not proxy_log.is_dir():
@@ -294,9 +468,38 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
     num_samples = labels_all.shape[0]
     actual_proxy_epochs = int(folds[0].train_logits.shape[0])
+    if actual_proxy_epochs != resolved_proxy_epochs:
+        print(
+            f"INFO: requested proxy epochs={resolved_proxy_epochs}, "
+            f"but loaded logs contain {actual_proxy_epochs} epochs; cache will use requested epochs tag."
+        )
 
-    a_result = AbsorptionGainScore().compute(folds=folds, labels_all=labels_all)
-    c_result = ConfusionComplementarityScore().compute(folds=folds, labels_all=labels_all)
+    component_results: dict[str, DynamicComponentResult] = {}
+    component_cache_paths: dict[str, Path] = {}
+    component_compute_fns: dict[str, Callable[[], DynamicComponentResult]] = {
+        "A": lambda: AbsorptionGainScore().compute(folds=folds, labels_all=labels_all),
+        "C": lambda: ConfusionComplementarityScore().compute(folds=folds, labels_all=labels_all),
+        "D": lambda: TransferabilityAlignmentScore().compute(folds=folds, labels_all=labels_all),
+        "E": lambda: PersistentDifficultyScore().compute(folds=folds, labels_all=labels_all),
+    }
+    for component_name in ("A", "C", "D", "E"):
+        result, from_cache, cache_path = get_or_compute_dynamic_component(
+            component_name=component_name,
+            dataset=args.dataset,
+            proxy_model=args.proxy_model,
+            proxy_training_seed=proxy_training_seed,
+            epochs=resolved_proxy_epochs,
+            proxy_log_path=proxy_log,
+            labels_all=labels_all,
+            compute_fn=component_compute_fns[component_name],
+        )
+        component_results[component_name] = result
+        component_cache_paths[component_name] = cache_path
+        status = "HIT" if from_cache else "MISS->RECOMPUTED"
+        print(f"Dynamic component cache {status}: {component_name} @ {cache_path}")
+
+    a_result = component_results["A"]
+    c_result = component_results["C"]
 
     class_names = load_class_names(args.dataset, args.data_root)
     dds_metric = DifficultyDirection(
@@ -349,8 +552,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     dataset_for_labels = _build_dataset(args.dataset, args.data_root, transform=None)
     num_samples_static = len(dataset_for_labels)
 
-    d_result = TransferabilityAlignmentScore().compute(folds=folds, labels_all=labels_all)
-    e_result = PersistentDifficultyScore().compute(folds=folds, labels_all=labels_all)
+    d_result = component_results["D"]
+    e_result = component_results["E"]
 
     for name, arr in {
         "A_final_normalized": a_result.final_normalized,
@@ -387,43 +590,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     # Defensive clip against tiny floating-point drift while preserving semantics.
     u_scores = np.clip(u_scores, 0.0, 1.0)
 
-    dynamic_cache_path = default_dynamic_cache_path(
-        args.dataset,
-        proxy_model=args.proxy_model,
-        epochs=actual_proxy_epochs,
-    )
-    dynamic_cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        dynamic_cache_path,
-        component_names=np.array(["A", "C", "D", "E"], dtype=object),
-        dataset=np.array(args.dataset, dtype=object),
-        seed=np.array(proxy_training_seed, dtype=np.int64),
-        seed_free=np.array(True),
-        proxy_log_path=np.array(str(proxy_log), dtype=object),
-        indices=np.arange(num_samples, dtype=np.int64),
-        labels=labels_all.astype(np.int64),
-        A_raw_foldwise=a_result.raw_foldwise.astype(np.float32),
-        C_raw_foldwise=c_result.raw_foldwise.astype(np.float32),
-        D_raw_foldwise=d_result.raw_foldwise.astype(np.float32),
-        E_raw_foldwise=e_result.raw_foldwise.astype(np.float32),
-        A_fold_normalized=a_result.fold_normalized.astype(np.float32),
-        C_fold_normalized=c_result.fold_normalized.astype(np.float32),
-        D_fold_normalized=d_result.fold_normalized.astype(np.float32),
-        E_fold_normalized=e_result.fold_normalized.astype(np.float32),
-        A_aggregated=a_result.aggregated.astype(np.float32),
-        C_aggregated=c_result.aggregated.astype(np.float32),
-        D_aggregated=d_result.aggregated.astype(np.float32),
-        E_aggregated=e_result.aggregated.astype(np.float32),
-        A_final_normalized=a_result.final_normalized.astype(np.float32),
-        C_final_normalized=c_result.final_normalized.astype(np.float32),
-        D_final_normalized=d_result.final_normalized.astype(np.float32),
-        E_final_normalized=e_result.final_normalized.astype(np.float32),
-        # For compatibility with existing readers, keep u_raw key as the weighted
-        # sum before dividing by total_weight; final utility is stored in u_scores/u_norm.
-        u_raw=u_raw.astype(np.float32),
-        u_scores=u_scores.astype(np.float32),
-        u_norm=u_scores.astype(np.float32),
-    )
+    dynamic_cache_dir = resolve_dynamic_component_cache_dir(args.dataset, args.proxy_model, resolved_proxy_epochs)
 
     dynamic_component_values = {
         "A": a_result.final_normalized,
@@ -544,7 +711,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "ridge_lambda": float(args.ridge_lambda),
             "proxy_log": str(proxy_log),
             "dynamic_components": ["A", "C", "D", "E"],
-            "dynamic_cache_path": str(dynamic_cache_path),
+            "dynamic_cache_path": str(dynamic_cache_dir),
+            "dynamic_component_cache_paths": {k: str(v) for k, v in component_cache_paths.items()},
             "proxy_training_seed": proxy_training_seed,
             "proxy_log_seed_free": True,
             "dynamic_cache_seed_free": True,
@@ -562,7 +730,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
 
     print("Learned weights saved to", output_path)
     print("Applied output seeds:", output_seeds)
-    print("Dynamic cache saved to", dynamic_cache_path)
+    print("Dynamic component cache dir:", dynamic_cache_dir)
 
 
 if __name__ == "__main__":

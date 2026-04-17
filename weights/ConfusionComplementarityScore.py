@@ -16,7 +16,7 @@ from .dynamic_utils import (
 
 
 class ConfusionComplementarityScore:
-    """C: training-view same-class complementarity over confusion-change patterns."""
+    """C: Confusion Complementarity over training-view same-class confusion-change patterns."""
 
     def __init__(self, k_ratio: float = 0.05) -> None:
         self.k_ratio = float(k_ratio)

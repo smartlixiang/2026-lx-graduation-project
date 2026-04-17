@@ -463,7 +463,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     )
 
     if not proxy_log.is_dir():
-        raise ValueError("Dynamic A/C/D/E flow requires proxy log directory containing fold_*.npz files.")
+        raise ValueError("Dynamic A/C/T/P flow requires proxy log directory containing fold_*.npz files.")
 
     folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
     num_samples = labels_all.shape[0]
@@ -479,10 +479,10 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     component_compute_fns: dict[str, Callable[[], DynamicComponentResult]] = {
         "A": lambda: AbsorptionGainScore().compute(folds=folds, labels_all=labels_all),
         "C": lambda: ConfusionComplementarityScore().compute(folds=folds, labels_all=labels_all),
-        "D": lambda: TransferabilityAlignmentScore().compute(folds=folds, labels_all=labels_all),
-        "E": lambda: PersistentDifficultyScore().compute(folds=folds, labels_all=labels_all),
+        "T": lambda: TransferabilityAlignmentScore().compute(folds=folds, labels_all=labels_all),
+        "P": lambda: PersistentDifficultyScore().compute(folds=folds, labels_all=labels_all),
     }
-    for component_name in ("A", "C", "D", "E"):
+    for component_name in ("A", "C", "T", "P"):
         result, from_cache, cache_path = get_or_compute_dynamic_component(
             component_name=component_name,
             dataset=args.dataset,
@@ -552,14 +552,14 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     dataset_for_labels = _build_dataset(args.dataset, args.data_root, transform=None)
     num_samples_static = len(dataset_for_labels)
 
-    d_result = component_results["D"]
-    e_result = component_results["E"]
+    t_result = component_results["T"]
+    p_result = component_results["P"]
 
     for name, arr in {
         "A_final_normalized": a_result.final_normalized,
         "C_final_normalized": c_result.final_normalized,
-        "D_final_normalized": d_result.final_normalized,
-        "E_final_normalized": e_result.final_normalized,
+        "T_final_normalized": t_result.final_normalized,
+        "P_final_normalized": p_result.final_normalized,
     }.items():
         if arr.shape != (num_samples,):
             raise ValueError(f"{name} shape mismatch: {arr.shape}")
@@ -573,8 +573,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     u_raw = (
         1.0 * a_result.final_normalized
         + 1.0 * c_result.final_normalized
-        + 0.5 * d_result.final_normalized
-        + 0.5 * e_result.final_normalized
+        + 0.5 * t_result.final_normalized
+        + 0.5 * p_result.final_normalized
     )
     if not np.all(np.isfinite(u_raw)):
         raise ValueError("u_raw contains NaN/inf values.")
@@ -595,8 +595,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     dynamic_component_values = {
         "A": a_result.final_normalized,
         "C": c_result.final_normalized,
-        "D": d_result.final_normalized,
-        "E": e_result.final_normalized,
+        "T": t_result.final_normalized,
+        "P": p_result.final_normalized,
     }
     dynamic_scores = u_scores.astype(np.float64)
     output_path = build_output_path(args.output)
@@ -710,7 +710,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "bias": float(bias),
             "ridge_lambda": float(args.ridge_lambda),
             "proxy_log": str(proxy_log),
-            "dynamic_components": ["A", "C", "D", "E"],
+            "dynamic_components": ["A", "C", "T", "P"],
             "dynamic_cache_path": str(dynamic_cache_dir),
             "dynamic_component_cache_paths": {k: str(v) for k, v in component_cache_paths.items()},
             "proxy_training_seed": proxy_training_seed,

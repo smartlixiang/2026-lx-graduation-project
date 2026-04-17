@@ -28,7 +28,7 @@ def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
 
 
 class TransferabilityAlignmentScore:
-    """D: alignment between train margin advances and same-class validation improvements."""
+    """T: Transferability Alignment between train margin advances and same-class validation improvements."""
 
     def __init__(self, tau_d: float = 1.0) -> None:
         if tau_d <= 0:
@@ -40,7 +40,7 @@ class TransferabilityAlignmentScore:
         raw_foldwise = np.full((len(folds), num_samples), np.nan, dtype=np.float32)
         fold_normalized = np.full((len(folds), num_samples), np.nan, dtype=np.float32)
 
-        for f_idx, fold in enumerate(tqdm(folds, desc="Computing D by fold", unit="fold")):
+        for f_idx, fold in enumerate(tqdm(folds, desc="Computing T by fold", unit="fold")):
             train_idx = fold.train_indices
             val_idx = fold.val_indices
             y_train = labels_all[train_idx]

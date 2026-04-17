@@ -16,7 +16,7 @@ from .dynamic_utils import (
 
 
 class AbsorptionGainScore:
-    """A: absorption gain with late-stage fluctuation penalty."""
+    """A: Absorption Gain with late-stage fluctuation penalty."""
 
     def compute(self, folds: list[FoldLogData], labels_all: np.ndarray) -> DynamicComponentResult:
         num_samples = labels_all.shape[0]

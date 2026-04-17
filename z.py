@@ -13,13 +13,13 @@ from weights.dynamic_utils import default_dynamic_cache_path
 COMPONENT_TITLES = {
     "A": "A / Absorption Gain",
     "C": "C / Confusion Complementarity",
-    "D": "D / Transferability Alignment",
-    "E": "E / Persistent Difficulty",
+    "T": "T / Transferability Alignment",
+    "P": "P / Persistent Difficulty",
 }
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plot A/C/D/E histograms from dynamic cache.")
+    parser = argparse.ArgumentParser(description="Plot A/C/T/P histograms from dynamic cache.")
     parser.add_argument("--cache", type=str, default=None, help="Path to dynamic_components.npz")
     parser.add_argument("--dataset", type=str, default="cifar10", help="Dataset name for default cache path")
     parser.add_argument("--proxy-model", type=str, default="resnet18", help="Proxy model for default cache path")
@@ -36,8 +36,11 @@ def parse_args() -> argparse.Namespace:
 
 def _resolve_component(data: np.lib.npyio.NpzFile, name: str) -> np.ndarray:
     key = f"{name}_final_normalized"
+    legacy_key = {"T": "D_final_normalized", "P": "E_final_normalized"}.get(name)
     if key not in data:
-        raise KeyError(f"Missing cache field: '{key}'.")
+        if legacy_key is None or legacy_key not in data:
+            raise KeyError(f"Missing cache field: '{key}'.")
+        key = legacy_key
     values = data[key].astype(np.float32)
     values = values[np.isfinite(values)]
     if values.size == 0:
@@ -71,7 +74,7 @@ def main() -> None:
         raise FileNotFoundError(f"Dynamic cache not found: {cache_path}")
 
     data = np.load(cache_path, allow_pickle=True)
-    components = ["A", "C", "D", "E"]
+    components = ["A", "C", "T", "P"]
     values = {name: _resolve_component(data, name) for name in components}
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)

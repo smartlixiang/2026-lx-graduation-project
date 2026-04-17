@@ -1,0 +1,441 @@
+{
+  "cifar100": {
+    "22": {
+      "sa": 0.2034059919436697,
+      "div": 0.4165641712398652,
+      "dds": 0.38002983681646507,
+      "bias": -0.022454045092790514,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/cifar100/resnet18/200",
+      "dynamic_components": [
+        "A",
+        "C",
+        "D",
+        "E"
+      ],
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200/dynamic_components.npz",
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": true,
+      "dynamic_cache_seed_free": true,
+      "output_seed": 22,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": -0.4492478666755981,
+            "Div": 0.45888573195118443,
+            "DDS": 0.242873554520556
+          },
+          "C": {
+            "SA": -0.08102696472059567,
+            "Div": 0.18504830176730236,
+            "DDS": 0.14221239446623743
+          },
+          "D": {
+            "SA": 0.01270874903732632,
+            "Div": -0.009474734969236683,
+            "DDS": 0.012752150278619324
+          },
+          "E": {
+            "SA": -0.4684073902437322,
+            "Div": 0.47087797909186485,
+            "DDS": 0.24657636074434228
+          }
+        },
+        "sa_gt_one_third_warning": false,
+        "div_is_lowest_warning": false
+      }
+    },
+    "42": {
+      "sa": 0.20516007621187998,
+      "div": 0.4170742932946404,
+      "dds": 0.37776563049347955,
+      "bias": -0.022707328292919184,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/cifar100/resnet18/200",
+      "dynamic_components": [
+        "A",
+        "C",
+        "D",
+        "E"
+      ],
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200/dynamic_components.npz",
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": true,
+      "dynamic_cache_seed_free": true,
+      "output_seed": 42,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": -0.4399952890061344,
+            "Div": 0.4590104004134404,
+            "DDS": 0.24406370485007436
+          },
+          "C": {
+            "SA": -0.07208528276388089,
+            "Div": 0.19420466348196,
+            "DDS": 0.1287108140761897
+          },
+          "D": {
+            "SA": 0.01355049523146484,
+            "Div": -0.009155224417856267,
+            "DDS": 0.004599658304732665
+          },
+          "E": {
+            "SA": -0.4629061944410669,
+            "Div": 0.4715316417692253,
+            "DDS": 0.24887963975133703
+          }
+        },
+        "sa_gt_one_third_warning": false,
+        "div_is_lowest_warning": false
+      }
+    },
+    "96": {
+      "sa": 0.20531149894586945,
+      "div": 0.4180055891717863,
+      "dds": 0.37668291188234426,
+      "bias": -0.023137722077067602,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/cifar100/resnet18/200",
+      "dynamic_components": [
+        "A",
+        "C",
+        "D",
+        "E"
+      ],
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200/dynamic_components.npz",
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": true,
+      "dynamic_cache_seed_free": true,
+      "output_seed": 96,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": -0.4472719965847699,
+            "Div": 0.4561291582102905,
+            "DDS": 0.23584971301632926
+          },
+          "C": {
+            "SA": -0.07528994431743603,
+            "Div": 0.19091689861903563,
+            "DDS": 0.12994262560072098
+          },
+          "D": {
+            "SA": 0.015300932084520366,
+            "Div": -0.008268280301358039,
+            "DDS": 0.007349261833754953
+          },
+          "E": {
+            "SA": -0.4690249583694888,
+            "Div": 0.4696936706303271,
+            "DDS": 0.244115163624322
+          }
+        },
+        "sa_gt_one_third_warning": false,
+        "div_is_lowest_warning": false
+      }
+    },
+    "naive": {
+      "dds": 0.3333333333333333,
+      "div": 0.3333333333333333,
+      "sa": 0.3333333333333333
+    }
+  },
+  "cifar10": {
+    "22": {
+      "sa": 0.2762216265455875,
+      "div": 0.3680890766467154,
+      "dds": 0.355689296807697,
+      "bias": -0.15647856341679944,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/cifar10/resnet18/200",
+      "dynamic_components": [
+        "A",
+        "C",
+        "D",
+        "E"
+      ],
+      "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/200",
+      "dynamic_component_cache_paths": {
+        "A": "weights/dynamic_cache/cifar10/resnet18/200/A.npz",
+        "C": "weights/dynamic_cache/cifar10/resnet18/200/C.npz",
+        "D": "weights/dynamic_cache/cifar10/resnet18/200/D.npz",
+        "E": "weights/dynamic_cache/cifar10/resnet18/200/E.npz"
+      },
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": true,
+      "dynamic_cache_seed_free": true,
+      "output_seed": 22,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": -0.39734185872012,
+            "Div": 0.39606492826708245,
+            "DDS": 0.2355843113687673
+          },
+          "C": {
+            "SA": -0.03388741213622365,
+            "Div": 0.14376228196031546,
+            "DDS": 0.07912992584160046
+          },
+          "D": {
+            "SA": 0.04944576119296245,
+            "Div": -0.02860700699383149,
+            "DDS": -0.025961745185933815
+          },
+          "E": {
+            "SA": -0.42128929619245004,
+            "Div": 0.38723550233395854,
+            "DDS": 0.26512124227735695
+          }
+        },
+        "sa_gt_one_third_warning": false,
+        "div_is_lowest_warning": false
+      }
+    },
+    "42": {
+      "sa": 0.276592471915541,
+      "div": 0.3696348083112593,
+      "dds": 0.3537727197731998,
+      "bias": -0.15698423681292706,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/cifar10/resnet18/200",
+      "dynamic_components": [
+        "A",
+        "C",
+        "D",
+        "E"
+      ],
+      "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/200",
+      "dynamic_component_cache_paths": {
+        "A": "weights/dynamic_cache/cifar10/resnet18/200/A.npz",
+        "C": "weights/dynamic_cache/cifar10/resnet18/200/C.npz",
+        "D": "weights/dynamic_cache/cifar10/resnet18/200/D.npz",
+        "E": "weights/dynamic_cache/cifar10/resnet18/200/E.npz"
+      },
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": true,
+      "dynamic_cache_seed_free": true,
+      "output_seed": 42,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": -0.39889161074780016,
+            "Div": 0.4048587172929761,
+            "DDS": 0.2348889013868837
+          },
+          "C": {
+            "SA": -0.02222948115641136,
+            "Div": 0.1452569345903602,
+            "DDS": 0.07864548215609685
+          },
+          "D": {
+            "SA": 0.05475426266703317,
+            "Div": -0.034123693882299536,
+            "DDS": -0.02938209961500141
+          },
+          "E": {
+            "SA": -0.42492842067915015,
+            "Div": 0.39488430137170166,
+            "DDS": 0.26409505465554395
+          }
+        },
+        "sa_gt_one_third_warning": false,
+        "div_is_lowest_warning": false
+      }
+    },
+    "96": {
+      "sa": 0.27329670956836066,
+      "div": 0.367226784665664,
+      "dds": 0.35947650576597534,
+      "bias": -0.15496238882563776,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/cifar10/resnet18/200",
+      "dynamic_components": [
+        "A",
+        "C",
+        "D",
+        "E"
+      ],
+      "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/200",
+      "dynamic_component_cache_paths": {
+        "A": "weights/dynamic_cache/cifar10/resnet18/200/A.npz",
+        "C": "weights/dynamic_cache/cifar10/resnet18/200/C.npz",
+        "D": "weights/dynamic_cache/cifar10/resnet18/200/D.npz",
+        "E": "weights/dynamic_cache/cifar10/resnet18/200/E.npz"
+      },
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": true,
+      "dynamic_cache_seed_free": true,
+      "output_seed": 96,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": -0.4000579839374123,
+            "Div": 0.39711977598679987,
+            "DDS": 0.24437738843906634
+          },
+          "C": {
+            "SA": -0.037036480438255207,
+            "Div": 0.14720525651973101,
+            "DDS": 0.08600345947870465
+          },
+          "D": {
+            "SA": 0.04723366037930822,
+            "Div": -0.026825819219738662,
+            "DDS": -0.020365554559579228
+          },
+          "E": {
+            "SA": -0.4224009724382299,
+            "Div": 0.386242072114867,
+            "DDS": 0.2662418339507069
+          }
+        },
+        "sa_gt_one_third_warning": false,
+        "div_is_lowest_warning": false
+      }
+    },
+    "naive": {
+      "dds": 0.3333333333333333,
+      "div": 0.3333333333333333,
+      "sa": 0.3333333333333333
+    }
+  },
+  "tiny-imagenet": {
+    "22": {
+      "sa": 0.22162704507441947,
+      "div": 0.40232464316204597,
+      "dds": 0.3760483117635346,
+      "bias": 0.03447133076021736,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/90",
+      "dynamic_components": [
+        "A",
+        "C",
+        "D",
+        "E"
+      ],
+      "dynamic_cache_path": "weights/dynamic_cache/tiny-imagenet/resnet18/90/dynamic_components.npz",
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": true,
+      "dynamic_cache_seed_free": true,
+      "output_seed": 22,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": -0.4414852871269712,
+            "Div": 0.4976601760596367,
+            "DDS": 0.32892084452316156
+          },
+          "C": {
+            "SA": -0.002963311004387677,
+            "Div": 0.14500658487936036,
+            "DDS": 0.12689561913344205
+          },
+          "D": {
+            "SA": -0.03646181202412287,
+            "Div": 0.03589781463629432,
+            "DDS": 0.03850363902260846
+          },
+          "E": {
+            "SA": -0.4998344428816516,
+            "Div": 0.5646701548083151,
+            "DDS": 0.3299370458414426
+          }
+        },
+        "sa_gt_one_third_warning": false,
+        "div_is_lowest_warning": false
+      }
+    },
+    "42": {
+      "sa": 0.2223686206186949,
+      "div": 0.4030177855781458,
+      "dds": 0.37461359380315934,
+      "bias": 0.0347319611358841,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/90",
+      "dynamic_components": [
+        "A",
+        "C",
+        "D",
+        "E"
+      ],
+      "dynamic_cache_path": "weights/dynamic_cache/tiny-imagenet/resnet18/90/dynamic_components.npz",
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": true,
+      "dynamic_cache_seed_free": true,
+      "output_seed": 42,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": -0.44282509995845754,
+            "Div": 0.4983796561769176,
+            "DDS": 0.32408795807481294
+          },
+          "C": {
+            "SA": -0.0009471683947212764,
+            "Div": 0.1469032980364341,
+            "DDS": 0.12206144084918882
+          },
+          "D": {
+            "SA": -0.037729181207328516,
+            "Div": 0.03624132240249719,
+            "DDS": 0.03913155854379778
+          },
+          "E": {
+            "SA": -0.5017938910702342,
+            "Div": 0.5646367004993885,
+            "DDS": 0.3274829279861036
+          }
+        },
+        "sa_gt_one_third_warning": false,
+        "div_is_lowest_warning": false
+      }
+    },
+    "96": {
+      "sa": 0.22224227003877303,
+      "div": 0.4031907230787649,
+      "dds": 0.3745670068824621,
+      "bias": 0.034959236678662124,
+      "ridge_lambda": 0.01,
+      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/90",
+      "dynamic_components": [
+        "A",
+        "C",
+        "D",
+        "E"
+      ],
+      "dynamic_cache_path": "weights/dynamic_cache/tiny-imagenet/resnet18/90/dynamic_components.npz",
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": true,
+      "dynamic_cache_seed_free": true,
+      "output_seed": 96,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": -0.44430695113625224,
+            "Div": 0.49673542530586434,
+            "DDS": 0.32005664633198394
+          },
+          "C": {
+            "SA": -0.003040108921151028,
+            "Div": 0.14451382120887685,
+            "DDS": 0.12188058341447383
+          },
+          "D": {
+            "SA": -0.037589054014962896,
+            "Div": 0.03530108302675835,
+            "DDS": 0.03781192645421761
+          },
+          "E": {
+            "SA": -0.503259582947093,
+            "Div": 0.5637246872921213,
+            "DDS": 0.323811950920545
+          }
+        },
+        "sa_gt_one_third_warning": false,
+        "div_is_lowest_warning": false
+      }
+    }
+  }
+}

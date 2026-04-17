@@ -15,7 +15,7 @@ from .dynamic_utils import (
 
 class PersistentDifficultyScore:
     """
-    E: validation-view persistent difficulty over mid+late.
+    P: validation-view persistent difficulty over mid+late.
 
     Persistent Difficulty = validation-view persistent difficulty over mid+late,
     computed by epoch-wise standardized margin difficulty and entropy difficulty.
@@ -32,7 +32,7 @@ class PersistentDifficultyScore:
         fold_normalized = np.full((len(folds), num_samples), np.nan, dtype=np.float32)
         eps = 1e-8
 
-        for f_idx, fold in enumerate(tqdm(folds, desc="Computing E by fold", unit="fold")):
+        for f_idx, fold in enumerate(tqdm(folds, desc="Computing P by fold", unit="fold")):
             val_idx = fold.val_indices
             y_val = labels_all[val_idx]
 

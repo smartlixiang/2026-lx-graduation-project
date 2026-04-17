@@ -3,7 +3,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from statistics import mean
+from statistics import mean, stdev
 
 import matplotlib.pyplot as plt
 
@@ -24,13 +24,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        # default=[
-        #     "random", "herding", "E2LN", "GraNd", "Forgetting", "MoSo",
-        #     "yangclip", "learned_group"
-        # ],
         default=[
-            "random", "naive_group", "learned_group"
+            "random", "herding", "E2LN", "GraNd", "Forgetting", "MoSo",
+            "yangclip", "learned_group"
         ],
+        # default=[
+        #     "random", "naive_group", "learned_group"
+        # ],
         help="Selection methods to compare",
     )
     parser.add_argument(
@@ -123,12 +123,13 @@ def build_style_map(methods: list[str]) -> dict[str, dict]:
     return style_map
 
 
-def load_method_mean_results(
+def load_method_seed_stats(
     method_root: Path,
     keep_ratios: list[int],
-) -> dict[int, float]:
+) -> dict[int, tuple[float, float]]:
     """
-    读取某一方法在指定数据集和模型下、跨 seed 的平均结果。
+    读取某一方法在指定数据集和模型下、跨 seed 的聚合结果。
+    返回每个 keep ratio 的 (mean, std)。
     """
     if not method_root.exists():
         return {}
@@ -139,17 +140,19 @@ def load_method_mean_results(
 
     seed_results = [load_seed_results(seed_dir) for seed_dir in seed_dirs]
 
-    avg_by_kr: dict[int, float] = {}
+    stats_by_kr: dict[int, tuple[float, float]] = {}
     for keep_ratio in keep_ratios:
         values = [result[keep_ratio] for result in seed_results if keep_ratio in result]
         if values:
-            avg_by_kr[keep_ratio] = mean(values)
+            mean_val = mean(values)
+            std_val = stdev(values) if len(values) > 1 else 0.0
+            stats_by_kr[keep_ratio] = (mean_val, std_val)
 
-    return avg_by_kr
+    return stats_by_kr
 
 
 def inject_kr100_from_random(
-    method_to_mean: dict[str, dict[int, float]],
+    method_to_stats: dict[str, dict[int, tuple[float, float]]],
     methods: list[str],
 ) -> None:
     """
@@ -158,14 +161,14 @@ def inject_kr100_from_random(
     - 其他方法一律复用 random 的 kr=100 结果；
     - 从而所有方法在 kr=100 处重合，但 marker 不同。
     """
-    if "random" not in method_to_mean or 100 not in method_to_mean["random"]:
+    if "random" not in method_to_stats or 100 not in method_to_stats["random"]:
         return
 
-    random_kr100 = method_to_mean["random"][100]
+    random_kr100_stats = method_to_stats["random"][100]
     for method in methods:
-        if method not in method_to_mean:
+        if method not in method_to_stats:
             continue
-        method_to_mean[method][100] = random_kr100
+        method_to_stats[method][100] = random_kr100_stats
 
 
 def main() -> None:
@@ -183,29 +186,34 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(8.6, 6.8))
     missing_methods: list[str] = []
     valid_methods: list[str] = []
-    method_to_mean: dict[str, dict[int, float]] = {}
+    method_to_stats: dict[str, dict[int, tuple[float, float]]] = {}
 
     # 先读取各方法结果
     for method in methods:
         method_root = result_root / method / args.dataset / args.model
-        avg_by_kr = load_method_mean_results(method_root, keep_ratios)
+        stats_by_kr = load_method_seed_stats(method_root, keep_ratios)
 
-        if not avg_by_kr:
+        if not stats_by_kr:
             missing_methods.append(method)
             continue
 
-        method_to_mean[method] = avg_by_kr
+        method_to_stats[method] = stats_by_kr
         valid_methods.append(method)
 
     # 特殊处理 kr=100：所有方法统一复用 random 的 kr=100 结果
     if 100 in keep_ratios:
-        inject_kr100_from_random(method_to_mean, valid_methods)
+        inject_kr100_from_random(method_to_stats, valid_methods)
+
+    method_to_mean: dict[str, dict[int, float]] = {
+        method: {kr: stats[0] for kr, stats in kr_to_stats.items()}
+        for method, kr_to_stats in method_to_stats.items()
+    }
 
     # 再开始画图
     for method in valid_methods:
-        avg_by_kr = method_to_mean.get(method, {})
-        x_values = [kr for kr in keep_ratios if kr in avg_by_kr]
-        y_values = [avg_by_kr[kr] for kr in x_values]
+        mean_by_kr = method_to_mean.get(method, {})
+        x_values = [kr for kr in keep_ratios if kr in mean_by_kr]
+        y_values = [mean_by_kr[kr] for kr in x_values]
 
         if not x_values:
             print(f"[WARN] method={method} has no results for requested keep ratios: {keep_ratios}")
@@ -265,18 +273,19 @@ def main() -> None:
 
     table_rows = []
     for method in valid_methods:
-        kr_to_value = method_to_mean.get(method, {})
+        kr_to_stats = method_to_stats.get(method, {})
         row = [method]
         for kr in keep_ratios:
-            val = kr_to_value.get(kr)
-            if val is None:
+            stats = kr_to_stats.get(kr)
+            if stats is None:
                 row.append("-")
             else:
-                cell = f"{val:.4f}"
+                mean_val, std_val = stats
+                cell = f"{mean_val:.4f}±{std_val:.4f}"
                 if (
                     kr != 100
                     and kr in best_by_kr
-                    and math.isclose(val, best_by_kr[kr], rel_tol=1e-12, abs_tol=1e-12)
+                    and math.isclose(mean_val, best_by_kr[kr], rel_tol=1e-12, abs_tol=1e-12)
                 ):
                     cell = f"**{cell}**"
                 row.append(cell)
@@ -347,7 +356,7 @@ def main() -> None:
     fig.savefig(output_path, dpi=240, bbox_inches="tight")
     print(f"Saved figure to {output_path}")
 
-    if 100 in keep_ratios and ("random" not in method_to_mean or 100 not in method_to_mean["random"]):
+    if 100 in keep_ratios and ("random" not in method_to_stats or 100 not in method_to_stats["random"]):
         print("[WARN] 请求绘制 kr=100，但未找到 random 的 kr=100 合法结果，因此无法为所有方法补齐 kr=100 节点。")
 
     if missing_methods:

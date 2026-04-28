@@ -10,8 +10,6 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.optim import SGD
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
-
 from dataset.dataset import BaseDataLoader
 from model.model_config import get_model
 from train_after_selection import (
@@ -20,6 +18,7 @@ from train_after_selection import (
 )
 from utils.global_config import CONFIG
 from utils.path_rules import resolve_checkpoint_path
+from utils.progress import create_persistent_bar, create_transient_batch_bar
 from utils.seed import set_seed
 from utils.training_defaults import apply_dataset_training_defaults
 
@@ -130,11 +129,16 @@ def train_one_epoch(
     total_epochs: int,
     use_amp: bool,
     scaler: GradScaler,
+    position: int = 1,
 ) -> float:
     model.train()
     running_loss = 0.0
 
-    progress = tqdm(loader, desc=f"Epoch {epoch}/{total_epochs}", unit="batch")
+    progress = create_transient_batch_bar(
+        loader,
+        desc=f"Train batch {epoch}/{total_epochs}",
+        position=position,
+    )
     for images, labels in progress:
         images = images.to(device)
         labels = labels.to(device)
@@ -153,7 +157,6 @@ def train_one_epoch(
             optimizer.step()
 
         running_loss += loss.item() * images.size(0)
-        progress.set_postfix(loss=f"{loss.item():.4f}")
 
     return running_loss / len(loader.dataset)
 
@@ -258,7 +261,13 @@ def run_single(mode: str, keep_ratio: int, train_args: argparse.Namespace) -> No
         f"num_selected={len(selected_indices)}/{len(train_dataset)}"
     )
 
+    epoch_bar = create_persistent_bar(
+        total=train_args.epochs,
+        desc=f"mode={mode}, kr={keep_ratio}",
+        position=0,
+    )
     for epoch in range(1, train_args.epochs + 1):
+        epoch_bar.set_postfix_str(f"epoch={epoch}/{train_args.epochs}")
         train_loss = train_one_epoch(
             model=model,
             loader=subset_loader,
@@ -269,8 +278,10 @@ def run_single(mode: str, keep_ratio: int, train_args: argparse.Namespace) -> No
             total_epochs=train_args.epochs,
             use_amp=bool(train_args.use_amp and device.type == "cuda"),
             scaler=scaler,
+            position=1,
         )
         scheduler.step()
+        epoch_bar.update(1)
 
         if epoch in {1, 50, 100, 150, train_args.epochs}:
             test_acc = evaluate(model, test_loader, device)
@@ -294,6 +305,7 @@ def run_single(mode: str, keep_ratio: int, train_args: argparse.Namespace) -> No
         f"[Done] mode={mode}, kr={keep_ratio}, final_test_accuracy={final_test_accuracy:.4f}\n"
         f"Saved checkpoint to: {checkpoint_path}"
     )
+    epoch_bar.close()
 
 
 def main() -> None:

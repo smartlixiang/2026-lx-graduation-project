@@ -1,4 +1,17 @@
-"""Learn scoring weights from proxy training dynamics."""
+"""Learn scoring weights from proxy training dynamics.
+
+Cache-first behavior:
+1. First try loading cached ACTP dynamic components directly.
+2. A cache file is considered usable as long as its final outputs
+   (labels / aggregated / final_normalized) are self-consistent and finite.
+   NaN in raw_foldwise / fold_normalized is allowed because those arrays may
+   deliberately use NaN as "undefined fold-slot" markers.
+3. If all four caches are available and mutually consistent, continue normally
+   without requiring original proxy logs.
+4. Otherwise, try proxy logs, recompute/save missing components, and continue.
+5. If neither a complete cache set nor proxy logs are available, raise an error
+   with concrete mismatch reasons.
+"""
 
 from __future__ import annotations
 
@@ -9,9 +22,9 @@ from typing import Callable, Iterable
 
 import numpy as np
 import torch
-from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torchvision import datasets
+from tqdm import tqdm
 
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET
 from model.adapter import AdapterMLP, load_trained_adapters
@@ -30,6 +43,7 @@ from weights import (
 from weights.dynamic_utils import DynamicComponentResult, load_cv_fold_logs
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+COMPONENT_NAMES = ("A", "C", "T", "P")
 
 
 def resolve_default_proxy_epochs(dataset_name: str) -> int:
@@ -48,115 +62,52 @@ def resolve_dynamic_component_cache_dir(dataset: str, proxy_model: str, epochs: 
 
 
 def resolve_dynamic_component_cache_path(dataset: str, proxy_model: str, epochs: int, component_name: str) -> Path:
-    normalized_component = component_name.strip().upper()
-    return resolve_dynamic_component_cache_dir(dataset, proxy_model, epochs) / f"{normalized_component}.npz"
+    return resolve_dynamic_component_cache_dir(dataset, proxy_model, epochs) / f"{component_name.strip().upper()}.npz"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Learn scoring weights from proxy logs.")
     parser.add_argument("--dataset", type=str, default=CIFAR10, choices=AVAILABLE_DATASETS)
-    parser.add_argument(
-        "--data-root",
-        type=str,
-        default="./data",
-        help="Dataset root path.",
-    )
-    parser.add_argument(
-        "--proxy-log",
-        type=str,
-        default="weights/proxy_logs",
-        help="Proxy log root path (or a specific log file/dir).",
-    )
-    parser.add_argument("--proxy-model", type=str, default="resnet18", help="Proxy model name used in proxy log path.")
-    parser.add_argument(
-        "--proxy-epochs",
-        type=int,
-        default=None,
-        help=(
-            "Proxy epochs for locating proxy logs/cache. "
-            "Default is auto-resolved by dataset (cifar10/cifar100->200, tiny-imagenet->90); "
-            "manual override is not recommended unless logs use custom epochs."
-        ),
-    )
-    parser.add_argument(
-        "--adapter-image-path",
-        type=str,
-        default=None,
-        help="图像 adapter 权重路径（默认按 dataset/seed 规则）",
-    )
-    parser.add_argument(
-        "--adapter-text-path",
-        type=str,
-        default=None,
-        help="文本 adapter 权重路径（默认按 dataset/seed 规则）",
-    )
+    parser.add_argument("--data-root", type=str, default="./data", help="Dataset root path.")
+    parser.add_argument("--proxy-log", type=str, default="weights/proxy_logs", help="Proxy log root path or specific log dir.")
+    parser.add_argument("--proxy-model", type=str, default="resnet18")
+    parser.add_argument("--proxy-epochs", type=int, default=None)
+    parser.add_argument("--adapter-image-path", type=str, default=None)
+    parser.add_argument("--adapter-text-path", type=str, default=None)
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--div-k", type=float, default=0.05)
-    parser.add_argument(
-        "--dds-k",
-        type=int,
-        default=5,
-        help="Deprecated compatibility arg. DDS legacy naming is kept, but direction count is now ratio-driven.",
-    )
-    parser.add_argument(
-        "--dds-important-eigval-ratio",
-        type=float,
-        default=0.8,
-        help=(
-            "Cumulative explained-variance ratio threshold for the third structural component "
-            "(legacy DDS name retained for compatibility). Default: 0.5."
-        ),
-    )
-    # Deprecated dynamic args are intentionally kept for CLI compatibility.
+    parser.add_argument("--dds-k", type=int, default=5)
+    parser.add_argument("--dds-important-eigval-ratio", type=float, default=0.8)
     parser.add_argument("--coverage-tau-g", type=float, default=0.15)
     parser.add_argument("--coverage-s-g", type=float, default=0.07)
-    parser.add_argument(
-        "--coverage-k-pct",
-        type=float,
-        default=0.05,
-        help="Deprecated: kept for compatibility, unused in current dynamic flow.",
-    )
+    parser.add_argument("--coverage-k-pct", type=float, default=0.05)
     parser.add_argument("--coverage-q-low", type=float, default=0.002)
     parser.add_argument("--coverage-q-high", type=float, default=0.998)
     parser.add_argument("--ridge-lambda", type=float, default=1e-2)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=1000)
     parser.add_argument("--tol", type=float, default=1e-6)
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="weights/scoring_weights.json",
-        help="Path to write learned weights JSON.",
-    )
+    parser.add_argument("--output", type=str, default="weights/scoring_weights.json")
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument(
-        "--debug-prompts",
-        action="store_true",
-        help="打印 tiny-imagenet 前几个最终英文 prompt（调试用）。",
-    )
+    parser.add_argument("--debug-prompts", action="store_true")
     parser.add_argument(
         "--seed",
         type=str,
         default=",".join(str(s) for s in CONFIG.exp_seeds),
-        help=(
-            "输出 seed 列表：会分别加载各自 adapter、分别计算 SA/Div/DDS、分别学习权重；"
-            "仅共享 proxy 动态监督标签。"
-        ),
+        help="输出 seed 列表：分别计算 SA/Div/DDS、分别学习权重；仅共享动态监督标签。",
     )
     parser.add_argument(
         "--proxy-training-seed",
         type=int,
         default=CONFIG.global_seed,
-        help="代理模型真实训练 seed（用于读取 proxy logs / 计算动态分量）",
+        help="代理模型真实训练 seed（仅用于匹配动态缓存/日志元信息）",
     )
     return parser.parse_args()
 
 
-def _build_dataset(
-    dataset_name: str, data_root: str, transform
-) -> datasets.VisionDataset:
+def _build_dataset(dataset_name: str, data_root: str, transform) -> datasets.VisionDataset:
     if dataset_name == CIFAR10:
         return datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform)
     if dataset_name == CIFAR100:
@@ -169,9 +120,7 @@ def _build_dataset(
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
-def build_score_loader(
-    preprocess, data_root: str, dataset_name: str, device: torch.device, batch_size: int, num_workers: int
-) -> DataLoader:
+def build_score_loader(preprocess, data_root: str, dataset_name: str, device: torch.device, batch_size: int, num_workers: int) -> DataLoader:
     dataset = _build_dataset(dataset_name, data_root, preprocess)
     return DataLoader(
         dataset,
@@ -191,13 +140,7 @@ def load_class_names(dataset_name: str, data_root: str) -> Iterable[str]:
     )
 
 
-def load_adapters_for_seed(
-    args: argparse.Namespace,
-    dataset_name: str,
-    input_dim: int,
-    seed: int,
-    device: torch.device,
-) -> tuple[AdapterMLP, AdapterMLP, dict[str, Path]]:
+def load_adapters_for_seed(args: argparse.Namespace, dataset_name: str, input_dim: int, seed: int, device: torch.device) -> tuple[AdapterMLP, AdapterMLP, dict[str, Path]]:
     image_adapter, text_adapter, adapter_paths = load_trained_adapters(
         dataset_name=dataset_name,
         clip_model=args.clip_model,
@@ -212,6 +155,24 @@ def load_adapters_for_seed(
     return image_adapter, text_adapter, adapter_paths
 
 
+def project_to_simplex(vector: np.ndarray) -> np.ndarray:
+    if vector.ndim != 1 or vector.size == 0:
+        raise ValueError("vector must be a non-empty 1D array.")
+    sorted_vec = np.sort(vector)[::-1]
+    cumulative_sum = np.cumsum(sorted_vec)
+    rho_candidates = sorted_vec - (cumulative_sum - 1) / np.arange(1, vector.size + 1)
+    rho_indices = np.where(rho_candidates > 0)[0]
+    if rho_indices.size == 0:
+        return np.full_like(vector, 1.0 / vector.size, dtype=np.float64)
+    rho = rho_indices[-1]
+    theta = (cumulative_sum[rho] - 1) / (rho + 1)
+    projected = np.maximum(vector - theta, 0.0)
+    denom = projected.sum()
+    if denom <= 0:
+        return np.full_like(vector, 1.0 / vector.size, dtype=np.float64)
+    return (projected / denom).astype(np.float64)
+
+
 def fit_ridge_regression_nonnegative(
     features: np.ndarray,
     targets: np.ndarray,
@@ -220,21 +181,8 @@ def fit_ridge_regression_nonnegative(
     max_iter: int,
     tol: float,
 ) -> tuple[np.ndarray, float]:
-    if features.ndim != 2:
-        raise ValueError("features must be a 2D array.")
-    if targets.ndim != 1:
-        raise ValueError("targets must be a 1D array.")
-    if features.shape[0] != targets.shape[0]:
-        raise ValueError("features and targets must have the same number of samples.")
-    if l2_lambda < 0:
-        raise ValueError("ridge-lambda must be non-negative.")
-    if learning_rate <= 0:
-        raise ValueError("learning-rate must be positive.")
-    if max_iter <= 0:
-        raise ValueError("max-iter must be positive.")
-    if tol <= 0:
-        raise ValueError("tol must be positive.")
-
+    if features.ndim != 2 or targets.ndim != 1 or features.shape[0] != targets.shape[0]:
+        raise ValueError("features/targets shape mismatch.")
     num_samples, num_features = features.shape
     weights = np.full(num_features, 1.0 / num_features, dtype=np.float64)
     bias = float(targets.mean())
@@ -247,39 +195,16 @@ def fit_ridge_regression_nonnegative(
         errors = preds - targets
         grad_w = (features.T @ errors) / num_samples + l2_lambda * weights
         grad_b = errors.mean()
-
         next_weights = project_to_simplex(weights - learning_rate * grad_w)
         next_bias = bias - learning_rate * grad_b
-
         if np.linalg.norm(next_weights - weights) < tol and abs(next_bias - bias) < tol:
             weights = next_weights
             bias = next_bias
             break
-
         weights = next_weights
         bias = next_bias
 
     return weights, float(bias)
-
-
-def project_to_simplex(vector: np.ndarray) -> np.ndarray:
-    if vector.ndim != 1:
-        raise ValueError("vector must be a 1D array.")
-    if vector.size == 0:
-        raise ValueError("vector must be non-empty.")
-    sorted_vec = np.sort(vector)[::-1]
-    cumulative_sum = np.cumsum(sorted_vec)
-    rho_candidates = sorted_vec - (cumulative_sum - 1) / np.arange(1, vector.size + 1)
-    rho_indices = np.where(rho_candidates > 0)[0]
-    if rho_indices.size == 0:
-        return np.full_like(vector, 1.0 / vector.size, dtype=np.float64)
-    rho = rho_indices[-1]
-    theta = (cumulative_sum[rho] - 1) / (rho + 1)
-    projected = np.maximum(vector - theta, 0.0)
-    projected_sum = projected.sum()
-    if projected_sum <= 0:
-        return np.full_like(vector, 1.0 / vector.size, dtype=np.float64)
-    return (projected / projected_sum).astype(np.float64)
 
 
 def build_output_path(base_path: str) -> Path:
@@ -311,9 +236,8 @@ def save_dynamic_component_cache(
     labels: np.ndarray,
     result: DynamicComponentResult,
 ) -> None:
-    labels_i64 = labels.astype(np.int64, copy=False)
-    num_samples = int(labels_i64.shape[0])
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    labels_i64 = labels.astype(np.int64, copy=False)
     np.savez_compressed(
         cache_path,
         component_name=np.array(component_name, dtype=np.str_),
@@ -321,9 +245,9 @@ def save_dynamic_component_cache(
         proxy_model=np.array(proxy_model, dtype=np.str_),
         proxy_training_seed=np.array(proxy_training_seed, dtype=np.int64),
         seed_free=np.array(True),
-        epochs=np.array(epochs, dtype=np.int64),
+        epochs=np.array(int(epochs), dtype=np.int64),
         proxy_log_path=np.array(str(proxy_log_path), dtype=np.str_),
-        num_samples=np.array(num_samples, dtype=np.int64),
+        num_samples=np.array(int(labels_i64.shape[0]), dtype=np.int64),
         labels=labels_i64,
         raw_foldwise=result.raw_foldwise.astype(np.float32),
         fold_normalized=result.fold_normalized.astype(np.float32),
@@ -345,20 +269,10 @@ def load_dynamic_component_cache_if_valid(
 ) -> DynamicComponentResult | None:
     if not cache_path.is_file():
         return None
-
     required_keys = {
-        "component_name",
-        "dataset",
-        "proxy_model",
-        "proxy_training_seed",
-        "epochs",
-        "proxy_log_path",
-        "num_samples",
-        "labels",
-        "raw_foldwise",
-        "fold_normalized",
-        "aggregated",
-        "final_normalized",
+        "component_name", "dataset", "proxy_model", "proxy_training_seed", "epochs",
+        "proxy_log_path", "num_samples", "labels", "raw_foldwise", "fold_normalized",
+        "aggregated", "final_normalized",
     }
     try:
         with np.load(cache_path, allow_pickle=False) as data:
@@ -376,28 +290,26 @@ def load_dynamic_component_cache_if_valid(
                 return None
             if str(data["proxy_log_path"].item()) != str(proxy_log_path):
                 return None
-            if int(data["num_samples"].item()) != int(labels_all.shape[0]):
-                return None
-            labels_cached = data["labels"].astype(np.int64, copy=False)
+            labels_cached = np.asarray(data["labels"], dtype=np.int64)
             if not np.array_equal(labels_cached, labels_all.astype(np.int64, copy=False)):
                 return None
-            raw_foldwise = data["raw_foldwise"].astype(np.float32, copy=False)
-            fold_normalized = data["fold_normalized"].astype(np.float32, copy=False)
-            aggregated = data["aggregated"].astype(np.float32, copy=False)
-            final_normalized = data["final_normalized"].astype(np.float32, copy=False)
+            raw_foldwise = np.asarray(data["raw_foldwise"], dtype=np.float32)
+            fold_normalized = np.asarray(data["fold_normalized"], dtype=np.float32)
+            aggregated = np.asarray(data["aggregated"], dtype=np.float32)
+            final_normalized = np.asarray(data["final_normalized"], dtype=np.float32)
     except Exception:
         return None
 
-    num_samples = int(labels_all.shape[0])
-    if aggregated.shape != (num_samples,) or final_normalized.shape != (num_samples,):
-        return None
+    num_samples = labels_all.shape[0]
     if raw_foldwise.ndim != 2 or fold_normalized.ndim != 2:
         return None
     if raw_foldwise.shape != fold_normalized.shape or raw_foldwise.shape[1] != num_samples:
         return None
-    if not np.all(np.isfinite(aggregated)) or not np.all(np.isfinite(final_normalized)):
+    if aggregated.shape != (num_samples,) or final_normalized.shape != (num_samples,):
         return None
-    if not np.all(np.isfinite(raw_foldwise)) or not np.all(np.isfinite(fold_normalized)):
+    # Important: allow NaN in raw_foldwise / fold_normalized because undefined fold-slots
+    # may be intentionally stored as NaN. Only final outputs must be finite.
+    if not np.all(np.isfinite(aggregated)) or not np.all(np.isfinite(final_normalized)):
         return None
 
     return DynamicComponentResult(
@@ -406,6 +318,137 @@ def load_dynamic_component_cache_if_valid(
         aggregated=aggregated,
         final_normalized=final_normalized,
     )
+
+
+def _load_dynamic_component_cache_with_reason(
+    *,
+    cache_path: Path,
+    component_name: str,
+    dataset: str,
+    proxy_model: str,
+    proxy_training_seed: int,
+    epochs: int,
+) -> tuple[DynamicComponentResult | None, np.ndarray | None, str]:
+    """Load cache with minimal necessary checks and return concrete mismatch reason."""
+    if not cache_path.is_file():
+        return None, None, f"cache file not found: {cache_path}"
+
+    try:
+        data = np.load(cache_path, allow_pickle=False)
+    except Exception as exc:
+        return None, None, f"failed to open npz: {exc}"
+
+    required_keys = {
+        "component_name", "dataset", "proxy_model", "proxy_training_seed", "epochs",
+        "num_samples", "labels", "raw_foldwise", "fold_normalized", "aggregated", "final_normalized",
+    }
+    files = set(data.files)
+    missing_keys = sorted(required_keys - files)
+    if missing_keys:
+        return None, None, f"missing keys: {missing_keys}"
+
+    try:
+        cache_component = str(data["component_name"].item())
+        cache_dataset = str(data["dataset"].item())
+        cache_proxy_model = str(data["proxy_model"].item())
+        cache_proxy_training_seed = int(data["proxy_training_seed"].item())
+        cache_epochs = int(data["epochs"].item())
+        declared_num_samples = int(data["num_samples"].item())
+
+        labels = np.asarray(data["labels"], dtype=np.int64)
+        raw_foldwise = np.asarray(data["raw_foldwise"], dtype=np.float32)
+        fold_normalized = np.asarray(data["fold_normalized"], dtype=np.float32)
+        aggregated = np.asarray(data["aggregated"], dtype=np.float32)
+        final_normalized = np.asarray(data["final_normalized"], dtype=np.float32)
+    except Exception as exc:
+        return None, None, f"failed to parse arrays/metadata: {exc}"
+
+    if cache_component != component_name:
+        return None, None, f"component_name mismatch: cache={cache_component}, expected={component_name}"
+    if cache_dataset != dataset:
+        return None, None, f"dataset mismatch: cache={cache_dataset}, expected={dataset}"
+    if cache_proxy_model != proxy_model:
+        return None, None, f"proxy_model mismatch: cache={cache_proxy_model}, expected={proxy_model}"
+    if cache_proxy_training_seed != int(proxy_training_seed):
+        return None, None, f"proxy_training_seed mismatch: cache={cache_proxy_training_seed}, expected={proxy_training_seed}"
+    if cache_epochs != int(epochs):
+        return None, None, f"epochs mismatch: cache={cache_epochs}, expected={epochs}"
+
+    if labels.ndim != 1:
+        return None, None, f"labels rank invalid: shape={labels.shape}"
+    num_samples = labels.shape[0]
+    if declared_num_samples != num_samples:
+        return None, None, f"num_samples mismatch: declared={declared_num_samples}, actual_labels={num_samples}"
+
+    if raw_foldwise.ndim != 2:
+        return None, None, f"raw_foldwise rank invalid: shape={raw_foldwise.shape}"
+    if fold_normalized.ndim != 2:
+        return None, None, f"fold_normalized rank invalid: shape={fold_normalized.shape}"
+    if raw_foldwise.shape != fold_normalized.shape:
+        return None, None, f"raw/fold shape mismatch: raw={raw_foldwise.shape}, fold={fold_normalized.shape}"
+    if raw_foldwise.shape[1] != num_samples:
+        return None, None, f"raw_foldwise sample dimension mismatch: raw={raw_foldwise.shape}, labels={num_samples}"
+    if aggregated.shape != (num_samples,):
+        return None, None, f"aggregated shape mismatch: aggregated={aggregated.shape}, expected=({num_samples},)"
+    if final_normalized.shape != (num_samples,):
+        return None, None, f"final_normalized shape mismatch: final={final_normalized.shape}, expected=({num_samples},)"
+
+    # Important: do NOT reject cache because raw_foldwise / fold_normalized contain NaN.
+    # For these dynamic components, NaN may legitimately mark undefined fold-slots.
+    if not np.all(np.isfinite(aggregated)):
+        return None, None, "aggregated contains NaN/inf"
+    if not np.all(np.isfinite(final_normalized)):
+        return None, None, "final_normalized contains NaN/inf"
+
+    return (
+        DynamicComponentResult(
+            raw_foldwise=raw_foldwise,
+            fold_normalized=fold_normalized,
+            aggregated=aggregated,
+            final_normalized=final_normalized,
+        ),
+        labels,
+        "ok",
+    )
+
+
+def _try_load_all_dynamic_components_from_cache(
+    *,
+    dataset: str,
+    proxy_model: str,
+    proxy_training_seed: int,
+    epochs: int,
+) -> tuple[dict[str, DynamicComponentResult] | None, dict[str, Path], np.ndarray | None, dict[str, str]]:
+    component_results: dict[str, DynamicComponentResult] = {}
+    component_cache_paths: dict[str, Path] = {}
+    component_reasons: dict[str, str] = {}
+    labels_ref: np.ndarray | None = None
+
+    for component_name in COMPONENT_NAMES:
+        cache_path = resolve_dynamic_component_cache_path(dataset, proxy_model, epochs, component_name)
+        component_cache_paths[component_name] = cache_path
+        result, labels, reason = _load_dynamic_component_cache_with_reason(
+            cache_path=cache_path,
+            component_name=component_name,
+            dataset=dataset,
+            proxy_model=proxy_model,
+            proxy_training_seed=proxy_training_seed,
+            epochs=epochs,
+        )
+        if result is None or labels is None:
+            component_reasons[component_name] = reason
+            return None, component_cache_paths, None, component_reasons
+
+        if labels_ref is None:
+            labels_ref = labels
+        elif not np.array_equal(labels_ref, labels):
+            component_reasons[component_name] = "labels mismatch with previously loaded component caches"
+            return None, component_cache_paths, None, component_reasons
+
+        component_results[component_name] = result
+        component_reasons[component_name] = "ok"
+
+    return component_results, component_cache_paths, labels_ref, component_reasons
 
 
 def get_or_compute_dynamic_component(
@@ -429,6 +472,7 @@ def get_or_compute_dynamic_component(
         epochs=epochs,
         proxy_log_path=proxy_log_path,
         labels_all=labels_all,
+        compute_fn=None if False else None,
     )
     if cached is not None:
         return cached, True, cache_path
@@ -452,109 +496,85 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     proxy_training_seed = int(args.proxy_training_seed)
     set_seed(proxy_training_seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
-
     resolved_proxy_epochs = int(args.proxy_epochs) if args.proxy_epochs is not None else resolve_default_proxy_epochs(args.dataset)
-    proxy_log = resolve_proxy_log_path(
-        args.proxy_log,
-        args.dataset,
-        proxy_training_seed,
+
+    cached_bundle, component_cache_paths, labels_all, cache_reasons = _try_load_all_dynamic_components_from_cache(
+        dataset=args.dataset,
         proxy_model=args.proxy_model,
-        max_epoch=resolved_proxy_epochs,
+        proxy_training_seed=proxy_training_seed,
+        epochs=resolved_proxy_epochs,
     )
 
-    if not proxy_log.is_dir():
-        raise ValueError("Dynamic A/C/T/P flow requires proxy log directory containing fold_*.npz files.")
+    proxy_log: Path | None = None
+    component_results: dict[str, DynamicComponentResult]
 
-    folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
-    num_samples = labels_all.shape[0]
-    actual_proxy_epochs = int(folds[0].train_logits.shape[0])
-    if actual_proxy_epochs != resolved_proxy_epochs:
-        print(
-            f"INFO: requested proxy epochs={resolved_proxy_epochs}, "
-            f"but loaded logs contain {actual_proxy_epochs} epochs; cache will use requested epochs tag."
-        )
+    if cached_bundle is not None and labels_all is not None:
+        component_results = cached_bundle
+        print("Dynamic component caches HIT for all ACTP components; proxy logs are not required.")
+        for name in COMPONENT_NAMES:
+            print(f"Dynamic component cache HIT: {name} @ {component_cache_paths[name]}")
+    else:
+        print("Dynamic cache set is not fully usable. Reasons:")
+        for name in COMPONENT_NAMES:
+            print(f"  - {name}: {cache_reasons.get(name, 'not attempted')}")
 
-    component_results: dict[str, DynamicComponentResult] = {}
-    component_cache_paths: dict[str, Path] = {}
-    component_compute_fns: dict[str, Callable[[], DynamicComponentResult]] = {
-        "A": lambda: AbsorptionGainScore().compute(folds=folds, labels_all=labels_all),
-        "C": lambda: ConfusionComplementarityScore().compute(folds=folds, labels_all=labels_all),
-        "T": lambda: TransferabilityAlignmentScore().compute(folds=folds, labels_all=labels_all),
-        "P": lambda: PersistentDifficultyScore().compute(folds=folds, labels_all=labels_all),
-    }
-    for component_name in ("A", "C", "T", "P"):
-        result, from_cache, cache_path = get_or_compute_dynamic_component(
-            component_name=component_name,
-            dataset=args.dataset,
+        proxy_log = resolve_proxy_log_path(
+            args.proxy_log,
+            args.dataset,
+            proxy_training_seed,
             proxy_model=args.proxy_model,
-            proxy_training_seed=proxy_training_seed,
-            epochs=resolved_proxy_epochs,
-            proxy_log_path=proxy_log,
-            labels_all=labels_all,
-            compute_fn=component_compute_fns[component_name],
+            max_epoch=resolved_proxy_epochs,
         )
-        component_results[component_name] = result
-        component_cache_paths[component_name] = cache_path
-        status = "HIT" if from_cache else "MISS->RECOMPUTED"
-        print(f"Dynamic component cache {status}: {component_name} @ {cache_path}")
+        if not proxy_log.is_dir():
+            reason_lines = "\n".join(
+                f"  - {name}: {cache_reasons.get(name, 'unknown')}" for name in COMPONENT_NAMES
+            )
+            raise FileNotFoundError(
+                "未能直接使用保存的动态分量缓存，且也找不到原始代理训练日志。\n"
+                f"动态缓存目录: {resolve_dynamic_component_cache_dir(args.dataset, args.proxy_model, resolved_proxy_epochs)}\n"
+                f"原始代理日志期望路径: {proxy_log}\n"
+                "缓存不匹配的具体原因如下：\n"
+                f"{reason_lines}"
+            )
+
+        folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
+        actual_proxy_epochs = int(folds[0].train_logits.shape[0])
+        if actual_proxy_epochs != resolved_proxy_epochs:
+            print(
+                f"INFO: requested proxy epochs={resolved_proxy_epochs}, "
+                f"but loaded logs contain {actual_proxy_epochs} epochs; cache will use requested epochs tag."
+            )
+
+        component_compute_fns: dict[str, Callable[[], DynamicComponentResult]] = {
+            "A": lambda: AbsorptionGainScore().compute(folds=folds, labels_all=labels_all),
+            "C": lambda: ConfusionComplementarityScore().compute(folds=folds, labels_all=labels_all),
+            "T": lambda: TransferabilityAlignmentScore().compute(folds=folds, labels_all=labels_all),
+            "P": lambda: PersistentDifficultyScore().compute(folds=folds, labels_all=labels_all),
+        }
+        component_results = {}
+        for name in COMPONENT_NAMES:
+            result, from_cache, cache_path = get_or_compute_dynamic_component(
+                component_name=name,
+                dataset=args.dataset,
+                proxy_model=args.proxy_model,
+                proxy_training_seed=proxy_training_seed,
+                epochs=resolved_proxy_epochs,
+                proxy_log_path=proxy_log,
+                labels_all=labels_all,
+                compute_fn=component_compute_fns[name],
+            )
+            component_results[name] = result
+            component_cache_paths[name] = cache_path
+            print(f"Dynamic component cache {'HIT' if from_cache else 'MISS->RECOMPUTED'}: {name} @ {cache_path}")
+
+    assert labels_all is not None
 
     a_result = component_results["A"]
     c_result = component_results["C"]
-
-    class_names = load_class_names(args.dataset, args.data_root)
-    dds_metric = DifficultyDirection(
-        class_names=class_names,
-        clip_model=args.clip_model,
-        device=device,
-        k=args.dds_k,
-        important_eigval_ratio=args.dds_important_eigval_ratio,
-    )
-    div_metric = Div(
-        class_names=class_names,
-        clip_model=args.clip_model,
-        device=device,
-        k=args.div_k,
-    )
-    sa_metric = SemanticAlignment(
-        class_names=class_names,
-        clip_model=args.clip_model,
-        device=device,
-        dataset_name=args.dataset,
-        data_root=args.data_root,
-        debug_prompts=args.debug_prompts,
-    )
-
-    dds_loader = build_score_loader(
-        dds_metric.extractor.preprocess,
-        args.data_root,
-        args.dataset,
-        device,
-        args.batch_size,
-        args.num_workers,
-    )
-    div_loader = build_score_loader(
-        div_metric.extractor.preprocess,
-        args.data_root,
-        args.dataset,
-        device,
-        args.batch_size,
-        args.num_workers,
-    )
-    sa_loader = build_score_loader(
-        sa_metric.extractor.preprocess,
-        args.data_root,
-        args.dataset,
-        device,
-        args.batch_size,
-        args.num_workers,
-    )
-
-    dataset_for_labels = _build_dataset(args.dataset, args.data_root, transform=None)
-    num_samples_static = len(dataset_for_labels)
-
     t_result = component_results["T"]
     p_result = component_results["P"]
 
+    num_samples = labels_all.shape[0]
     for name, arr in {
         "A_final_normalized": a_result.final_normalized,
         "C_final_normalized": c_result.final_normalized,
@@ -566,31 +586,41 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         if not np.all(np.isfinite(arr)):
             raise ValueError(f"{name} contains NaN/inf values.")
 
-    # All dynamic components are already normalized to [0, 1]. Keep the original
-    # component weights and aggregate via weighted average so final utility remains
-    # in [0, 1] without an extra normalization pass.
-    total_weight = 1.0 + 1.0 + 0.5 + 0.5
-    u_raw = (
-        1.0 * a_result.final_normalized
-        + 1.0 * c_result.final_normalized
-        + 0.5 * t_result.final_normalized
-        + 0.5 * p_result.final_normalized
+    u_scores = np.clip(
+        (
+            a_result.final_normalized
+            + c_result.final_normalized
+            + 0.5 * t_result.final_normalized
+            + 0.5 * p_result.final_normalized
+        ).astype(np.float32) / 3.0,
+        0.0,
+        1.0,
     )
-    if not np.all(np.isfinite(u_raw)):
-        raise ValueError("u_raw contains NaN/inf values.")
-    u_scores = (u_raw / total_weight).astype(np.float32)
-    if u_scores.shape != (num_samples,):
-        raise ValueError(f"u_scores shape mismatch: {u_scores.shape}")
-    if not np.all(np.isfinite(u_scores)):
-        raise ValueError("u_scores contains NaN/inf values.")
-    u_min = float(np.min(u_scores))
-    u_max = float(np.max(u_scores))
-    if u_min < -1e-6 or u_max > 1.0 + 1e-6:
-        raise ValueError(f"u_scores out of [0,1] tolerance range: min={u_min:.8f}, max={u_max:.8f}")
-    # Defensive clip against tiny floating-point drift while preserving semantics.
-    u_scores = np.clip(u_scores, 0.0, 1.0)
 
-    dynamic_cache_dir = resolve_dynamic_component_cache_dir(args.dataset, args.proxy_model, resolved_proxy_epochs)
+    class_names = load_class_names(args.dataset, args.data_root)
+    dds_metric = DifficultyDirection(
+        class_names=class_names,
+        clip_model=args.clip_model,
+        device=device,
+        k=args.dds_k,
+        important_eigval_ratio=args.dds_important_eigval_ratio,
+    )
+    div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device, k=args.div_k)
+    sa_metric = SemanticAlignment(
+        class_names=class_names,
+        clip_model=args.clip_model,
+        device=device,
+        dataset_name=args.dataset,
+        data_root=args.data_root,
+        debug_prompts=args.debug_prompts,
+    )
+
+    dds_loader = build_score_loader(dds_metric.extractor.preprocess, args.data_root, args.dataset, device, args.batch_size, args.num_workers)
+    div_loader = build_score_loader(div_metric.extractor.preprocess, args.data_root, args.dataset, device, args.batch_size, args.num_workers)
+    sa_loader = build_score_loader(sa_metric.extractor.preprocess, args.data_root, args.dataset, device, args.batch_size, args.num_workers)
+
+    dataset_for_labels = _build_dataset(args.dataset, args.data_root, transform=None)
+    num_samples_static = len(dataset_for_labels)
 
     dynamic_component_values = {
         "A": a_result.final_normalized,
@@ -601,6 +631,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     dynamic_scores = u_scores.astype(np.float64)
     output_path = build_output_path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
     data: dict[str, dict[str, dict[str, object]]] = {}
     if output_path.exists():
         with open(output_path, "r", encoding="utf-8") as f:
@@ -609,6 +640,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
                 data = loaded
 
     dataset_entry = data.get(args.dataset, {})
+    dynamic_cache_dir = resolve_dynamic_component_cache_dir(args.dataset, args.proxy_model, resolved_proxy_epochs)
+
     for seed in output_seeds:
         image_adapter, text_adapter, adapter_paths = load_adapters_for_seed(
             args, args.dataset, dds_metric.extractor.embed_dim, seed, device
@@ -654,14 +687,10 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         if num_samples != num_samples_static:
             raise ValueError("Dynamic labels and static dataset sample count mismatch.")
         if not np.array_equal(labels_all, static_scores["labels"]):
-            raise ValueError("代理训练日志的标签与评分数据集标签不一致。")
+            raise ValueError("动态监督标签与静态评分数据集标签不一致。")
 
         static_features = np.stack(
-            [
-                static_scores["sa"],
-                static_scores["div"],
-                static_scores["dds"],
-            ],
+            [static_scores["sa"], static_scores["div"], static_scores["dds"]],
             axis=1,
         ).astype(np.float64)
 
@@ -691,8 +720,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             print(f"  {d_name}: " + ", ".join(row_str))
 
         print(
-            f"Learned weights for seed {seed}:",
-            f"SA={weights[0]:.6f}, Div={weights[1]:.6f}, DDS={weights[2]:.6f}, bias={bias:.6f}",
+            f"Learned weights for seed {seed}: "
+            f"SA={weights[0]:.6f}, Div={weights[1]:.6f}, DDS={weights[2]:.6f}, bias={bias:.6f}"
         )
         sa_warning = bool(weights[0] > (1.0 / 3.0))
         div_is_lowest = bool(weights[1] <= min(weights[0], weights[2]))
@@ -701,15 +730,13 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         if div_is_lowest:
             print(f"WARNING (seed={seed}): learned Div weight is the lowest among SA/Div/DDS.")
 
-        seed_key = str(seed)
-        dataset_entry.pop(f"{seed_key}_meta", None)
-        dataset_entry[seed_key] = {
+        dataset_entry[str(seed)] = {
             "sa": float(weights[0]),
             "div": float(weights[1]),
             "dds": float(weights[2]),
             "bias": float(bias),
             "ridge_lambda": float(args.ridge_lambda),
-            "proxy_log": str(proxy_log),
+            "proxy_log": str(proxy_log) if proxy_log is not None else "",
             "dynamic_components": ["A", "C", "T", "P"],
             "dynamic_cache_path": str(dynamic_cache_dir),
             "dynamic_component_cache_paths": {k: str(v) for k, v in component_cache_paths.items()},
@@ -723,8 +750,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
                 "div_is_lowest_warning": div_is_lowest,
             },
         }
-    data[args.dataset] = dataset_entry
 
+    data[args.dataset] = dataset_entry
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -737,5 +764,5 @@ if __name__ == "__main__":
     args = parse_args()
     output_seeds = parse_seed_list(args.seed)
     if not output_seeds:
-        raise ValueError("--seed 至少需要一个 seed（用于写入 scoring_weights.json）。")
+        raise ValueError("--seed 至少需要一个 seed。")
     run_once(args, output_seeds)

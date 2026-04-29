@@ -1,401 +1,454 @@
-#!/usr/bin/env python3
+from __future__ import annotations
+
+"""Visualize ablation results for CIFAR-10 / CIFAR-100.
+
+This script reads per-seed result JSON files produced by the project and
+plots the ablation curves for two datasets in one figure.
+
+Key features:
+- Two side-by-side subplots: CIFAR-10 and CIFAR-100.
+- Default kr values: [20, 30, 50, 60, 80, 90].
+- Default methods:
+  ["random", "naive_group", "ablation_dds", "ablation_sa", "ablation_div", "learned_group"].
+- The last method uses a red five-point star marker.
+- Ranking / ordering uses mean accuracy descending; when means tie, smaller
+  standard deviation ranks ahead.
+
+The script is intentionally robust to slightly different result JSON layouts.
+It tries several common accuracy field names and nested structures.
+"""
+
 import argparse
 import json
 from pathlib import Path
-from statistics import mean
+from typing import Any, Iterable
 
 import matplotlib.pyplot as plt
+import numpy as np
+
+try:
+    from utils.path_rules import resolve_result_path
+except Exception:  # pragma: no cover - fallback for running outside repo root
+    def resolve_result_path(
+        mode: str,
+        dataset: str,
+        model: str,
+        seed: int,
+        keep_ratio: int,
+        *,
+        root: Path | str | None = None,
+    ) -> Path:
+        base = Path(root) if root is not None else Path("result")
+        return base / mode / dataset / model / str(seed) / f"result_{int(keep_ratio)}.json"
 
 
-METHODS = ["random", "naive_topk", "learned_topk", "naive_group", "learned_group"]
-DATASETS = ["cifar10", "cifar100", "tiny-imagenet"]
-KEEP_RATIOS = [20, 30, 40, 60, 80]
-TARGET_MODEL = "resnet50"
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_DATASETS = ["cifar10", "cifar100"]
+DEFAULT_METHODS = [
+    "random",
+    "naive_group",
+    "ablation_dds",
+    "ablation_sa",
+    "ablation_div",
+    "learned_group",
+]
+DEFAULT_KR = [20, 30, 50, 60, 80, 90]
+DEFAULT_SEEDS = [22, 42, 96]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Show ablation-study curves for three datasets in one combined figure."
+    parser = argparse.ArgumentParser(description="Show ablation curves.")
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=DEFAULT_DATASETS,
+        help="Datasets to plot. Default: cifar10 cifar100.",
     )
     parser.add_argument(
-        "--result-dir",
-        default="result",
-        help="Root directory that stores result/<method>/<dataset>/<model>/<seed>/result_*.json",
+        "--methods",
+        nargs="+",
+        default=DEFAULT_METHODS,
+        help="Methods to plot. Default matches the ablation setup.",
     )
     parser.add_argument(
-        "--model",
-        default=TARGET_MODEL,
-        help="Model name used in the saved result directories.",
+        "--kr",
+        nargs="+",
+        type=int,
+        default=DEFAULT_KR,
+        help="Keep ratios to visualize.",
+    )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=DEFAULT_SEEDS,
+        help="Seeds used to aggregate results.",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="resnet50",
+        help="Model name used in the result directory.",
     )
     parser.add_argument(
         "--output",
-        default="picture/ablation_result.png",
-        help="Output image path.",
+        type=str,
+        default=str(PROJECT_ROOT / "figures" / "show_ablation.png"),
+        help="Output figure path.",
+    )
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=300,
+        help="Output DPI.",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Show the figure interactively after saving.",
     )
     return parser.parse_args()
 
 
-def load_seed_results(seed_dir: Path) -> dict[int, float]:
-    results: dict[int, float] = {}
-    for path in seed_dir.glob("result_*.json"):
-        with path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-
-        metadata = payload.get("metadata", {})
-        keep_ratio = int(
-            metadata.get("keep_ratio", metadata.get("cut_ratio", path.stem.split("_")[-1]))
-        )
-
-        acc_samples = payload.get("accuracy_samples")
-        if acc_samples:
-            acc_value = mean(acc_samples[-10:])
-        else:
-            acc_value = float(payload.get("accuracy", 0.0))
-
-        results[keep_ratio] = acc_value
-    return results
+def _flatten_numeric_values(obj: Any) -> list[float]:
+    values: list[float] = []
+    if obj is None:
+        return values
+    if isinstance(obj, (int, float, np.integer, np.floating)):
+        if np.isfinite(obj):
+            values.append(float(obj))
+        return values
+    if isinstance(obj, list) or isinstance(obj, tuple):
+        for item in obj:
+            values.extend(_flatten_numeric_values(item))
+        return values
+    if isinstance(obj, dict):
+        for v in obj.values():
+            values.extend(_flatten_numeric_values(v))
+        return values
+    return values
 
 
-def load_method_mean_results(
-    result_root: Path,
-    method: str,
+def _extract_accuracy_from_mapping(data: dict[str, Any]) -> float | None:
+    # Preferred keys first.
+    preferred_keys = [
+        "test_acc",
+        "test_accuracy",
+        "accuracy",
+        "acc",
+        "best_acc",
+        "best_accuracy",
+        "final_acc",
+        "final_accuracy",
+        "top1_acc",
+        "top1_accuracy",
+    ]
+    for key in preferred_keys:
+        if key in data:
+            vals = _flatten_numeric_values(data[key])
+            if vals:
+                return vals[-1]
+
+    # Then search nested dict/list values whose key suggests accuracy.
+    for key, value in data.items():
+        if isinstance(key, str) and ("acc" in key.lower() or "accuracy" in key.lower()):
+            vals = _flatten_numeric_values(value)
+            if vals:
+                return vals[-1]
+
+    # Generic recursive search.
+    for value in data.values():
+        if isinstance(value, dict):
+            nested = _extract_accuracy_from_mapping(value)
+            if nested is not None:
+                return nested
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    nested = _extract_accuracy_from_mapping(item)
+                    if nested is not None:
+                        return nested
+    return None
+
+
+def read_result_accuracy(path: Path) -> float:
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # The project may store a dict, list of dicts, or a raw scalar.
+    if isinstance(data, (int, float, np.integer, np.floating)):
+        value = float(data)
+    elif isinstance(data, list):
+        value = None
+        # Try the last dict / scalar first.
+        for item in reversed(data):
+            if isinstance(item, (int, float, np.integer, np.floating)):
+                value = float(item)
+                break
+            if isinstance(item, dict):
+                value = _extract_accuracy_from_mapping(item)
+                if value is not None:
+                    break
+        if value is None:
+            flat = _flatten_numeric_values(data)
+            if not flat:
+                raise ValueError(f"No numeric accuracy found in {path}")
+            value = flat[-1]
+    elif isinstance(data, dict):
+        value = _extract_accuracy_from_mapping(data)
+        if value is None:
+            flat = _flatten_numeric_values(data)
+            if not flat:
+                raise ValueError(f"No numeric accuracy found in {path}")
+            value = flat[-1]
+    else:
+        raise TypeError(f"Unsupported JSON type in {path}: {type(data)!r}")
+
+    return float(value)
+
+
+def normalize_accuracy(values: np.ndarray) -> np.ndarray:
+    """Convert accuracy to percent if it looks like a ratio in [0, 1]."""
+    values = np.asarray(values, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return values
+    # If the median is at most 1.5, treat as a ratio.
+    if np.median(finite) <= 1.5:
+        return values * 100.0
+    return values
+
+
+def collect_statistics(
     dataset: str,
-    model: str,
-    keep_ratios: list[int],
-) -> dict[int, float]:
-    method_root = result_root / method / dataset / model
-    if not method_root.exists():
-        return {}
+    method: str,
+    krs: Iterable[int],
+    seeds: Iterable[int],
+    model_name: str,
+) -> tuple[np.ndarray, np.ndarray, dict[int, list[float]]]:
+    means: list[float] = []
+    stds: list[float] = []
+    per_kr: dict[int, list[float]] = {}
 
-    seed_dirs = sorted(path for path in method_root.iterdir() if path.is_dir())
-    if not seed_dirs:
-        return {}
-
-    seed_results = [load_seed_results(seed_dir) for seed_dir in seed_dirs]
-
-    avg_by_kr: dict[int, float] = {}
-    for keep_ratio in keep_ratios:
-        values = [result[keep_ratio] for result in seed_results if keep_ratio in result]
-        if values:
-            avg_by_kr[keep_ratio] = mean(values)
-
-    return avg_by_kr
-
-
-def collect_all_results(
-    result_root: Path,
-    datasets: list[str],
-    methods: list[str],
-    model: str,
-    keep_ratios: list[int],
-) -> dict[str, dict[str, dict[int, float]]]:
-    all_results: dict[str, dict[str, dict[int, float]]] = {}
-    for dataset in datasets:
-        all_results[dataset] = {}
-        for method in methods:
-            all_results[dataset][method] = load_method_mean_results(
-                result_root=result_root,
-                method=method,
+    for kr in krs:
+        seed_values: list[float] = []
+        for seed in seeds:
+            result_path = resolve_result_path(
+                mode=method,
                 dataset=dataset,
-                model=model,
-                keep_ratios=keep_ratios,
+                model=model_name,
+                seed=seed,
+                keep_ratio=kr,
             )
-    return all_results
+            acc = read_result_accuracy(result_path)
+            seed_values.append(acc)
+        per_kr[int(kr)] = seed_values
+        arr = normalize_accuracy(np.asarray(seed_values, dtype=np.float64))
+        means.append(float(np.mean(arr)))
+        stds.append(float(np.std(arr, ddof=0)))
+
+    return np.asarray(means, dtype=np.float64), np.asarray(stds, dtype=np.float64), per_kr
 
 
-def compute_avg_improvement_percent(
-    dataset_results: dict[str, dict[int, float]],
-    baseline_method: str,
-    target_method: str = "learned_group",
-    keep_ratios: list[int] = KEEP_RATIOS,
-) -> float | None:
-    target = dataset_results.get(target_method, {})
-    baseline = dataset_results.get(baseline_method, {})
-
-    diffs = []
-    for kr in keep_ratios:
-        if kr in target and kr in baseline:
-            diffs.append((target[kr] - baseline[kr]) * 100.0)
-
-    if not diffs:
-        return None
-    return mean(diffs)
+def method_ranking(
+    methods: list[str],
+    means_by_method: dict[str, np.ndarray],
+    stds_by_method: dict[str, np.ndarray],
+) -> list[str]:
+    # Rank by average mean descending; if tied, smaller average std first.
+    items = []
+    for idx, method in enumerate(methods):
+        mean_val = float(np.mean(means_by_method[method]))
+        std_val = float(np.mean(stds_by_method[method]))
+        items.append((method, mean_val, std_val, idx))
+    items.sort(key=lambda x: (-x[1], x[2], x[3]))
+    return [m for m, *_ in items]
 
 
-def format_improvement(value: float | None) -> str:
-    if value is None:
-        return "-"
-    return f"{value:+.2f}%"
-
-
-def get_style_map() -> dict[str, dict]:
-    return {
-        "random": {
-            "color": "#1f77b4",
-            "marker": "o",
-            "linewidth": 2.1,
-            "markersize": 5.8,
-            "zorder": 3,
-        },
-        "naive_topk": {
-            "color": "#ff7f0e",
-            "marker": "s",
-            "linewidth": 2.1,
-            "markersize": 5.8,
-            "zorder": 3,
-        },
-        "learned_topk": {
-            "color": "#2ca02c",
-            "marker": "^",
-            "linewidth": 2.15,
-            "markersize": 6.2,
-            "zorder": 4,
-        },
-        "naive_group": {
-            "color": "#d62728",
-            "marker": "v",
-            "linewidth": 2.2,
-            "markersize": 6.2,
-            "zorder": 4,
-        },
-        "learned_group": {
+def _style_for_method(method: str, is_last: bool) -> dict[str, Any]:
+    # Keep the last method as a red five-point star, consistent with draw_acc_curve.py.
+    if is_last:
+        return {
             "color": "red",
             "marker": "*",
-            "linewidth": 2.8,
-            "markersize": 10.0,
+            "markersize": 12,
+            "linewidth": 2.2,
+            "linestyle": "-",
             "zorder": 6,
-        },
+        }
+
+    palette = {
+        "random": "#7f7f7f",
+        "naive_group": "#1f77b4",
+        "ablation_dds": "#ff7f0e",
+        "ablation_sa": "#2ca02c",
+        "ablation_div": "#9467bd",
+    }
+    markers = {
+        "random": "o",
+        "naive_group": "s",
+        "ablation_dds": "^",
+        "ablation_sa": "D",
+        "ablation_div": "v",
+    }
+    return {
+        "color": palette.get(method, "#333333"),
+        "marker": markers.get(method, "o"),
+        "markersize": 7,
+        "linewidth": 2.0,
+        "linestyle": "-",
+        "zorder": 4,
     }
 
 
-def configure_axis(ax, dataset: str, dataset_results: dict[str, dict[int, float]]) -> None:
-    ax.set_title(f"{dataset.upper()} {TARGET_MODEL}", fontsize=14, pad=8)
-    ax.set_xlabel("Keep Ratio (kr)", fontsize=11)
-    ax.set_ylabel("Accuracy (mean of last 10 epochs)", fontsize=11)
-
-    x_pos = list(range(len(KEEP_RATIOS)))
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels([str(kr) for kr in KEEP_RATIOS])
-
-    ax.grid(True, linestyle="--", alpha=0.22, linewidth=0.8)
-
-    all_y = []
-    for method in METHODS:
-        for kr in KEEP_RATIOS:
-            val = dataset_results.get(method, {}).get(kr)
-            if val is not None:
-                all_y.append(val)
-
-    if all_y:
-        ymin = min(all_y)
-        ymax = max(all_y)
-        span = ymax - ymin
-
-        if span == 0:
-            pad = 0.0008
-        else:
-            pad = max(0.0006, 0.045 * span)
-
-        ax.set_ylim(ymin - pad, ymax + pad)
-
-    ax.set_xlim(-0.15, len(KEEP_RATIOS) - 1 + 0.15)
-
-
-def draw_dataset_panel(
-    ax,
-    dataset: str,
-    dataset_results: dict[str, dict[int, float]],
-    style_map: dict[str, dict],
+def add_table(
+    ax: plt.Axes,
+    methods_order: list[str],
+    krs: list[int],
+    means_by_method: dict[str, np.ndarray],
+    stds_by_method: dict[str, np.ndarray],
 ) -> None:
-    x_pos_map = {kr: idx for idx, kr in enumerate(KEEP_RATIOS)}
-
-    for method in METHODS:
-        avg_by_kr = dataset_results.get(method, {})
-        valid_krs = [kr for kr in KEEP_RATIOS if kr in avg_by_kr]
-        x_values = [x_pos_map[kr] for kr in valid_krs]
-        y_values = [avg_by_kr[kr] for kr in valid_krs]
-        if not x_values:
-            continue
-
-        style = style_map[method]
-        ax.plot(
-            x_values,
-            y_values,
-            label=method,
-            color=style["color"],
-            marker=style["marker"],
-            linewidth=style["linewidth"],
-            markersize=style["markersize"],
-            markeredgewidth=0.8,
-            alpha=0.98,
-            zorder=style["zorder"],
-        )
-
-    configure_axis(ax, dataset, dataset_results)
-
-    ax.legend(
-        loc="lower right",
-        frameon=True,
-        fancybox=True,
-        framealpha=0.92,
-        fontsize=9.0,
-        ncol=1,
-        handlelength=1.9,
-        borderpad=0.42,
-        labelspacing=0.35,
-    )
-
-
-def draw_summary_table(
-    ax,
-    all_results: dict[str, dict[str, dict[int, float]]],
-) -> None:
-    ax.axis("off")
-
-    title_text = (
-        "Average accuracy gains of learned_group over other ablation variants\n"
-        "computed on the shown keep ratios (20, 30, 40, 60, 80)"
-    )
-    ax.text(
-        0.5,
-        0.92,
-        title_text,
-        ha="center",
-        va="center",
-        fontsize=12.5,
-        transform=ax.transAxes,
-    )
-
-    baseline_methods = ["random", "naive_topk", "learned_topk", "naive_group"]
-
-    row_labels = []
-    cell_text = []
-
-    for dataset in DATASETS:
-        row_labels.append(dataset)
+    cell_text: list[list[str]] = []
+    row_labels: list[str] = []
+    for method in methods_order:
+        row_labels.append(method)
         row = []
-        per_dataset_values = []
-        for baseline in baseline_methods:
-            value = compute_avg_improvement_percent(
-                dataset_results=all_results[dataset],
-                baseline_method=baseline,
-                target_method="learned_group",
-                keep_ratios=KEEP_RATIOS,
-            )
-            row.append(format_improvement(value))
-            if value is not None:
-                per_dataset_values.append(value)
-
-        row.append(format_improvement(mean(per_dataset_values) if per_dataset_values else None))
+        for i in range(len(krs)):
+            row.append(f"{means_by_method[method][i]:.2f}±{stds_by_method[method][i]:.2f}")
         cell_text.append(row)
-
-    # 缩短列表头，避免重叠
-    col_labels = ["random", "naive_topk", "learned_topk", "naive_group", "mean"]
 
     table = ax.table(
         cellText=cell_text,
         rowLabels=row_labels,
-        colLabels=col_labels,
-        bbox=[0.08, 0.18, 0.86, 0.52],
+        colLabels=[str(kr) for kr in krs],
+        loc="bottom",
         cellLoc="center",
         rowLoc="center",
-        colWidths=[0.18, 0.20, 0.20, 0.20, 0.16],
+        bbox=[0.0, -0.60, 1.0, 0.42],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(10.5)
-    table.scale(1.0, 1.55)
+    table.set_fontsize(8)
 
+    # Make the table more compact and readable.
     for (row, col), cell in table.get_celld().items():
-        cell.set_linewidth(0.8)
+        cell.set_linewidth(0.6)
         if row == 0:
             cell.set_text_props(weight="bold")
-            cell.set_facecolor("#f2f2f2")
         if col == -1:
             cell.set_text_props(weight="bold")
-            cell.set_facecolor("#f7f7f7")
 
 
-def print_terminal_summary(all_results: dict[str, dict[str, dict[int, float]]]) -> None:
-    print("\nAblation mean accuracy by dataset and keep ratio:")
-    for dataset in DATASETS:
-        print(f"\n[{dataset}]")
-        header = ["method"] + [str(kr) for kr in KEEP_RATIOS]
-        print("  ".join(h.rjust(14) for h in header))
-        for method in METHODS:
-            row = [method]
-            for kr in KEEP_RATIOS:
-                value = all_results[dataset].get(method, {}).get(kr)
-                row.append("-" if value is None else f"{value:.4f}")
-            print("  ".join(str(x).rjust(14) for x in row))
+def plot_dataset_panel(
+    ax: plt.Axes,
+    dataset: str,
+    methods: list[str],
+    krs: list[int],
+    seeds: list[int],
+    model_name: str,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    means_by_method: dict[str, np.ndarray] = {}
+    stds_by_method: dict[str, np.ndarray] = {}
 
-    print("\nAverage improvement of learned_group:")
-    baseline_methods = ["random", "naive_topk", "learned_topk", "naive_group"]
-    for dataset in DATASETS:
-        pieces = []
-        values = []
-        for baseline in baseline_methods:
-            improvement = compute_avg_improvement_percent(all_results[dataset], baseline)
-            pieces.append(f"vs {baseline}: {format_improvement(improvement)}")
-            if improvement is not None:
-                values.append(improvement)
-        overall = mean(values) if values else None
-        pieces.append(f"avg vs all: {format_improvement(overall)}")
-        print(f"  {dataset}: " + " | ".join(pieces))
+    for method in methods:
+        means, stds, _ = collect_statistics(dataset, method, krs, seeds, model_name)
+        means_by_method[method] = means
+        stds_by_method[method] = stds
+
+    ranked_methods = method_ranking(methods, means_by_method, stds_by_method)
+
+    for idx, method in enumerate(methods):
+        style = _style_for_method(method, is_last=(idx == len(methods) - 1))
+        ax.errorbar(
+            krs,
+            means_by_method[method],
+            yerr=stds_by_method[method],
+            label=method,
+            capsize=3,
+            **style,
+        )
+
+    ax.set_title(dataset.upper(), fontsize=15, pad=12)
+    ax.set_xlabel("kr (%)", fontsize=12)
+    ax.set_ylabel("Accuracy (%)", fontsize=12)
+    ax.set_xticks(krs)
+    ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.35)
+    ax.tick_params(axis="both", labelsize=10)
+
+    # Keep the y-range visually stable across datasets.
+    all_vals = []
+    for method in methods:
+        all_vals.extend(means_by_method[method].tolist())
+        all_vals.extend((means_by_method[method] + stds_by_method[method]).tolist())
+        all_vals.extend((means_by_method[method] - stds_by_method[method]).tolist())
+    finite_vals = np.asarray([v for v in all_vals if np.isfinite(v)], dtype=np.float64)
+    if finite_vals.size:
+        ymin = max(0.0, float(np.min(finite_vals)) - 1.0)
+        ymax = min(100.0, float(np.max(finite_vals)) + 1.0)
+        if ymax <= ymin:
+            ymax = ymin + 1.0
+        ax.set_ylim(ymin, ymax)
+
+    add_table(ax, ranked_methods, krs, means_by_method, stds_by_method)
+    return means_by_method, stds_by_method
 
 
 def main() -> None:
     args = parse_args()
-    result_root = Path(args.result_dir)
-    output_path = Path(args.output)
 
-    all_results = collect_all_results(
-        result_root=result_root,
-        datasets=DATASETS,
-        methods=METHODS,
-        model=args.model,
-        keep_ratios=KEEP_RATIOS,
+    datasets = [str(x).strip().lower() for x in args.datasets]
+    methods = [str(x).strip() for x in args.methods]
+    krs = [int(x) for x in args.kr]
+    seeds = [int(x) for x in args.seeds]
+
+    if len(datasets) != 2:
+        raise ValueError("This script is designed for exactly two datasets: cifar10 and cifar100.")
+    if datasets != ["cifar10", "cifar100"]:
+        # Keep the figure layout fixed as requested; only these two datasets are expected.
+        raise ValueError("datasets must be exactly ['cifar10', 'cifar100'].")
+    if len(methods) < 2:
+        raise ValueError("At least two methods are required.")
+    if not krs:
+        raise ValueError("kr cannot be empty.")
+    if not seeds:
+        raise ValueError("seeds cannot be empty.")
+
+    # Fixed and reasonable overall figure size, independent of the number of subplots.
+    fig, axes = plt.subplots(1, 2, figsize=(18.0, 8.4), constrained_layout=False)
+    plt.subplots_adjust(left=0.055, right=0.985, top=0.84, bottom=0.30, wspace=0.24)
+
+    for ax, dataset in zip(axes, datasets, strict=True):
+        plot_dataset_panel(ax, dataset, methods, krs, seeds, args.model_name)
+
+    # A compact shared legend. The last method is the red star.
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=min(3, len(labels)),
+        frameon=False,
+        fontsize=11,
+        bbox_to_anchor=(0.5, 0.965),
     )
 
-    print_terminal_summary(all_results)
-
-    style_map = get_style_map()
-
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    ax_cifar10 = axes[0, 0]
-    ax_cifar100 = axes[0, 1]
-    ax_tiny = axes[1, 0]
-    ax_table = axes[1, 1]
-
-    draw_dataset_panel(
-        ax=ax_cifar10,
-        dataset="cifar10",
-        dataset_results=all_results["cifar10"],
-        style_map=style_map,
-    )
-    draw_dataset_panel(
-        ax=ax_cifar100,
-        dataset="cifar100",
-        dataset_results=all_results["cifar100"],
-        style_map=style_map,
-    )
-    draw_dataset_panel(
-        ax=ax_tiny,
-        dataset="tiny-imagenet",
-        dataset_results=all_results["tiny-imagenet"],
-        style_map=style_map,
-    )
-    draw_summary_table(ax=ax_table, all_results=all_results)
-
+    # Add a subtle figure title for context.
     fig.suptitle(
-        "Ablation Study of Static Scoring and Group Selection",
-        fontsize=19,
-        y=0.975,
+        "Ablation Results on CIFAR-10 / CIFAR-100",
+        fontsize=16,
+        y=0.985,
     )
 
+    output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout(rect=[0, 0, 1, 0.955])
-    fig.savefig(output_path, dpi=260, bbox_inches="tight")
-    print(f"\nSaved figure to {output_path}")
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches="tight")
+    print(f"Figure saved to: {output_path}")
+
+    if args.show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 if __name__ == "__main__":

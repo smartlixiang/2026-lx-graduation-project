@@ -1,3 +1,4 @@
+__pycache__/
 data/
 adapter_weights/
 pretrained_clip/
@@ -6,4 +7,17 @@ weights/static_cache/
 checkpoint/
 debug/
 mask/
-__pycache__/
+noise_exp/mask/
+noise_exp/adapters/
+noise_exp/static_scores/
+picture/
+picture_old/
+result/
+result_old/
+unseen_result/adapter/
+unseen_result/mask/
+unseen_result/static_scores/
+weights/dynamic_cache/
+
+
+

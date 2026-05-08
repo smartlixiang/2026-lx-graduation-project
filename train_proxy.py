@@ -20,6 +20,7 @@ from dataset.dataset_config import AVAILABLE_DATASETS
 from model.model_config import get_model
 from utils.global_config import CONFIG
 from utils.path_rules import resolve_proxy_log_dir
+from utils.progress import PersistentStatusLine, create_persistent_bar, create_transient_batch_bar
 from utils.seed import set_seed
 from utils.training_defaults import apply_dataset_training_defaults
 
@@ -228,13 +229,25 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
         train_pos_map = build_index_mapping(num_samples, train_indices)
         val_pos_map = build_index_mapping(num_samples, val_indices_list)
 
+        fold_bar = create_persistent_bar(
+            total=args.epochs,
+            desc=f"Fold {fold_id + 1}/{args.k_folds}",
+            position=0,
+        )
+        val_status = PersistentStatusLine(
+            f"Last val result: fold={fold_id + 1}, epoch=0, val_acc=NA, val_loss=NA",
+            position=2,
+        )
+        last_val_acc = 0.0
+        last_val_loss = 0.0
+
         for epoch in range(1, args.epochs + 1):
             model.train()
             running_loss = 0.0
-            train_progress = tqdm(
+            train_progress = create_transient_batch_bar(
                 train_loader,
-                desc=f"Fold {fold_id} Epoch {epoch}/{args.epochs}",
-                unit="batch",
+                desc=f"Fold {fold_id + 1} train {epoch}/{args.epochs}",
+                position=1,
             )
             epoch_idx = epoch - 1
             total_batches = len(train_loader)
@@ -275,20 +288,24 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
 
             scheduler.step()
             epoch_loss = running_loss / len(train_loader.dataset) if len(train_loader.dataset) else 0.0
-            print(f"Fold {fold_id} Epoch {epoch}: train_loss={epoch_loss:.4f}")
 
             model.eval()
+            val_running_loss = 0.0
+            val_correct = 0
+            val_total = 0
             with torch.no_grad():
-                val_progress = tqdm(
+                val_progress = create_transient_batch_bar(
                     val_loader,
-                    desc=f"Fold {fold_id} Epoch {epoch}/{args.epochs} (val)",
-                    unit="batch",
+                    desc=f"Fold {fold_id + 1} val {epoch}/{args.epochs}",
+                    position=1,
                 )
                 for images, labels, indices in val_progress:
                     images = images.to(device)
                     labels = labels.to(device)
                     with autocast(enabled=runtime_use_amp):
                         outputs = model(images)
+                        val_losses = criterion(outputs, labels)
+                        val_loss = val_losses.mean()
 
                     batch_indices = indices.detach().cpu().numpy().astype(np.int64)
                     positions = val_pos_map[batch_indices]
@@ -296,6 +313,23 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
                         raise ValueError("Val batch contains indices outside current fold.")
 
                     val_logits_memmap[epoch_idx, positions, :] = outputs.detach().float().cpu().numpy()
+                    preds = outputs.argmax(dim=1)
+                    val_correct += (preds == labels).sum().item()
+                    val_total += labels.size(0)
+                    val_running_loss += val_losses.sum().item()
+                    val_progress.set_postfix(loss=f"{val_loss.item():.4f}")
+
+            last_val_loss = val_running_loss / len(val_loader.dataset) if len(val_loader.dataset) else 0.0
+            last_val_acc = val_correct / val_total if val_total else 0.0
+            fold_bar.set_postfix_str(
+                f"epoch={epoch}/{args.epochs}, train_loss={epoch_loss:.4f}, "
+                f"val_loss={last_val_loss:.4f}, val_acc={last_val_acc:.4f}"
+            )
+            val_status.update(
+                f"Last val result: epoch={epoch}, val_acc={last_val_acc:.4f}, "
+                f"val_loss={last_val_loss:.4f}"
+            )
+            fold_bar.update(1)
 
             train_logits_memmap.flush()
             val_logits_memmap.flush()
@@ -358,6 +392,12 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
                 path.unlink()
             except FileNotFoundError:
                 pass
+        fold_bar.close()
+        val_status.close()
+        tqdm.write(
+            f"Fold {fold_id + 1} done: last_val_acc={last_val_acc:.4f}, "
+            f"last_val_loss={last_val_loss:.4f}, saved={out_path}"
+        )
 
 
 def main() -> None:

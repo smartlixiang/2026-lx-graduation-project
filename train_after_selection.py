@@ -20,6 +20,7 @@ from dataset.dataset_config import AVAILABLE_DATASETS
 from model.model_config import get_model
 from utils.global_config import CONFIG
 from utils.path_rules import resolve_checkpoint_path, resolve_mask_path, resolve_result_path
+from utils.progress import PersistentStatusLine, create_persistent_bar, create_transient_batch_bar
 from utils.seed import parse_seed_list, set_seed
 from utils.training_defaults import apply_dataset_training_defaults
 
@@ -195,10 +196,15 @@ def train_one_epoch(
     use_amp: bool,
     grad_accum_steps: int,
     scaler: GradScaler,
+    position: int = 1,
 ) -> float:
     model.train()
     running_loss = 0.0
-    progress = tqdm(loader, desc=f"Epoch {epoch}/{total_epochs}", unit="batch")
+    progress = create_transient_batch_bar(
+        loader,
+        desc=f"Train batch {epoch}/{total_epochs}",
+        position=position,
+    )
     optimizer.zero_grad(set_to_none=True)
     total_batches = len(loader)
     for batch_idx, (images, labels) in enumerate(progress, start=1):
@@ -225,7 +231,6 @@ def train_one_epoch(
             optimizer.zero_grad(set_to_none=True)
 
         running_loss += loss.item() * images.size(0)
-        progress.set_postfix(loss=f"{loss.item():.4f}")
 
     return running_loss / len(loader.dataset)
 
@@ -342,8 +347,25 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             elapsed_time = float(checkpoint.get("elapsed_time", 0.0))
             start_time = time.time() - elapsed_time
 
+        epoch_bar = create_persistent_bar(
+            total=args.epochs,
+            desc=f"[seed={seed}] mode={args.mode} kr={keep_ratio}",
+            position=0,
+            initial=max(0, start_epoch - 1),
+        )
+        test_status = PersistentStatusLine(
+            "Last-10 test accs (0/10): []",
+            position=2,
+        )
+        if accuracy_samples:
+            formatted = ", ".join(f"{acc:.4f}" for acc in accuracy_samples)
+            test_status.update(
+                f"Last-10 test accs ({len(accuracy_samples)}/10): [{formatted}]"
+            )
+
         for epoch in range(start_epoch, args.epochs + 1):
-            train_loss = train_one_epoch(
+            epoch_bar.set_postfix_str(f"epoch={epoch}/{args.epochs}")
+            train_one_epoch(
                 model,
                 subset_loader,
                 optimizer,
@@ -354,6 +376,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 runtime_use_amp,
                 args.grad_accum_steps,
                 scaler,
+                position=1,
             )
             scheduler.step()
             if epoch >= start_eval_epoch:
@@ -362,7 +385,10 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                     4,
                 )
                 accuracy_samples.append(eval_accuracy)
-                print(f"Test accuracy at epoch {epoch}: {eval_accuracy:.4f}")
+                formatted = ", ".join(f"{acc:.4f}" for acc in accuracy_samples)
+                test_status.update(
+                    f"Last-10 test accs ({len(accuracy_samples)}/10): [{formatted}]"
+                )
             if epoch % 20 == 0:
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(
@@ -381,10 +407,13 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                     },
                     checkpoint_path,
                 )
+            epoch_bar.update(1)
 
         total_time = time.time() - start_time
         accuracy = float(np.mean(accuracy_samples)) if accuracy_samples else 0.0
+        accuracy_std = float(np.std(accuracy_samples, ddof=0)) if accuracy_samples else 0.0
         accuracy = round(accuracy, 4)
+        accuracy_std = round(accuracy_std, 4)
 
         result_dir.mkdir(parents=True, exist_ok=True)
 
@@ -416,6 +445,8 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 "num_total": len(train_dataset),
             },
             "accuracy": accuracy,
+            "accuracy_mean": accuracy,
+            "accuracy_std": accuracy_std,
             "accuracy_samples": accuracy_samples,
             "time_seconds": total_time,
         }
@@ -425,8 +456,13 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
         if checkpoint_path.exists():
             checkpoint_path.unlink()
-        if multi_seed:
-            print(f"Saved result to {result_path}")
+        epoch_bar.close()
+        test_status.close()
+        tqdm.write(f"Saved result to {result_path}")
+        tqdm.write(
+            f"Last-10 test accs: [{', '.join(f'{acc:.4f}' for acc in accuracy_samples)}]"
+        )
+        tqdm.write(f"Last-10 mean/std: mean={accuracy:.4f}, std={accuracy_std:.4f}")
 
 
 def main() -> None:

@@ -1,19 +1,25 @@
 {
   "cifar100": {
     "22": {
-      "sa": 0.2034059919436697,
-      "div": 0.4165641712398652,
-      "dds": 0.38002983681646507,
-      "bias": -0.022454045092790514,
+      "sa": 0.25271968836502046,
+      "div": 0.3798318367135304,
+      "dds": 0.36744847492144916,
+      "bias": -0.025071205464570208,
       "ridge_lambda": 0.01,
       "proxy_log": "weights/proxy_logs/cifar100/resnet18/200",
       "dynamic_components": [
         "A",
         "C",
-        "D",
-        "E"
+        "T",
+        "P"
       ],
-      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200/dynamic_components.npz",
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200",
+      "dynamic_component_cache_paths": {
+        "A": "weights/dynamic_cache/cifar100/resnet18/200/A.npz",
+        "C": "weights/dynamic_cache/cifar100/resnet18/200/C.npz",
+        "T": "weights/dynamic_cache/cifar100/resnet18/200/T.npz",
+        "P": "weights/dynamic_cache/cifar100/resnet18/200/P.npz"
+      },
       "proxy_training_seed": 42,
       "proxy_log_seed_free": true,
       "dynamic_cache_seed_free": true,
@@ -21,24 +27,24 @@
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.4492478666755981,
-            "Div": 0.45888573195118443,
-            "DDS": 0.242873554520556
+            "SA": -0.44922546345494313,
+            "Div": 0.458734079243009,
+            "DDS": 0.24219606916464728
           },
           "C": {
-            "SA": -0.08102696472059567,
-            "Div": 0.18504830176730236,
-            "DDS": 0.14221239446623743
+            "SA": -0.0807428269383288,
+            "Div": 0.1851343629609451,
+            "DDS": 0.1416051937491376
           },
-          "D": {
-            "SA": 0.01270874903732632,
-            "Div": -0.009474734969236683,
-            "DDS": 0.012752150278619324
+          "T": {
+            "SA": 0.012815755608722789,
+            "Div": -0.009443712595620608,
+            "DDS": 0.012738051048727146
           },
-          "E": {
-            "SA": -0.4684073902437322,
-            "Div": 0.47087797909186485,
-            "DDS": 0.24657636074434228
+          "P": {
+            "SA": -0.4684251848542814,
+            "Div": 0.47077461003031207,
+            "DDS": 0.24613759345039402
           }
         },
         "sa_gt_one_third_warning": false,
@@ -46,19 +52,25 @@
       }
     },
     "42": {
-      "sa": 0.20516007621187998,
-      "div": 0.4170742932946404,
-      "dds": 0.37776563049347955,
-      "bias": -0.022707328292919184,
+      "sa": 0.25380157189343183,
+      "div": 0.3799393181832971,
+      "dds": 0.3662591099232711,
+      "bias": -0.025240382270704798,
       "ridge_lambda": 0.01,
       "proxy_log": "weights/proxy_logs/cifar100/resnet18/200",
       "dynamic_components": [
         "A",
         "C",
-        "D",
-        "E"
+        "T",
+        "P"
       ],
-      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200/dynamic_components.npz",
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200",
+      "dynamic_component_cache_paths": {
+        "A": "weights/dynamic_cache/cifar100/resnet18/200/A.npz",
+        "C": "weights/dynamic_cache/cifar100/resnet18/200/C.npz",
+        "T": "weights/dynamic_cache/cifar100/resnet18/200/T.npz",
+        "P": "weights/dynamic_cache/cifar100/resnet18/200/P.npz"
+      },
       "proxy_training_seed": 42,
       "proxy_log_seed_free": true,
       "dynamic_cache_seed_free": true,
@@ -66,24 +78,24 @@
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.4399952890061344,
-            "Div": 0.4590104004134404,
-            "DDS": 0.24406370485007436
+            "SA": -0.439522028779665,
+            "Div": 0.45901878385625733,
+            "DDS": 0.24463891414466815
           },
           "C": {
-            "SA": -0.07208528276388089,
-            "Div": 0.19420466348196,
-            "DDS": 0.1287108140761897
+            "SA": -0.07168107802703118,
+            "Div": 0.1942592749905315,
+            "DDS": 0.12914975219666328
           },
-          "D": {
-            "SA": 0.01355049523146484,
-            "Div": -0.009155224417856267,
-            "DDS": 0.004599658304732665
+          "T": {
+            "SA": 0.01357705988098619,
+            "Div": -0.009163675532914906,
+            "DDS": 0.004620445171747697
           },
-          "E": {
-            "SA": -0.4629061944410669,
-            "Div": 0.4715316417692253,
-            "DDS": 0.24887963975133703
+          "P": {
+            "SA": -0.4626319797690918,
+            "Div": 0.4715343393248549,
+            "DDS": 0.2493199691802353
           }
         },
         "sa_gt_one_third_warning": false,
@@ -91,19 +103,25 @@
       }
     },
     "96": {
-      "sa": 0.20531149894586945,
-      "div": 0.4180055891717863,
-      "dds": 0.37668291188234426,
-      "bias": -0.023137722077067602,
+      "sa": 0.24678702467458902,
+      "div": 0.3986596254687035,
+      "dds": 0.3545533498567076,
+      "bias": -0.03314990291743363,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights/proxy_logs/cifar100/resnet18/200",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
-        "D",
-        "E"
+        "T",
+        "P"
       ],
-      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200/dynamic_components.npz",
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200",
+      "dynamic_component_cache_paths": {
+        "A": "weights/dynamic_cache/cifar100/resnet18/200/A.npz",
+        "C": "weights/dynamic_cache/cifar100/resnet18/200/C.npz",
+        "T": "weights/dynamic_cache/cifar100/resnet18/200/T.npz",
+        "P": "weights/dynamic_cache/cifar100/resnet18/200/P.npz"
+      },
       "proxy_training_seed": 42,
       "proxy_log_seed_free": true,
       "dynamic_cache_seed_free": true,
@@ -111,24 +129,24 @@
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.4472719965847699,
-            "Div": 0.4561291582102905,
-            "DDS": 0.23584971301632926
+            "SA": -0.4471119998518612,
+            "Div": 0.45659141872002496,
+            "DDS": 0.1299178202962811
           },
           "C": {
-            "SA": -0.07528994431743603,
-            "Div": 0.19091689861903563,
-            "DDS": 0.12994262560072098
+            "SA": -0.077350939822218,
+            "Div": 0.19159621796611792,
+            "DDS": 0.09702562221555891
           },
-          "D": {
-            "SA": 0.015300932084520366,
-            "Div": -0.008268280301358039,
-            "DDS": 0.007349261833754953
+          "T": {
+            "SA": 0.027539254277195228,
+            "Div": -0.016654583898162975,
+            "DDS": 0.0109924390592856
           },
-          "E": {
-            "SA": -0.4690249583694888,
-            "Div": 0.4696936706303271,
-            "DDS": 0.244115163624322
+          "P": {
+            "SA": -0.4693204275341123,
+            "Div": 0.4712892472345483,
+            "DDS": 0.11952876829338939
           }
         },
         "sa_gt_one_third_warning": false,
@@ -143,24 +161,24 @@
   },
   "cifar10": {
     "22": {
-      "sa": 0.2762216265455875,
-      "div": 0.3680890766467154,
-      "dds": 0.355689296807697,
-      "bias": -0.15647856341679944,
+      "sa": 0.2766753158127604,
+      "div": 0.3724935820405507,
+      "dds": 0.35083110214668894,
+      "bias": -0.15764598394465912,
       "ridge_lambda": 0.01,
       "proxy_log": "weights/proxy_logs/cifar10/resnet18/200",
       "dynamic_components": [
         "A",
         "C",
-        "D",
-        "E"
+        "T",
+        "P"
       ],
       "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/200",
       "dynamic_component_cache_paths": {
         "A": "weights/dynamic_cache/cifar10/resnet18/200/A.npz",
         "C": "weights/dynamic_cache/cifar10/resnet18/200/C.npz",
-        "D": "weights/dynamic_cache/cifar10/resnet18/200/D.npz",
-        "E": "weights/dynamic_cache/cifar10/resnet18/200/E.npz"
+        "T": "weights/dynamic_cache/cifar10/resnet18/200/T.npz",
+        "P": "weights/dynamic_cache/cifar10/resnet18/200/P.npz"
       },
       "proxy_training_seed": 42,
       "proxy_log_seed_free": true,
@@ -169,24 +187,24 @@
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.39734185872012,
-            "Div": 0.39606492826708245,
-            "DDS": 0.2355843113687673
+            "SA": -0.3946204981417922,
+            "Div": 0.3942681121624368,
+            "DDS": 0.21310831373268158
           },
           "C": {
-            "SA": -0.03388741213622365,
-            "Div": 0.14376228196031546,
-            "DDS": 0.07912992584160046
+            "SA": -0.03501305224922103,
+            "Div": 0.1472373998976623,
+            "DDS": 0.05445560824386637
           },
-          "D": {
-            "SA": 0.04944576119296245,
-            "Div": -0.02860700699383149,
-            "DDS": -0.025961745185933815
+          "T": {
+            "SA": 0.04412468750849762,
+            "Div": -0.03433228488164503,
+            "DDS": -0.031186639973971413
           },
-          "E": {
-            "SA": -0.42128929619245004,
-            "Div": 0.38723550233395854,
-            "DDS": 0.26512124227735695
+          "P": {
+            "SA": -0.42533987036922816,
+            "Div": 0.3898095617207183,
+            "DDS": 0.2301746120691406
           }
         },
         "sa_gt_one_third_warning": false,
@@ -194,24 +212,24 @@
       }
     },
     "42": {
-      "sa": 0.276592471915541,
-      "div": 0.3696348083112593,
-      "dds": 0.3537727197731998,
-      "bias": -0.15698423681292706,
+      "sa": 0.276188137973607,
+      "div": 0.37232431839234337,
+      "dds": 0.3514875436340496,
+      "bias": -0.1553780879445798,
       "ridge_lambda": 0.01,
       "proxy_log": "weights/proxy_logs/cifar10/resnet18/200",
       "dynamic_components": [
         "A",
         "C",
-        "D",
-        "E"
+        "T",
+        "P"
       ],
       "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/200",
       "dynamic_component_cache_paths": {
         "A": "weights/dynamic_cache/cifar10/resnet18/200/A.npz",
         "C": "weights/dynamic_cache/cifar10/resnet18/200/C.npz",
-        "D": "weights/dynamic_cache/cifar10/resnet18/200/D.npz",
-        "E": "weights/dynamic_cache/cifar10/resnet18/200/E.npz"
+        "T": "weights/dynamic_cache/cifar10/resnet18/200/T.npz",
+        "P": "weights/dynamic_cache/cifar10/resnet18/200/P.npz"
       },
       "proxy_training_seed": 42,
       "proxy_log_seed_free": true,
@@ -220,24 +238,24 @@
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.39889161074780016,
-            "Div": 0.4048587172929761,
-            "DDS": 0.2348889013868837
+            "SA": -0.39589474964309906,
+            "Div": 0.40258767075940083,
+            "DDS": 0.21687789657667364
           },
           "C": {
-            "SA": -0.02222948115641136,
-            "Div": 0.1452569345903602,
-            "DDS": 0.07864548215609685
+            "SA": -0.02389455901898588,
+            "Div": 0.14893752515664885,
+            "DDS": 0.05529280375012614
           },
-          "D": {
-            "SA": 0.05475426266703317,
-            "Div": -0.034123693882299536,
-            "DDS": -0.02938209961500141
+          "T": {
+            "SA": 0.048746538228055185,
+            "Div": -0.03623701393731805,
+            "DDS": -0.03564691507897688
           },
-          "E": {
-            "SA": -0.42492842067915015,
-            "Div": 0.39488430137170166,
-            "DDS": 0.26409505465554395
+          "P": {
+            "SA": -0.4291433970495761,
+            "Div": 0.3975809951500351,
+            "DDS": 0.23598455928353093
           }
         },
         "sa_gt_one_third_warning": false,
@@ -245,24 +263,24 @@
       }
     },
     "96": {
-      "sa": 0.27329670956836066,
-      "div": 0.367226784665664,
-      "dds": 0.35947650576597534,
-      "bias": -0.15496238882563776,
+      "sa": 0.27506455761083354,
+      "div": 0.3735857265885873,
+      "dds": 0.3513497158005793,
+      "bias": -0.15815771149879335,
       "ridge_lambda": 0.01,
       "proxy_log": "weights/proxy_logs/cifar10/resnet18/200",
       "dynamic_components": [
         "A",
         "C",
-        "D",
-        "E"
+        "T",
+        "P"
       ],
       "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/200",
       "dynamic_component_cache_paths": {
         "A": "weights/dynamic_cache/cifar10/resnet18/200/A.npz",
         "C": "weights/dynamic_cache/cifar10/resnet18/200/C.npz",
-        "D": "weights/dynamic_cache/cifar10/resnet18/200/D.npz",
-        "E": "weights/dynamic_cache/cifar10/resnet18/200/E.npz"
+        "T": "weights/dynamic_cache/cifar10/resnet18/200/T.npz",
+        "P": "weights/dynamic_cache/cifar10/resnet18/200/P.npz"
       },
       "proxy_training_seed": 42,
       "proxy_log_seed_free": true,
@@ -271,24 +289,24 @@
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.4000579839374123,
-            "Div": 0.39711977598679987,
-            "DDS": 0.24437738843906634
+            "SA": -0.39722746393589353,
+            "Div": 0.39498577128379786,
+            "DDS": 0.2019363356241817
           },
           "C": {
-            "SA": -0.037036480438255207,
-            "Div": 0.14720525651973101,
-            "DDS": 0.08600345947870465
+            "SA": -0.03913498514469095,
+            "Div": 0.1503608853450289,
+            "DDS": 0.05727026033324835
           },
-          "D": {
-            "SA": 0.04723366037930822,
-            "Div": -0.026825819219738662,
-            "DDS": -0.020365554559579228
+          "T": {
+            "SA": 0.03815211645566587,
+            "Div": -0.03591886310101697,
+            "DDS": -0.02313316283369823
           },
-          "E": {
-            "SA": -0.4224009724382299,
-            "Div": 0.386242072114867,
-            "DDS": 0.2662418339507069
+          "P": {
+            "SA": -0.42642204823205687,
+            "Div": 0.3886706406338959,
+            "DDS": 0.218048000390013
           }
         },
         "sa_gt_one_third_warning": false,

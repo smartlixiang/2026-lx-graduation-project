@@ -1,0 +1,252 @@
+{
+  "cifar100": {
+    "ablation_dds": {
+      "96": {
+        "experiment": "ablation_dds",
+        "static_components": [
+          "SA",
+          "Div"
+        ],
+        "dynamic_components": [
+          "A",
+          "C",
+          "T",
+          "P"
+        ],
+        "sa": 0.4266292338871249,
+        "div": 0.5733707661128751,
+        "bias": -0.07943397030378659,
+        "ridge_lambda": 0.01,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 200,
+        "proxy_training_seed": 42,
+        "dynamic_cache_paths": {
+          "A": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/A.npz",
+          "C": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/C.npz",
+          "T": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/T.npz",
+          "P": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/P.npz"
+        },
+        "static_cache_dir": "/nvme/home/lixiang/code/static_scores/cifar100/96/Div_5%_DDS_[2%-20%]",
+        "adapter_image_path": "adapter_weights/cifar100/96/adapter_image.pt",
+        "adapter_text_path": "adapter_weights/cifar100/96/adapter_context.pt"
+      },
+      "22": {
+        "experiment": "ablation_dds",
+        "static_components": [
+          "SA",
+          "Div"
+        ],
+        "dynamic_components": [
+          "A",
+          "C",
+          "T",
+          "P"
+        ],
+        "sa": 0.4260366283790132,
+        "div": 0.5739633716209868,
+        "bias": -0.08007683621505754,
+        "ridge_lambda": 0.01,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 200,
+        "proxy_training_seed": 42,
+        "dynamic_cache_paths": {
+          "A": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/A.npz",
+          "C": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/C.npz",
+          "T": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/T.npz",
+          "P": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/P.npz"
+        },
+        "static_cache_dir": "/nvme/home/lixiang/code/static_scores/cifar100/22/Div_5%_DDS_[2%-20%]",
+        "adapter_image_path": "adapter_weights/cifar100/22/adapter_image.pt",
+        "adapter_text_path": "adapter_weights/cifar100/22/adapter_context.pt"
+      },
+      "42": {
+        "experiment": "ablation_dds",
+        "static_components": [
+          "SA",
+          "Div"
+        ],
+        "dynamic_components": [
+          "A",
+          "C",
+          "T",
+          "P"
+        ],
+        "sa": 0.4271316747800907,
+        "div": 0.5728683252199094,
+        "bias": -0.0807404572918654,
+        "ridge_lambda": 0.01,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 200,
+        "proxy_training_seed": 42,
+        "dynamic_cache_paths": {
+          "A": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/A.npz",
+          "C": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/C.npz",
+          "T": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/T.npz",
+          "P": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar100/resnet18/200/P.npz"
+        },
+        "static_cache_dir": "/nvme/home/lixiang/code/static_scores/cifar100/42/Div_5%_DDS_[2%-20%]",
+        "adapter_image_path": "adapter_weights/cifar100/42/adapter_image.pt",
+        "adapter_text_path": "adapter_weights/cifar100/42/adapter_context.pt"
+      }
+    },
+    "ablation_sa": {
+      "22": {
+        "dds": 0.4917143797318923,
+        "div": 0.5082856202681076,
+        "sa": 0.0
+      },
+      "42": {
+        "dds": 0.49083339783042784,
+        "div": 0.5091666021695722,
+        "sa": 0.0
+      },
+      "96": {
+        "dds": 0.47072124547977906,
+        "div": 0.5292787545202209,
+        "sa": 0.0
+      }
+    },
+    "ablation_div": {
+      "22": {
+        "dds": 0.5924981265955706,
+        "div": 0.0,
+        "sa": 0.4075018734044294
+      },
+      "42": {
+        "dds": 0.5906826874591953,
+        "div": 0.0,
+        "sa": 0.40931731254080467
+      },
+      "96": {
+        "dds": 0.5896050970019392,
+        "div": 0.0,
+        "sa": 0.41039490299806075
+      }
+    }
+  },
+  "cifar10": {
+    "ablation_dds": {
+      "22": {
+        "experiment": "ablation_dds",
+        "static_components": [
+          "SA",
+          "Div"
+        ],
+        "dynamic_components": [
+          "A",
+          "C",
+          "T",
+          "P"
+        ],
+        "sa": 0.42900839718121025,
+        "div": 0.5709916028187898,
+        "bias": -0.21169225770397243,
+        "ridge_lambda": 0.01,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 200,
+        "proxy_training_seed": 42,
+        "dynamic_cache_paths": {
+          "A": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/A.npz",
+          "C": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/C.npz",
+          "T": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/T.npz",
+          "P": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/P.npz"
+        },
+        "static_cache_dir": "/nvme/home/lixiang/code/static_scores/cifar10/22/Div_5%_DDS_[2%-20%]",
+        "adapter_image_path": "adapter_weights/cifar10/22/adapter_image.pt",
+        "adapter_text_path": "adapter_weights/cifar10/22/adapter_context.pt"
+      },
+      "42": {
+        "experiment": "ablation_dds",
+        "static_components": [
+          "SA",
+          "Div"
+        ],
+        "dynamic_components": [
+          "A",
+          "C",
+          "T",
+          "P"
+        ],
+        "sa": 0.42903659365207986,
+        "div": 0.5709634063479202,
+        "bias": -0.2103651610653446,
+        "ridge_lambda": 0.01,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 200,
+        "proxy_training_seed": 42,
+        "dynamic_cache_paths": {
+          "A": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/A.npz",
+          "C": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/C.npz",
+          "T": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/T.npz",
+          "P": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/P.npz"
+        },
+        "static_cache_dir": "/nvme/home/lixiang/code/static_scores/cifar10/42/Div_5%_DDS_[2%-20%]",
+        "adapter_image_path": "adapter_weights/cifar10/42/adapter_image.pt",
+        "adapter_text_path": "adapter_weights/cifar10/42/adapter_context.pt"
+      },
+      "96": {
+        "experiment": "ablation_dds",
+        "static_components": [
+          "SA",
+          "Div"
+        ],
+        "dynamic_components": [
+          "A",
+          "C",
+          "T",
+          "P"
+        ],
+        "sa": 0.4282858587601117,
+        "div": 0.5717141412398883,
+        "bias": -0.21235610716849315,
+        "ridge_lambda": 0.01,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 200,
+        "proxy_training_seed": 42,
+        "dynamic_cache_paths": {
+          "A": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/A.npz",
+          "C": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/C.npz",
+          "T": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/T.npz",
+          "P": "/nvme/home/lixiang/code/weights/dynamic_cache/cifar10/resnet18/200/P.npz"
+        },
+        "static_cache_dir": "/nvme/home/lixiang/code/static_scores/cifar10/96/Div_5%_DDS_[2%-20%]",
+        "adapter_image_path": "adapter_weights/cifar10/96/adapter_image.pt",
+        "adapter_text_path": "adapter_weights/cifar10/96/adapter_context.pt"
+      }
+    },
+    "ablation_sa": {
+      "22": {
+        "dds": 0.4850257565050454,
+        "div": 0.5149742434949547,
+        "sa": 0.0
+      },
+      "42": {
+        "dds": 0.48560622182955193,
+        "div": 0.5143937781704482,
+        "sa": 0.0
+      },
+      "96": {
+        "dds": 0.4846634545038074,
+        "div": 0.5153365454961927,
+        "sa": 0.0
+      }
+    },
+    "ablation_div": {
+      "22": {
+        "dds": 0.5590876716249941,
+        "div": 0.0,
+        "sa": 0.4409123283750058
+      },
+      "42": {
+        "dds": 0.5599827330155435,
+        "div": 0.0,
+        "sa": 0.4400172669844566
+      },
+      "96": {
+        "dds": 0.5608903416059643,
+        "div": 0.0,
+        "sa": 0.43910965839403565
+      }
+    }
+  }
+}

@@ -1,4 +1,4 @@
-"""Train a proxy model and reserve hooks for scoring-weight learning."""
+"""Train a proxy model and save seed-aware CV dynamics for scoring-weight learning."""
 from __future__ import annotations
 
 import argparse
@@ -66,9 +66,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--k_folds", type=int, default=5)
     parser.add_argument(
         "--seed",
-        type=str,
-        default=str(CONFIG.global_seed),
-        help="代理模型交叉验证唯一真实训练种子（仅支持单个整数）",
+        type=int,
+        default=CONFIG.global_seed,
+        help="代理模型交叉验证真实训练种子；日志保存到 [dataset]/[model]/[seed]/[epochs]。",
     )
     return parser.parse_args()
 
@@ -132,6 +132,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
     proxy_model_name = args.model
     log_dir = resolve_proxy_log_dir(
         args.dataset,
+        seed=seed,
         proxy_model=proxy_model_name,
         epochs=args.epochs,
     )
@@ -140,7 +141,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
     runtime_use_amp = bool(args.use_amp and device.type == "cuda")
 
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
-    val_indices_list = [fold.tolist() for fold in folds]
+    fold_val_indices = [fold.tolist() for fold in folds]
     meta_payload = {
         "k_folds": args.k_folds,
         "num_samples": num_samples,
@@ -149,9 +150,11 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
         "dataset": args.dataset,
         "model": proxy_model_name,
         "seed": seed,
-        "proxy_log_seed_free": True,
+        "proxy_training_seed": seed,
+        "proxy_log_seed_free": False,
+        "proxy_log_path_rule": "[dataset]/[proxy_model]/[seed]/[max_epochs]",
         "timestamp": timestamp,
-        "val_indices": val_indices_list,
+        "val_indices": fold_val_indices,
         "physical_batch_size": args.physical_batch_size,
         "grad_accum_steps": args.grad_accum_steps,
         "effective_batch_size": args.effective_batch_size,
@@ -164,7 +167,8 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
     meta_path.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     for fold_id, val_indices in enumerate(folds):
-        seed_fold = seed * 100 + fold_id
+        fold_no = fold_id + 1
+        seed_fold = seed * 100 + fold_no
         set_seed(seed_fold)
 
         val_set = set(val_indices.tolist())
@@ -209,8 +213,8 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
         )
         scaler = GradScaler(enabled=runtime_use_amp)
 
-        train_logits_path = log_dir / f"fold_{fold_id}_train_logits.dat"
-        val_logits_path = log_dir / f"fold_{fold_id}_val_logits.dat"
+        train_logits_path = log_dir / f"fold_{fold_no}_train_logits.dat"
+        val_logits_path = log_dir / f"fold_{fold_no}_val_logits.dat"
         dat_paths = [train_logits_path, val_logits_path]
 
         train_logits_memmap = np.memmap(
@@ -231,11 +235,11 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
 
         fold_bar = create_persistent_bar(
             total=args.epochs,
-            desc=f"Fold {fold_id + 1}/{args.k_folds}",
+            desc=f"Fold {fold_no}/{args.k_folds}",
             position=0,
         )
         val_status = PersistentStatusLine(
-            f"Last val result: fold={fold_id + 1}, epoch=0, val_acc=NA, val_loss=NA",
+            f"Last val result: fold={fold_no}, epoch=0, val_acc=NA, val_loss=NA",
             position=2,
         )
         last_val_acc = 0.0
@@ -246,7 +250,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
             running_loss = 0.0
             train_progress = create_transient_batch_bar(
                 train_loader,
-                desc=f"Fold {fold_id + 1} train {epoch}/{args.epochs}",
+                desc=f"Fold {fold_no} train {epoch}/{args.epochs}",
                 position=1,
             )
             epoch_idx = epoch - 1
@@ -296,7 +300,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
             with torch.no_grad():
                 val_progress = create_transient_batch_bar(
                     val_loader,
-                    desc=f"Fold {fold_id + 1} val {epoch}/{args.epochs}",
+                    desc=f"Fold {fold_no} val {epoch}/{args.epochs}",
                     position=1,
                 )
                 for images, labels, indices in val_progress:
@@ -351,12 +355,13 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
         fold_meta = {
             "epochs": args.epochs,
             "num_classes": num_classes,
-            "fold_id": fold_id,
+            "fold_id": fold_no,
             "k_folds": args.k_folds,
             "dataset_name": args.dataset,
             "model": proxy_model_name,
             "seed": seed,
             "proxy_training_seed": seed,
+            "proxy_log_seed_free": False,
             "physical_batch_size": args.physical_batch_size,
             "grad_accum_steps": args.grad_accum_steps,
             "effective_batch_size": args.effective_batch_size,
@@ -365,7 +370,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
             "lr_gamma": args.lr_gamma,
             "use_amp": runtime_use_amp,
         }
-        out_path = log_dir / f"fold_{fold_id}.npz"
+        out_path = log_dir / f"fold_{fold_no}.npz"
         np.savez(
             out_path,
             train_indices=np.asarray(train_indices, dtype=np.int64),
@@ -395,7 +400,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
         fold_bar.close()
         val_status.close()
         tqdm.write(
-            f"Fold {fold_id + 1} done: last_val_acc={last_val_acc:.4f}, "
+            f"Fold {fold_no} done: last_val_acc={last_val_acc:.4f}, "
             f"last_val_loss={last_val_loss:.4f}, saved={out_path}"
         )
 
@@ -403,15 +408,7 @@ def run_for_seed(args: argparse.Namespace, seed: int) -> None:
 def main() -> None:
     args = parse_args()
     args = apply_dataset_defaults(args)
-    seed_text = args.seed.strip()
-    if not seed_text:
-        raise ValueError("--seed 不能为空，且仅支持单个整数。")
-    if "," in seed_text or seed_text.startswith("[") or seed_text.startswith("("):
-        raise ValueError(
-            "train_proxy.py 现仅支持单个 seed。请传入单个整数（例如 --seed 22）。"
-        )
-    seed = int(seed_text)
-    run_for_seed(args, seed)
+    run_for_seed(args, int(args.seed))
 
 
 if __name__ == "__main__":

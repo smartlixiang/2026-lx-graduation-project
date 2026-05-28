@@ -1,50 +1,51 @@
 {
   "cifar100": {
     "22": {
-      "sa": 0.25271968836502046,
-      "div": 0.3798318367135304,
-      "dds": 0.36744847492144916,
-      "bias": -0.025071205464570208,
+      "sa": 0.24799908392652215,
+      "div": 0.3984992629119724,
+      "dds": 0.3535016531615054,
+      "bias": -0.034392653907829,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights/proxy_logs/cifar100/resnet18/200",
+      "proxy_log": "weights/proxy_logs/cifar100/resnet18/22/200",
       "dynamic_components": [
         "A",
         "C",
         "T",
         "P"
       ],
-      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200",
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/22/200",
       "dynamic_component_cache_paths": {
-        "A": "weights/dynamic_cache/cifar100/resnet18/200/A.npz",
-        "C": "weights/dynamic_cache/cifar100/resnet18/200/C.npz",
-        "T": "weights/dynamic_cache/cifar100/resnet18/200/T.npz",
-        "P": "weights/dynamic_cache/cifar100/resnet18/200/P.npz"
+        "A": "weights/dynamic_cache/cifar100/resnet18/22/200/A.npz",
+        "C": "weights/dynamic_cache/cifar100/resnet18/22/200/C.npz",
+        "T": "weights/dynamic_cache/cifar100/resnet18/22/200/T.npz",
+        "P": "weights/dynamic_cache/cifar100/resnet18/22/200/P.npz"
       },
-      "proxy_training_seed": 42,
-      "proxy_log_seed_free": true,
-      "dynamic_cache_seed_free": true,
+      "proxy_training_seed": 22,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
       "output_seed": 22,
+      "adapter_seed": 22,
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.44922546345494313,
-            "Div": 0.458734079243009,
-            "DDS": 0.24219606916464728
+            "SA": -0.44828215595162263,
+            "Div": 0.45733395101722085,
+            "DDS": 0.13093028539441634
           },
           "C": {
-            "SA": -0.0807428269383288,
-            "Div": 0.1851343629609451,
-            "DDS": 0.1416051937491376
+            "SA": -0.0771304974032051,
+            "Div": 0.18040004995754727,
+            "DDS": 0.11041280409086597
           },
           "T": {
-            "SA": 0.012815755608722789,
-            "Div": -0.009443712595620608,
-            "DDS": 0.012738051048727146
+            "SA": 0.019201758469610756,
+            "Div": -0.016473161757921,
+            "DDS": 0.006916375790793467
           },
           "P": {
-            "SA": -0.4684251848542814,
-            "Div": 0.47077461003031207,
-            "DDS": 0.24613759345039402
+            "SA": -0.46744648130602995,
+            "Div": 0.47006981096926626,
+            "DDS": 0.12049329855741488
           }
         },
         "sa_gt_one_third_warning": false,

@@ -101,43 +101,47 @@ def resolve_proxy_log_path(
     proxy_model: str = "resnet18",
     max_epoch: int | None = None,
 ) -> Path:
+    """Resolve proxy log directory under the seed-aware path rule.
+
+    Canonical directory:
+        [proxy_log_root]/[dataset_name]/[proxy_model]/[seed]/[max_epoch]
+
+    Direct file/dir inputs are still accepted, but the automatic search no
+    longer falls back to the old seed-free directory.  This is intentional:
+    silently loading weights/proxy_logs/[dataset]/[model]/[epochs] would make
+    different seeds share the same dynamic supervision again.
+    """
     candidate = Path(proxy_log_root)
     proxy_training_seed = CONFIG.global_seed if seed is None else int(seed)
+
     if candidate.exists():
         if candidate.is_file():
             return candidate
         if candidate.is_dir() and any(candidate.glob("fold_*.npz")):
             return candidate
 
-    seed_free_base_dir = candidate / dataset_name / proxy_model
-    legacy_seed_base_dir = seed_free_base_dir / str(proxy_training_seed)
+    seed_base_dir = candidate / dataset_name / proxy_model / str(proxy_training_seed)
     if max_epoch is not None:
-        epoch_dir = seed_free_base_dir / str(max_epoch)
+        epoch_dir = seed_base_dir / str(int(max_epoch))
         if epoch_dir.exists():
             return epoch_dir
-        legacy_epoch_dir = legacy_seed_base_dir / str(max_epoch)
-        if legacy_epoch_dir.exists():
-            return legacy_epoch_dir
-        raise FileNotFoundError(f"未找到代理训练日志路径: {epoch_dir} (legacy: {legacy_epoch_dir})")
+        legacy_seed_free = candidate / dataset_name / proxy_model / str(int(max_epoch))
+        raise FileNotFoundError(
+            f"未找到代理训练日志路径: {epoch_dir}. "
+            f"如果你要复用旧缓存，请手动将旧目录 {legacy_seed_free} "
+            f"移动到 {epoch_dir}."
+        )
 
-    if seed_free_base_dir.exists() and seed_free_base_dir.is_dir():
-        epoch_dirs = [p for p in seed_free_base_dir.iterdir() if p.is_dir() and p.name.isdigit()]
+    if seed_base_dir.exists() and seed_base_dir.is_dir():
+        epoch_dirs = [p for p in seed_base_dir.iterdir() if p.is_dir() and p.name.isdigit()]
         if epoch_dirs:
             epoch_dirs.sort(key=lambda p: int(p.name))
             return epoch_dirs[-1]
-    if legacy_seed_base_dir.exists() and legacy_seed_base_dir.is_dir():
-        epoch_dirs = [p for p in legacy_seed_base_dir.iterdir() if p.is_dir() and p.name.isdigit()]
-        if epoch_dirs:
-            epoch_dirs.sort(key=lambda p: int(p.name))
-            return epoch_dirs[-1]
 
-    legacy_dir = candidate / str(proxy_training_seed)
-    if legacy_dir.exists() and legacy_dir.is_dir():
-        matches = sorted(legacy_dir.glob("*.npz"))
-        if matches:
-            return matches[-1]
-
-    raise FileNotFoundError(f"未找到代理训练日志路径: {proxy_log_root}")
+    raise FileNotFoundError(
+        f"未找到代理训练日志路径: {proxy_log_root}. "
+        f"期望目录结构为 [root]/{dataset_name}/{proxy_model}/{proxy_training_seed}/[max_epochs]."
+    )
 
 
 def load_proxy_log(proxy_log_path: str | Path, dataset_name: str, data_root: str) -> dict[str, np.ndarray]:

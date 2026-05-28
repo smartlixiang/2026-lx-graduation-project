@@ -15,9 +15,23 @@ def resolve_proxy_log_dir(
     epochs: int,
     root: Path | str | None = None,
 ) -> Path:
-    del seed  # deprecated: kept only for compatibility with old call sites.
+    """Return the canonical proxy-CV log directory.
+
+    New rule:
+        weights/proxy_logs/[dataset]/[proxy_model]/[seed]/[max_epochs]
+
+    ``seed`` is the actual random seed used by train_proxy.py for fold
+    construction, model initialization, dataloader shuffling and trajectory
+    logging.  Keeping it in the path prevents different proxy runs from
+    overwriting each other or sharing downstream dynamic caches by accident.
+    """
+    if seed is None:
+        raise ValueError(
+            "resolve_proxy_log_dir now requires an explicit seed. "
+            "Expected path rule: [dataset]/[proxy_model]/[seed]/[max_epochs]."
+        )
     base = Path(root) if root is not None else PROJECT_ROOT / "weights" / "proxy_logs"
-    return base / dataset / proxy_model / str(int(epochs))
+    return base / dataset / proxy_model / str(int(seed)) / str(int(epochs))
 
 
 def resolve_checkpoint_path(

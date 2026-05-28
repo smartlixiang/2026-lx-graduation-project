@@ -14,7 +14,7 @@ OUTPUT_PATH = Path("picture") / "cifar10_cifar100_densenet121_dual.png"
 DATASETS = ["cifar10", "cifar100"]
 MODEL = "densenet121"
 METHODS = [
-    "random", "herding", "E2LN", "GraNd", "Forgetting", "MoSo",
+    "random", "herding", "EL2N", "GraNd", "Forgetting", "MoSo",
     "yangclip", "learned_group"
 ]
 KEEP_RATIOS = [20, 30, 40, 50, 60, 70, 80, 90, 100]

@@ -24,13 +24,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        # default=[
-        #     "random", "herding", "E2LN", "GraNd", "Forgetting", "MoSo",
-        #     "MDS", "yangclip", "naive_group", "learned_group"
-        # ],
         default=[
-            "random", "naive_group", "ablation_dds", "ablation_sa", "ablation_div", "unseen_exp", "learned_group"
+            "random", "herding", "EL2N", "GraNd", "Forgetting", "MoSo",
+            "MDS", "yangclip", "naive_group", "learned_group"
         ],
+        # default=[
+        #     "random", "naive_group", "ablation_dds", "ablation_sa", "ablation_div", "unseen_exp", "learned_group"
+        # ],
         help="Selection methods to compare",
     )
     parser.add_argument(

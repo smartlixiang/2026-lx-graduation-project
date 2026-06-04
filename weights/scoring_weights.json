@@ -1,24 +1,22 @@
 {
   "cifar100": {
     "22": {
-      "sa": 0.24799908392652215,
-      "div": 0.3984992629119724,
-      "dds": 0.3535016531615054,
-      "bias": -0.034392653907829,
+      "sa": 0.2760076587884769,
+      "div": 0.37343350677478837,
+      "dds": 0.35055883443673475,
+      "bias": -0.035030971187536696,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights/proxy_logs/cifar100/resnet18/22/200",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
-        "T",
-        "P"
+        "T"
       ],
       "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/22/200",
       "dynamic_component_cache_paths": {
         "A": "weights/dynamic_cache/cifar100/resnet18/22/200/A.npz",
         "C": "weights/dynamic_cache/cifar100/resnet18/22/200/C.npz",
-        "T": "weights/dynamic_cache/cifar100/resnet18/22/200/T.npz",
-        "P": "weights/dynamic_cache/cifar100/resnet18/22/200/P.npz"
+        "T": "weights/dynamic_cache/cifar100/resnet18/22/200/T.npz"
       },
       "proxy_training_seed": 22,
       "proxy_log_seed_free": false,
@@ -41,11 +39,6 @@
             "SA": 0.019201758469610756,
             "Div": -0.016473161757921,
             "DDS": 0.006916375790793467
-          },
-          "P": {
-            "SA": -0.46744648130602995,
-            "Div": 0.47006981096926626,
-            "DDS": 0.12049329855741488
           }
         },
         "sa_gt_one_third_warning": false,
@@ -53,50 +46,44 @@
       }
     },
     "42": {
-      "sa": 0.25380157189343183,
-      "div": 0.3799393181832971,
-      "dds": 0.3662591099232711,
-      "bias": -0.025240382270704798,
+      "sa": 0.27681879687830563,
+      "div": 0.372265292944162,
+      "dds": 0.3509159101775323,
+      "bias": -0.03605852153926829,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights/proxy_logs/cifar100/resnet18/200",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
-        "T",
-        "P"
+        "T"
       ],
-      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200",
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/42/200",
       "dynamic_component_cache_paths": {
-        "A": "weights/dynamic_cache/cifar100/resnet18/200/A.npz",
-        "C": "weights/dynamic_cache/cifar100/resnet18/200/C.npz",
-        "T": "weights/dynamic_cache/cifar100/resnet18/200/T.npz",
-        "P": "weights/dynamic_cache/cifar100/resnet18/200/P.npz"
+        "A": "weights/dynamic_cache/cifar100/resnet18/42/200/A.npz",
+        "C": "weights/dynamic_cache/cifar100/resnet18/42/200/C.npz",
+        "T": "weights/dynamic_cache/cifar100/resnet18/42/200/T.npz"
       },
       "proxy_training_seed": 42,
-      "proxy_log_seed_free": true,
-      "dynamic_cache_seed_free": true,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
       "output_seed": 42,
+      "adapter_seed": 42,
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.439522028779665,
-            "Div": 0.45901878385625733,
-            "DDS": 0.24463891414466815
+            "SA": -0.439585662053804,
+            "Div": 0.4595521719422771,
+            "DDS": 0.13396283966605496
           },
           "C": {
-            "SA": -0.07168107802703118,
-            "Div": 0.1942592749905315,
-            "DDS": 0.12914975219666328
+            "SA": -0.07234401943886722,
+            "Div": 0.19456322677975355,
+            "DDS": 0.10078567174721471
           },
           "T": {
-            "SA": 0.01357705988098619,
-            "Div": -0.009163675532914906,
-            "DDS": 0.004620445171747697
-          },
-          "P": {
-            "SA": -0.4626319797690918,
-            "Div": 0.4715343393248549,
-            "DDS": 0.2493199691802353
+            "SA": 0.02383057452193156,
+            "Div": -0.018650932230484547,
+            "DDS": 0.009742370876967724
           }
         },
         "sa_gt_one_third_warning": false,
@@ -104,50 +91,44 @@
       }
     },
     "96": {
-      "sa": 0.24678702467458902,
-      "div": 0.3986596254687035,
-      "dds": 0.3545533498567076,
-      "bias": -0.03314990291743363,
+      "sa": 0.27503976923492035,
+      "div": 0.37377703430254977,
+      "dds": 0.35118319646253,
+      "bias": -0.030381439109961127,
       "ridge_lambda": 0.01,
       "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
-        "T",
-        "P"
+        "T"
       ],
-      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/200",
+      "dynamic_cache_path": "weights/dynamic_cache/cifar100/resnet18/96/200",
       "dynamic_component_cache_paths": {
-        "A": "weights/dynamic_cache/cifar100/resnet18/200/A.npz",
-        "C": "weights/dynamic_cache/cifar100/resnet18/200/C.npz",
-        "T": "weights/dynamic_cache/cifar100/resnet18/200/T.npz",
-        "P": "weights/dynamic_cache/cifar100/resnet18/200/P.npz"
+        "A": "weights/dynamic_cache/cifar100/resnet18/96/200/A.npz",
+        "C": "weights/dynamic_cache/cifar100/resnet18/96/200/C.npz",
+        "T": "weights/dynamic_cache/cifar100/resnet18/96/200/T.npz"
       },
-      "proxy_training_seed": 42,
-      "proxy_log_seed_free": true,
-      "dynamic_cache_seed_free": true,
+      "proxy_training_seed": 96,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
       "output_seed": 96,
+      "adapter_seed": 96,
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.4471119998518612,
-            "Div": 0.45659141872002496,
-            "DDS": 0.1299178202962811
+            "SA": -0.44751053601445934,
+            "Div": 0.4564865196329179,
+            "DDS": 0.12899567609380827
           },
           "C": {
-            "SA": -0.077350939822218,
-            "Div": 0.19159621796611792,
-            "DDS": 0.09702562221555891
+            "SA": -0.07151125373497792,
+            "Div": 0.18489952929224543,
+            "DDS": 0.09520115856646305
           },
           "T": {
-            "SA": 0.027539254277195228,
-            "Div": -0.016654583898162975,
-            "DDS": 0.0109924390592856
-          },
-          "P": {
-            "SA": -0.4693204275341123,
-            "Div": 0.4712892472345483,
-            "DDS": 0.11952876829338939
+            "SA": 0.018257820399330205,
+            "Div": -0.0063223877519564264,
+            "DDS": 0.00589273825003313
           }
         },
         "sa_gt_one_third_warning": false,
@@ -162,50 +143,44 @@
   },
   "cifar10": {
     "22": {
-      "sa": 0.2766753158127604,
-      "div": 0.3724935820405507,
-      "dds": 0.35083110214668894,
-      "bias": -0.15764598394465912,
+      "sa": 0.2981085859791826,
+      "div": 0.35808512244861823,
+      "dds": 0.3438062915721991,
+      "bias": -0.11703176330275382,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights/proxy_logs/cifar10/resnet18/200",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
-        "T",
-        "P"
+        "T"
       ],
-      "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/200",
+      "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/22/200",
       "dynamic_component_cache_paths": {
-        "A": "weights/dynamic_cache/cifar10/resnet18/200/A.npz",
-        "C": "weights/dynamic_cache/cifar10/resnet18/200/C.npz",
-        "T": "weights/dynamic_cache/cifar10/resnet18/200/T.npz",
-        "P": "weights/dynamic_cache/cifar10/resnet18/200/P.npz"
+        "A": "weights/dynamic_cache/cifar10/resnet18/22/200/A.npz",
+        "C": "weights/dynamic_cache/cifar10/resnet18/22/200/C.npz",
+        "T": "weights/dynamic_cache/cifar10/resnet18/22/200/T.npz"
       },
-      "proxy_training_seed": 42,
-      "proxy_log_seed_free": true,
-      "dynamic_cache_seed_free": true,
+      "proxy_training_seed": 22,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
       "output_seed": 22,
+      "adapter_seed": 22,
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.3946204981417922,
-            "Div": 0.3942681121624368,
-            "DDS": 0.21310831373268158
+            "SA": -0.39585389267659166,
+            "Div": 0.39489704283883065,
+            "DDS": 0.2110543895473152
           },
           "C": {
-            "SA": -0.03501305224922103,
-            "Div": 0.1472373998976623,
-            "DDS": 0.05445560824386637
+            "SA": -0.030895819993135443,
+            "Div": 0.14380041272670377,
+            "DDS": 0.048182078659972545
           },
           "T": {
-            "SA": 0.04412468750849762,
-            "Div": -0.03433228488164503,
-            "DDS": -0.031186639973971413
-          },
-          "P": {
-            "SA": -0.42533987036922816,
-            "Div": 0.3898095617207183,
-            "DDS": 0.2301746120691406
+            "SA": 0.026451389104368978,
+            "Div": -0.020682478800737383,
+            "DDS": -0.020973361880468944
           }
         },
         "sa_gt_one_third_warning": false,
@@ -213,29 +188,28 @@
       }
     },
     "42": {
-      "sa": 0.276188137973607,
-      "div": 0.37232431839234337,
-      "dds": 0.3514875436340496,
-      "bias": -0.1553780879445798,
+      "sa": 0.29912626843792384,
+      "div": 0.35676141059205074,
+      "dds": 0.3441123209700255,
+      "bias": -0.11746062451951449,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights/proxy_logs/cifar10/resnet18/200",
+      "proxy_log": "weights/proxy_logs/cifar10/resnet18/42/200",
       "dynamic_components": [
         "A",
         "C",
-        "T",
-        "P"
+        "T"
       ],
-      "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/200",
+      "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/42/200",
       "dynamic_component_cache_paths": {
-        "A": "weights/dynamic_cache/cifar10/resnet18/200/A.npz",
-        "C": "weights/dynamic_cache/cifar10/resnet18/200/C.npz",
-        "T": "weights/dynamic_cache/cifar10/resnet18/200/T.npz",
-        "P": "weights/dynamic_cache/cifar10/resnet18/200/P.npz"
+        "A": "weights/dynamic_cache/cifar10/resnet18/42/200/A.npz",
+        "C": "weights/dynamic_cache/cifar10/resnet18/42/200/C.npz",
+        "T": "weights/dynamic_cache/cifar10/resnet18/42/200/T.npz"
       },
       "proxy_training_seed": 42,
-      "proxy_log_seed_free": true,
-      "dynamic_cache_seed_free": true,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
       "output_seed": 42,
+      "adapter_seed": 42,
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
@@ -252,11 +226,6 @@
             "SA": 0.048746538228055185,
             "Div": -0.03623701393731805,
             "DDS": -0.03564691507897688
-          },
-          "P": {
-            "SA": -0.4291433970495761,
-            "Div": 0.3975809951500351,
-            "DDS": 0.23598455928353093
           }
         },
         "sa_gt_one_third_warning": false,
@@ -264,50 +233,44 @@
       }
     },
     "96": {
-      "sa": 0.27506455761083354,
-      "div": 0.3735857265885873,
-      "dds": 0.3513497158005793,
-      "bias": -0.15815771149879335,
+      "sa": 0.2981977204548542,
+      "div": 0.35870031854280254,
+      "dds": 0.34310196100234336,
+      "bias": -0.12095377169647405,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights/proxy_logs/cifar10/resnet18/200",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
-        "T",
-        "P"
+        "T"
       ],
-      "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/200",
+      "dynamic_cache_path": "weights/dynamic_cache/cifar10/resnet18/96/200",
       "dynamic_component_cache_paths": {
-        "A": "weights/dynamic_cache/cifar10/resnet18/200/A.npz",
-        "C": "weights/dynamic_cache/cifar10/resnet18/200/C.npz",
-        "T": "weights/dynamic_cache/cifar10/resnet18/200/T.npz",
-        "P": "weights/dynamic_cache/cifar10/resnet18/200/P.npz"
+        "A": "weights/dynamic_cache/cifar10/resnet18/96/200/A.npz",
+        "C": "weights/dynamic_cache/cifar10/resnet18/96/200/C.npz",
+        "T": "weights/dynamic_cache/cifar10/resnet18/96/200/T.npz"
       },
-      "proxy_training_seed": 42,
-      "proxy_log_seed_free": true,
-      "dynamic_cache_seed_free": true,
+      "proxy_training_seed": 96,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
       "output_seed": 96,
+      "adapter_seed": 96,
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.39722746393589353,
-            "Div": 0.39498577128379786,
-            "DDS": 0.2019363356241817
+            "SA": -0.39669361871707676,
+            "Div": 0.3945153537089311,
+            "DDS": 0.19860912838282352
           },
           "C": {
-            "SA": -0.03913498514469095,
-            "Div": 0.1503608853450289,
-            "DDS": 0.05727026033324835
+            "SA": -0.03702690590857969,
+            "Div": 0.1504729095821921,
+            "DDS": 0.05306950458305023
           },
           "T": {
-            "SA": 0.03815211645566587,
-            "Div": -0.03591886310101697,
-            "DDS": -0.02313316283369823
-          },
-          "P": {
-            "SA": -0.42642204823205687,
-            "Div": 0.3886706406338959,
-            "DDS": 0.218048000390013
+            "SA": 0.051701692278908036,
+            "Div": -0.026629137943308952,
+            "DDS": -0.033941930318528137
           }
         },
         "sa_gt_one_third_warning": false,
@@ -412,49 +375,54 @@
       }
     },
     "96": {
-      "sa": 0.22224227003877303,
-      "div": 0.4031907230787649,
-      "dds": 0.3745670068824621,
-      "bias": 0.034959236678662124,
+      "sa": 0.2882817657504246,
+      "div": 0.3746351886852601,
+      "dds": 0.33708304556431534,
+      "bias": -0.021441459989048887,
       "ridge_lambda": 0.01,
-      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/90",
+      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/96/90",
       "dynamic_components": [
         "A",
         "C",
-        "D",
-        "E"
+        "T"
       ],
-      "dynamic_cache_path": "weights/dynamic_cache/tiny-imagenet/resnet18/90/dynamic_components.npz",
-      "proxy_training_seed": 42,
-      "proxy_log_seed_free": true,
-      "dynamic_cache_seed_free": true,
+      "dynamic_cache_path": "weights/dynamic_cache/tiny-imagenet/resnet18/96/90",
+      "dynamic_component_cache_paths": {
+        "A": "weights/dynamic_cache/tiny-imagenet/resnet18/96/90/A.npz",
+        "C": "weights/dynamic_cache/tiny-imagenet/resnet18/96/90/C.npz",
+        "T": "weights/dynamic_cache/tiny-imagenet/resnet18/96/90/T.npz"
+      },
+      "proxy_training_seed": 96,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
       "output_seed": 96,
+      "adapter_seed": 96,
       "diagnostics": {
         "dynamic_static_pearson": {
           "A": {
-            "SA": -0.44430695113625224,
-            "Div": 0.49673542530586434,
-            "DDS": 0.32005664633198394
+            "SA": -0.4430100558142494,
+            "Div": 0.49591173323850984,
+            "DDS": 0.1360534284210371
           },
           "C": {
-            "SA": -0.003040108921151028,
-            "Div": 0.14451382120887685,
-            "DDS": 0.12188058341447383
+            "SA": 0.0005438188825256433,
+            "Div": 0.14283017038198853,
+            "DDS": 0.08617284021691284
           },
-          "D": {
-            "SA": -0.037589054014962896,
-            "Div": 0.03530108302675835,
-            "DDS": 0.03781192645421761
-          },
-          "E": {
-            "SA": -0.503259582947093,
-            "Div": 0.5637246872921213,
-            "DDS": 0.323811950920545
+          "T": {
+            "SA": -0.045889179098272004,
+            "Div": 0.03831178703943676,
+            "DDS": 0.025428426481734663
           }
         },
         "sa_gt_one_third_warning": false,
         "div_is_lowest_warning": false
       }
+    },
+    "naive": {
+      "dds": 0.3333333333333333,
+      "div": 0.3333333333333333,
+      "sa": 0.3333333333333333
     }
   }
 }

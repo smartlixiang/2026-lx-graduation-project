@@ -1,7 +1,7 @@
 """Learn seed-specific scoring weights from proxy training dynamics.
 
 Cache-first behavior:
-1. For each requested seed, first try loading cached ACTP dynamic components under
+1. For each requested seed, first try loading cached ACT dynamic components under
    weights/dynamic_cache/[dataset]/[proxy_model]/[seed]/[epochs].
 2. A cache file is usable as long as its final outputs are self-consistent and
    finite. NaN in raw_foldwise / fold_normalized is allowed because those arrays
@@ -39,13 +39,12 @@ from utils.static_score_cache import get_or_compute_static_scores
 from weights import (
     AbsorptionGainScore,
     ConfusionComplementarityScore,
-    PersistentDifficultyScore,
     TransferabilityAlignmentScore,
 )
 from weights.dynamic_utils import DynamicComponentResult, load_cv_fold_logs
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-COMPONENT_NAMES = ("A", "C", "T", "P")
+COMPONENT_NAMES = ("A", "C", "T")
 
 
 def resolve_default_proxy_epochs(dataset_name: str) -> int:
@@ -554,7 +553,6 @@ def load_or_compute_dynamic_components_for_seed(
         "A": lambda: AbsorptionGainScore().compute(folds=folds, labels_all=labels_all),
         "C": lambda: ConfusionComplementarityScore().compute(folds=folds, labels_all=labels_all),
         "T": lambda: TransferabilityAlignmentScore().compute(folds=folds, labels_all=labels_all),
-        "P": lambda: PersistentDifficultyScore().compute(folds=folds, labels_all=labels_all),
     }
     component_results: dict[str, DynamicComponentResult] = {}
     for name in COMPONENT_NAMES:
@@ -579,14 +577,12 @@ def build_dynamic_target(component_results: dict[str, DynamicComponentResult]) -
     a_result = component_results["A"]
     c_result = component_results["C"]
     t_result = component_results["T"]
-    p_result = component_results["P"]
 
     num_samples = a_result.final_normalized.shape[0]
     for name, arr in {
         "A_final_normalized": a_result.final_normalized,
         "C_final_normalized": c_result.final_normalized,
         "T_final_normalized": t_result.final_normalized,
-        "P_final_normalized": p_result.final_normalized,
     }.items():
         if arr.shape != (num_samples,):
             raise ValueError(f"{name} shape mismatch: {arr.shape}")
@@ -597,8 +593,7 @@ def build_dynamic_target(component_results: dict[str, DynamicComponentResult]) -
         (
             a_result.final_normalized
             + c_result.final_normalized
-            + 0.5 * t_result.final_normalized
-            + 0.5 * p_result.final_normalized
+            + t_result.final_normalized
         ).astype(np.float32) / 3.0,
         0.0,
         1.0,
@@ -607,7 +602,6 @@ def build_dynamic_target(component_results: dict[str, DynamicComponentResult]) -
         "A": a_result.final_normalized,
         "C": c_result.final_normalized,
         "T": t_result.final_normalized,
-        "P": p_result.final_normalized,
     }
     return u_scores.astype(np.float64), dynamic_component_values
 
@@ -773,7 +767,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "bias": float(bias),
             "ridge_lambda": float(args.ridge_lambda),
             "proxy_log": str(proxy_log) if proxy_log is not None else "",
-            "dynamic_components": ["A", "C", "T", "P"],
+            "dynamic_components": list(COMPONENT_NAMES),
             "dynamic_cache_path": str(dynamic_cache_dir),
             "dynamic_component_cache_paths": {k: str(v) for k, v in component_cache_paths.items()},
             "proxy_training_seed": proxy_training_seed,

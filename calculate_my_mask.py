@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-candidate-pool-size",
         type=int,
-        default=10,
+        default=5,
         help="group 模式下类内贪心候选池大小，1 表示纯贪心。",
     )
     parser.add_argument(
@@ -424,7 +424,7 @@ def select_group_mask(
         budget = int(class_budgets[class_id])
         if class_indices.size == 0 or budget <= 0:
             continue
-        init_count = min(3, budget, int(class_indices.size))
+        init_count = min(10, budget, int(class_indices.size))
         init_per_class[class_id] = init_count
         class_static = static_init_score[class_indices]
         ranked_local = np.argsort(-class_static, kind="mergesort")[:init_count]

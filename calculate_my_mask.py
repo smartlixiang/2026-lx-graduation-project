@@ -25,6 +25,7 @@ from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
+from utils.score_utils import standard_zscore  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 
 
@@ -379,14 +380,6 @@ def select_group_mask(
         num_classes=num_classes,
     )
     full_class_mean_f32 = full_class_mean.astype(np.float32, copy=False)
-    def _quantile_minmax(values: np.ndarray, low_q: float = 0.002, high_q: float = 0.998) -> np.ndarray:
-        if values.size == 0:
-            return np.zeros(0, dtype=np.float32)
-        low = float(np.quantile(values, low_q))
-        high = float(np.quantile(values, high_q))
-        if abs(high - low) <= 1e-12:
-            return np.full(values.shape, 0.5, dtype=np.float32)
-        return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)
 
     def _allocate_class_budgets() -> np.ndarray:
         class_sizes = np.asarray([idx.size for idx in class_indices_list], dtype=np.int64)
@@ -478,13 +471,13 @@ def select_group_mask(
                 query_indices=torch.as_tensor(candidate_indices, dtype=torch.long, device=device),
                 reference_indices=torch.as_tensor(reference_indices, dtype=torch.long, device=device),
             ).detach().cpu().numpy().astype(np.float32)
-            div_scores = _quantile_minmax(div_raw)
+            div_scores = standard_zscore(div_raw)
 
             candidate_features_np = div_features_np[candidate_indices]
             mu_new = (current_sum[None, :] + candidate_features_np) / float(current_count + 1)
             new_dist = np.linalg.norm(mu_new - mu_full[None, :], axis=1)
             dist_improve = (old_dist - new_dist).astype(np.float32)
-            dist_scores = _quantile_minmax(dist_improve)
+            dist_scores = standard_zscore(dist_improve)
 
             combined_scores = (
                 weights["sa"] * sa_scores_np[candidate_indices]

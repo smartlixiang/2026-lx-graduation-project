@@ -8,7 +8,7 @@ from .dynamic_utils import (
     DynamicComponentResult,
     FoldLogData,
     aggregate_train_fold_component,
-    quantile_minmax_dynamic,
+    standard_zscore_dynamic,
     resolve_epoch_windows,
     softmax,
 )
@@ -91,10 +91,10 @@ class TransferabilityAlignmentScore:
                 raw[local_i] = np.float32(corr01)
 
             raw_foldwise[f_idx, train_idx] = raw
-            fold_normalized[f_idx, train_idx] = quantile_minmax_dynamic(raw)
+            fold_normalized[f_idx, train_idx] = standard_zscore_dynamic(raw)
 
         aggregated = aggregate_train_fold_component(fold_normalized, folds)
-        final_normalized = quantile_minmax_dynamic(aggregated)
+        final_normalized = standard_zscore_dynamic(aggregated)
         return DynamicComponentResult(
             raw_foldwise=raw_foldwise,
             fold_normalized=fold_normalized,

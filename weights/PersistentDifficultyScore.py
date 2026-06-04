@@ -7,7 +7,7 @@ from .dynamic_utils import (
     DynamicComponentResult,
     FoldLogData,
     aggregate_val_fold_component,
-    quantile_minmax_dynamic,
+    standard_zscore_dynamic,
     resolve_epoch_windows,
     softmax,
 )
@@ -75,10 +75,10 @@ class PersistentDifficultyScore:
             e_entropy = np.mean(z_entropy[hard_idx], axis=0)
             raw = (e_margin + e_entropy).astype(np.float32)
             raw_foldwise[f_idx, val_idx] = raw
-            fold_normalized[f_idx, val_idx] = quantile_minmax_dynamic(raw)
+            fold_normalized[f_idx, val_idx] = standard_zscore_dynamic(raw)
 
         aggregated = aggregate_val_fold_component(fold_normalized, folds)
-        final_normalized = quantile_minmax_dynamic(aggregated)
+        final_normalized = standard_zscore_dynamic(aggregated)
         return DynamicComponentResult(
             raw_foldwise=raw_foldwise,
             fold_normalized=fold_normalized,

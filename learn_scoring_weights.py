@@ -35,7 +35,8 @@ from utils.class_name_utils import resolve_class_names_for_prompts
 from utils.global_config import CONFIG
 from utils.proxy_log_utils import resolve_proxy_log_path
 from utils.seed import parse_seed_list, set_seed
-from utils.static_score_cache import get_or_compute_static_scores
+from utils.score_utils import standard_zscore
+from utils.static_score_cache import NORMALIZATION_VERSION, get_or_compute_static_scores
 from weights import (
     AbsorptionGainScore,
     ConfusionComplementarityScore,
@@ -208,7 +209,7 @@ def fit_ridge_regression_nonnegative(
         errors = preds - targets
         grad_w = (features.T @ errors) / num_samples + l2_lambda * weights
         grad_b = errors.mean()
-        next_weights = project_to_simplex(weights - learning_rate * grad_w)
+        next_weights = np.maximum(weights - learning_rate * grad_w, 0.0)
         next_bias = bias - learning_rate * grad_b
         if np.linalg.norm(next_weights - weights) < tol and abs(next_bias - bias) < tol:
             weights = next_weights
@@ -260,6 +261,7 @@ def save_dynamic_component_cache(
         seed_free=np.array(False),
         epochs=np.array(int(epochs), dtype=np.int64),
         proxy_log_path=np.array(str(proxy_log_path), dtype=np.str_),
+        normalization=np.array(NORMALIZATION_VERSION, dtype=np.str_),
         num_samples=np.array(int(labels_i64.shape[0]), dtype=np.int64),
         labels=labels_i64,
         raw_foldwise=result.raw_foldwise.astype(np.float32),
@@ -284,7 +286,7 @@ def load_dynamic_component_cache_if_valid(
         return None
     required_keys = {
         "component_name", "dataset", "proxy_model", "proxy_training_seed", "epochs",
-        "proxy_log_path", "num_samples", "labels", "raw_foldwise", "fold_normalized",
+        "proxy_log_path", "normalization", "num_samples", "labels", "raw_foldwise", "fold_normalized",
         "aggregated", "final_normalized",
     }
     try:
@@ -302,6 +304,8 @@ def load_dynamic_component_cache_if_valid(
             if int(data["epochs"].item()) != int(epochs):
                 return None
             if str(data["proxy_log_path"].item()) != str(proxy_log_path):
+                return None
+            if str(data["normalization"].item()) != NORMALIZATION_VERSION:
                 return None
             labels_cached = np.asarray(data["labels"], dtype=np.int64)
             if not np.array_equal(labels_cached, labels_all.astype(np.int64, copy=False)):
@@ -351,7 +355,7 @@ def _load_dynamic_component_cache_with_reason(
 
     required_keys = {
         "component_name", "dataset", "proxy_model", "proxy_training_seed", "epochs",
-        "num_samples", "labels", "raw_foldwise", "fold_normalized", "aggregated", "final_normalized",
+        "normalization", "num_samples", "labels", "raw_foldwise", "fold_normalized", "aggregated", "final_normalized",
     }
     files = set(data.files)
     missing_keys = sorted(required_keys - files)
@@ -364,6 +368,7 @@ def _load_dynamic_component_cache_with_reason(
         cache_proxy_model = str(data["proxy_model"].item())
         cache_proxy_training_seed = int(data["proxy_training_seed"].item())
         cache_epochs = int(data["epochs"].item())
+        cache_normalization = str(data["normalization"].item())
         declared_num_samples = int(data["num_samples"].item())
 
         labels = np.asarray(data["labels"], dtype=np.int64)
@@ -384,6 +389,8 @@ def _load_dynamic_component_cache_with_reason(
         return None, None, f"proxy_training_seed mismatch: cache={cache_proxy_training_seed}, expected={proxy_training_seed}"
     if cache_epochs != int(epochs):
         return None, None, f"epochs mismatch: cache={cache_epochs}, expected={epochs}"
+    if cache_normalization != NORMALIZATION_VERSION:
+        return None, None, f"normalization mismatch: cache={cache_normalization}, expected={NORMALIZATION_VERSION}"
 
     if labels.ndim != 1:
         return None, None, f"labels rank invalid: shape={labels.shape}"
@@ -589,15 +596,12 @@ def build_dynamic_target(component_results: dict[str, DynamicComponentResult]) -
         if not np.all(np.isfinite(arr)):
             raise ValueError(f"{name} contains NaN/inf values.")
 
-    u_scores = np.clip(
-        (
-            a_result.final_normalized
-            + c_result.final_normalized
-            + t_result.final_normalized
-        ).astype(np.float32) / 3.0,
-        0.0,
-        1.0,
-    )
+    utility_raw = (
+        a_result.final_normalized
+        + c_result.final_normalized
+        + t_result.final_normalized
+    ).astype(np.float32) / 3.0
+    u_scores = standard_zscore(utility_raw)
     dynamic_component_values = {
         "A": a_result.final_normalized,
         "C": c_result.final_normalized,
@@ -718,7 +722,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             [static_scores["sa"], static_scores["div"], static_scores["dds"]],
             axis=1,
         ).astype(np.float64)
-        weights, bias = fit_ridge_regression_nonnegative(
+        raw_weights, bias = fit_ridge_regression_nonnegative(
             static_features,
             dynamic_scores,
             args.ridge_lambda,
@@ -726,6 +730,12 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             args.max_iter,
             args.tol,
         )
+
+        raw_sum = float(np.sum(raw_weights))
+        if raw_sum > 1e-12:
+            weights = raw_weights / raw_sum
+        else:
+            weights = np.full_like(raw_weights, 1.0 / raw_weights.size, dtype=np.float64)
 
         static_component_values = {
             "SA": static_scores["sa"],
@@ -777,6 +787,13 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "adapter_seed": seed,
             "diagnostics": {
                 "dynamic_static_pearson": correlation_matrix,
+                "raw_weights": {"sa": float(raw_weights[0]), "div": float(raw_weights[1]), "dds": float(raw_weights[2])},
+                "normalized_weights": {"sa": float(weights[0]), "div": float(weights[1]), "dds": float(weights[2])},
+                "weight_solver": "nonnegative_ridge_then_l1_normalize",
+                "dynamic_score_min": float(np.min(dynamic_scores)),
+                "dynamic_score_max": float(np.max(dynamic_scores)),
+                "dynamic_score_mean": float(np.mean(dynamic_scores)),
+                "dynamic_score_std": float(np.std(dynamic_scores)),
                 "sa_gt_one_third_warning": sa_warning,
                 "div_is_lowest_warning": div_is_lowest,
             },

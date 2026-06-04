@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from model.adapter import AdapterMLP, CLIPFeatureExtractor
 from utils.class_name_utils import build_class_prompts
 from utils.global_config import CONFIG
+from utils.score_utils import standard_zscore_by_class
 
 
 @dataclass
@@ -121,28 +122,6 @@ class SemanticAlignment:
         negative_max = sims.masked_fill(~mask, float("-inf")).max(dim=1).values
         return target_sim - negative_max
 
-    @staticmethod
-    def _quantile_normalize(
-        values: torch.Tensor,
-        labels: torch.Tensor,
-        num_classes: int,
-        low_q: float = 0.002,
-        high_q: float = 0.998,
-    ) -> torch.Tensor:
-        scores = torch.zeros_like(values)
-        for class_idx in range(num_classes):
-            mask = labels == class_idx
-            if not mask.any():
-                continue
-            class_values = values[mask]
-            q_low = torch.quantile(class_values, low_q)
-            q_high = torch.quantile(class_values, high_q)
-            if torch.isclose(q_low, q_high):
-                scores[mask] = 0.5
-                continue
-            scaled = (class_values - q_low) / (q_high - q_low)
-            scores[mask] = torch.clamp(scaled, 0.0, 1.0)
-        return scores
 
     def score_dataset(
         self,
@@ -158,7 +137,14 @@ class SemanticAlignment:
         image_features, labels = self._encode_images(dataloader, adapter_image)
         text_features = text_features.to(image_features.device)
         scores = self._margin_similarity(image_features, text_features, labels)
-        scores = self._quantile_normalize(scores, labels, len(self.class_names))
+        scores = torch.as_tensor(
+            standard_zscore_by_class(
+                scores.detach().cpu().numpy(),
+                labels.detach().cpu().numpy(),
+            ),
+            device=scores.device,
+            dtype=scores.dtype,
+        )
 
         return SAResult(
             scores=scores.detach().cpu(),

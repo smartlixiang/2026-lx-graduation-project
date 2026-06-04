@@ -8,7 +8,7 @@ import numpy as np
 from tqdm import tqdm
 
 from utils.proxy_log_utils import load_dataset_labels
-from utils.score_utils import quantile_minmax
+from utils.score_utils import quantile_minmax, standard_zscore
 
 Q_LOW_DEFAULT = 0.002
 Q_HIGH_DEFAULT = 0.998
@@ -143,6 +143,26 @@ def quantile_minmax_dynamic(values: np.ndarray, q_low: float = Q_LOW_DEFAULT, q_
     normalized = np.nan_to_num(normalized, nan=0.5, posinf=1.0, neginf=0.0)
     assert_finite("quantile_minmax_dynamic", normalized)
     return normalized.astype(np.float32)
+
+
+
+def standard_zscore_dynamic(values: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Standard z-score for dynamic component arrays, preserving NaN fold slots.
+
+    Finite values determine mean/std. NaN entries remain NaN so existing fold
+    aggregation can distinguish undefined slots; infinities are treated as
+    undefined for fold arrays and become 0.0 when all slots are finite outputs.
+    """
+    values = np.asarray(values, dtype=np.float32)
+    finite = np.isfinite(values)
+    output = np.full(values.shape, np.nan, dtype=np.float32)
+    if int(finite.sum()) < 2:
+        output[finite] = 0.0
+        return output
+
+    normalized = standard_zscore(values[finite], eps=eps)
+    output[finite] = normalized.astype(np.float32, copy=False)
+    return output
 
 
 def resolve_epoch_windows(num_epochs: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

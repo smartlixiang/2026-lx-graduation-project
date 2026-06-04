@@ -3,8 +3,10 @@
 # Key interfaces:
 # - stable_sigmoid(values): numerically stable sigmoid for numpy arrays.
 # - robust_z_by_class(values, labels): class-wise median/MAD standardization.
-# - quantile_minmax_by_class(values, labels): class-wise quantile min-max to [0,1].
-# - quantile_minmax(values): global quantile min-max to [0,1].
+# - standard_zscore(values): global finite-only mean/std z-score.
+# - standard_zscore_by_class(values, labels): class-wise standard z-score.
+# - quantile_minmax_by_class(values, labels): historical class-wise quantile min-max to [0,1].
+# - quantile_minmax(values): historical global quantile min-max to [0,1].
 from __future__ import annotations
 
 from typing import Iterable
@@ -82,6 +84,59 @@ def robust_z_by_class(values: np.ndarray, labels: np.ndarray, eps: float = 1e-6)
         median = np.median(class_vals)
         mad = np.median(np.abs(class_vals - median))
         output[mask] = ((class_vals - median) / (mad + eps)).astype(np.float32)
+    return output
+
+
+
+def standard_zscore(values: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Apply finite-only standard mean/std z-score to a 1D array.
+
+    Non-finite inputs are returned as 0.0. If fewer than two finite values are
+    available, or the finite standard deviation is too small/unusable, the
+    entire output is 0.0.
+    """
+    values = np.asarray(values)
+    if values.ndim != 1:
+        raise ValueError("values must be a 1D array.")
+    if eps <= 0:
+        raise ValueError("eps must be positive.")
+
+    output = np.zeros(values.shape, dtype=np.float32)
+    finite = np.isfinite(values)
+    if int(finite.sum()) < 2:
+        return output
+
+    finite_vals = values[finite].astype(np.float64, copy=False)
+    mean = float(np.mean(finite_vals))
+    std = float(np.std(finite_vals))
+    if (not np.isfinite(mean)) or (not np.isfinite(std)) or std < eps:
+        return output
+
+    z = (finite_vals - mean) / (std + eps)
+    output[finite] = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return output
+
+
+def standard_zscore_by_class(values: np.ndarray, labels: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Apply class-wise finite-only standard mean/std z-score to 1D values."""
+    values = np.asarray(values)
+    labels = np.asarray(labels)
+    if values.ndim != 1:
+        raise ValueError("values must be a 1D array.")
+    if labels.ndim != 1:
+        raise ValueError("labels must be a 1D array.")
+    if values.shape[0] != labels.shape[0]:
+        raise ValueError("labels length must match values length.")
+    if eps <= 0:
+        raise ValueError("eps must be positive.")
+
+    output = np.zeros(values.shape, dtype=np.float32)
+    labels_i64 = labels.astype(np.int64, copy=False)
+    for cls in _iter_classes(labels_i64):
+        mask = labels_i64 == cls
+        if not np.any(mask):
+            continue
+        output[mask] = standard_zscore(values[mask], eps=eps)
     return output
 
 

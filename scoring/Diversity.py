@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from model.adapter import AdapterMLP, CLIPFeatureExtractor
 from utils.global_config import CONFIG
+from utils.score_utils import standard_zscore_by_class
 
 
 @dataclass
@@ -41,7 +42,7 @@ class DivResult:
 class Div:
     """计算图像样本的多样性覆盖度 (Div)。
 
-    使用类内前 k 个近邻距离均值作为原始度量，并进行类内分位点归一化。
+    使用类内前 k 个近邻距离均值作为原始度量，并进行类内 standard z-score 归一化。
     """
 
     def __init__(
@@ -154,28 +155,6 @@ class Div:
 
         return distances
 
-    @staticmethod
-    def _quantile_normalize(
-        values: torch.Tensor,
-        labels: torch.Tensor,
-        num_classes: int,
-        low_q: float = 0.002,
-        high_q: float = 0.998,
-    ) -> torch.Tensor:
-        scores = torch.zeros_like(values)
-        for class_idx in range(num_classes):
-            mask = labels == class_idx
-            if not mask.any():
-                continue
-            class_values = values[mask]
-            q_low = torch.quantile(class_values, low_q)
-            q_high = torch.quantile(class_values, high_q)
-            if torch.isclose(q_low, q_high):
-                scores[mask] = 0.5
-                continue
-            scaled = (class_values - q_low) / (q_high - q_low)
-            scores[mask] = torch.clamp(scaled, 0.0, 1.0)
-        return scores
 
     def score_dataset(
         self, dataloader: DataLoader, adapter: AdapterMLP | None = None
@@ -194,7 +173,14 @@ class Div:
             class_distances = self._knn_mean_distance(class_features, self.k)
             k_distances[mask] = class_distances
 
-        scores = self._quantile_normalize(k_distances, labels, len(self.class_names))
+        scores = torch.as_tensor(
+            standard_zscore_by_class(
+                k_distances.detach().cpu().numpy(),
+                labels.detach().cpu().numpy(),
+            ),
+            device=k_distances.device,
+            dtype=k_distances.dtype,
+        )
 
         return DivResult(
             scores=scores.detach().cpu(),
@@ -257,7 +243,14 @@ class Div:
             )
             k_distances[class_mask] = class_distances
 
-        scores = self._quantile_normalize(k_distances, labels, len(self.class_names))
+        scores = torch.as_tensor(
+            standard_zscore_by_class(
+                k_distances.detach().cpu().numpy(),
+                labels.detach().cpu().numpy(),
+            ),
+            device=k_distances.device,
+            dtype=k_distances.dtype,
+        )
         return DivResult(
             scores=scores.detach().cpu(),
             labels=labels.detach().cpu(),

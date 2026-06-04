@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 
 from model.adapter import AdapterMLP, CLIPFeatureExtractor
 from utils.global_config import CONFIG
+from utils.score_utils import standard_zscore_by_class
 
 
 @dataclass
@@ -233,28 +234,6 @@ class DifficultyDirection:
             "important_eigval_ratio": float(self.important_eigval_ratio),
         }
 
-    @staticmethod
-    def _quantile_normalize(
-        values: torch.Tensor,
-        labels: torch.Tensor,
-        num_classes: int,
-        low_q: float = 0.002,
-        high_q: float = 0.998,
-    ) -> torch.Tensor:
-        scores = torch.zeros_like(values)
-        for class_idx in range(num_classes):
-            mask = labels == class_idx
-            if not mask.any():
-                continue
-            class_values = values[mask]
-            q_low = torch.quantile(class_values, low_q)
-            q_high = torch.quantile(class_values, high_q)
-            if torch.isclose(q_low, q_high):
-                scores[mask] = 0.5
-                continue
-            scaled = (class_values - q_low) / (q_high - q_low)
-            scores[mask] = torch.clamp(scaled, 0.0, 1.0)
-        return scores
 
     def score_dataset(
         self,
@@ -272,7 +251,14 @@ class DifficultyDirection:
             class_features = image_features[mask]
             class_scores, _ = self._dds_from_pca(class_features)
             scores[mask] = class_scores
-        scores = self._quantile_normalize(scores, labels, len(self.class_names))
+        scores = torch.as_tensor(
+            standard_zscore_by_class(
+                scores.detach().cpu().numpy(),
+                labels.detach().cpu().numpy(),
+            ),
+            device=scores.device,
+            dtype=scores.dtype,
+        )
         return DDSResult(
             scores=scores.detach().cpu(),
             labels=labels.detach().cpu(),
@@ -321,7 +307,14 @@ class DifficultyDirection:
             class_scores = self._dds_from_reference_pca(class_features, ref_features)
             scores[class_mask] = class_scores
 
-        scores = self._quantile_normalize(scores, labels, len(self.class_names))
+        scores = torch.as_tensor(
+            standard_zscore_by_class(
+                scores.detach().cpu().numpy(),
+                labels.detach().cpu().numpy(),
+            ),
+            device=scores.device,
+            dtype=scores.dtype,
+        )
         return DDSResult(
             scores=scores.detach().cpu(),
             labels=labels.detach().cpu(),

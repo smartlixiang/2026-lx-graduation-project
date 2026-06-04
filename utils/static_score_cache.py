@@ -9,6 +9,8 @@ from typing import Callable
 
 import numpy as np
 
+NORMALIZATION_VERSION = "standard_zscore_v1"
+
 
 def _sanitize(text: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "-" for ch in text)
@@ -149,6 +151,7 @@ def get_or_compute_static_scores(
         "dds_eigval_upper_bound": float(dds_eigval_upper_bound),
         "prompt_template": prompt_template,
         "num_samples": int(num_samples),
+        "normalization": NORMALIZATION_VERSION,
     }
 
     cached: dict[str, np.ndarray] = {}
@@ -201,4 +204,4 @@ def get_or_compute_static_scores(
     }
 
 
-__all__ = ["get_or_compute_static_scores"]
+__all__ = ["get_or_compute_static_scores", "NORMALIZATION_VERSION"]

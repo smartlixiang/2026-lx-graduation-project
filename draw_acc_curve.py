@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=[
             "random", "herding", "EL2N", "GraNd", "Forgetting", "MoSo",
-            "MDS", "yangclip", "naive_group", "learned_group"
+            "MDS", "yangclip", "learned_group"
         ],
         # default=[
         #     "random", "naive_group", "ablation_dds", "ablation_sa", "ablation_div", "unseen_exp", "learned_group"

@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coverage-k-pct", type=float, default=0.05)
     parser.add_argument("--coverage-q-low", type=float, default=0.002)
     parser.add_argument("--coverage-q-high", type=float, default=0.998)
-    parser.add_argument("--ridge-lambda", type=float, default=1e-2)
+    parser.add_argument("--ridge-lambda", type=float, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=1000)
     parser.add_argument("--tol", type=float, default=1e-6)
@@ -168,6 +168,22 @@ def load_adapters_for_seed(args: argparse.Namespace, dataset_name: str, input_di
     text_adapter.to(device).eval()
     return image_adapter, text_adapter, adapter_paths
 
+def _softmax_simplex(theta: np.ndarray) -> np.ndarray:
+    """Map unconstrained parameters to strictly positive simplex weights."""
+    theta = np.asarray(theta, dtype=np.float64)
+    if theta.ndim != 1 or theta.size == 0:
+        raise ValueError("theta must be a non-empty 1D array.")
+
+    shifted = theta - float(np.max(theta))
+    shifted = np.clip(shifted, -50.0, 50.0)
+    exp_theta = np.exp(shifted)
+    denom = float(np.sum(exp_theta))
+
+    if (not np.isfinite(denom)) or denom <= 0.0:
+        return np.full(theta.shape, 1.0 / theta.size, dtype=np.float64)
+
+    weights = exp_theta / denom
+    return weights.astype(np.float64)
 
 def project_to_simplex(vector: np.ndarray) -> np.ndarray:
     if vector.ndim != 1 or vector.size == 0:
@@ -195,31 +211,61 @@ def fit_ridge_regression_nonnegative(
     max_iter: int,
     tol: float,
 ) -> tuple[np.ndarray, float]:
+    """Fit positive simplex weights with ridge regularization.
+
+    The returned weights satisfy:
+      - weights_i > 0
+      - sum_i weights_i = 1
+
+    We optimize unconstrained theta and set weights = softmax(theta).
+    The L2 term is applied to weights. Under the simplex constraint, this
+    discourages overly concentrated weights and favors a more balanced mixture.
+    """
     if features.ndim != 2 or targets.ndim != 1 or features.shape[0] != targets.shape[0]:
         raise ValueError("features/targets shape mismatch.")
+    if l2_lambda < 0:
+        raise ValueError("l2_lambda must be non-negative.")
+    if learning_rate <= 0:
+        raise ValueError("learning_rate must be positive.")
+    if max_iter <= 0:
+        raise ValueError("max_iter must be positive.")
+    if tol <= 0:
+        raise ValueError("tol must be positive.")
+
     num_samples, num_features = features.shape
-    weights = np.full(num_features, 1.0 / num_features, dtype=np.float64)
-    bias = float(targets.mean())
+    features = features.astype(np.float64, copy=False)
+    targets = targets.astype(np.float64, copy=False)
 
-    features = features.astype(np.float64)
-    targets = targets.astype(np.float64)
+    theta = np.zeros(num_features, dtype=np.float64)
+    weights = _softmax_simplex(theta)
+    bias = float(np.mean(targets))
 
-    for _ in tqdm(range(max_iter), desc="Fitting ridge weights", unit="iter", leave=False):
+    for _ in tqdm(range(max_iter), desc="Fitting positive simplex weights", unit="iter", leave=False):
         preds = features @ weights + bias
         errors = preds - targets
+
         grad_w = (features.T @ errors) / num_samples + l2_lambda * weights
-        grad_b = errors.mean()
-        next_weights = np.maximum(weights - learning_rate * grad_w, 0.0)
+        grad_b = float(np.mean(errors))
+
+        # Chain rule through softmax:
+        # dL/dtheta_i = w_i * (dL/dw_i - sum_j w_j * dL/dw_j)
+        grad_theta = weights * (grad_w - float(np.dot(weights, grad_w)))
+
+        next_theta = theta - learning_rate * grad_theta
         next_bias = bias - learning_rate * grad_b
+        next_weights = _softmax_simplex(next_theta)
+
         if np.linalg.norm(next_weights - weights) < tol and abs(next_bias - bias) < tol:
+            theta = next_theta
             weights = next_weights
             bias = next_bias
             break
+
+        theta = next_theta
         weights = next_weights
         bias = next_bias
 
-    return weights, float(bias)
-
+    return weights.astype(np.float64), float(bias)
 
 def build_output_path(base_path: str) -> Path:
     return Path(base_path)
@@ -722,7 +768,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             [static_scores["sa"], static_scores["div"], static_scores["dds"]],
             axis=1,
         ).astype(np.float64)
-        raw_weights, bias = fit_ridge_regression_nonnegative(
+        weights, bias = fit_ridge_regression_nonnegative(
             static_features,
             dynamic_scores,
             args.ridge_lambda,
@@ -730,12 +776,6 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             args.max_iter,
             args.tol,
         )
-
-        raw_sum = float(np.sum(raw_weights))
-        if raw_sum > 1e-12:
-            weights = raw_weights / raw_sum
-        else:
-            weights = np.full_like(raw_weights, 1.0 / raw_weights.size, dtype=np.float64)
 
         static_component_values = {
             "SA": static_scores["sa"],
@@ -787,13 +827,9 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "adapter_seed": seed,
             "diagnostics": {
                 "dynamic_static_pearson": correlation_matrix,
-                "raw_weights": {"sa": float(raw_weights[0]), "div": float(raw_weights[1]), "dds": float(raw_weights[2])},
-                "normalized_weights": {"sa": float(weights[0]), "div": float(weights[1]), "dds": float(weights[2])},
-                "weight_solver": "nonnegative_ridge_then_l1_normalize",
-                "dynamic_score_min": float(np.min(dynamic_scores)),
-                "dynamic_score_max": float(np.max(dynamic_scores)),
-                "dynamic_score_mean": float(np.mean(dynamic_scores)),
-                "dynamic_score_std": float(np.std(dynamic_scores)),
+                "weight_solver": "positive_simplex_ridge_softmax",
+                "weights_sum": float(np.sum(weights)),
+                "weights_min": float(np.min(weights)),
                 "sa_gt_one_third_warning": sa_warning,
                 "div_is_lowest_warning": div_is_lowest,
             },

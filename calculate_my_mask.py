@@ -25,7 +25,7 @@ from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
-from utils.score_utils import standard_zscore  # noqa: E402
+from utils.score_utils import standard_zscore, standard_zscore_by_class  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 
 
@@ -80,6 +80,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="group 模式下类内贪心候选池大小，1 表示纯贪心。",
+    )
+    parser.add_argument(
+        "--group-init-count",
+        type=int,
+        default=2,
+        help="group 模式下每个类别随机初始化的样本数。",
     )
     parser.add_argument(
         "--debug-prompts",
@@ -322,7 +328,7 @@ def select_topk_mask(
 
 
 def select_group_mask(
-    sa_scores: np.ndarray,
+    sa_raw_scores: np.ndarray,
     div_metric: Div,
     div_loader: DataLoader,
     image_adapter,
@@ -339,16 +345,19 @@ def select_group_mask(
     div_static_scores: np.ndarray | None = None,
     dds_static_scores: np.ndarray | None = None,
     group_candidate_pool_size: int = 1,
+    group_init_count: int = 2,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
         raise ValueError("kr 必须在 1-100 之间。")
 
-    num_samples = sa_scores.shape[0]
+    num_samples = sa_raw_scores.shape[0]
     labels_np = np.asarray(labels, dtype=np.int64)
-    sa_scores_np = np.asarray(sa_scores, dtype=np.float32)
-    div_static_np = np.asarray(div_static_scores, dtype=np.float32) if div_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
-    dds_static_np = np.asarray(dds_static_scores, dtype=np.float32) if dds_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
-    if labels_np.shape[0] != num_samples or div_static_np.shape[0] != num_samples or dds_static_np.shape[0] != num_samples:
+    sa_raw_np = np.asarray(sa_raw_scores, dtype=np.float32)
+    # Static cache stores raw metric scores. Static Div is retained for future use;
+    # current group scoring uses raw SA, raw DDS, dynamic raw Div, and distribution correction.
+    div_static_raw_np = np.asarray(div_static_scores, dtype=np.float32) if div_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
+    dds_raw_np = np.asarray(dds_static_scores, dtype=np.float32) if dds_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
+    if labels_np.shape[0] != num_samples or div_static_raw_np.shape[0] != num_samples or dds_raw_np.shape[0] != num_samples:
         raise ValueError("样本数不一致，无法执行 group。")
 
     sr = float(keep_ratio) / 100.0
@@ -405,24 +414,29 @@ def select_group_mask(
 
     class_budgets = _allocate_class_budgets()
     candidate_pool_size = max(1, int(group_candidate_pool_size))
-    dist_weight = 0.75 * max(0.0, 1.0 - 0.01 * float(keep_ratio))
-    # dist_weight = 1.0 / 3.0
+    dist_weight_max = 0.6
+    dist_weight_min = 0.0
 
     selected_mask = np.zeros(num_samples, dtype=np.uint8)
     class_selected_counts = np.zeros(num_classes, dtype=np.int64)
     class_selected_sum = np.zeros((num_classes, div_features_np.shape[1]), dtype=np.float32)
     init_per_class = np.zeros(num_classes, dtype=np.int64)
-    static_init_score = (weights["sa"] * sa_scores_np + weights["dds"] * dds_static_np).astype(np.float32)
+    requested_init_count = max(0, int(group_init_count))
 
     for class_id, class_indices in enumerate(class_indices_list):
         budget = int(class_budgets[class_id])
-        if class_indices.size == 0 or budget <= 0:
+        if class_indices.size == 0 or budget <= 0 or requested_init_count <= 0:
             continue
-        init_count = min(10, budget, int(class_indices.size))
+        init_count = min(requested_init_count, budget, int(class_indices.size))
         init_per_class[class_id] = init_count
-        class_static = static_init_score[class_indices]
-        ranked_local = np.argsort(-class_static, kind="mergesort")[:init_count]
-        init_indices = class_indices[ranked_local]
+        top_pool_size = max(init_count, int(np.ceil(0.5 * class_indices.size)))
+        top_pool_size = min(int(class_indices.size), max(1, top_pool_size))
+        ranked_by_sa = np.argsort(-sa_raw_np[class_indices], kind="mergesort")[:top_pool_size]
+        init_pool = class_indices[ranked_by_sa]
+        if init_pool.size <= init_count:
+            init_indices = init_pool
+        else:
+            init_indices = rng.choice(init_pool, size=init_count, replace=False).astype(np.int64)
         selected_mask[init_indices] = 1
         class_selected_counts[class_id] = init_count
         class_selected_sum[class_id] = np.sum(div_features_np[init_indices], axis=0, dtype=np.float32)
@@ -455,6 +469,10 @@ def select_group_mask(
             current_count = int(class_selected_counts[class_id])
             if current_count <= 0:
                 continue
+            class_budget = int(class_budgets[class_id])
+            progress = current_count / float(class_budget) if class_budget > 0 else 1.0
+            progress = float(np.clip(progress, 0.0, 1.0))
+            dist_weight_t = dist_weight_max * (1.0 - progress)
             current_sum = class_selected_sum[class_id]
             mu_full = full_class_mean_f32[class_id]
             mu_sub = current_sum / float(current_count)
@@ -472,19 +490,21 @@ def select_group_mask(
                 query_indices=torch.as_tensor(candidate_indices, dtype=torch.long, device=device),
                 reference_indices=torch.as_tensor(reference_indices, dtype=torch.long, device=device),
             ).detach().cpu().numpy().astype(np.float32)
-            div_scores = standard_zscore(div_raw)
+            div_local = standard_zscore(div_raw)
 
             candidate_features_np = div_features_np[candidate_indices]
             mu_new = (current_sum[None, :] + candidate_features_np) / float(current_count + 1)
             new_dist = np.linalg.norm(mu_new - mu_full[None, :], axis=1)
             dist_improve = (old_dist - new_dist).astype(np.float32)
-            dist_scores = standard_zscore(dist_improve)
+            dist_local = standard_zscore(dist_improve)
+            sa_local = standard_zscore(sa_raw_np[candidate_indices])
+            dds_local = standard_zscore(dds_raw_np[candidate_indices])
 
             combined_scores = (
-                weights["sa"] * sa_scores_np[candidate_indices]
-                + weights["dds"] * dds_static_np[candidate_indices]
-                + weights["div"] * div_scores
-                + dist_weight * dist_scores
+                weights["sa"] * sa_local
+                + weights["dds"] * dds_local
+                + weights["div"] * div_local
+                + dist_weight_t * dist_local
             ).astype(np.float32)
             rank = np.argsort(-combined_scores, kind="mergesort")
             pool_n = min(candidate_pool_size, candidate_indices.size)
@@ -520,12 +540,13 @@ def select_group_mask(
         dtype=np.float32,
     )
     selected_bool = final_mask.astype(bool)
+    final_div_z = standard_zscore_by_class(final_div_scores, labels_np)
     subset_comprehensive_score = float(
         np.sum(
             (
-                weights["sa"] * sa_scores_np
-                + weights["dds"] * dds_static_np
-                + weights["div"] * final_div_scores
+                weights["sa"] * standard_zscore_by_class(sa_raw_np, labels_np)
+                + weights["dds"] * standard_zscore_by_class(dds_raw_np, labels_np)
+                + weights["div"] * final_div_z
             )[selected_bool],
             dtype=np.float64,
         )
@@ -543,7 +564,10 @@ def select_group_mask(
     stats: dict[str, object] = {
         "solver": "group_classwise_greedy_add",
         "sr": float(sr),
-        "dist_weight": float(dist_weight),
+        "dist_weight": float(dist_weight_max),
+        "dist_weight_schedule": "linear_decay_by_class_progress",
+        "dist_weight_max": float(dist_weight_max),
+        "dist_weight_min": float(dist_weight_min),
         "final_rate": float(final_mask.mean()),
         "selected_by_class": selected_by_class,
         "class_budgets": {int(c): int(v) for c, v in enumerate(class_budgets.tolist())},
@@ -703,19 +727,22 @@ def main() -> None:
             f"[Seed {seed}] Static scores ready (cache/compute) | elapsed={static_score_seconds:.2f}s"
         )
 
-        dds_scores_np = np.asarray(static_scores["dds"])
-        div_scores_np = np.asarray(static_scores["div"])
-        sa_scores_np = np.asarray(static_scores["sa"], dtype=np.float32)
+        dds_raw_np = np.asarray(static_scores["dds"], dtype=np.float32)
+        div_raw_np = np.asarray(static_scores["div"], dtype=np.float32)
+        sa_raw_np = np.asarray(static_scores["sa"], dtype=np.float32)
+        labels = np.asarray(dataset_for_names.targets)
 
-        if not (len(dds_scores_np) == len(div_scores_np) == len(sa_scores_np)):
+        if not (len(dds_raw_np) == len(div_raw_np) == len(sa_raw_np)):
             raise RuntimeError("三个指标的样本数不一致，无法合并。")
 
+        sa_global_z = standard_zscore_by_class(sa_raw_np, labels)
+        div_global_z = standard_zscore_by_class(div_raw_np, labels)
+        dds_global_z = standard_zscore_by_class(dds_raw_np, labels)
         total_scores_np = (
-            weights["dds"] * dds_scores_np
-            + weights["div"] * div_scores_np
-            + weights["sa"] * sa_scores_np
+            weights["dds"] * dds_global_z
+            + weights["div"] * div_global_z
+            + weights["sa"] * sa_global_z
         )
-        labels = np.asarray(dataset_for_names.targets)
         for keep_ratio in keep_ratios:
             task_idx += 1
             print(
@@ -742,7 +769,7 @@ def main() -> None:
                 )
             else:
                 mask, selected_by_class, group_stats = select_group_mask(
-                    sa_scores_np,
+                    sa_raw_np,
                     div_metric=div_metric,
                     div_loader=div_loader,
                     image_adapter=image_adapter,
@@ -756,9 +783,10 @@ def main() -> None:
                     weight_group=weight_group,
                     clip_model=args.clip_model,
                     adapter_image_path=str(adapter_paths["image_path"]),
-                    div_static_scores=div_scores_np,
-                    dds_static_scores=dds_scores_np,
+                    div_static_scores=div_raw_np,
+                    dds_static_scores=dds_raw_np,
                     group_candidate_pool_size=args.group_candidate_pool_size,
+                    group_init_count=args.group_init_count,
                 )
 
             total_time = time.perf_counter() - total_start

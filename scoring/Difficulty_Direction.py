@@ -10,7 +10,6 @@ from torch.utils.data import DataLoader
 
 from model.adapter import AdapterMLP, CLIPFeatureExtractor
 from utils.global_config import CONFIG
-from utils.score_utils import standard_zscore_by_class
 
 
 @dataclass
@@ -251,14 +250,6 @@ class DifficultyDirection:
             class_features = image_features[mask]
             class_scores, _ = self._dds_from_pca(class_features)
             scores[mask] = class_scores
-        scores = torch.as_tensor(
-            standard_zscore_by_class(
-                scores.detach().cpu().numpy(),
-                labels.detach().cpu().numpy(),
-            ),
-            device=scores.device,
-            dtype=scores.dtype,
-        )
         return DDSResult(
             scores=scores.detach().cpu(),
             labels=labels.detach().cpu(),
@@ -307,14 +298,6 @@ class DifficultyDirection:
             class_scores = self._dds_from_reference_pca(class_features, ref_features)
             scores[class_mask] = class_scores
 
-        scores = torch.as_tensor(
-            standard_zscore_by_class(
-                scores.detach().cpu().numpy(),
-                labels.detach().cpu().numpy(),
-            ),
-            device=scores.device,
-            dtype=scores.dtype,
-        )
         return DDSResult(
             scores=scores.detach().cpu(),
             labels=labels.detach().cpu(),

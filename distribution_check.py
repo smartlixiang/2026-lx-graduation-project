@@ -22,6 +22,7 @@ from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.seed import set_seed  # noqa: E402
+from utils.score_utils import standard_zscore_by_class  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 
 DATASET_REGISTRY = {
@@ -231,9 +232,10 @@ def _compute_dataset_scores(
         compute_fn=_compute_scores,
     )
 
-    sa_scores = static_scores["sa"]
-    div_scores = static_scores["div"]
-    dds_scores = static_scores["dds"]
+    labels_for_z = np.asarray(static_scores["labels"], dtype=np.int64)
+    sa_scores = standard_zscore_by_class(static_scores["sa"], labels_for_z)
+    div_scores = standard_zscore_by_class(static_scores["div"], labels_for_z)
+    dds_scores = standard_zscore_by_class(static_scores["dds"], labels_for_z)
 
     if not (len(sa_scores) == len(div_scores) == len(dds_scores)):
         raise RuntimeError(f"[{dataset_name}] 三个指标样本数不一致，无法计算综合分。")

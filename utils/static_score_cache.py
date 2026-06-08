@@ -9,7 +9,7 @@ from typing import Callable
 
 import numpy as np
 
-NORMALIZATION_VERSION = "standard_zscore_v1"
+NORMALIZATION_VERSION = "raw_static_scores_v1"
 
 
 def _sanitize(text: str) -> str:
@@ -151,7 +151,8 @@ def get_or_compute_static_scores(
         "dds_eigval_upper_bound": float(dds_eigval_upper_bound),
         "prompt_template": prompt_template,
         "num_samples": int(num_samples),
-        "normalization": NORMALIZATION_VERSION,
+        "score_storage": NORMALIZATION_VERSION,
+        "score_version": NORMALIZATION_VERSION,
     }
 
     cached: dict[str, np.ndarray] = {}

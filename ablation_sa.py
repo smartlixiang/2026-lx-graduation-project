@@ -29,6 +29,7 @@ from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
+from utils.score_utils import standard_zscore_by_class  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 
 
@@ -260,7 +261,9 @@ def main() -> None:
         sa_scores_np = np.asarray(static_scores["sa"], dtype=np.float32)
         labels = np.asarray(dataset_for_names.targets)
 
-        total_scores_np = weights["dds"] * dds_scores_np + weights["div"] * div_scores_np
+        dds_global_z = standard_zscore_by_class(dds_scores_np, labels)
+        div_global_z = standard_zscore_by_class(div_scores_np, labels)
+        total_scores_np = weights["dds"] * dds_global_z + weights["div"] * div_global_z
 
         for keep_ratio in keep_ratios:
             task_idx += 1

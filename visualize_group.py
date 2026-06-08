@@ -57,11 +57,7 @@ def parse_args() -> argparse.Namespace:
         "--dist-weight",
         type=str,
         default=None,
-        help=(
-            "Distribution correction coefficient(s). "
-            "Use comma-separated values, e.g. '0,0.1,0.3,0.5,1.0'. "
-            "If omitted, use current default max(0, 1 - 0.01 * keep_ratio)."
-        ),
+        help="Deprecated; group visualization now uses linear decay by class progress with max 0.6.",
     )
     parser.add_argument(
         "--class-ids",
@@ -73,7 +69,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--num-auto-classes", type=int, default=3)
-    parser.add_argument("--init-count", type=int, default=10)
+    parser.add_argument("--group-init-count", type=int, default=2)
     parser.add_argument(
         "--late-fraction",
         type=float,
@@ -205,17 +201,23 @@ def choose_auto_classes(
 def init_selected_for_class(
     class_indices: np.ndarray,
     budget: int,
-    static_init_score: np.ndarray,
+    sa_raw_scores: np.ndarray,
     init_count: int,
+    rng: np.random.Generator,
 ) -> np.ndarray:
     selected = np.zeros(class_indices.shape[0], dtype=bool)
     if class_indices.size == 0 or budget <= 0:
         return selected
 
     count = min(init_count, budget, int(class_indices.size))
-    local_scores = static_init_score[class_indices]
-    ranked_local = np.argsort(-local_scores, kind="mergesort")[:count]
-    selected[ranked_local] = True
+    top_pool_size = max(count, int(np.ceil(0.5 * class_indices.size)))
+    top_pool_size = min(int(class_indices.size), max(1, top_pool_size))
+    ranked_local = np.argsort(-sa_raw_scores[class_indices], kind="mergesort")[:top_pool_size]
+    if ranked_local.size <= count:
+        chosen_local = ranked_local
+    else:
+        chosen_local = rng.choice(ranked_local, size=count, replace=False).astype(np.int64)
+    selected[chosen_local] = True
     return selected
 
 
@@ -231,7 +233,7 @@ def compute_candidate_table(
     sa_scores: np.ndarray,
     dds_scores: np.ndarray,
     weights: dict[str, float],
-    dist_weight: float,
+    class_budget: int,
     top_candidates: int,
 ) -> tuple[list[dict[str, float | int]], int | None]:
     candidate_indices = class_indices[~selected_local]
@@ -274,11 +276,16 @@ def compute_candidate_table(
     new_dist = np.linalg.norm(mu_new - mu_full[None, :], axis=1)
     dist_improve = (old_dist - new_dist).astype(np.float32)
     dist_z = standard_zscore(dist_improve)
+    sa_z = standard_zscore(sa_scores[candidate_indices])
+    dds_z = standard_zscore(dds_scores[candidate_indices])
+    progress = current_count / float(class_budget) if class_budget > 0 else 1.0
+    progress = float(np.clip(progress, 0.0, 1.0))
+    dist_weight_t = 0.6 * (1.0 - progress)
 
-    sa_component = float(weights["sa"]) * sa_scores[candidate_indices]
-    dds_component = float(weights["dds"]) * dds_scores[candidate_indices]
+    sa_component = float(weights["sa"]) * sa_z
+    dds_component = float(weights["dds"]) * dds_z
     div_component = float(weights["div"]) * div_z
-    dist_component = float(dist_weight) * dist_z
+    dist_component = float(dist_weight_t) * dist_z
     total = sa_component + dds_component + div_component + dist_component
 
     order = np.argsort(-total, kind="mergesort")
@@ -298,13 +305,14 @@ def compute_candidate_table(
                 "new_mean_shift": float(new_dist[local_pos]),
                 "dist_improve_raw": float(dist_improve[local_pos]),
                 "div_raw": float(div_raw[local_pos]),
-                "sa_z": float(sa_scores[sample_index]),
-                "dds_z": float(dds_scores[sample_index]),
+                "sa_z": float(sa_z[local_pos]),
+                "dds_z": float(dds_z[local_pos]),
                 "div_z": float(div_z[local_pos]),
                 "dist_z": float(dist_z[local_pos]),
                 "sa_component": float(sa_component[local_pos]),
                 "dds_component": float(dds_component[local_pos]),
                 "div_component": float(div_component[local_pos]),
+                "dist_weight_t": float(dist_weight_t),
                 "dist_component": float(dist_component[local_pos]),
                 "total": float(total[local_pos]),
             }
@@ -327,7 +335,7 @@ def greedy_advance_one_class(
     sa_scores: np.ndarray,
     dds_scores: np.ndarray,
     weights: dict[str, float],
-    dist_weight: float,
+    class_budget: int,
 ) -> np.ndarray:
     selected = selected_local.copy()
 
@@ -343,7 +351,7 @@ def greedy_advance_one_class(
             sa_scores=sa_scores,
             dds_scores=dds_scores,
             weights=weights,
-            dist_weight=dist_weight,
+            class_budget=class_budget,
             top_candidates=1,
         )
         if picked_idx is None:
@@ -411,8 +419,9 @@ def main() -> None:
     set_seed(args.seed)
 
     device = torch.device(args.device) if args.device else CONFIG.global_device
-    default_dist_weight = max(0.0, 1.0 - 0.01 * float(args.keep_ratio))
-    dist_weights = parse_float_list(args.dist_weight, default_dist_weight)
+    if args.dist_weight is not None:
+        print("[warn] --dist-weight is ignored; using linear decay by class progress with max 0.6.")
+    dist_weights = [0.6]
 
     output_root = (
         Path(args.output_dir)
@@ -502,7 +511,8 @@ def main() -> None:
 
     sa_scores = np.asarray(static_scores["sa"], dtype=np.float32)
     dds_scores = np.asarray(static_scores["dds"], dtype=np.float32)
-    static_init_score = (weights["sa"] * sa_scores + weights["dds"] * dds_scores).astype(np.float32)
+    static_init_score = sa_scores
+    rng = np.random.default_rng(args.seed)
 
     print("Encoding Div features for group visualization...")
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
@@ -547,8 +557,9 @@ def main() -> None:
             init_selected = init_selected_for_class(
                 class_indices=class_indices,
                 budget=budget,
-                static_init_score=static_init_score,
-                init_count=args.init_count,
+                sa_raw_scores=sa_scores,
+                init_count=args.group_init_count,
+                rng=rng,
             )
             init_selected_count = int(np.sum(init_selected))
             if init_selected_count <= 0:
@@ -571,7 +582,7 @@ def main() -> None:
                     sa_scores=sa_scores,
                     dds_scores=dds_scores,
                     weights=weights,
-                    dist_weight=float(dist_weight),
+                    class_budget=budget,
                 ),
             }
 
@@ -589,12 +600,11 @@ def main() -> None:
                     sa_scores=sa_scores,
                     dds_scores=dds_scores,
                     weights=weights,
-                    dist_weight=float(dist_weight),
+                    class_budget=budget,
                     top_candidates=args.top_candidates,
                 )
 
-                safe_dist = str(float(dist_weight)).replace(".", "p")
-                base_name = f"class_{class_id}_{phase}_dist_{safe_dist}"
+                base_name = f"class_{class_id}_{phase}_dist_linear_decay"
                 csv_path = output_root / f"{base_name}.csv"
                 png_path = output_root / f"{base_name}.png"
 
@@ -602,7 +612,7 @@ def main() -> None:
 
                 title = (
                     f"{dataset_name} | class {class_id} ({class_label}) | {phase} | "
-                    f"selected={int(np.sum(selected_local))}/{budget} | dist_weight={float(dist_weight):.4f}"
+                    f"selected={int(np.sum(selected_local))}/{budget} | dist schedule=linear_decay(max=0.6)"
                 )
                 plot_candidate_contributions(png_path, title, rows)
 
@@ -615,7 +625,9 @@ def main() -> None:
                         "class_id": int(class_id),
                         "class_name": class_label,
                         "phase": phase,
-                        "dist_weight": float(dist_weight),
+                        "dist_weight_schedule": "linear_decay_by_class_progress",
+                        "dist_weight_max": 0.6,
+                        "dist_weight_min": 0.0,
                         "selected_count_before_add": int(np.sum(selected_local)),
                         "class_budget": int(budget),
                         "picked_sample_index": int(picked_idx) if picked_idx is not None else None,
@@ -632,8 +644,9 @@ def main() -> None:
         json.dump(
             {
                 "weights": weights,
-                "default_dist_weight": float(default_dist_weight),
-                "dist_weights": [float(v) for v in dist_weights],
+                "dist_weight_schedule": "linear_decay_by_class_progress",
+                "dist_weight_max": 0.6,
+                "dist_weight_min": 0.0,
                 "class_ids": [int(c) for c in class_ids],
                 "summary": summary,
             },

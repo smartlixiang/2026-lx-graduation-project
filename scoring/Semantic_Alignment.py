@@ -10,7 +10,6 @@ from torch.utils.data import DataLoader
 from model.adapter import AdapterMLP, CLIPFeatureExtractor
 from utils.class_name_utils import build_class_prompts
 from utils.global_config import CONFIG
-from utils.score_utils import standard_zscore_by_class
 
 
 @dataclass
@@ -137,14 +136,6 @@ class SemanticAlignment:
         image_features, labels = self._encode_images(dataloader, adapter_image)
         text_features = text_features.to(image_features.device)
         scores = self._margin_similarity(image_features, text_features, labels)
-        scores = torch.as_tensor(
-            standard_zscore_by_class(
-                scores.detach().cpu().numpy(),
-                labels.detach().cpu().numpy(),
-            ),
-            device=scores.device,
-            dtype=scores.dtype,
-        )
 
         return SAResult(
             scores=scores.detach().cpu(),

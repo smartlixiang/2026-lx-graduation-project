@@ -21,6 +21,7 @@ from model.adapter import load_trained_adapters
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.global_config import CONFIG
 from utils.seed import set_seed
+from utils.score_utils import standard_zscore_by_class
 from utils.static_score_cache import get_or_compute_static_scores
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -367,12 +368,10 @@ def main() -> None:
         raise ValueError("Static score labels mismatch CIFAR100 raw dataset order.")
 
     w_sa, w_div, w_dds, bias = _load_learned_weights(Path(args.weights_json), args.dataset, args.seed)
-    final_scores = (
-        w_sa * static_scores["sa"].astype(np.float64)
-        + w_div * static_scores["div"].astype(np.float64)
-        + w_dds * static_scores["dds"].astype(np.float64)
-        + bias
-    )
+    sa_z = standard_zscore_by_class(static_scores["sa"], labels).astype(np.float64)
+    div_z = standard_zscore_by_class(static_scores["div"], labels).astype(np.float64)
+    dds_z = standard_zscore_by_class(static_scores["dds"], labels).astype(np.float64)
+    final_scores = w_sa * sa_z + w_div * div_z + w_dds * dds_z + bias
 
     high_pairs, low_pairs = _select_extreme_indices_per_class(final_scores, labels, TARGET_CLASS_IDS, rng)
     _plot_pairs(raw_dataset, class_names, final_scores, high_pairs, low_pairs, Path(args.output))

@@ -27,6 +27,7 @@ from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
+from utils.score_utils import standard_zscore, standard_zscore_by_class  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 
 ABLATION_NAME = "ablation_div"
@@ -197,15 +198,6 @@ def select_group_mask_without_div_component(
     )
     full_class_mean = full_class_mean.astype(np.float32, copy=False)
 
-    def _quantile_minmax(values: np.ndarray, low_q: float = 0.002, high_q: float = 0.998) -> np.ndarray:
-        if values.size == 0:
-            return np.zeros(0, dtype=np.float32)
-        low = float(np.quantile(values, low_q))
-        high = float(np.quantile(values, high_q))
-        if abs(high - low) <= 1e-12:
-            return np.full(values.shape, 0.5, dtype=np.float32)
-        return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)
-
     class_sizes = np.asarray([idx.size for idx in class_indices_list], dtype=np.int64)
     raw = class_sizes.astype(np.float64) * sr
     class_budgets = np.minimum(np.floor(raw).astype(np.int64), class_sizes)
@@ -225,20 +217,22 @@ def select_group_mask_without_div_component(
     class_selected_counts = np.zeros(num_classes, dtype=np.int64)
     class_selected_sum = np.zeros((num_classes, div_features_np.shape[1]), dtype=np.float32)
     init_per_class = np.zeros(num_classes, dtype=np.int64)
-    static_init_score = (weights["sa"] * sa_scores_np + weights["dds"] * dds_static_np).astype(np.float32)
     for class_id, class_indices in enumerate(class_indices_list):
         budget = int(class_budgets[class_id])
         if class_indices.size == 0 or budget <= 0:
             continue
-        init_count = min(3, budget, int(class_indices.size))
+        init_count = min(2, budget, int(class_indices.size))
         init_per_class[class_id] = init_count
-        init_indices = class_indices[np.argsort(-static_init_score[class_indices], kind="mergesort")[:init_count]]
+        top_pool_size = max(init_count, int(np.ceil(0.5 * class_indices.size)))
+        top_pool_size = min(int(class_indices.size), max(1, top_pool_size))
+        init_pool = class_indices[np.argsort(-sa_scores_np[class_indices], kind="mergesort")[:top_pool_size]]
+        init_indices = init_pool if init_pool.size <= init_count else rng.choice(init_pool, size=init_count, replace=False).astype(np.int64)
         selected_mask[init_indices] = 1
         class_selected_counts[class_id] = init_count
         class_selected_sum[class_id] = np.sum(div_features_np[init_indices], axis=0, dtype=np.float32)
 
     candidate_pool_size = max(1, int(group_candidate_pool_size))
-    dist_weight = max(0.0, 1.0 - 0.01 * float(keep_ratio))
+    dist_weight_max = 0.6
     selected_count_history = [int(np.sum(selected_mask))]
     total_to_add = int(np.sum(class_budgets) - np.sum(init_per_class))
     total_score_acc = 0.0
@@ -256,13 +250,18 @@ def select_group_mask_without_div_component(
             if candidate_indices.size == 0:
                 continue
             current_count = int(class_selected_counts[class_id])
+            class_budget = int(class_budgets[class_id])
+            progress = current_count / float(class_budget) if class_budget > 0 else 1.0
+            dist_weight_t = dist_weight_max * (1.0 - float(np.clip(progress, 0.0, 1.0)))
             current_sum = class_selected_sum[class_id]
             mu_full = full_class_mean[class_id]
             old_dist = float(np.linalg.norm(current_sum / float(current_count) - mu_full))
             candidate_features_np = div_features_np[candidate_indices]
             mu_new = (current_sum[None, :] + candidate_features_np) / float(current_count + 1)
-            dist_scores = _quantile_minmax((old_dist - np.linalg.norm(mu_new - mu_full[None, :], axis=1)).astype(np.float32))
-            combined_scores = (weights["sa"] * sa_scores_np[candidate_indices] + weights["dds"] * dds_static_np[candidate_indices] + dist_weight * dist_scores).astype(np.float32)
+            dist_local = standard_zscore((old_dist - np.linalg.norm(mu_new - mu_full[None, :], axis=1)).astype(np.float32))
+            sa_local = standard_zscore(sa_scores_np[candidate_indices])
+            dds_local = standard_zscore(dds_static_np[candidate_indices])
+            combined_scores = (weights["sa"] * sa_local + weights["dds"] * dds_local + dist_weight_t * dist_local).astype(np.float32)
             rank = np.argsort(-combined_scores, kind="mergesort")
             pool_n = min(candidate_pool_size, candidate_indices.size)
             pool_indices = candidate_indices[rank[:pool_n]]
@@ -279,7 +278,7 @@ def select_group_mask_without_div_component(
     final_mask = selected_mask.astype(np.uint8)
     selected_by_class = {int(c): int(final_mask[class_indices_list[c]].sum()) if class_indices_list[c].size > 0 else 0 for c in range(num_classes)}
     selected_bool = final_mask.astype(bool)
-    subset_comprehensive_score = float(np.sum((weights["sa"] * sa_scores_np + weights["dds"] * dds_static_np)[selected_bool], dtype=np.float64))
+    subset_comprehensive_score = float(np.sum((weights["sa"] * standard_zscore_by_class(sa_scores_np, labels_np) + weights["dds"] * standard_zscore_by_class(dds_static_np, labels_np))[selected_bool], dtype=np.float64))
     class_shift_values = []
     for class_id in range(num_classes):
         if class_selected_counts[class_id] <= 0:
@@ -289,7 +288,10 @@ def select_group_mask_without_div_component(
     stats = {
         "solver": "group_classwise_greedy_add_without_div_component",
         "sr": float(sr),
-        "dist_weight": float(dist_weight),
+        "dist_weight": float(dist_weight_max),
+        "dist_weight_schedule": "linear_decay_by_class_progress",
+        "dist_weight_max": float(dist_weight_max),
+        "dist_weight_min": 0.0,
         "final_rate": float(final_mask.mean()),
         "selected_by_class": selected_by_class,
         "class_budgets": {int(c): int(v) for c, v in enumerate(class_budgets.tolist())},
@@ -366,7 +368,9 @@ def main() -> None:
         div_scores_np = np.asarray(static_scores["div"], dtype=np.float32)
         sa_scores_np = np.asarray(static_scores["sa"], dtype=np.float32)
         labels = np.asarray(dataset_for_names.targets)
-        total_scores_np = weights["dds"] * dds_scores_np + weights["sa"] * sa_scores_np
+        dds_global_z = standard_zscore_by_class(dds_scores_np, labels)
+        sa_global_z = standard_zscore_by_class(sa_scores_np, labels)
+        total_scores_np = weights["dds"] * dds_global_z + weights["sa"] * sa_global_z
 
         for keep_ratio in keep_ratios:
             task_idx += 1

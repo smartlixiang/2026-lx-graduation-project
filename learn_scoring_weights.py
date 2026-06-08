@@ -35,7 +35,7 @@ from utils.class_name_utils import resolve_class_names_for_prompts
 from utils.global_config import CONFIG
 from utils.proxy_log_utils import resolve_proxy_log_path
 from utils.seed import parse_seed_list, set_seed
-from utils.score_utils import standard_zscore
+from utils.score_utils import standard_zscore, standard_zscore_by_class
 from utils.static_score_cache import NORMALIZATION_VERSION, get_or_compute_static_scores
 from weights import (
     AbsorptionGainScore,
@@ -764,10 +764,11 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         if not np.array_equal(labels_all, static_scores["labels"]):
             raise ValueError("动态监督标签与静态评分数据集标签不一致。")
 
-        static_features = np.stack(
-            [static_scores["sa"], static_scores["div"], static_scores["dds"]],
-            axis=1,
-        ).astype(np.float64)
+        sa_z = standard_zscore_by_class(static_scores["sa"], static_scores["labels"])
+        div_z = standard_zscore_by_class(static_scores["div"], static_scores["labels"])
+        dds_z = standard_zscore_by_class(static_scores["dds"], static_scores["labels"])
+
+        static_features = np.stack([sa_z, div_z, dds_z], axis=1).astype(np.float64)
         weights, bias = fit_ridge_regression_nonnegative(
             static_features,
             dynamic_scores,
@@ -778,9 +779,9 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         )
 
         static_component_values = {
-            "SA": static_scores["sa"],
-            "Div": static_scores["div"],
-            "DDS": static_scores["dds"],
+            "SA": sa_z,
+            "Div": div_z,
+            "DDS": dds_z,
         }
         correlation_matrix: dict[str, dict[str, float]] = {}
         print(f"Dynamic-vs-static Pearson correlations (seed={seed}):")

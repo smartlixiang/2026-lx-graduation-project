@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader
 
 from model.adapter import AdapterMLP, CLIPFeatureExtractor
 from utils.global_config import CONFIG
-from utils.score_utils import standard_zscore_by_class
 
 
 @dataclass
@@ -42,7 +41,7 @@ class DivResult:
 class Div:
     """计算图像样本的多样性覆盖度 (Div)。
 
-    使用类内前 k 个近邻距离均值作为原始度量，并进行类内 standard z-score 归一化。
+    使用类内前 k 个近邻距离均值作为原始度量。
     """
 
     def __init__(
@@ -173,17 +172,8 @@ class Div:
             class_distances = self._knn_mean_distance(class_features, self.k)
             k_distances[mask] = class_distances
 
-        scores = torch.as_tensor(
-            standard_zscore_by_class(
-                k_distances.detach().cpu().numpy(),
-                labels.detach().cpu().numpy(),
-            ),
-            device=k_distances.device,
-            dtype=k_distances.dtype,
-        )
-
         return DivResult(
-            scores=scores.detach().cpu(),
+            scores=k_distances.detach().cpu(),
             labels=labels.detach().cpu(),
             image_features=image_features.detach().cpu(),
             k_distances=k_distances.detach().cpu(),
@@ -243,16 +233,8 @@ class Div:
             )
             k_distances[class_mask] = class_distances
 
-        scores = torch.as_tensor(
-            standard_zscore_by_class(
-                k_distances.detach().cpu().numpy(),
-                labels.detach().cpu().numpy(),
-            ),
-            device=k_distances.device,
-            dtype=k_distances.dtype,
-        )
         return DivResult(
-            scores=scores.detach().cpu(),
+            scores=k_distances.detach().cpu(),
             labels=labels.detach().cpu(),
             image_features=image_features.detach().cpu(),
             k_distances=k_distances.detach().cpu(),

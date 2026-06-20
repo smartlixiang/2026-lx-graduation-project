@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-init-count",
         type=int,
-        default=2,
+        default=10,
         help="group 模式下每个类别随机初始化的样本数。",
     )
     parser.add_argument(
@@ -414,8 +414,9 @@ def select_group_mask(
 
     class_budgets = _allocate_class_budgets()
     candidate_pool_size = max(1, int(group_candidate_pool_size))
-    dist_weight_max = 0.6
-    dist_weight_min = 0.0
+    # dist_weight_max = max(0.0, 1.0 - 0.01 * float(keep_ratio))
+    dist_weight_max = max(0.0, 0.8 - 0.005 * keep_ratio)
+    dist_weight_min = 0.5 * dist_weight_max
 
     selected_mask = np.zeros(num_samples, dtype=np.uint8)
     class_selected_counts = np.zeros(num_classes, dtype=np.int64)
@@ -472,7 +473,7 @@ def select_group_mask(
             class_budget = int(class_budgets[class_id])
             progress = current_count / float(class_budget) if class_budget > 0 else 1.0
             progress = float(np.clip(progress, 0.0, 1.0))
-            dist_weight_t = dist_weight_max * (1.0 - progress)
+            dist_weight_t = dist_weight_min + (dist_weight_max - dist_weight_min) * progress
             current_sum = class_selected_sum[class_id]
             mu_full = full_class_mean_f32[class_id]
             mu_sub = current_sum / float(current_count)
@@ -565,7 +566,7 @@ def select_group_mask(
         "solver": "group_classwise_greedy_add",
         "sr": float(sr),
         "dist_weight": float(dist_weight_max),
-        "dist_weight_schedule": "linear_decay_by_class_progress",
+        "dist_weight_schedule": "linear_increase_by_class_progress",
         "dist_weight_max": float(dist_weight_max),
         "dist_weight_min": float(dist_weight_min),
         "final_rate": float(final_mask.mean()),

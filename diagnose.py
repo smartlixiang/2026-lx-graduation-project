@@ -8,7 +8,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torchvision import datasets
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -20,6 +19,8 @@ from calculate_my_mask import (  # noqa: E402
     _get_or_compute_group_mean_stats,
     _mean_stats_cache_path,
     build_score_loader,
+    ensure_scoring_weights,
+    load_scoring_weights,
 )
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR100  # noqa: E402
 from model.adapter import load_trained_adapters  # noqa: E402
@@ -31,15 +32,26 @@ from utils.seed import set_seed  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 
 
-NAIVE_WEIGHTS = {"sa": 1.0 / 3.0, "div": 1.0 / 3.0, "dds": 1.0 / 3.0}
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare distribution shift of random and naive_group masks for each keep ratio."
+        description=(
+            "Compare distribution shift of random and group selection for each keep ratio. "
+            "The group selection can use naive or learned static metric weights."
+        )
     )
     parser.add_argument("--dataset", type=str, default=CIFAR100, choices=AVAILABLE_DATASETS)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="naive",
+        choices=["naive", "learned"],
+        help=(
+            "Static metric weight mode for group selection. "
+            "'naive' uses equal SA/Div/DDS weights; 'learned' loads weights/scoring_weights.json "
+            "for the selected dataset and seed."
+        ),
+    )
     parser.add_argument("--kr", type=str, default="20,30,40,50,60,70,80,90")
     parser.add_argument("--clip-model", type=str, default="ViT-B/32")
     parser.add_argument("--device", type=str, default=None)
@@ -51,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         "--dist-min-ratio",
         type=float,
         default=0.5,
-        help="Initial coefficient ratio relative to old kr-dependent max. Current strategy: 0.5.",
+        help="Initial coefficient ratio relative to kr-dependent maximum. Current strategy: 0.5.",
     )
     parser.add_argument(
         "--dist-power",
@@ -66,6 +78,21 @@ def parse_args() -> argparse.Namespace:
 def parse_ratio_list(ratio_text: str) -> list[int]:
     items = [item.strip() for item in ratio_text.split(",") if item.strip()]
     return [int(item) for item in items]
+
+
+def load_group_weights(dataset_name: str, mode: str, seed: int) -> dict[str, float]:
+    """Load SA/Div/DDS weights for group selection.
+
+    mode='naive' returns equal weights through calculate_my_mask's weight loader.
+    mode='learned' requires weights/scoring_weights.json to contain the entry for this dataset and seed.
+    """
+    weights_path = PROJECT_ROOT / "weights" / "scoring_weights.json"
+    all_weights = ensure_scoring_weights(weights_path, dataset_name)
+    weights = load_scoring_weights(all_weights, mode, seed)
+    total = float(weights["sa"] + weights["div"] + weights["dds"])
+    if total <= 0:
+        raise ValueError(f"Invalid {mode} weights: {weights}")
+    return {key: float(value) / total for key, value in weights.items()}
 
 
 def allocate_class_budgets(labels: np.ndarray, num_classes: int, keep_ratio: int) -> np.ndarray:
@@ -99,15 +126,15 @@ def allocate_class_budgets(labels: np.ndarray, num_classes: int, keep_ratio: int
 # ---------------------------------------------------------------------
 # Distribution correction coefficient strategy.
 #
-# This is the code location to edit when testing another strategy.
+# Edit this function to test another strategy.
 #
 # Current strategy:
-#   dist_weight_max = max(0, 1 - 0.01 * keep_ratio)
+#   dist_weight_max = max(0, 0.8 - 0.005 * keep_ratio)
 #   dist_weight_t = dist_weight_max * (min_ratio + (1 - min_ratio) * progress^power)
 # where progress = selected_count_in_class / class_budget.
 #
 # With default min_ratio=0.5 and power=1.0, the coefficient linearly increases
-# from half of the old kr-dependent coefficient to the full old coefficient.
+# from half of the kr-dependent maximum to the full kr-dependent maximum.
 # ---------------------------------------------------------------------
 def compute_dist_weight(
     *,
@@ -117,7 +144,7 @@ def compute_dist_weight(
     min_ratio: float = 0.5,
     power: float = 1.0,
 ) -> tuple[float, float, float]:
-    dist_weight_max = max(0.0, 0.8 - 0.005 * keep_ratio)
+    dist_weight_max = max(0.0, 0.8 - 0.005 * float(keep_ratio))
     min_ratio = float(np.clip(min_ratio, 0.0, 1.0))
     progress = 1.0 if class_budget <= 0 else float(np.clip(current_count / float(class_budget), 0.0, 1.0))
     power = max(float(power), 1e-8)
@@ -159,12 +186,13 @@ def compute_distribution_shift(
     return float(np.mean(shifts)) if shifts else 0.0
 
 
-def make_naive_group_mask(
+def make_group_mask(
     *,
     labels: np.ndarray,
     num_classes: int,
     keep_ratio: int,
     seed: int,
+    weights: dict[str, float],
     sa_raw_np: np.ndarray,
     dds_raw_np: np.ndarray,
     div_features_np: np.ndarray,
@@ -207,7 +235,7 @@ def make_naive_group_mask(
 
     candidate_pool_size = max(1, int(group_candidate_pool_size))
     total_to_add = int(np.sum(budgets) - np.sum(init_per_class))
-    pbar = tqdm(total=total_to_add, desc=f"[group] kr={keep_ratio}", unit="sample", leave=False)
+    pbar = tqdm(total=total_to_add, desc=f"[group:{keep_ratio}]", unit="sample", leave=False)
 
     dist_weights_used = []
     progress_used = []
@@ -275,9 +303,9 @@ def make_naive_group_mask(
             dds_local = standard_zscore(dds_raw_np[candidate_indices])
 
             combined_scores = (
-                NAIVE_WEIGHTS["sa"] * sa_local
-                + NAIVE_WEIGHTS["dds"] * dds_local
-                + NAIVE_WEIGHTS["div"] * div_local
+                weights["sa"] * sa_local
+                + weights["dds"] * dds_local
+                + weights["div"] * div_local
                 + dist_weight_t * dist_local
             ).astype(np.float32)
 
@@ -293,9 +321,9 @@ def make_naive_group_mask(
 
     pbar.close()
 
-    dist_weight_max = max(0.0, 1.0 - 0.01 * float(keep_ratio))
+    dist_weight_max = max(0.0, 0.8 - 0.005 * float(keep_ratio))
     stats = {
-        "dist_weight_strategy": "increase_from_min_ratio_to_old_kr_formula",
+        "dist_weight_strategy": "increase_from_min_ratio_to_kr_linear_max",
         "dist_weight_max": float(dist_weight_max),
         "dist_weight_min_ratio": float(dist_min_ratio),
         "dist_weight_power": float(dist_power),
@@ -315,6 +343,12 @@ def main() -> None:
 
     set_seed(args.seed)
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
+
+    group_weights = load_group_weights(dataset_name, args.mode, args.seed)
+    print(
+        f"[Weights] mode={args.mode} | "
+        f"SA={group_weights['sa']:.6f}, Div={group_weights['div']:.6f}, DDS={group_weights['dds']:.6f}"
+    )
 
     start_time = time.perf_counter()
 
@@ -410,16 +444,17 @@ def main() -> None:
     )
 
     rows = []
-    print("\n[Run] computing random and naive_group distribution shifts...")
+    print("\n[Run] computing random and group distribution shifts...")
     for keep_ratio in keep_ratios:
         random_mask, _ = make_random_mask(labels, num_classes, keep_ratio, args.seed)
         random_shift = compute_distribution_shift(random_mask, labels, div_features_np, full_class_mean, num_classes)
 
-        group_mask, group_stats = make_naive_group_mask(
+        group_mask, group_stats = make_group_mask(
             labels=labels,
             num_classes=num_classes,
             keep_ratio=keep_ratio,
             seed=args.seed,
+            weights=group_weights,
             sa_raw_np=sa_raw_np,
             dds_raw_np=dds_raw_np,
             div_features_np=div_features_np,
@@ -452,6 +487,12 @@ def main() -> None:
         )
 
     print("\n=== Distribution shift comparison ===")
+    print(f"dataset={dataset_name} | mode={args.mode} | seed={args.seed}")
+    print(
+        f"weights: SA={group_weights['sa']:.6f}, "
+        f"Div={group_weights['div']:.6f}, DDS={group_weights['dds']:.6f}"
+    )
+
     headers = ["kr", "dist_max", "dist_mean", "random_shift", "group_shift", "group/random", "group-random"]
     table_rows = [
         [

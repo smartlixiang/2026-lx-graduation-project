@@ -1,112 +1,131 @@
+"""Train after data selection and save evaluation results.
+
+The default behavior is the standard data-selection training experiment.  When
+``--exp label_noise`` is used, the script first applies the fixed label-noise
+mapping under ``noise/{dataset}/noise_list_{seed}.txt`` to the training split,
+keeps the test split clean, and then trains on the selected subset.
+
+Result roots:
+  - default: result/
+  - --exp label_noise: result_label_noise/
+
+Checkpoint roots are separated in the same way to avoid accidentally resuming a
+clean experiment checkpoint in a label-noise run.
+"""
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import sys
 import time
-from math import ceil
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from torchvision import datasets
+from torch import nn
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim import SGD
+from torch.optim.lr_scheduler import MultiStepLR
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+from dataset.dataset import BaseDataLoader
+from dataset.dataset_config import AVAILABLE_DATASETS
+from model.model_config import get_model
+from utils.global_config import CONFIG
+from utils.path_rules import resolve_checkpoint_path, resolve_mask_path, resolve_result_path
+from utils.progress import PersistentStatusLine, create_persistent_bar, create_transient_batch_bar
+from utils.seed import parse_seed_list, set_seed
+from utils.training_defaults import apply_dataset_training_defaults
 
-from model.adapter import load_trained_adapters  # noqa: E402
-from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET  # noqa: E402
-from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
-from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
-from utils.global_config import CONFIG  # noqa: E402
-from utils.path_rules import resolve_mask_path  # noqa: E402
-from utils.seed import parse_seed_list, set_seed  # noqa: E402
-from utils.score_utils import standard_zscore, standard_zscore_by_class  # noqa: E402
-from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
+
+SUPPORTED_EXPERIMENTS = {"label_noise"}
+
+
+def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    return apply_dataset_training_defaults(args, lr_attr="init_lr")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Calculate selection masks")
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--dataset",
         type=str,
-        default=CIFAR10,
+        default="cifar10",
         choices=AVAILABLE_DATASETS,
-        help="目标数据集名称",
     )
+    parser.add_argument("--data_root", type=str, default=str(Path("data")))
     parser.add_argument(
-        "--kr",
+        "--kr",  # keep ratios
         type=str,
         default="20,30,40,50,60,70,80,90",
-        help="keep_ratio 列表（百分比），支持逗号分隔或单值",
+        help="裁剪比例列表（百分比），支持逗号分隔或单值",
     )
-    parser.add_argument("--clip-model", type=str, default="ViT-B/32", help="CLIP 模型规格")
-    parser.add_argument("--device", type=str, default=None, help="设备，例如 cuda 或 cpu")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="random",
+        help="数据选择方法名称（random 为随机采样）",
+    )
+    parser.add_argument("--model", type=str, default="resnet50")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--init_lr", type=float, default=None)
+    parser.add_argument("--momentum", type=float, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument(
+        "--lr_milestones",
+        type=int,
+        nargs="+",
+        default=None,
+        help="MultiStepLR milestones，例如: --lr_milestones 60 120 160",
+    )
+    parser.add_argument("--lr_gamma", type=float, default=None)
+    parser.add_argument("--device", type=str, default="")
     parser.add_argument(
         "--seed",
         type=str,
-        default=str(CONFIG.global_seed),
-        help="随机种子列表，逗号分隔",
+        default=",".join(str(s) for s in CONFIG.exp_seeds),
+        help="随机种子，支持单个整数或逗号分隔列表",
     )
     parser.add_argument(
-        "--weight-group",
+        "--exp",
         type=str,
-        default="naive",
-        help="权重组，仅支持 {naive, learned}",
+        default=None,
+        choices=sorted(SUPPORTED_EXPERIMENTS),
+        help="实验设置。默认 None；当前仅支持 label_noise。",
     )
     parser.add_argument(
-        "--method",
+        "--noise_root",
         type=str,
-        default="topk",
-        help="数据选择方式，可选 {topk, group}",
+        default=str(Path("noise")),
+        help="标签注噪列表根目录，仅在 --exp label_noise 时使用。",
     )
     parser.add_argument(
-        "--model-name",
+        "--strict_noise_check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="标签噪声实验中是否严格检查注噪表合法性。",
+    )
+    parser.add_argument("--result_root", type=str, default="result")
+    parser.add_argument(
+        "--checkpoint_root",
         type=str,
-        default="resnet50",
-        help="mask 保存路径中的模型名称",
+        default="checkpoint",
+        help="checkpoint 根目录；指定 --exp 时会自动追加实验名。",
     )
     parser.add_argument(
-        "--skip-saved",
+        "--skip_saved",
         action="store_true",
-        help="仅在显式传入该参数时，若目标 mask 已存在则跳过重新生成",
+        help="跳过已经保存的结果文件",
     )
     parser.add_argument(
-        "--group-candidate-pool-size",
-        type=int,
-        default=5,
-        help="group 模式下类内贪心候选池大小，1 表示纯贪心。",
-    )
-    parser.add_argument(
-        "--group-init-count",
-        type=int,
-        default=10,
-        help="group 模式下每个类别随机初始化的样本数。",
-    )
-    parser.add_argument(
-        "--debug-prompts",
-        action="store_true",
-        help="打印 tiny-imagenet 前几个最终英文 prompt（调试用）。",
+        "--load_checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="训练开始前是否加载已有 checkpoint",
     )
     return parser.parse_args()
-
-
-def _build_dataset(dataset_name: str, transform) -> datasets.VisionDataset:
-    data_root = PROJECT_ROOT / "data"
-    if dataset_name == CIFAR10:
-        return datasets.CIFAR10(root=str(data_root), train=True, download=True, transform=transform)
-    if dataset_name == CIFAR100:
-        return datasets.CIFAR100(root=str(data_root), train=True, download=True, transform=transform)
-    if dataset_name == TINY_IMAGENET:
-        train_root = data_root / "tiny-imagenet-200" / "train"
-        if not train_root.exists():
-            raise FileNotFoundError(f"tiny-imagenet train split not found: {train_root}")
-        return datasets.ImageFolder(root=str(train_root), transform=transform)
-    raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
 def parse_ratio_list(ratio_text: str) -> list[int]:
@@ -120,692 +139,542 @@ def parse_ratio_list(ratio_text: str) -> list[int]:
     return [int(item) for item in items]
 
 
-def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str, object]]:
-    data: dict[str, dict[str, dict[str, float]]] = {}
+def _root_for_exp(base_root: str | Path, exp: str | None) -> Path:
+    base = Path(base_root)
+    if exp is None:
+        return base
+
+    # Default result/checkpoint roots become result_label_noise/checkpoint_label_noise.
+    # Custom roots are handled consistently by appending the experiment name.
+    return base.with_name(f"{base.name}_{exp}")
+
+
+def _extract_labels(dataset: torch.utils.data.Dataset) -> np.ndarray:
+    if hasattr(dataset, "targets"):
+        return np.asarray(dataset.targets)
+    if hasattr(dataset, "labels"):
+        return np.asarray(dataset.labels)
+    if hasattr(dataset, "samples"):
+        return np.asarray([label for _, label in dataset.samples])
+    return np.asarray([dataset[idx][1] for idx in range(len(dataset))])
+
+
+def _set_dataset_labels(dataset: torch.utils.data.Dataset, labels: np.ndarray) -> None:
+    """Mutate a torchvision-style dataset so subsequent __getitem__ returns labels."""
+    labels_list = [int(x) for x in labels.tolist()]
     updated = False
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-            if isinstance(loaded, dict):
-                data = loaded
-    dataset_entry = data.get(dataset_name)
-    if not isinstance(dataset_entry, dict):
-        dataset_entry = {}
-        updated = True
-    naive = dataset_entry.get("naive")
-    if not isinstance(naive, dict):
-        naive = {}
-        updated = True
-    default_weight = 1.0 / 3.0
-    for key in ("dds", "div", "sa"):
-        if key not in naive:
-            naive[key] = default_weight
-            updated = True
 
-    naive_total = 0.0
-    for key in ("dds", "div", "sa"):
-        try:
-            naive[key] = float(naive[key])
-        except (TypeError, ValueError):
-            naive[key] = default_weight
-            updated = True
-        naive_total += naive[key]
-
-    if naive_total <= 0:
-        for key in ("dds", "div", "sa"):
-            naive[key] = default_weight
+    if hasattr(dataset, "targets"):
+        dataset.targets = labels_list
         updated = True
-    elif abs(naive_total - 1.0) > 1e-12:
-        for key in ("dds", "div", "sa"):
-            naive[key] /= naive_total
+    if hasattr(dataset, "labels"):
+        dataset.labels = labels_list
         updated = True
 
-    dataset_entry["naive"] = naive
-    data[dataset_name] = dataset_entry
-    if updated or not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+    # ImageFolder/DatasetFolder also stores labels inside samples/imgs.
+    if hasattr(dataset, "samples"):
+        dataset.samples = [(path, int(labels[idx])) for idx, (path, _) in enumerate(dataset.samples)]
+        updated = True
+    if hasattr(dataset, "imgs"):
+        dataset.imgs = [(path, int(labels[idx])) for idx, (path, _) in enumerate(dataset.imgs)]
+        updated = True
+
+    if not updated:
+        raise TypeError(
+            "当前训练集对象不支持原地修改标签。请确认 BaseDataLoader 返回的是 "
+            "torchvision CIFAR/ImageFolder 风格数据集。"
+        )
+
+
+def read_noise_list(noise_path: Path) -> np.ndarray:
+    if not noise_path.exists():
+        raise FileNotFoundError(f"未找到标签注噪文件: {noise_path}")
+    mapping = np.loadtxt(noise_path, dtype=np.int64)
+    if mapping.ndim == 1:
+        mapping = mapping.reshape(1, 2)
+    if mapping.ndim != 2 or mapping.shape[1] != 2:
+        raise ValueError(f"标签注噪文件必须是两列 txt: {noise_path}, 当前 shape={mapping.shape}")
+    return mapping
+
+
+def apply_label_noise_to_dataset(
+    dataset: torch.utils.data.Dataset,
+    dataset_name: str,
+    seed: int,
+    noise_root: Path,
+    num_classes: int,
+    strict: bool = True,
+) -> dict[str, object]:
+    """Apply fixed label noise to the training dataset in-place.
+
+    The noise list uses the original training-set order. Since this script loads
+    train split with val_split=0.0, the dataset order should match the original
+    torchvision training order.
+    """
+    clean_labels = _extract_labels(dataset).astype(np.int64)
+    num_total = int(clean_labels.shape[0])
+
+    noise_path = noise_root / dataset_name / f"noise_list_{seed}.txt"
+    mapping = read_noise_list(noise_path)
+    noisy_indices = mapping[:, 0].astype(np.int64)
+    noisy_new_labels = mapping[:, 1].astype(np.int64)
+
+    if strict:
+        if len(np.unique(noisy_indices)) != len(noisy_indices):
+            raise ValueError(f"标签注噪文件存在重复 sample_id: {noise_path}")
+        if np.any(noisy_indices < 0) or np.any(noisy_indices >= num_total):
+            raise ValueError(f"标签注噪文件存在越界 sample_id: {noise_path}")
+        if np.any(noisy_new_labels < 0) or np.any(noisy_new_labels >= num_classes):
+            raise ValueError(f"标签注噪文件存在越界 noisy_label: {noise_path}")
+        same = noisy_new_labels == clean_labels[noisy_indices]
+        if np.any(same):
+            raise ValueError(
+                f"标签注噪文件中有 {int(np.sum(same))} 个 noisy_label 与原始标签相同: {noise_path}"
+            )
+
+    noisy_labels = clean_labels.copy()
+    noisy_labels[noisy_indices] = noisy_new_labels
+    _set_dataset_labels(dataset, noisy_labels)
+
+    is_noisy = np.zeros(num_total, dtype=bool)
+    is_noisy[noisy_indices] = True
+
     return {
-        group_name: group
-        for group_name, group in dataset_entry.items()
-        if isinstance(group, dict)
+        "noise_path": str(noise_path),
+        "num_noisy": int(noisy_indices.shape[0]),
+        "noise_ratio": float(noisy_indices.shape[0] / num_total) if num_total else 0.0,
+        "num_total": num_total,
+        "noisy_indices": noisy_indices,
+        "is_noisy": is_noisy,
     }
 
 
-def _to_weight_triplet(selected: dict[str, object], group_name: str) -> dict[str, float]:
-    required = {"dds", "div", "sa"}
-    missing = required - selected.keys()
-    if missing:
-        missing_str = ", ".join(sorted(missing))
-        raise ValueError(f"权重组 {group_name} 缺少必要键: {missing_str}")
-    weights: dict[str, float] = {}
-    for key in sorted(required):
-        value = selected[key]
-        try:
-            weights[key] = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"权重组 {group_name} 的 {key} 无法转换为 float。") from exc
-    return weights
-
-
-def load_scoring_weights(
-    all_weights: dict[str, dict[str, object]],
-    weight_group: str,
-    seed: int,
-) -> dict[str, float]:
-    mode = weight_group.strip().lower()
-    if mode not in {"naive", "learned"}:
-        raise ValueError("weight-group 仅支持 {'naive', 'learned'}")
-
-    if mode == "naive":
-        selected = all_weights.get("naive")
-        if selected is None or not isinstance(selected, dict):
-            raise KeyError("未找到 naive 权重组。")
-        return _to_weight_triplet(selected, "naive")
-
-    selected = all_weights.get(str(seed))
-    if selected is None or not isinstance(selected, dict):
-        raise KeyError(f"未找到 learned 权重组（seed={seed}）。")
-    return _to_weight_triplet(selected, str(seed))
-
-
-def build_score_loader(
-    preprocess,
-    dataset_name: str,
-    device: torch.device,
-    batch_size: int,
-    num_workers: int,
-) -> DataLoader:
-    dataset = _build_dataset(dataset_name, preprocess)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-    )
-
-
-def _hash_file(path: Path) -> str:
-    hasher = hashlib.sha1()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def _mean_stats_cache_path(
-    dataset_name: str,
-    clip_model: str,
-    adapter_image_path: str,
-) -> Path:
-    adapter_sha1 = _hash_file(Path(adapter_image_path))
-    clip_tag = clip_model.replace("/", "-").replace(" ", "_")
-    return PROJECT_ROOT / "static_scores" / "group_mean_stats" / dataset_name / clip_tag / f"img_adapter_{adapter_sha1}.npz"
-
-
-def _get_or_compute_group_mean_stats(
-    *,
-    cache_path: Path,
-    image_features: np.ndarray,
-    labels: np.ndarray,
-    num_classes: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    n_samples = int(image_features.shape[0])
-    feat_dim = int(image_features.shape[1]) if image_features.ndim == 2 else 0
-    if cache_path.exists():
-        try:
-            cached = np.load(cache_path, allow_pickle=False)
-            cached_n = int(np.asarray(cached["n_samples"]).item())
-            cached_dim = int(np.asarray(cached["feat_dim"]).item())
-            cached_cls = int(np.asarray(cached["num_classes"]).item())
-            means = np.asarray(cached["full_class_mean"], dtype=np.float32)
-            vars_ = np.asarray(cached["full_class_var"], dtype=np.float32)
-            if (
-                cached_n == n_samples
-                and cached_dim == feat_dim
-                and cached_cls == int(num_classes)
-                and means.shape == (num_classes, feat_dim)
-                and vars_.shape == (num_classes,)
-            ):
-                return means, vars_
-        except Exception:
-            pass
-
-    full_class_mean = np.zeros((num_classes, feat_dim), dtype=np.float32)
-    full_class_var = np.zeros((num_classes,), dtype=np.float32)
-    for class_id in range(num_classes):
-        class_mask = labels == class_id
-        class_feats = image_features[class_mask]
-        if class_feats.shape[0] == 0:
-            continue
-        class_mean = np.mean(class_feats, axis=0, dtype=np.float32)
-        diff = class_feats - class_mean
-        sigma2 = float(np.mean(np.sum(diff * diff, axis=1)))
-        full_class_mean[class_id] = class_mean
-        full_class_var[class_id] = np.float32(max(sigma2, 0.0))
-
-    np.savez_compressed(
-        cache_path,
-        full_class_mean=full_class_mean,
-        full_class_var=full_class_var,
-        n_samples=np.asarray(n_samples, dtype=np.int64),
-        feat_dim=np.asarray(feat_dim, dtype=np.int64),
-        num_classes=np.asarray(num_classes, dtype=np.int64),
-    )
-    return full_class_mean, full_class_var
-
-
-def select_topk_mask(
-    scores: np.ndarray,
+def select_random_indices_by_class(
     labels: np.ndarray,
     num_classes: int,
     keep_ratio: int,
-) -> tuple[np.ndarray, dict[int, int]]:
-    if keep_ratio <= 0 or keep_ratio > 100:
-        raise ValueError("kr 必须在 1-100 之间。")
-    mask = np.zeros(scores.shape[0], dtype=np.uint8)
-    selected_by_class: dict[int, int] = {}
+    seed: int,
+) -> np.ndarray:
+    if keep_ratio <= 0:
+        raise ValueError("keep_ratio must be positive")
+    if keep_ratio > 100:
+        raise ValueError("keep_ratio must be <= 100")
+    rng = np.random.default_rng(seed)
+    selected: list[int] = []
     ratio = keep_ratio / 100.0
     for class_id in range(num_classes):
         class_indices = np.flatnonzero(labels == class_id)
         if class_indices.size == 0:
-            selected_by_class[class_id] = 0
             continue
         if keep_ratio == 100:
             num_select = class_indices.size
         else:
             num_select = max(1, int(class_indices.size * ratio))
-        class_scores = scores[class_indices]
-        topk_indices = class_indices[
-            np.argpartition(-class_scores, num_select - 1)[:num_select]
-        ]
-        mask[topk_indices] = 1
-        selected_by_class[class_id] = int(num_select)
-    return mask, selected_by_class
+        chosen = rng.choice(class_indices, size=num_select, replace=False)
+        selected.extend(chosen.tolist())
+    return np.sort(np.asarray(selected, dtype=np.int64))
 
 
-def select_group_mask(
-    sa_raw_scores: np.ndarray,
-    div_metric: Div,
-    div_loader: DataLoader,
-    image_adapter,
-    labels: np.ndarray,
-    weights: dict[str, float],
-    num_classes: int,
-    keep_ratio: int,
-    device: torch.device,
+def load_selection_mask(
     dataset_name: str,
+    mode: str,
+    keep_ratio: int,
     seed: int,
-    weight_group: str,
-    clip_model: str,
-    adapter_image_path: str,
-    div_static_scores: np.ndarray | None = None,
-    dds_static_scores: np.ndarray | None = None,
-    group_candidate_pool_size: int = 1,
-    group_init_count: int = 2,
-) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
-    if keep_ratio <= 0 or keep_ratio > 100:
-        raise ValueError("kr 必须在 1-100 之间。")
+    model_name: str,
+) -> np.ndarray:
+    """Load a 0/1 mask for a selection method.
 
-    num_samples = sa_raw_scores.shape[0]
-    labels_np = np.asarray(labels, dtype=np.int64)
-    sa_raw_np = np.asarray(sa_raw_scores, dtype=np.float32)
-    # Static cache stores raw metric scores. Static Div is retained for future use;
-    # current group scoring uses raw SA, raw DDS, dynamic raw Div, and distribution correction.
-    div_static_raw_np = np.asarray(div_static_scores, dtype=np.float32) if div_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
-    dds_raw_np = np.asarray(dds_static_scores, dtype=np.float32) if dds_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
-    if labels_np.shape[0] != num_samples or div_static_raw_np.shape[0] != num_samples or dds_raw_np.shape[0] != num_samples:
-        raise ValueError("样本数不一致，无法执行 group。")
-
-    sr = float(keep_ratio) / 100.0
-    target_size = int(round(sr * num_samples))
-    target_size = min(num_samples, max(1, target_size)) if num_samples > 0 else 0
-    if target_size <= 0:
-        raise ValueError("target_size 必须大于 0。")
-
-    class_indices_list = [np.flatnonzero(labels_np == c).astype(np.int64) for c in range(num_classes)]
-    rng = np.random.default_rng(seed)
-    labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
-
-    div_features, _ = div_metric._encode_images(div_loader, image_adapter)
-    div_features_np = (
-        div_features.detach().cpu().numpy()
-        if isinstance(div_features, torch.Tensor)
-        else np.asarray(div_features)
-    ).astype(np.float32)
-
-    mean_stats_cache_path = _mean_stats_cache_path(
-        dataset_name=dataset_name,
-        clip_model=clip_model,
-        adapter_image_path=adapter_image_path,
+    The mask should have shape (N,) and values in {0, 1}, where 1 indicates
+    the sample is selected.
+    """
+    mask_seed = CONFIG.global_seed if mode == "my_naive" else seed
+    mask_path = resolve_mask_path(
+        mode=mode,
+        dataset=dataset_name,
+        model=model_name,
+        seed=mask_seed,
+        keep_ratio=keep_ratio,
     )
-    full_class_mean, _ = _get_or_compute_group_mean_stats(
-        cache_path=mean_stats_cache_path,
-        image_features=div_features_np,
-        labels=labels_np,
-        num_classes=num_classes,
+    if not mask_path.exists():
+        raise FileNotFoundError(f"未找到 mask 文件: {mask_path}")
+    with np.load(mask_path) as data:
+        if "mask" in data:
+            mask = data["mask"]
+        elif len(data.files) == 1:
+            mask = data[data.files[0]]
+        else:
+            raise ValueError(f"mask 文件格式不正确: {mask_path}")
+    return np.asarray(mask)
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    for images, labels in loader:
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs = model(images)
+        preds = outputs.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+    return correct / total if total else 0.0
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+    epoch: int,
+    total_epochs: int,
+    use_amp: bool,
+    grad_accum_steps: int,
+    scaler: GradScaler,
+    position: int = 1,
+) -> float:
+    model.train()
+    running_loss = 0.0
+    progress = create_transient_batch_bar(
+        loader,
+        desc=f"Train batch {epoch}/{total_epochs}",
+        position=position,
     )
-    full_class_mean_f32 = full_class_mean.astype(np.float32, copy=False)
+    optimizer.zero_grad(set_to_none=True)
+    total_batches = len(loader)
+    for batch_idx, (images, labels) in enumerate(progress, start=1):
+        images = images.to(device)
+        labels = labels.to(device)
 
-    def _allocate_class_budgets() -> np.ndarray:
-        class_sizes = np.asarray([idx.size for idx in class_indices_list], dtype=np.int64)
-        raw = class_sizes.astype(np.float64) * sr
-        floor_budget = np.floor(raw).astype(np.int64)
-        floor_budget = np.minimum(floor_budget, class_sizes)
-        need = int(target_size - np.sum(floor_budget))
-        if need <= 0:
-            return floor_budget
-        frac = raw - floor_budget.astype(np.float64)
-        order = np.lexsort((np.arange(num_classes, dtype=np.int64), -frac))
-        budgets = floor_budget.copy()
-        for class_id in order:
-            if need <= 0:
-                break
-            if budgets[class_id] >= class_sizes[class_id]:
-                continue
-            budgets[class_id] += 1
-            need -= 1
-        if need != 0:
-            raise RuntimeError("类别预算分配失败，无法满足目标总样本数。")
-        return budgets
+        with autocast(enabled=use_amp):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
 
-    class_budgets = _allocate_class_budgets()
-    candidate_pool_size = max(1, int(group_candidate_pool_size))
-    # dist_weight_max = max(0.0, 1.0 - 0.01 * float(keep_ratio))
-    dist_weight_max = max(0.0, 0.8 - 0.005 * keep_ratio)
-    dist_weight_min = 0.5 * dist_weight_max
-
-    selected_mask = np.zeros(num_samples, dtype=np.uint8)
-    class_selected_counts = np.zeros(num_classes, dtype=np.int64)
-    class_selected_sum = np.zeros((num_classes, div_features_np.shape[1]), dtype=np.float32)
-    init_per_class = np.zeros(num_classes, dtype=np.int64)
-    requested_init_count = max(0, int(group_init_count))
-
-    for class_id, class_indices in enumerate(class_indices_list):
-        budget = int(class_budgets[class_id])
-        if class_indices.size == 0 or budget <= 0 or requested_init_count <= 0:
-            continue
-        init_count = min(requested_init_count, budget, int(class_indices.size))
-        init_per_class[class_id] = init_count
-        top_pool_size = max(init_count, int(np.ceil(0.5 * class_indices.size)))
-        top_pool_size = min(int(class_indices.size), max(1, top_pool_size))
-        ranked_by_sa = np.argsort(-sa_raw_np[class_indices], kind="mergesort")[:top_pool_size]
-        init_pool = class_indices[ranked_by_sa]
-        if init_pool.size <= init_count:
-            init_indices = init_pool
+        loss_for_backward = loss / grad_accum_steps
+        if scaler.is_enabled():
+            scaler.scale(loss_for_backward).backward()
         else:
-            init_indices = rng.choice(init_pool, size=init_count, replace=False).astype(np.int64)
-        selected_mask[init_indices] = 1
-        class_selected_counts[class_id] = init_count
-        class_selected_sum[class_id] = np.sum(div_features_np[init_indices], axis=0, dtype=np.float32)
+            loss_for_backward.backward()
 
-    selected_count_history: list[int] = [int(np.sum(selected_mask))]
-    total_to_add = int(np.sum(class_budgets) - np.sum(init_per_class))
-    pbar = tqdm(total=total_to_add, desc="[group] classwise greedy add", unit="sample")
-    round_id = 0
-    total_score_acc = 0.0
-
-    while True:
-        remaining_by_class = class_budgets - class_selected_counts
-        active_classes = np.flatnonzero(remaining_by_class > 0).astype(np.int64)
-        if active_classes.size == 0:
-            break
-        round_id += 1
-        remain_total = int(np.sum(remaining_by_class))
-        if remain_total < active_classes.size:
-            chosen_classes = np.sort(rng.choice(active_classes, size=remain_total, replace=False).astype(np.int64))
-        else:
-            chosen_classes = active_classes
-
-        for class_id in chosen_classes:
-            class_indices = class_indices_list[int(class_id)]
-            unselected_mask = selected_mask[class_indices] == 0
-            candidate_indices = class_indices[unselected_mask]
-            if candidate_indices.size == 0:
-                continue
-
-            current_count = int(class_selected_counts[class_id])
-            if current_count <= 0:
-                continue
-            class_budget = int(class_budgets[class_id])
-            progress = current_count / float(class_budget) if class_budget > 0 else 1.0
-            progress = float(np.clip(progress, 0.0, 1.0))
-            dist_weight_t = dist_weight_min + (dist_weight_max - dist_weight_min) * progress
-            current_sum = class_selected_sum[class_id]
-            mu_full = full_class_mean_f32[class_id]
-            mu_sub = current_sum / float(current_count)
-            old_dist = float(np.linalg.norm(mu_sub - mu_full))
-
-            dynamic_k = max(3, int(ceil(0.05 * current_count)))
-
-            candidate_features_t = torch.as_tensor(div_features_np[candidate_indices], dtype=torch.float32, device=device)
-            reference_indices = class_indices[selected_mask[class_indices] > 0]
-            reference_features_t = torch.as_tensor(div_features_np[reference_indices], dtype=torch.float32, device=device)
-            div_raw = div_metric._knn_mean_distance_to_reference(
-                query_features=candidate_features_t,
-                reference_features=reference_features_t,
-                k=float(dynamic_k),
-                query_indices=torch.as_tensor(candidate_indices, dtype=torch.long, device=device),
-                reference_indices=torch.as_tensor(reference_indices, dtype=torch.long, device=device),
-            ).detach().cpu().numpy().astype(np.float32)
-            div_local = standard_zscore(div_raw)
-
-            candidate_features_np = div_features_np[candidate_indices]
-            mu_new = (current_sum[None, :] + candidate_features_np) / float(current_count + 1)
-            new_dist = np.linalg.norm(mu_new - mu_full[None, :], axis=1)
-            dist_improve = (old_dist - new_dist).astype(np.float32)
-            dist_local = standard_zscore(dist_improve)
-            sa_local = standard_zscore(sa_raw_np[candidate_indices])
-            dds_local = standard_zscore(dds_raw_np[candidate_indices])
-
-            combined_scores = (
-                weights["sa"] * sa_local
-                + weights["dds"] * dds_local
-                + weights["div"] * div_local
-                + dist_weight_t * dist_local
-            ).astype(np.float32)
-            rank = np.argsort(-combined_scores, kind="mergesort")
-            pool_n = min(candidate_pool_size, candidate_indices.size)
-            pool_indices = candidate_indices[rank[:pool_n]]
-            if pool_n == 1:
-                picked_idx = int(pool_indices[0])
+        should_step = (batch_idx % grad_accum_steps == 0) or (batch_idx == total_batches)
+        if should_step:
+            if scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                picked_idx = int(rng.choice(pool_indices, size=1, replace=False)[0])
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-            selected_mask[picked_idx] = 1
-            class_selected_counts[class_id] += 1
-            class_selected_sum[class_id] += div_features_np[picked_idx]
-            total_score_acc += float(np.max(combined_scores))
-            selected_count_history.append(int(np.sum(selected_mask)))
-            pbar.update(1)
-            pbar.set_postfix(active_classes=int(active_classes.size))
-    pbar.close()
+        running_loss += loss.item() * images.size(0)
 
-    final_mask = selected_mask.astype(np.uint8)
-    selected_by_class: dict[int, int] = {}
-    for class_id in range(num_classes):
-        class_indices = class_indices_list[class_id]
-        selected_by_class[class_id] = int(final_mask[class_indices].sum()) if class_indices.size > 0 else 0
+    return running_loss / len(loader.dataset)
 
-    final_div_scores = np.asarray(
-        div_metric.score_dataset_dynamic(
-            div_loader,
-            adapter=image_adapter,
-            selected_mask=final_mask,
-            image_features=div_features,
-            labels=labels_t,
-        ).scores,
-        dtype=np.float32,
-    )
-    selected_bool = final_mask.astype(bool)
-    final_div_z = standard_zscore_by_class(final_div_scores, labels_np)
-    subset_comprehensive_score = float(
-        np.sum(
-            (
-                weights["sa"] * standard_zscore_by_class(sa_raw_np, labels_np)
-                + weights["dds"] * standard_zscore_by_class(dds_raw_np, labels_np)
-                + weights["div"] * final_div_z
-            )[selected_bool],
-            dtype=np.float64,
+
+def prepare_selection_indices(
+    dataset_name: str,
+    mode: str,
+    keep_ratio: int,
+    seed: int,
+    dataset: torch.utils.data.Dataset,
+    num_classes: int,
+    model_name: str,
+) -> np.ndarray:
+    if mode == "random":
+        labels = _extract_labels(dataset)
+        return select_random_indices_by_class(labels, num_classes, keep_ratio, seed)
+
+    mask = load_selection_mask(dataset_name, mode, keep_ratio, seed, model_name)
+    if mask.shape[0] != len(dataset):
+        raise ValueError(
+            f"mask 长度与训练集长度不一致: mask={mask.shape[0]}, train={len(dataset)}, "
+            f"dataset={dataset_name}, mode={mode}, kr={keep_ratio}, seed={seed}"
         )
-    )
+    mask = np.asarray(mask).astype(bool)
+    return np.flatnonzero(mask)
 
-    class_shift_values: list[float] = []
-    for class_id in range(num_classes):
-        if class_selected_counts[class_id] <= 0:
-            continue
-        mu_sub = class_selected_sum[class_id] / float(class_selected_counts[class_id])
-        mu_full = full_class_mean_f32[class_id]
-        class_shift_values.append(float(np.linalg.norm(mu_sub - mu_full)))
-    distribution_shift = float(np.mean(class_shift_values)) if class_shift_values else 0.0
 
-    stats: dict[str, object] = {
-        "solver": "group_classwise_greedy_add",
-        "sr": float(sr),
-        "dist_weight": float(dist_weight_max),
-        "dist_weight_schedule": "linear_increase_by_class_progress",
-        "dist_weight_max": float(dist_weight_max),
-        "dist_weight_min": float(dist_weight_min),
-        "final_rate": float(final_mask.mean()),
-        "selected_by_class": selected_by_class,
-        "class_budgets": {int(c): int(v) for c, v in enumerate(class_budgets.tolist())},
-        "init_per_class": {int(c): int(v) for c, v in enumerate(init_per_class.tolist())},
-        "candidate_pool_size": int(candidate_pool_size),
-        "selected_count_history": selected_count_history,
-        "accumulated_greedy_score": float(total_score_acc),
-        "subset_comprehensive_score": subset_comprehensive_score,
-        "distribution_shift": distribution_shift,
+def _selected_noise_stats(selected_indices: np.ndarray, noise_info: dict[str, object] | None) -> dict[str, object]:
+    if noise_info is None:
+        return {}
+
+    is_noisy = np.asarray(noise_info["is_noisy"], dtype=bool)
+    selected_is_noisy = is_noisy[selected_indices]
+    num_selected = int(selected_indices.shape[0])
+    num_noisy_selected = int(np.sum(selected_is_noisy))
+    return {
+        "num_noisy_selected": num_noisy_selected,
+        "noise_ratio_in_selection": float(num_noisy_selected / num_selected) if num_selected else 0.0,
     }
-    return final_mask, selected_by_class, stats
+
+
+def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
+    del multi_seed  # kept for backward-compatible function signature
+
+    set_seed(seed)
+    device = torch.device(args.device) if args.device else CONFIG.global_device
+
+    data_loader = BaseDataLoader(
+        args.dataset,
+        data_path=Path(args.data_root),
+        batch_size=args.physical_batch_size,
+        num_workers=args.num_workers,
+        val_split=0.0,
+        seed=seed,
+    )
+    train_loader, _, test_loader = data_loader.load()
+    train_dataset = train_loader.dataset
+
+    noise_info: dict[str, object] | None = None
+    if args.exp == "label_noise":
+        noise_info = apply_label_noise_to_dataset(
+            dataset=train_dataset,
+            dataset_name=args.dataset,
+            seed=seed,
+            noise_root=Path(args.noise_root),
+            num_classes=data_loader.num_classes,
+            strict=args.strict_noise_check,
+        )
+        tqdm.write(
+            f"Applied label noise: dataset={args.dataset}, seed={seed}, "
+            f"num_noisy={noise_info['num_noisy']}/{noise_info['num_total']} "
+            f"({noise_info['noise_ratio']:.4f}), path={noise_info['noise_path']}"
+        )
+
+    model_name = args.model
+    keep_ratios = parse_ratio_list(args.kr)
+    model_factory = get_model(model_name)
+
+    result_root = _root_for_exp(args.result_root, args.exp)
+    checkpoint_root = _root_for_exp(args.checkpoint_root, args.exp)
+
+    for keep_ratio in keep_ratios:
+        # Result files are model-sensitive and therefore include the model name.
+        result_path = resolve_result_path(
+            mode=args.mode,
+            dataset=args.dataset,
+            model=model_name,
+            seed=seed,
+            keep_ratio=keep_ratio,
+            root=result_root,
+        )
+        result_dir = result_path.parent
+        checkpoint_path = resolve_checkpoint_path(
+            mode=args.mode,
+            dataset=args.dataset,
+            model=model_name,
+            seed=seed,
+            keep_ratio=keep_ratio,
+            root=checkpoint_root,
+        )
+        checkpoint_dir = checkpoint_path.parent
+        if args.skip_saved and result_path.exists():
+            continue
+
+        start_time = time.time()
+        selected_indices = prepare_selection_indices(
+            args.dataset,
+            args.mode,
+            keep_ratio,
+            seed,
+            train_dataset,
+            data_loader.num_classes,
+            model_name,
+        )
+        noise_selection_stats = _selected_noise_stats(selected_indices, noise_info)
+        if noise_selection_stats:
+            tqdm.write(
+                f"Selection stats: mode={args.mode}, kr={keep_ratio}, "
+                f"num_selected={len(selected_indices)}, "
+                f"noisy_selected={noise_selection_stats['num_noisy_selected']}, "
+                f"noise_ratio_in_selection={noise_selection_stats['noise_ratio_in_selection']:.4f}"
+            )
+
+        subset = Subset(train_dataset, selected_indices.tolist())
+
+        generator = torch.Generator().manual_seed(seed)
+        subset_loader = DataLoader(
+            subset,
+            batch_size=args.physical_batch_size,
+            shuffle=True,
+            generator=generator,
+            num_workers=args.num_workers,
+            drop_last=False,
+        )
+
+        model = model_factory(num_classes=data_loader.num_classes).to(device)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = SGD(
+            model.parameters(),
+            lr=args.init_lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+        scheduler = MultiStepLR(
+            optimizer,
+            milestones=args.lr_milestones,
+            gamma=args.lr_gamma,
+        )
+        runtime_use_amp = bool(args.use_amp and device.type == "cuda")
+        scaler = GradScaler(enabled=runtime_use_amp)
+
+        accuracy_samples: list[float] = []
+        start_eval_epoch = max(1, args.epochs - 9)
+        start_epoch = 1
+        if args.load_checkpoint and checkpoint_path.exists():
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state"])
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+            scheduler.load_state_dict(checkpoint["scheduler_state"])
+            accuracy_samples = list(checkpoint.get("accuracy_samples", []))
+            if checkpoint.get("scaler_state") is not None and scaler.is_enabled():
+                scaler.load_state_dict(checkpoint["scaler_state"])
+            start_epoch = int(checkpoint["epoch"]) + 1
+            elapsed_time = float(checkpoint.get("elapsed_time", 0.0))
+            start_time = time.time() - elapsed_time
+
+        epoch_bar = create_persistent_bar(
+            total=args.epochs,
+            desc=f"[seed={seed}] mode={args.mode} kr={keep_ratio}",
+            position=0,
+            initial=max(0, start_epoch - 1),
+        )
+        test_status = PersistentStatusLine(
+            "Last-10 test accs (0/10): []",
+            position=2,
+        )
+        if accuracy_samples:
+            formatted = ", ".join(f"{acc:.4f}" for acc in accuracy_samples)
+            test_status.update(
+                f"Last-10 test accs ({len(accuracy_samples)}/10): [{formatted}]"
+            )
+
+        for epoch in range(start_epoch, args.epochs + 1):
+            epoch_bar.set_postfix_str(f"epoch={epoch}/{args.epochs}")
+            train_one_epoch(
+                model,
+                subset_loader,
+                optimizer,
+                criterion,
+                device,
+                epoch,
+                args.epochs,
+                runtime_use_amp,
+                args.grad_accum_steps,
+                scaler,
+                position=1,
+            )
+            scheduler.step()
+            if epoch >= start_eval_epoch:
+                eval_accuracy = round(
+                    float(evaluate(model, test_loader, device)),
+                    4,
+                )
+                accuracy_samples.append(eval_accuracy)
+                formatted = ", ".join(f"{acc:.4f}" for acc in accuracy_samples)
+                test_status.update(
+                    f"Last-10 test accs ({len(accuracy_samples)}/10): [{formatted}]"
+                )
+            if epoch % 20 == 0:
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                checkpoint_payload = {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "scaler_state": scaler.state_dict() if scaler.is_enabled() else None,
+                    "accuracy_samples": accuracy_samples,
+                    "elapsed_time": time.time() - start_time,
+                    "use_amp": runtime_use_amp,
+                    "grad_accum_steps": args.grad_accum_steps,
+                    "physical_batch_size": args.physical_batch_size,
+                    "effective_batch_size": args.effective_batch_size,
+                    "exp": args.exp,
+                }
+                if noise_info is not None:
+                    checkpoint_payload["noise_path"] = noise_info["noise_path"]
+                torch.save(checkpoint_payload, checkpoint_path)
+            epoch_bar.update(1)
+
+        total_time = time.time() - start_time
+        accuracy = float(np.mean(accuracy_samples)) if accuracy_samples else 0.0
+        accuracy_std = float(np.std(accuracy_samples, ddof=0)) if accuracy_samples else 0.0
+        accuracy = round(accuracy, 4)
+        accuracy_std = round(accuracy_std, 4)
+
+        result_dir.mkdir(parents=True, exist_ok=True)
+
+        metadata = {
+            "dataset": args.dataset,
+            "data_root": str(Path(args.data_root)),
+            "exp": args.exp,
+            "result_root": str(result_root),
+            "model": model_name,
+            "keep_ratio": keep_ratio,
+            "selection_method": args.mode,
+            "seed": seed,
+            "epochs": args.epochs,
+            "batch_size": args.physical_batch_size,
+            "physical_batch_size": args.physical_batch_size,
+            "grad_accum_steps": args.grad_accum_steps,
+            "effective_batch_size": args.effective_batch_size,
+            "reference_effective_batch_size": args.reference_effective_batch_size,
+            "optimizer": "SGD",
+            "momentum": args.momentum,
+            "weight_decay": args.weight_decay,
+            "init_lr": args.init_lr,
+            "use_amp": runtime_use_amp,
+            "lr_schedule": {
+                "type": "MultiStepLR",
+                "milestones": args.lr_milestones,
+                "gamma": args.lr_gamma,
+            },
+            "num_selected": len(selected_indices),
+            "num_total": len(train_dataset),
+        }
+        if noise_info is not None:
+            metadata.update(
+                {
+                    "noise_root": str(Path(args.noise_root)),
+                    "noise_path": noise_info["noise_path"],
+                    "noise_rate": noise_info["noise_ratio"],
+                    "num_noisy_total": int(noise_info["num_noisy"]),
+                    "num_noisy_selected": int(noise_selection_stats["num_noisy_selected"]),
+                    "noise_ratio_in_selection": float(noise_selection_stats["noise_ratio_in_selection"]),
+                }
+            )
+
+        result_payload = {
+            "metadata": metadata,
+            "accuracy": accuracy,
+            "accuracy_mean": accuracy,
+            "accuracy_std": accuracy_std,
+            "accuracy_samples": accuracy_samples,
+            "time_seconds": total_time,
+        }
+
+        with result_path.open("w", encoding="utf-8") as f:
+            json.dump(result_payload, f, ensure_ascii=False, indent=2)
+
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+        epoch_bar.close()
+        test_status.close()
+        tqdm.write(f"Saved result to {result_path}")
+        tqdm.write(
+            f"Last-10 test accs: [{', '.join(f'{acc:.4f}' for acc in accuracy_samples)}]"
+        )
+        tqdm.write(f"Last-10 mean/std: mean={accuracy:.4f}, std={accuracy_std:.4f}")
 
 
 def main() -> None:
-    total_start = time.perf_counter()
     args = parse_args()
-    dataset_name = args.dataset.strip().lower()
-
-    device = torch.device(args.device) if args.device is not None else CONFIG.global_device
-    method = args.method.strip().lower()
-    if method not in {"topk", "group"}:
-        raise ValueError(f"未知 method={method}，应为 {{'topk','group'}}")
-
-    weight_group = args.weight_group.strip().lower()
-    if weight_group not in {"naive", "learned"}:
-        raise ValueError("weight-group 仅支持 {'naive', 'learned'}")
-
-    weights_path = PROJECT_ROOT / "weights" / "scoring_weights.json"
-    all_weights = ensure_scoring_weights(weights_path, dataset_name)
-
-    data_load_start = time.perf_counter()
-    dataset_for_names = _build_dataset(dataset_name, transform=None)
-    class_names = resolve_class_names_for_prompts(
-        dataset_name=dataset_name,
-        data_root=PROJECT_ROOT / "data",
-        class_names=dataset_for_names.classes,  # type: ignore[attr-defined]
-    )
-    print(
-        f"[Init] {dataset_name} data ready | samples={len(dataset_for_names)} | elapsed={time.perf_counter() - data_load_start:.2f}s"
-    )
-
-    metric_init_start = time.perf_counter()
-    dds_metric = DifficultyDirection(
-        class_names=class_names, clip_model=args.clip_model, device=device
-    )
-    div_metric = Div(
-        class_names=class_names,
-        clip_model=args.clip_model,
-        device=device,
-    )
-    sa_metric = SemanticAlignment(
-        class_names=class_names,
-        clip_model=args.clip_model,
-        device=device,
-        dataset_name=dataset_name,
-        data_root=str(PROJECT_ROOT / "data"),
-        debug_prompts=args.debug_prompts,
-    )
-    print(
-        f"[Init] Metrics ready (DDS/Div/SA) | elapsed={time.perf_counter() - metric_init_start:.2f}s"
-    )
-
-    batch_size = 128
-    num_workers = 4
-
-    loader_build_start = time.perf_counter()
-    dds_loader = build_score_loader(
-        dds_metric.extractor.preprocess,
-        dataset_name,
-        device,
-        batch_size,
-        num_workers,
-    )
-    div_loader = build_score_loader(
-        div_metric.extractor.preprocess,
-        dataset_name,
-        device,
-        batch_size,
-        num_workers,
-    )
-    sa_loader = build_score_loader(
-        sa_metric.extractor.preprocess,
-        dataset_name,
-        device,
-        batch_size,
-        num_workers,
-    )
-    print(
-        f"[Init] DataLoaders ready (DDS/Div/SA) | elapsed={time.perf_counter() - loader_build_start:.2f}s"
-    )
-
-    method_name = f"{weight_group}_{method}"
-    keep_ratios = parse_ratio_list(args.kr)
-    if not keep_ratios:
-        raise ValueError("kr 参数不能为空。")
+    args = apply_dataset_defaults(args)
     seeds = parse_seed_list(args.seed)
-    if not seeds:
-        raise ValueError("seed 参数不能为空。")
-
-    total_tasks = len(seeds) * len(keep_ratios)
-    task_idx = 0
-
+    multi_seed = len(seeds) > 1
     for seed in seeds:
-        set_seed(seed)
-        weights = load_scoring_weights(all_weights, weight_group, seed)
-        image_adapter, text_adapter, adapter_paths = load_trained_adapters(
-            dataset_name=dataset_name,
-            clip_model=args.clip_model,
-            input_dim=dds_metric.extractor.embed_dim,
-            seed=seed,
-            map_location=device,
-        )
-        image_adapter.to(device).eval()
-        text_adapter.to(device).eval()
-
-        num_samples = len(dataset_for_names)
-
-        def _compute_scores() -> dict[str, np.ndarray]:
-            dds_scores_local = dds_metric.score_dataset(
-                tqdm(dds_loader, desc="Scoring DDS", unit="batch"),
-                adapter=image_adapter,
-            ).scores
-            div_scores_local = div_metric.score_dataset(
-                tqdm(div_loader, desc="Scoring Div", unit="batch"),
-                adapter=image_adapter,
-            ).scores
-            sa_scores_local = sa_metric.score_dataset(
-                tqdm(sa_loader, desc="Scoring SA", unit="batch"),
-                adapter_image=image_adapter,
-                adapter_text=text_adapter,
-            ).scores
-            return {
-                "sa": np.asarray(sa_scores_local),
-                "div": np.asarray(div_scores_local),
-                "dds": np.asarray(dds_scores_local),
-                "labels": np.asarray(dataset_for_names.targets),
-            }
-
-        static_compute_start = time.perf_counter()
-        static_scores = get_or_compute_static_scores(
-            cache_root=PROJECT_ROOT / "static_scores",
-            dataset=dataset_name,
-            seed=seed,
-            clip_model=args.clip_model,
-            adapter_image_path=str(adapter_paths["image_path"]),
-            adapter_text_path=str(adapter_paths["text_path"]),
-            div_k=div_metric.k,
-            dds_k=dds_metric.k,
-            dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
-            dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
-            prompt_template=sa_metric.prompt_template,
-            num_samples=num_samples,
-            compute_fn=_compute_scores,
-        )
-        static_score_seconds = time.perf_counter() - static_compute_start
-        print(
-            f"[Seed {seed}] Static scores ready (cache/compute) | elapsed={static_score_seconds:.2f}s"
-        )
-
-        dds_raw_np = np.asarray(static_scores["dds"], dtype=np.float32)
-        div_raw_np = np.asarray(static_scores["div"], dtype=np.float32)
-        sa_raw_np = np.asarray(static_scores["sa"], dtype=np.float32)
-        labels = np.asarray(dataset_for_names.targets)
-
-        if not (len(dds_raw_np) == len(div_raw_np) == len(sa_raw_np)):
-            raise RuntimeError("三个指标的样本数不一致，无法合并。")
-
-        sa_global_z = standard_zscore_by_class(sa_raw_np, labels)
-        div_global_z = standard_zscore_by_class(div_raw_np, labels)
-        dds_global_z = standard_zscore_by_class(dds_raw_np, labels)
-        total_scores_np = (
-            weights["dds"] * dds_global_z
-            + weights["div"] * div_global_z
-            + weights["sa"] * sa_global_z
-        )
-        for keep_ratio in keep_ratios:
-            task_idx += 1
-            print(
-                f"[Mask {task_idx}/{total_tasks}] seed={seed} | kr={keep_ratio} | method={method} | weight_group={weight_group}"
-            )
-            mask_path = resolve_mask_path(
-                mode=method_name,
-                dataset=dataset_name,
-                model=args.model_name,
-                seed=seed,
-                keep_ratio=keep_ratio,
-            )
-            if args.skip_saved and mask_path.exists():
-                print(f"[Skip] mask already exists and --skip-saved is enabled: {mask_path}")
-                continue
-
-            group_stats: dict[str, object] | None = None
-            if method == "topk":
-                mask, selected_by_class = select_topk_mask(
-                    total_scores_np,
-                    labels,
-                    num_classes=len(class_names),
-                    keep_ratio=keep_ratio,
-                )
-            else:
-                mask, selected_by_class, group_stats = select_group_mask(
-                    sa_raw_np,
-                    div_metric=div_metric,
-                    div_loader=div_loader,
-                    image_adapter=image_adapter,
-                    labels=labels,
-                    weights=weights,
-                    num_classes=len(class_names),
-                    keep_ratio=keep_ratio,
-                    device=device,
-                    dataset_name=dataset_name,
-                    seed=seed,
-                    weight_group=weight_group,
-                    clip_model=args.clip_model,
-                    adapter_image_path=str(adapter_paths["image_path"]),
-                    div_static_scores=div_raw_np,
-                    dds_static_scores=dds_raw_np,
-                    group_candidate_pool_size=args.group_candidate_pool_size,
-                    group_init_count=args.group_init_count,
-                )
-
-            total_time = time.perf_counter() - total_start
-            mask_dir = mask_path.parent
-            mask_dir.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(mask_path, mask=mask.astype(np.uint8))
-
-            print(
-                f"seed={seed} | kr={keep_ratio} | selected={int(mask.sum())} "
-                f"| static_score_seconds={static_score_seconds:.2f} | total_seconds={total_time:.2f}"
-            )
-            if group_stats is not None:
-                print(
-                    f"group_summary: dist_weight={group_stats['dist_weight']:.6f} | "
-                    f"subset_score={group_stats['subset_comprehensive_score']:.6f} | "
-                    f"distribution_shift={group_stats['distribution_shift']:.6f}"
-                )
-            print(f"mask saved to: {mask_path}")
+        run_for_seed(args, seed, multi_seed)
 
 
 if __name__ == "__main__":

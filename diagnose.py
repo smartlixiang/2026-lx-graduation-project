@@ -14,11 +14,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from calculate_my_mask import (  # noqa: E402
+from learn_scoring_weights import (  # noqa: E402
     _build_dataset,
+    build_score_loader,
+)
+from noise_exp.cal_noise_mask import (  # noqa: E402
     _get_or_compute_group_mean_stats,
     _mean_stats_cache_path,
-    build_score_loader,
     ensure_scoring_weights,
     load_scoring_weights,
 )
@@ -352,7 +354,7 @@ def main() -> None:
 
     start_time = time.perf_counter()
 
-    dataset_for_names = _build_dataset(dataset_name, transform=None)
+    dataset_for_names = _build_dataset(dataset_name, str(PROJECT_ROOT / "data"), transform=None)
     labels = np.asarray(dataset_for_names.targets, dtype=np.int64)
     class_names = resolve_class_names_for_prompts(
         dataset_name=dataset_name,
@@ -384,9 +386,30 @@ def main() -> None:
     image_adapter.to(device).eval()
     text_adapter.to(device).eval()
 
-    dds_loader = build_score_loader(dds_metric.extractor.preprocess, dataset_name, device, args.batch_size, args.num_workers)
-    div_loader = build_score_loader(div_metric.extractor.preprocess, dataset_name, device, args.batch_size, args.num_workers)
-    sa_loader = build_score_loader(sa_metric.extractor.preprocess, dataset_name, device, args.batch_size, args.num_workers)
+    dds_loader = build_score_loader(
+        dds_metric.extractor.preprocess,
+        str(PROJECT_ROOT / "data"),
+        dataset_name,
+        device,
+        args.batch_size,
+        args.num_workers,
+    )
+    div_loader = build_score_loader(
+        div_metric.extractor.preprocess,
+        str(PROJECT_ROOT / "data"),
+        dataset_name,
+        device,
+        args.batch_size,
+        args.num_workers,
+    )
+    sa_loader = build_score_loader(
+        sa_metric.extractor.preprocess,
+        str(PROJECT_ROOT / "data"),
+        dataset_name,
+        device,
+        args.batch_size,
+        args.num_workers,
+    )
 
     num_samples = int(labels.shape[0])
 

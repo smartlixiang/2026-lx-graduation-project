@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coverage-k-pct", type=float, default=0.05)
     parser.add_argument("--coverage-q-low", type=float, default=0.002)
     parser.add_argument("--coverage-q-high", type=float, default=0.998)
-    parser.add_argument("--ridge-lambda", type=float, default=1)
+    parser.add_argument("--ridge-lambda", type=float, default=0.01)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=1000)
     parser.add_argument("--tol", type=float, default=1e-6)

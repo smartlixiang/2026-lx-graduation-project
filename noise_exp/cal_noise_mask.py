@@ -74,7 +74,9 @@ PROXY_LOG_ROOT = WEIGHTS_ROOT / "proxy_logs"
 DYNAMIC_CACHE_ROOT = WEIGHTS_ROOT / "dynamic_cache"
 STATIC_SCORE_ROOT = NOISE_EXP_ROOT / "static_scores"
 MASK_ROOT = NOISE_EXP_ROOT / "mask"
-NOISE_GATE_CACHE_VERSION = "noise_gate_v1_gate_positive_act"
+NOISE_GATE_CACHE_VERSION = "noise_gate_v2_final_risk_rank_min"
+NOISE_PRIOR_RATIO = 0.2
+NOISE_RISK_FACTOR = float(1.0 - np.sqrt(NOISE_PRIOR_RATIO))
 
 # Project imports are intentionally placed after sys.path is set.
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET  # noqa: E402
@@ -90,8 +92,8 @@ from utils.training_defaults import get_default_training_config  # noqa: E402
 from weights.dynamic_utils import (  # noqa: E402
     FoldLogData,
     load_cv_fold_logs,
-    quantile_minmax_dynamic,
     resolve_epoch_windows,
+    standard_zscore_dynamic,
 )
 
 import learn_scoring_weights as learn_weights_mod  # noqa: E402
@@ -142,6 +144,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-prompts", action="store_true")
     parser.add_argument("--skip-saved", action="store_true", help="Skip existing final masks.")
     parser.add_argument("--force", action="store_true", help="Rerun intermediate stages even if files exist.")
+    parser.add_argument("--learn-window", type=int, default=10)
+    parser.add_argument("--learn-min-correct", type=int, default=8)
+    parser.add_argument("--gate-low", type=float, default=0.2)
+    parser.add_argument("--gate-high", type=float, default=0.8)
     return parser.parse_args()
 
 
@@ -531,108 +537,149 @@ def _cross_entropy_from_logits(logits: np.ndarray, labels: np.ndarray) -> np.nda
     return np.nan_to_num(losses, nan=0.0, posinf=1.0e6, neginf=0.0).astype(np.float64)
 
 
-def _classwise_quantile_score(values: np.ndarray, labels: np.ndarray) -> np.ndarray:
+def _percentile_rank_tie_aware(values: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype=np.float64)
-    labels = np.asarray(labels, dtype=np.int64)
-    if values.ndim != 1 or labels.shape != values.shape:
-        raise ValueError("values and labels must be one-dimensional arrays with the same shape.")
+    if values.ndim != 1:
+        raise ValueError("values must be one-dimensional.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("values contains NaN/inf values.")
+    n = int(values.shape[0])
+    if n <= 1:
+        return np.zeros(n, dtype=np.float64)
 
-    safe_values = np.nan_to_num(values, nan=0.0, posinf=1.0, neginf=0.0)
-    output = np.zeros_like(safe_values, dtype=np.float64)
-    for cls in np.unique(labels):
-        idx = labels == int(cls)
-        output[idx] = quantile_minmax_dynamic(safe_values[idx]).astype(np.float64)
-    return np.nan_to_num(output, nan=0.0, posinf=1.0, neginf=0.0).astype(np.float64)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.zeros(n, dtype=np.float64)
+    sorted_values = values[order]
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and sorted_values[j] == sorted_values[i]:
+            j += 1
+        avg_rank = 0.5 * float(i + j - 1)
+        ranks[order[i:j]] = avg_rank / float(n - 1)
+        i = j
+    return ranks.astype(np.float64)
 
 
-def _compute_gate_source_metrics(
+def _validate_gate_thresholds(gate_low: float, gate_high: float) -> tuple[float, float]:
+    gate_low = float(gate_low)
+    gate_high = float(gate_high)
+    if not (0.0 <= gate_low <= 1.0 and 0.0 <= gate_high <= 1.0 and gate_low < gate_high):
+        raise ValueError("gate_low and gate_high must satisfy 0 <= gate_low < gate_high <= 1.")
+    return gate_low, gate_high
+
+
+def _build_gate_from_final_risk(final_risk: np.ndarray, gate_low: float, gate_high: float) -> np.ndarray:
+    gate_low, gate_high = _validate_gate_thresholds(gate_low, gate_high)
+    final_risk = np.asarray(final_risk, dtype=np.float64)
+    if not np.all(np.isfinite(final_risk)):
+        raise ValueError("final_risk contains NaN/inf values.")
+    gate = np.where(
+        final_risk <= gate_low,
+        1.0,
+        np.where(final_risk >= gate_high, 0.0, 1.0 - (final_risk - gate_low) / (gate_high - gate_low)),
+    )
+    return np.clip(gate, 0.0, 1.0).astype(np.float64)
+
+
+def _softmax_logits(logits: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits, dtype=np.float64)
+    shifted = logits - np.max(logits, axis=-1, keepdims=True)
+    exp = np.exp(shifted)
+    return exp / np.sum(exp, axis=-1, keepdims=True)
+
+
+def _compute_final_noise_risk(
     folds: list[FoldLogData],
     labels_for_metric: np.ndarray,
-) -> dict[str, np.ndarray]:
+    learn_window: int,
+    learn_min_correct: int,
+) -> np.ndarray:
     labels_for_metric = np.asarray(labels_for_metric, dtype=np.int64)
     num_samples = int(labels_for_metric.shape[0])
-    ever_sum = np.zeros(num_samples, dtype=np.float64)
-    ever_count = np.zeros(num_samples, dtype=np.int64)
-    forgetting_sum = np.zeros(num_samples, dtype=np.float64)
-    forgetting_count = np.zeros(num_samples, dtype=np.int64)
-    loss_sum = np.zeros(num_samples, dtype=np.float64)
-    loss_count = np.zeros(num_samples, dtype=np.int64)
+    learn_window = int(learn_window)
+    learn_min_correct = int(learn_min_correct)
+    if learn_window <= 0:
+        raise ValueError("learn_window must be positive.")
+    if learn_min_correct <= 0 or learn_min_correct > learn_window:
+        raise ValueError("learn_min_correct must be in [1, learn_window].")
+
+    learn_sum = np.zeros(num_samples, dtype=np.float64)
+    learn_count = np.zeros(num_samples, dtype=np.int64)
+    loss_var_sum = np.zeros(num_samples, dtype=np.float64)
+    loss_var_count = np.zeros(num_samples, dtype=np.int64)
+    val_bias_raw = np.full(num_samples, np.nan, dtype=np.float64)
 
     for fold in folds:
         train_idx = np.asarray(fold.train_indices, dtype=np.int64)
         y_train = labels_for_metric[train_idx]
-        logits = np.asarray(fold.train_logits, dtype=np.float64)
-        if logits.ndim != 3 or logits.shape[1] != train_idx.shape[0]:
+        train_logits = np.asarray(fold.train_logits, dtype=np.float64)
+        if train_logits.ndim != 3 or train_logits.shape[1] != train_idx.shape[0]:
             raise ValueError(f"fold {fold.fold_id} train_logits shape mismatch.")
 
-        preds = np.argmax(logits, axis=2)
-        correct = preds == y_train.reshape(1, -1)
+        train_preds = np.argmax(train_logits, axis=2)
+        correct = train_preds == y_train.reshape(1, -1)
         num_epochs = int(correct.shape[0])
-        has_correct = np.any(correct, axis=0)
+        for local_i, sample_idx in enumerate(train_idx):
+            seq = correct[:, local_i].astype(np.int64)
+            learned_time = None
+            if num_epochs >= learn_window:
+                window_sum = np.convolve(seq, np.ones(learn_window, dtype=np.int64), mode="valid")
+                hit = np.flatnonzero(window_sum >= learn_min_correct)
+                if hit.size > 0:
+                    learned_time = int(hit[0] + learn_window - 1)
+            if learned_time is None:
+                learn_risk = 1.0
+            else:
+                prev_correct = correct[:-1, local_i]
+                next_wrong = ~correct[1:, local_i]
+                forget_frequency = float(np.sum(prev_correct & next_wrong)) / float(max(1, int(np.sum(prev_correct))))
+                learn_time_norm = float(learned_time) / float(max(1, num_epochs - 1))
+                learn_risk = max(learn_time_norm, forget_frequency)
+            learn_sum[int(sample_idx)] += float(learn_risk)
+            learn_count[int(sample_idx)] += 1
 
-        ever_sum[train_idx] += has_correct.astype(np.float64)
-        ever_count[train_idx] += 1
+        losses = _cross_entropy_from_logits(train_logits, y_train)
+        _, mid_idx, late_idx = resolve_epoch_windows(num_epochs)
+        mid_late_idx = np.concatenate([mid_idx, late_idx]).astype(np.int64)
+        loss_var = np.var(losses[mid_late_idx], axis=0).astype(np.float64)
+        loss_var_sum[train_idx] += loss_var
+        loss_var_count[train_idx] += 1
 
-        first_correct = np.argmax(correct, axis=0)
-        seen_correct = np.maximum.accumulate(correct, axis=0)
-        forgetting_count_raw = np.sum(seen_correct & ~correct, axis=0).astype(np.float64)
-        after_learn_epochs = (num_epochs - first_correct - 1).astype(np.float64)
-        valid_forgetting = has_correct & (after_learn_epochs > 0)
-        fold_forgetting = np.full(train_idx.shape[0], np.nan, dtype=np.float64)
-        fold_forgetting[valid_forgetting] = (
-            forgetting_count_raw[valid_forgetting] / after_learn_epochs[valid_forgetting]
-        )
-        finite_forgetting = np.isfinite(fold_forgetting)
-        forgetting_sum[train_idx[finite_forgetting]] += fold_forgetting[finite_forgetting]
-        forgetting_count[train_idx[finite_forgetting]] += 1
+        val_idx = np.asarray(fold.val_indices, dtype=np.int64)
+        y_val = labels_for_metric[val_idx]
+        val_logits = np.asarray(fold.val_logits, dtype=np.float64)
+        if val_logits.ndim != 3 or val_logits.shape[1] != val_idx.shape[0]:
+            raise ValueError(f"fold {fold.fold_id} val_logits shape mismatch.")
+        _, val_mid_idx, val_late_idx = resolve_epoch_windows(int(val_logits.shape[0]))
+        val_mid_late_idx = np.concatenate([val_mid_idx, val_late_idx]).astype(np.int64)
+        probs = _softmax_logits(val_logits[val_mid_late_idx])
+        preds = np.argmax(probs, axis=2)
+        for local_i, sample_idx in enumerate(val_idx):
+            label = int(y_val[local_i])
+            other_preds = preds[:, local_i]
+            other_mask = other_preds != label
+            if not np.any(other_mask):
+                val_bias_raw[int(sample_idx)] = 0.0
+                continue
+            counts = np.bincount(other_preds[other_mask], minlength=probs.shape[2]).astype(np.int64)
+            counts[label] = -1
+            c_star = int(np.argmax(counts))
+            stable_freq = float(np.sum(other_preds == c_star)) / float(len(val_mid_late_idx))
+            margin = np.maximum(probs[:, local_i, c_star] - probs[:, local_i, label], 0.0)
+            val_bias_raw[int(sample_idx)] = stable_freq * float(np.mean(margin))
 
-        losses = _cross_entropy_from_logits(logits, y_train)
-        _, _, late_idx = resolve_epoch_windows(num_epochs)
-        late_loss_mean = np.mean(losses[late_idx], axis=0)
-        late_loss_std = np.std(losses[late_idx], axis=0)
-        late_mean_score = _classwise_quantile_score(late_loss_mean, y_train)
-        late_std_score = _classwise_quantile_score(late_loss_std, y_train)
-        loss_difficulty = np.maximum(late_mean_score, late_std_score)
-        loss_sum[train_idx] += loss_difficulty.astype(np.float64)
-        loss_count[train_idx] += 1
+    if np.any(learn_count <= 0) or np.any(loss_var_count <= 0) or np.any(~np.isfinite(val_bias_raw)):
+        missing = np.where((learn_count <= 0) | (loss_var_count <= 0) | (~np.isfinite(val_bias_raw)))[0]
+        raise ValueError(f"Some samples lack noise gate metrics: {missing[:10]}.")
 
-    if np.any(ever_count <= 0) or np.any(loss_count <= 0):
-        missing = np.where((ever_count <= 0) | (loss_count <= 0))[0]
-        raise ValueError(f"Some samples never appeared in train folds: {missing[:10]}.")
-
-    ever_learned = ever_sum / ever_count
-    forgetting_rate = np.full(num_samples, np.nan, dtype=np.float64)
-    finite_global = forgetting_count > 0
-    forgetting_rate[finite_global] = forgetting_sum[finite_global] / forgetting_count[finite_global]
-    loss_difficulty_global = loss_sum / loss_count
-    return {
-        "ever_learned": ever_learned.astype(np.float64),
-        "forgetting_rate": forgetting_rate.astype(np.float64),
-        "loss_difficulty": loss_difficulty_global.astype(np.float64),
-    }
-
-
-def _build_noise_gate_from_metrics(
-    metrics: dict[str, np.ndarray],
-    labels: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    forgetting_rate = np.nan_to_num(
-        np.asarray(metrics["forgetting_rate"], dtype=np.float64),
-        nan=0.0,
-        posinf=1.0,
-        neginf=0.0,
-    )
-    dynamic_failure = np.maximum.reduce(
-        [
-            1.0 - np.clip(np.asarray(metrics["ever_learned"], dtype=np.float64), 0.0, 1.0),
-            np.clip(forgetting_rate, 0.0, 1.0),
-            np.clip(np.asarray(metrics["loss_difficulty"], dtype=np.float64), 0.0, 1.0),
-        ]
-    )
-    penalty = np.maximum(0.0, standard_zscore_by_class(dynamic_failure, np.asarray(labels, dtype=np.int64)))
-    gate = np.maximum(0.0, 1.0 - penalty)
-    gate = np.clip(gate, 0.0, 1.0)
-    return dynamic_failure.astype(np.float64), penalty.astype(np.float64), gate.astype(np.float64)
+    learn_risk_raw = learn_sum / learn_count
+    loss_var_raw = loss_var_sum / loss_var_count
+    learn_risk_rank = _percentile_rank_tie_aware(learn_risk_raw)
+    loss_var_rank = _percentile_rank_tie_aware(loss_var_raw)
+    val_bias_rank = _percentile_rank_tie_aware(val_bias_raw)
+    final_risk = np.minimum.reduce([learn_risk_rank, loss_var_rank, val_bias_rank])
+    return final_risk.astype(np.float64)
 
 
 def _load_noise_gate_cache_if_valid(
@@ -642,6 +689,8 @@ def _load_noise_gate_cache_if_valid(
     seed,
     epochs,
     labels_all: np.ndarray,
+    learn_window: int,
+    learn_min_correct: int,
 ) -> dict[str, np.ndarray] | None:
     if not cache_path.is_file():
         return None
@@ -657,38 +706,21 @@ def _load_noise_gate_cache_if_valid(
                 return None
             if int(np.asarray(data["epochs"]).item()) != int(epochs):
                 return None
+            if int(np.asarray(data["learn_window"]).item()) != int(learn_window):
+                return None
+            if int(np.asarray(data["learn_min_correct"]).item()) != int(learn_min_correct):
+                return None
             labels_cached = np.asarray(data["labels"], dtype=np.int64)
             labels_all = np.asarray(labels_all, dtype=np.int64)
             if not np.array_equal(labels_cached, labels_all):
                 return None
-
-            num_samples = int(labels_all.shape[0])
-            out = {
-                key: np.asarray(data[key], dtype=np.float64)
-                for key in (
-                    "dynamic_failure",
-                    "penalty",
-                    "gate",
-                    "ever_learned",
-                    "forgetting_rate",
-                    "loss_difficulty",
-                )
-            }
+            final_risk = np.asarray(data["final_risk"], dtype=np.float64)
     except Exception:
         return None
 
-    for key, value in out.items():
-        if value.shape != (num_samples,):
-            return None
-        if key == "forgetting_rate":
-            finite = value[np.isfinite(value)]
-            if finite.size and np.any(np.isinf(finite)):
-                return None
-        elif not np.all(np.isfinite(value)):
-            return None
-    if np.any(out["gate"] < 0.0) or np.any(out["gate"] > 1.0):
+    if final_risk.shape != (int(labels_all.shape[0]),) or not np.all(np.isfinite(final_risk)):
         return None
-    return out
+    return {"final_risk": final_risk.astype(np.float64)}
 
 
 def _save_noise_gate_cache(
@@ -698,10 +730,9 @@ def _save_noise_gate_cache(
     seed,
     epochs,
     labels_all: np.ndarray,
-    metrics: dict[str, np.ndarray],
-    dynamic_failure: np.ndarray,
-    penalty: np.ndarray,
-    gate: np.ndarray,
+    learn_window: int,
+    learn_min_correct: int,
+    final_risk: np.ndarray,
 ) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -712,12 +743,9 @@ def _save_noise_gate_cache(
         seed=np.array(int(seed), dtype=np.int64),
         epochs=np.array(int(epochs), dtype=np.int64),
         labels=np.asarray(labels_all, dtype=np.int64),
-        ever_learned=np.asarray(metrics["ever_learned"], dtype=np.float64),
-        forgetting_rate=np.asarray(metrics["forgetting_rate"], dtype=np.float64),
-        loss_difficulty=np.asarray(metrics["loss_difficulty"], dtype=np.float64),
-        dynamic_failure=np.asarray(dynamic_failure, dtype=np.float64),
-        penalty=np.asarray(penalty, dtype=np.float64),
-        gate=np.asarray(gate, dtype=np.float64),
+        learn_window=np.array(int(learn_window), dtype=np.int64),
+        learn_min_correct=np.array(int(learn_min_correct), dtype=np.int64),
+        final_risk=np.asarray(final_risk, dtype=np.float64),
     )
 
 
@@ -726,17 +754,26 @@ def get_or_compute_noise_gate(args, seed, epochs, *, force=False) -> dict[str, n
     proxy_log_path = PROXY_LOG_ROOT / args.dataset / args.proxy_model / str(int(seed)) / str(int(epochs))
     folds, labels_all = load_cv_fold_logs(proxy_log_path, args.dataset, str(DATA_ROOT))
     labels_all = np.asarray(labels_all, dtype=np.int64)
+    _validate_gate_thresholds(args.gate_low, args.gate_high)
 
+    cached = None
     if not force:
         cached = _load_noise_gate_cache_if_valid(
-            cache_path, args.dataset, args.proxy_model, seed, epochs, labels_all
+            cache_path,
+            args.dataset,
+            args.proxy_model,
+            seed,
+            epochs,
+            labels_all,
+            args.learn_window,
+            args.learn_min_correct,
         )
         if cached is not None:
             print(f"[noise-gate] cache HIT: {cache_path}")
-            return cached
+            final_risk = cached["final_risk"]
+            return {"final_risk": final_risk, "gate": _build_gate_from_final_risk(final_risk, args.gate_low, args.gate_high)}
 
-    metrics = _compute_gate_source_metrics(folds, labels_all)
-    dynamic_failure, penalty, gate = _build_noise_gate_from_metrics(metrics, labels_all)
+    final_risk = _compute_final_noise_risk(folds, labels_all, args.learn_window, args.learn_min_correct)
     _save_noise_gate_cache(
         cache_path,
         args.dataset,
@@ -744,49 +781,54 @@ def get_or_compute_noise_gate(args, seed, epochs, *, force=False) -> dict[str, n
         seed,
         epochs,
         labels_all,
-        metrics,
-        dynamic_failure,
-        penalty,
-        gate,
+        args.learn_window,
+        args.learn_min_correct,
+        final_risk,
     )
     status = "FORCE->RECOMPUTED" if force else "MISS->COMPUTED"
     print(f"[noise-gate] cache {status}: {cache_path}")
-    return {
-        "dynamic_failure": dynamic_failure,
-        "penalty": penalty,
-        "gate": gate,
-        "ever_learned": metrics["ever_learned"],
-        "forgetting_rate": metrics["forgetting_rate"],
-        "loss_difficulty": metrics["loss_difficulty"],
-    }
-
+    return {"final_risk": final_risk, "gate": _build_gate_from_final_risk(final_risk, args.gate_low, args.gate_high)}
 
 @contextlib.contextmanager
 def patched_noise_gate_dynamic_target(args, seed: int, epochs: int) -> Iterator[dict[str, np.ndarray]]:
     gate_data = get_or_compute_noise_gate(args, seed, epochs, force=args.force)
     old_build_dynamic_target = learn_weights_mod.build_dynamic_target
 
-    def _split_gate_positive_part(values: np.ndarray, gate: np.ndarray) -> np.ndarray:
-        positive = np.maximum(values, 0.0)
-        negative = np.minimum(values, 0.0)
-        return negative + gate * positive
+    def _gate_raw_component_then_normalize(result, gate: np.ndarray) -> np.ndarray:
+        raw = result.raw_foldwise.astype(np.float64)
+        gate = np.asarray(gate, dtype=np.float64)
+        if raw.ndim != 2 or raw.shape[1] != gate.shape[0]:
+            raise ValueError(f"raw_foldwise/noise_gate shape mismatch: raw={raw.shape}, gate={gate.shape}")
+        fold_normalized = np.full(raw.shape, np.nan, dtype=np.float32)
+        for f in range(raw.shape[0]):
+            finite = np.isfinite(raw[f])
+            if not np.any(finite):
+                continue
+            values = np.maximum(raw[f, finite], 0.0) * gate[finite]
+            fold_normalized[f, finite] = standard_zscore_dynamic(values.astype(np.float32))
+
+        finite_counts = np.sum(np.isfinite(fold_normalized), axis=0)
+        if np.any(finite_counts <= 0):
+            missing = np.where(finite_counts <= 0)[0]
+            raise ValueError(f"raw component has samples without finite fold values: {missing[:10]}.")
+        aggregated = np.nanmean(fold_normalized.astype(np.float64), axis=0)
+        final_normalized = standard_zscore_dynamic(aggregated.astype(np.float32))
+        if not np.all(np.isfinite(final_normalized)):
+            raise ValueError("gated raw component normalization produced NaN/inf values.")
+        return final_normalized.astype(np.float64)
 
     def _build_dynamic_target_with_noise_gate(component_results):
         a = component_results["A"].final_normalized.astype(np.float64)
-        c = component_results["C"].final_normalized.astype(np.float64)
-        t = component_results["T"].final_normalized.astype(np.float64)
         gate = gate_data["gate"].astype(np.float64)
-        if not (a.shape == c.shape == t.shape == gate.shape):
-            raise ValueError(
-                f"A/C/T/noise_gate shape mismatch: A={a.shape}, C={c.shape}, T={t.shape}, gate={gate.shape}"
-            )
-        for name, values in (("A", a), ("C", c), ("T", t)):
-            if not np.all(np.isfinite(values)):
-                raise ValueError(f"{name} contains NaN/inf values.")
+        final_risk = gate_data["final_risk"].astype(np.float64)
+        if not (a.shape == gate.shape == final_risk.shape):
+            raise ValueError(f"A/noise_gate/final_risk shape mismatch: A={a.shape}, gate={gate.shape}, risk={final_risk.shape}")
+        if not np.all(np.isfinite(a)):
+            raise ValueError("A contains NaN/inf values.")
 
-        gated_a = _split_gate_positive_part(a, gate)
-        gated_c = _split_gate_positive_part(c, gate)
-        gated_t = _split_gate_positive_part(t, gate)
+        gated_a = np.minimum(a, 0.0) + gate * np.maximum(a, 0.0)
+        gated_c = _gate_raw_component_then_normalize(component_results["C"], gate)
+        gated_t = _gate_raw_component_then_normalize(component_results["T"], gate)
         utility_raw = (gated_a + gated_c + gated_t) / 3.0
         u_scores = standard_zscore(utility_raw)
         dynamic_component_values = {
@@ -794,8 +836,7 @@ def patched_noise_gate_dynamic_target(args, seed: int, epochs: int) -> Iterator[
             "C": component_results["C"].final_normalized,
             "T": component_results["T"].final_normalized,
             "noise_gate": gate_data["gate"],
-            "noise_penalty": gate_data["penalty"],
-            "dynamic_failure": gate_data["dynamic_failure"],
+            "noise_final_risk": gate_data["final_risk"],
         }
         return u_scores.astype(np.float64), dynamic_component_values
 
@@ -804,7 +845,6 @@ def patched_noise_gate_dynamic_target(args, seed: int, epochs: int) -> Iterator[
         yield gate_data
     finally:
         learn_weights_mod.build_dynamic_target = old_build_dynamic_target  # type: ignore[assignment]
-
 
 # ---------------------------------------------------------------------------
 # Pipeline stages
@@ -868,6 +908,10 @@ def run_weight_learning_stage(args: argparse.Namespace, seed: int, device: torch
         return
 
     print(f"[weights] learn static-score weights | dataset={args.dataset} seed={seed}")
+    base_ridge_lambda = 0.01
+    scaled_ridge_lambda = base_ridge_lambda * (NOISE_RISK_FACTOR ** 2)
+    # 标签注噪实验中动态监督更不稳定，按噪声风险因子的平方降低线性回归正则强度。
+    print(f"[weights] ridge_lambda scaled by noise factor: base={base_ridge_lambda}, scaled={scaled_ridge_lambda}")
     with (
         patched_training_label_noise(args.dataset, seed, verbose_once=True),
         patched_weight_learning_paths(),
@@ -887,6 +931,7 @@ def run_weight_learning_stage(args: argparse.Namespace, seed: int, device: torch
             "--output", str(weights_path),
             "--seed", str(seed),
             "--proxy-training-seed", str(seed),
+            "--ridge-lambda", f"{scaled_ridge_lambda:.12g}",
         ]
         if args.device is not None:
             cli += ["--device", str(device)]
@@ -1177,9 +1222,10 @@ def select_group_mask_local(
 
     class_budgets = _allocate_class_budgets()
     candidate_pool_size = max(1, int(group_candidate_pool_size))
-    dist_weight_max = max(0.0, 0.8 - 0.005 * keep_ratio) * 0.25
+    base_dist_weight_max = max(0.0, 0.8 - 0.005 * keep_ratio) * 0.25
+    # 标签注噪实验中分布修正项可能放大错误标签结构，因此按先验噪声风险因子降低其强度。
+    dist_weight_max = base_dist_weight_max * NOISE_RISK_FACTOR
     dist_weight_min = 0.5 * dist_weight_max
-    
 
     selected_mask = np.zeros(num_samples, dtype=np.uint8)
     class_selected_counts = np.zeros(num_classes, dtype=np.int64)
@@ -1332,6 +1378,9 @@ def select_group_mask_local(
         "dist_weight_schedule": "linear_increase_by_class_progress",
         "dist_weight_max": float(dist_weight_max),
         "dist_weight_min": float(dist_weight_min),
+        "noise_prior_ratio": float(NOISE_PRIOR_RATIO),
+        "noise_risk_factor": float(NOISE_RISK_FACTOR),
+        "base_dist_weight_max": float(base_dist_weight_max),
         "final_rate": float(final_mask.mean()),
         "selected_by_class": selected_by_class,
         "class_budgets": {int(c): int(v) for c, v in enumerate(class_budgets.tolist())},

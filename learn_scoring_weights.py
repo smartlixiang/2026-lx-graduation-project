@@ -95,7 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coverage-q-high", type=float, default=0.998)
     parser.add_argument("--ridge-lambda", type=float, default=0.01)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
-    parser.add_argument("--max-iter", type=int, default=1000)
+    parser.add_argument("--max-iter", type=int, default=10000)
     parser.add_argument("--tol", type=float, default=1e-6)
     parser.add_argument("--output", type=str, default="weights/scoring_weights.json")
     parser.add_argument("--device", type=str, default=None)

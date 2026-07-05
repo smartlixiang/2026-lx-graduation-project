@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -14,31 +16,77 @@ if str(PROJECT_ROOT) not in sys.path:
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET
 from utils.score_utils import standard_zscore, standard_zscore_by_class
 from utils.seed import set_seed
+from weights.dynamic_utils import load_cv_fold_logs
+
+# 直接复用正式噪声实验脚本中的新版门控定义，避免诊断脚本与正式脚本分叉。
+from noise_exp.cal_noise_mask import (  # noqa: E402
+    NOISE_GATE_CACHE_VERSION,
+    _build_gate_from_final_risk,
+    _compute_final_noise_risk,
+    _load_noise_gate_cache_if_valid,
+    _save_noise_gate_cache,
+)
 
 COMPONENT_NAMES = ("A", "C", "T")
 EPS = 1e-8
 
 
+@dataclass
+class ComponentArrays:
+    raw_foldwise: np.ndarray
+    final_normalized: np.ndarray
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Read cached static scores and dynamic components, then test the modified "
-            "linear regression solver without simplex constraint during fitting."
+            "Compare clean/noise CIFAR-100 static-weight learning under the new noise gate. "
+            "A/C/T are gated after final normalization instead of Gate-2 raw-component gating."
         )
     )
     parser.add_argument("--dataset", type=str, default=CIFAR100, choices=AVAILABLE_DATASETS)
     parser.add_argument("--seed", type=int, default=22)
     parser.add_argument("--proxy-model", type=str, default="resnet18")
     parser.add_argument("--proxy-epochs", type=int, default=None)
+
     parser.add_argument("--normal-static-root", type=str, default="static_scores")
     parser.add_argument("--normal-dynamic-root", type=str, default="weights/dynamic_cache")
+    parser.add_argument("--normal-proxy-root", type=str, default="weights/proxy_logs")
+
     parser.add_argument("--noise-static-root", type=str, default="noise_exp/static_scores")
     parser.add_argument("--noise-dynamic-root", type=str, default="noise_exp/weights/dynamic_cache")
+    parser.add_argument("--noise-proxy-root", type=str, default="noise_exp/weights/proxy_logs")
+
+    parser.add_argument("--data-root", type=str, default="data")
+    parser.add_argument("--learn-window", type=int, default=10)
+    parser.add_argument("--learn-min-correct", type=int, default=8)
+    parser.add_argument("--gate-low", type=float, default=0.2)
+    parser.add_argument("--gate-high", type=float, default=0.8)
+
+    # 与 learn_scoring_weights.py 中的 softmax-simplex ridge 拟合保持一致。
+    parser.add_argument("--simplex-ridge-lambda", type=float, default=1e-2)
+    parser.add_argument("--simplex-learning-rate", type=float, default=1e-2)
+    parser.add_argument("--simplex-max-iter", type=int, default=10000)
+    parser.add_argument("--simplex-tol", type=float, default=1e-6)
+
+    # 原版 test_regression.py 中的 softplus 非 simplex + ratio regularizer 拟合。
     parser.add_argument("--ratio-lambda", type=float, default=1e-2)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--max-iter", type=int, default=10000)
-    parser.add_argument("--tol", type=float, default=1e-8)
+    parser.add_argument("--ratio-learning-rate", type=float, default=2e-3)
+    parser.add_argument("--ratio-max-iter", type=int, default=10000)
+    parser.add_argument("--ratio-tol", type=float, default=1e-8)
+
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--save-clean-gate-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Only clean-mode gate cache may be saved. No other cache/result is written.",
+    )
+    parser.add_argument(
+        "--overwrite-clean-gate-cache",
+        action="store_true",
+        help="Allow overwriting an existing clean noise_gate.npz cache. Noise-mode cache is never overwritten.",
+    )
     return parser.parse_args()
 
 
@@ -62,26 +110,29 @@ def load_dynamic_component_cache(
     proxy_model: str,
     seed: int,
     epochs: int,
-) -> tuple[dict[str, np.ndarray], np.ndarray, Path]:
+) -> tuple[dict[str, ComponentArrays], np.ndarray, Path]:
     cache_dir = Path(dynamic_root) / dataset_name / proxy_model / str(int(seed)) / str(int(epochs))
     if not cache_dir.is_dir():
         raise FileNotFoundError(f"Dynamic cache directory not found: {cache_dir}")
 
-    components: dict[str, np.ndarray] = {}
+    components: dict[str, ComponentArrays] = {}
     labels_ref: np.ndarray | None = None
 
     for name in COMPONENT_NAMES:
         path = require_file(cache_dir / f"{name}.npz")
         with np.load(path, allow_pickle=False) as data:
-            for key in ("labels", "final_normalized"):
+            for key in ("labels", "raw_foldwise", "final_normalized"):
                 if key not in data.files:
                     raise KeyError(f"{path} missing key: {key}")
             labels = np.asarray(data["labels"], dtype=np.int64)
-            values = np.asarray(data["final_normalized"], dtype=np.float64)
+            raw_foldwise = np.asarray(data["raw_foldwise"], dtype=np.float32)
+            final_normalized = np.asarray(data["final_normalized"], dtype=np.float64)
 
-        if labels.ndim != 1 or values.shape != labels.shape:
-            raise ValueError(f"Invalid shape in {path}: labels={labels.shape}, final={values.shape}")
-        if not np.all(np.isfinite(values)):
+        if labels.ndim != 1 or final_normalized.shape != labels.shape:
+            raise ValueError(f"Invalid final shape in {path}: labels={labels.shape}, final={final_normalized.shape}")
+        if raw_foldwise.ndim != 2 or raw_foldwise.shape[1] != labels.shape[0]:
+            raise ValueError(f"Invalid raw_foldwise shape in {path}: raw={raw_foldwise.shape}, labels={labels.shape}")
+        if not np.all(np.isfinite(final_normalized)):
             raise ValueError(f"{path} final_normalized contains NaN/inf.")
 
         if labels_ref is None:
@@ -89,80 +140,10 @@ def load_dynamic_component_cache(
         elif not np.array_equal(labels_ref, labels):
             raise ValueError(f"Dynamic component labels mismatch at {path}")
 
-        components[name] = values
+        components[name] = ComponentArrays(raw_foldwise=raw_foldwise, final_normalized=final_normalized)
 
     assert labels_ref is not None
     return components, labels_ref, cache_dir
-
-
-def load_noise_gate_cache(dynamic_cache_dir: Path, labels_all: np.ndarray) -> dict[str, np.ndarray]:
-    path = require_file(dynamic_cache_dir / "noise_gate.npz")
-    with np.load(path, allow_pickle=False) as data:
-        required = {
-            "labels",
-            "gate",
-            "penalty",
-            "dynamic_failure",
-            "ever_learned",
-            "forgetting_rate",
-            "loss_difficulty",
-        }
-        missing = required - set(data.files)
-        if missing:
-            raise KeyError(f"{path} missing keys: {sorted(missing)}")
-
-        labels = np.asarray(data["labels"], dtype=np.int64)
-        if not np.array_equal(labels, labels_all.astype(np.int64, copy=False)):
-            raise ValueError(f"noise_gate labels mismatch: {path}")
-
-        gate_data = {
-            "gate": np.asarray(data["gate"], dtype=np.float64),
-            "penalty": np.asarray(data["penalty"], dtype=np.float64),
-            "dynamic_failure": np.asarray(data["dynamic_failure"], dtype=np.float64),
-            "ever_learned": np.asarray(data["ever_learned"], dtype=np.float64),
-            "forgetting_rate": np.asarray(data["forgetting_rate"], dtype=np.float64),
-            "loss_difficulty": np.asarray(data["loss_difficulty"], dtype=np.float64),
-        }
-
-    n = labels_all.shape[0]
-    for name, values in gate_data.items():
-        if values.shape != (n,):
-            raise ValueError(f"noise_gate {name} shape mismatch: {values.shape}, expected=({n},)")
-        if name != "forgetting_rate" and not np.all(np.isfinite(values)):
-            raise ValueError(f"noise_gate {name} contains NaN/inf.")
-        if name == "forgetting_rate" and np.any(np.isinf(values[np.isfinite(values)])):
-            raise ValueError("forgetting_rate contains inf.")
-
-    if not np.all((gate_data["gate"] >= -1e-8) & (gate_data["gate"] <= 1.0 + 1e-8)):
-        raise ValueError("noise_gate gate values are outside [0, 1].")
-
-    gate_data["gate"] = np.clip(gate_data["gate"], 0.0, 1.0)
-    return gate_data
-
-
-def split_gate_positive_part(values: np.ndarray, gate: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64)
-    gate = np.asarray(gate, dtype=np.float64)
-    return np.minimum(values, 0.0) + gate * np.maximum(values, 0.0)
-
-
-def build_dynamic_target(components: dict[str, np.ndarray], *, gate: np.ndarray | None = None) -> np.ndarray:
-    a = np.asarray(components["A"], dtype=np.float64)
-    c = np.asarray(components["C"], dtype=np.float64)
-    t = np.asarray(components["T"], dtype=np.float64)
-
-    if gate is None:
-        utility_raw = (a + c + t) / 3.0
-    else:
-        if gate.shape != a.shape:
-            raise ValueError(f"gate shape mismatch: gate={gate.shape}, components={a.shape}")
-        utility_raw = (
-            split_gate_positive_part(a, gate)
-            + split_gate_positive_part(c, gate)
-            + split_gate_positive_part(t, gate)
-        ) / 3.0
-
-    return standard_zscore(utility_raw).astype(np.float64)
 
 
 def load_static_cache_dir(static_root: str | Path, dataset_name: str, seed: int) -> Path:
@@ -228,7 +209,169 @@ def build_static_features(static_scores: dict[str, np.ndarray], labels: np.ndarr
     return np.stack([sa_z, div_z, dds_z], axis=1).astype(np.float64)
 
 
-def fit_nonnegative_ratio_regularized_regression(
+def split_gate_positive_part(values: np.ndarray, gate: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    gate = np.asarray(gate, dtype=np.float64)
+    if values.shape != gate.shape:
+        raise ValueError(f"values/gate shape mismatch: values={values.shape}, gate={gate.shape}")
+    return np.minimum(values, 0.0) + gate * np.maximum(values, 0.0)
+
+
+def build_normalized_gate_dynamic_target(components: dict[str, ComponentArrays], gate: np.ndarray) -> np.ndarray:
+    """Build target by gating positive parts after each dynamic component is normalized.
+
+    This deliberately restores the lighter normalized-space gate: A/C/T all use
+    final_normalized values, and only their positive parts are multiplied by gate.
+    It is used here to test whether Gate-2 raw-component gating is too strong.
+    """
+    gate = np.asarray(gate, dtype=np.float64)
+    gated_parts = []
+    for name in COMPONENT_NAMES:
+        values = components[name].final_normalized.astype(np.float64)
+        if values.shape != gate.shape:
+            raise ValueError(f"{name}/gate shape mismatch: {name}={values.shape}, gate={gate.shape}")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"{name}.final_normalized contains NaN/inf values.")
+        gated_parts.append(split_gate_positive_part(values, gate))
+
+    utility_raw = (gated_parts[0] + gated_parts[1] + gated_parts[2]) / 3.0
+    return standard_zscore(utility_raw).astype(np.float64)
+
+
+def compute_or_load_gate(
+    *,
+    case_name: str,
+    dataset_name: str,
+    proxy_model: str,
+    seed: int,
+    epochs: int,
+    labels: np.ndarray,
+    dynamic_cache_dir: Path,
+    proxy_root: str | Path,
+    data_root: str | Path,
+    learn_window: int,
+    learn_min_correct: int,
+    gate_low: float,
+    gate_high: float,
+    save_clean_gate_cache: bool,
+    overwrite_clean_gate_cache: bool,
+) -> tuple[np.ndarray, np.ndarray, Path]:
+    cache_path = dynamic_cache_dir / "noise_gate.npz"
+    cached = _load_noise_gate_cache_if_valid(
+        cache_path,
+        dataset_name,
+        proxy_model,
+        seed,
+        epochs,
+        labels,
+        learn_window,
+        learn_min_correct,
+    )
+    if cached is not None:
+        final_risk = np.asarray(cached["final_risk"], dtype=np.float64)
+        gate = _build_gate_from_final_risk(final_risk, gate_low, gate_high)
+        print(f"[{case_name}] gate cache HIT: {cache_path}")
+        return final_risk, gate, cache_path
+
+    proxy_log_path = Path(proxy_root) / dataset_name / proxy_model / str(int(seed)) / str(int(epochs))
+    folds, _ = load_cv_fold_logs(proxy_log_path, dataset_name, str(data_root))
+    final_risk = _compute_final_noise_risk(folds, labels, learn_window, learn_min_correct)
+    gate = _build_gate_from_final_risk(final_risk, gate_low, gate_high)
+    print(f"[{case_name}] gate cache MISS -> computed from proxy logs: {proxy_log_path}")
+
+    if case_name == "clean" and save_clean_gate_cache:
+        if cache_path.exists() and not overwrite_clean_gate_cache:
+            print(f"[clean] existing invalid/outdated gate cache is kept unchanged: {cache_path}")
+        else:
+            _save_noise_gate_cache(
+                cache_path,
+                dataset_name,
+                proxy_model,
+                seed,
+                epochs,
+                labels,
+                learn_window,
+                learn_min_correct,
+                final_risk,
+            )
+            print(f"[clean] saved gate cache: {cache_path}")
+    elif case_name != "clean":
+        print(f"[{case_name}] gate cache is not saved by this diagnostic script.")
+
+    return final_risk, gate, cache_path
+
+
+def softmax_simplex(theta: np.ndarray) -> np.ndarray:
+    theta = np.asarray(theta, dtype=np.float64)
+    shifted = theta - float(np.max(theta))
+    shifted = np.clip(shifted, -50.0, 50.0)
+    exp_theta = np.exp(shifted)
+    denom = float(np.sum(exp_theta))
+    if (not np.isfinite(denom)) or denom <= 0.0:
+        return np.full(theta.shape, 1.0 / theta.size, dtype=np.float64)
+    return (exp_theta / denom).astype(np.float64)
+
+
+def fit_simplex_ridge_regression(
+    features: np.ndarray,
+    targets: np.ndarray,
+    *,
+    l2_lambda: float,
+    learning_rate: float,
+    max_iter: int,
+    tol: float,
+) -> dict[str, object]:
+    if features.ndim != 2 or features.shape[1] != 3:
+        raise ValueError(f"features must have shape (N,3), got {features.shape}")
+    if targets.ndim != 1 or targets.shape[0] != features.shape[0]:
+        raise ValueError(f"target shape mismatch: features={features.shape}, targets={targets.shape}")
+    if l2_lambda < 0:
+        raise ValueError("l2_lambda must be non-negative.")
+
+    x = features.astype(np.float64, copy=False)
+    y = targets.astype(np.float64, copy=False)
+    n, d = x.shape
+    theta = np.zeros(d, dtype=np.float64)
+    weights = softmax_simplex(theta)
+    bias = float(np.mean(y))
+
+    final_iter = 0
+    for step in tqdm(range(max_iter), desc="Fitting simplex ridge", unit="iter", leave=False):
+        pred = x @ weights + bias
+        errors = pred - y
+        grad_w = (x.T @ errors) / n + l2_lambda * weights
+        grad_b = float(np.mean(errors))
+        grad_theta = weights * (grad_w - float(np.dot(weights, grad_w)))
+
+        next_theta = theta - learning_rate * grad_theta
+        next_bias = bias - learning_rate * grad_b
+        next_weights = softmax_simplex(next_theta)
+        final_iter = step + 1
+
+        if np.linalg.norm(next_weights - weights) < tol and abs(next_bias - bias) < tol:
+            theta = next_theta
+            weights = next_weights
+            bias = next_bias
+            break
+
+        theta = next_theta
+        weights = next_weights
+        bias = next_bias
+
+    pred = x @ weights + bias
+    mse = float(np.mean((pred - y) ** 2))
+    return {
+        "raw_weights": weights.astype(np.float64),
+        "normalized_weights": weights.astype(np.float64),
+        "bias": float(bias),
+        "mse": mse,
+        "regularizer": float(np.sum(weights * weights)),
+        "iterations": final_iter,
+        "pred": pred.astype(np.float64),
+    }
+
+
+def fit_softplus_ratio_regularized_regression(
     features: np.ndarray,
     targets: np.ndarray,
     *,
@@ -247,14 +390,13 @@ def fit_nonnegative_ratio_regularized_regression(
 
     x = torch.as_tensor(features, dtype=torch.float64, device=device)
     y = torch.as_tensor(targets, dtype=torch.float64, device=device)
-
     theta = torch.zeros(3, dtype=torch.float64, device=device, requires_grad=True)
     bias = torch.tensor(float(np.mean(targets)), dtype=torch.float64, device=device, requires_grad=True)
     optimizer = torch.optim.Adam([theta, bias], lr=learning_rate)
 
     last_loss = None
     final_iter = 0
-    for step in range(max_iter):
+    for step in tqdm(range(max_iter), desc="Fitting softplus ratio", unit="iter", leave=False):
         optimizer.zero_grad()
         raw_weights = torch.nn.functional.softplus(theta) + 1e-8
         pred = x @ raw_weights + bias
@@ -286,7 +428,7 @@ def fit_nonnegative_ratio_regularized_regression(
         "normalized_weights": normalized_weights,
         "bias": bias_value,
         "mse": mse_value,
-        "ratio_regularizer": ratio_value,
+        "regularizer": ratio_value,
         "iterations": final_iter,
         "pred": pred,
     }
@@ -305,125 +447,140 @@ def safe_corr(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(xx, yy)[0, 1])
 
 
+def print_weight_result(case_name: str, solver_name: str, result: dict[str, object], target: np.ndarray) -> None:
+    raw = np.asarray(result["raw_weights"], dtype=np.float64)
+    norm = np.asarray(result["normalized_weights"], dtype=np.float64)
+    pred = np.asarray(result["pred"], dtype=np.float64)
+    print(f"\n[{case_name} | {solver_name}]")
+    print(
+        "  raw_weights:        "
+        f"SA={raw[0]:.8f}, Div={raw[1]:.8f}, DDS={raw[2]:.8f}, sum={float(np.sum(raw)):.8f}"
+    )
+    print(
+        "  normalized_weights: "
+        f"SA={norm[0]:.8f}, Div={norm[1]:.8f}, DDS={norm[2]:.8f}, sum={float(np.sum(norm)):.8f}"
+    )
+    print(
+        "  diagnostics:        "
+        f"bias={float(result['bias']):.8f}, mse={float(result['mse']):.8f}, "
+        f"reg={float(result['regularizer']):.8f}, corr={safe_corr(pred, target):+.6f}, "
+        f"iters={int(result['iterations'])}"
+    )
+
+
 def run_case(
     *,
-    title: str,
+    case_name: str,
     dataset_name: str,
     seed: int,
     proxy_model: str,
     epochs: int,
     static_root: str | Path,
     dynamic_root: str | Path,
-    use_noise_gate: bool,
+    proxy_root: str | Path,
     args: argparse.Namespace,
 ) -> None:
-    print("=" * 90)
-    print(f"[{title}] dataset={dataset_name}, seed={seed}, proxy_model={proxy_model}, epochs={epochs}")
+    print("=" * 100)
+    print(f"[{case_name}] dataset={dataset_name}, seed={seed}, proxy_model={proxy_model}, epochs={epochs}")
 
-    components, dynamic_labels, dynamic_cache_dir = load_dynamic_component_cache(
-        dynamic_root, dataset_name, proxy_model, seed, epochs
-    )
+    components, dynamic_labels, dynamic_cache_dir = load_dynamic_component_cache(dynamic_root, dataset_name, proxy_model, seed, epochs)
     static_scores, static_labels, static_cache_dir = load_static_scores(static_root, dataset_name, seed)
-
     if not np.array_equal(dynamic_labels, static_labels):
         raise ValueError(
-            f"{title}: dynamic labels and static-score labels mismatch.\n"
-            f"dynamic_cache={dynamic_cache_dir}\n"
-            f"static_cache={static_cache_dir}"
+            f"{case_name}: dynamic labels and static-score labels mismatch.\n"
+            f"dynamic_cache={dynamic_cache_dir}\nstatic_cache={static_cache_dir}"
         )
 
-    if use_noise_gate:
-        gate_data = load_noise_gate_cache(dynamic_cache_dir, dynamic_labels)
-        target = build_dynamic_target(components, gate=gate_data["gate"])
-        print(f"dynamic_cache: {dynamic_cache_dir}")
-        print(f"static_cache:  {static_cache_dir}")
-        print(
-            "noise_gate:    "
-            f"mean_gate={float(np.mean(gate_data['gate'])):.6f}, "
-            f"mean_penalty={float(np.mean(gate_data['penalty'])):.6f}, "
-            f"mean_failure={float(np.mean(gate_data['dynamic_failure'])):.6f}"
-        )
-    else:
-        target = build_dynamic_target(components, gate=None)
-        print(f"dynamic_cache: {dynamic_cache_dir}")
-        print(f"static_cache:  {static_cache_dir}")
+    final_risk, gate, gate_cache_path = compute_or_load_gate(
+        case_name=case_name,
+        dataset_name=dataset_name,
+        proxy_model=proxy_model,
+        seed=seed,
+        epochs=epochs,
+        labels=dynamic_labels,
+        dynamic_cache_dir=dynamic_cache_dir,
+        proxy_root=proxy_root,
+        data_root=args.data_root,
+        learn_window=args.learn_window,
+        learn_min_correct=args.learn_min_correct,
+        gate_low=args.gate_low,
+        gate_high=args.gate_high,
+        save_clean_gate_cache=args.save_clean_gate_cache,
+        overwrite_clean_gate_cache=args.overwrite_clean_gate_cache,
+    )
 
+    target = build_normalized_gate_dynamic_target(components, gate)
     features = build_static_features(static_scores, static_labels)
-    result = fit_nonnegative_ratio_regularized_regression(
+
+    print(f"dynamic_cache: {dynamic_cache_dir}")
+    print(f"static_cache:  {static_cache_dir}")
+    print(f"gate_cache:    {gate_cache_path}")
+    print(
+        "gate summary:  "
+        f"mean_gate={float(np.mean(gate)):.6f}, min_gate={float(np.min(gate)):.6f}, "
+        f"max_gate={float(np.max(gate)):.6f}, mean_final_risk={float(np.mean(final_risk)):.6f}"
+    )
+    print(
+        "target summary: "
+        f"mean={float(np.mean(target)):.6f}, std={float(np.std(target)):.6f}, "
+        f"min={float(np.min(target)):.6f}, max={float(np.max(target)):.6f}"
+    )
+
+    simplex_result = fit_simplex_ridge_regression(
+        features,
+        target,
+        l2_lambda=args.simplex_ridge_lambda,
+        learning_rate=args.simplex_learning_rate,
+        max_iter=args.simplex_max_iter,
+        tol=args.simplex_tol,
+    )
+    print_weight_result(case_name, "simplex-ridge(sum=1)", simplex_result, target)
+
+    ratio_result = fit_softplus_ratio_regularized_regression(
         features,
         target,
         ratio_lambda=args.ratio_lambda,
-        learning_rate=args.learning_rate,
-        max_iter=args.max_iter,
-        tol=args.tol,
+        learning_rate=args.ratio_learning_rate,
+        max_iter=args.ratio_max_iter,
+        tol=args.ratio_tol,
         device=args.device,
     )
-
-    raw = np.asarray(result["raw_weights"], dtype=np.float64)
-    norm = np.asarray(result["normalized_weights"], dtype=np.float64)
-    pred = np.asarray(result["pred"], dtype=np.float64)
-
-    print(
-        "raw_weights:        "
-        f"SA={raw[0]:.8f}, Div={raw[1]:.8f}, DDS={raw[2]:.8f}, "
-        f"sum={float(np.sum(raw)):.8f}"
-    )
-    print(
-        "normalized_weights: "
-        f"SA={norm[0]:.8f}, Div={norm[1]:.8f}, DDS={norm[2]:.8f}, "
-        f"sum={float(np.sum(norm)):.8f}"
-    )
-    print(
-        "diagnostics:        "
-        f"bias={float(result['bias']):.8f}, "
-        f"mse={float(result['mse']):.8f}, "
-        f"ratio_reg={float(result['ratio_regularizer']):.8f}, "
-        f"corr={safe_corr(pred, target):+.6f}, "
-        f"iters={int(result['iterations'])}"
-    )
+    print_weight_result(case_name, "softplus-ratio(no simplex)", ratio_result, target)
     print()
 
 
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
-
-    if args.device != "cpu" and not torch.cuda.is_available():
-        raise RuntimeError(f"Requested device={args.device}, but torch.cuda.is_available() is False.")
-
     epochs = int(args.proxy_epochs) if args.proxy_epochs is not None else resolve_default_proxy_epochs(args.dataset)
 
-    print("=== Modified linear regression diagnostic ===")
-    print("Fitting rule: nonnegative weights, no simplex constraint during fitting.")
-    print("Regularizer: Var(w) / Mean(w)^2. Final weights are normalized to sum to 1.")
-    print(
-        f"config: dataset={args.dataset}, seed={args.seed}, proxy_model={args.proxy_model}, "
-        f"epochs={epochs}, ratio_lambda={args.ratio_lambda}, lr={args.learning_rate}, "
-        f"max_iter={args.max_iter}, device={args.device}"
-    )
-    print()
+    print("=== test_regression_2: clean/noise weight-learning comparison with normalized-space gate ===")
+    print(f"dataset={args.dataset}, seed={args.seed}, proxy_model={args.proxy_model}, proxy_epochs={epochs}")
+    print(f"noise_gate_cache_version={NOISE_GATE_CACHE_VERSION}")
+    print(f"gate: learn_window={args.learn_window}, learn_min_correct={args.learn_min_correct}, low={args.gate_low}, high={args.gate_high}")
+    print("This script never writes static/dynamic/weight results. It may only save clean gate cache when enabled. A/C/T are gated after final normalization.")
 
     run_case(
-        title="clean-data cached regression",
+        case_name="clean",
         dataset_name=args.dataset,
         seed=args.seed,
         proxy_model=args.proxy_model,
         epochs=epochs,
         static_root=args.normal_static_root,
         dynamic_root=args.normal_dynamic_root,
-        use_noise_gate=False,
+        proxy_root=args.normal_proxy_root,
         args=args,
     )
 
     run_case(
-        title="noise-data cached regression",
+        case_name="noise",
         dataset_name=args.dataset,
         seed=args.seed,
         proxy_model=args.proxy_model,
         epochs=epochs,
         static_root=args.noise_static_root,
         dynamic_root=args.noise_dynamic_root,
-        use_noise_gate=True,
+        proxy_root=args.noise_proxy_root,
         args=args,
     )
 

@@ -74,7 +74,7 @@ PROXY_LOG_ROOT = WEIGHTS_ROOT / "proxy_logs"
 DYNAMIC_CACHE_ROOT = WEIGHTS_ROOT / "dynamic_cache"
 STATIC_SCORE_ROOT = NOISE_EXP_ROOT / "static_scores"
 MASK_ROOT = NOISE_EXP_ROOT / "mask"
-NOISE_GATE_CACHE_VERSION = "noise_gate_v2_final_risk_rank_min"
+NOISE_GATE_CACHE_VERSION = "noise_gate_v3_rank_min_normalized_positive"
 NOISE_PRIOR_RATIO = 0.2
 NOISE_RISK_FACTOR = float(1.0 - np.sqrt(NOISE_PRIOR_RATIO))
 
@@ -148,6 +148,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learn-min-correct", type=int, default=8)
     parser.add_argument("--gate-low", type=float, default=0.2)
     parser.add_argument("--gate-high", type=float, default=0.8)
+    parser.add_argument("--ratio-lambda", type=float, default=1e-2)
+    parser.add_argument("--regression-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--regression-max-iter", type=int, default=10000)
+    parser.add_argument("--regression-tol", type=float, default=1e-8)
     return parser.parse_args()
 
 
@@ -502,7 +506,10 @@ def weights_entry_exists(weights_path: Path, dataset_name: str, seed: int) -> bo
     except Exception:
         return False
     entry = data.get(dataset_name)
-    return isinstance(entry, dict) and isinstance(entry.get(str(seed)), dict)
+    if not isinstance(entry, dict):
+        return False
+    seed_entry = entry.get(str(seed))
+    return isinstance(seed_entry, dict) and seed_entry.get("method_version") == learn_weights_mod.METHOD_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +709,7 @@ def _load_noise_gate_cache_if_valid(
                 return None
             if str(np.asarray(data["proxy_model"]).item()) != str(proxy_model):
                 return None
-            if int(np.asarray(data["seed"]).item()) != int(seed):
+            if int(np.asarray(data["proxy_training_seed"]).item()) != int(seed):
                 return None
             if int(np.asarray(data["epochs"]).item()) != int(epochs):
                 return None
@@ -740,7 +747,7 @@ def _save_noise_gate_cache(
         cache_version=np.array(NOISE_GATE_CACHE_VERSION),
         dataset=np.array(dataset_name),
         proxy_model=np.array(proxy_model),
-        seed=np.array(int(seed), dtype=np.int64),
+        proxy_training_seed=np.array(int(seed), dtype=np.int64),
         epochs=np.array(int(epochs), dtype=np.int64),
         labels=np.asarray(labels_all, dtype=np.int64),
         learn_window=np.array(int(learn_window), dtype=np.int64),
@@ -908,14 +915,13 @@ def run_weight_learning_stage(args: argparse.Namespace, seed: int, device: torch
         return
 
     print(f"[weights] learn static-score weights | dataset={args.dataset} seed={seed}")
-    base_ridge_lambda = 0.01
-    scaled_ridge_lambda = base_ridge_lambda * (NOISE_RISK_FACTOR ** 2)
-    # 标签注噪实验中动态监督更不稳定，按噪声风险因子的平方降低线性回归正则强度。
-    print(f"[weights] ridge_lambda scaled by noise factor: base={base_ridge_lambda}, scaled={scaled_ridge_lambda}")
+    base_ratio_lambda = float(args.ratio_lambda)
+    scaled_ratio_lambda = base_ratio_lambda * (NOISE_RISK_FACTOR ** 2)
+    # 标签注噪实验中动态监督更不稳定，按先验噪声风险因子的平方降低 ratio 正则强度。
+    print(f"[weights] ratio_lambda scaled by noise factor: base={base_ratio_lambda}, scaled={scaled_ratio_lambda}")
     with (
         patched_training_label_noise(args.dataset, seed, verbose_once=True),
         patched_weight_learning_paths(),
-        patched_noise_gate_dynamic_target(args, seed, epochs),
     ):
         cli = [
             "--dataset", args.dataset,
@@ -931,12 +937,22 @@ def run_weight_learning_stage(args: argparse.Namespace, seed: int, device: torch
             "--output", str(weights_path),
             "--seed", str(seed),
             "--proxy-training-seed", str(seed),
-            "--ridge-lambda", f"{scaled_ridge_lambda:.12g}",
+            "--ratio-lambda", f"{scaled_ratio_lambda:.12g}",
+            "--regression-learning-rate", str(args.regression_learning_rate),
+            "--regression-max-iter", str(args.regression_max_iter),
+            "--regression-tol", str(args.regression_tol),
+            "--learn-window", str(args.learn_window),
+            "--learn-min-correct", str(args.learn_min_correct),
+            "--gate-low", str(args.gate_low),
+            "--gate-high", str(args.gate_high),
+            "--use-noise-gate",
         ]
         if args.device is not None:
             cli += ["--device", str(device)]
         if args.debug_prompts:
             cli += ["--debug-prompts"]
+        if args.force:
+            cli += ["--force-noise-gate"]
         call_module_main(learn_weights_mod, cli)
 
 

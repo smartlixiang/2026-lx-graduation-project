@@ -42,10 +42,12 @@ from weights import (
     ConfusionComplementarityScore,
     TransferabilityAlignmentScore,
 )
-from weights.dynamic_utils import DynamicComponentResult, load_cv_fold_logs
+from weights.dynamic_utils import DynamicComponentResult, FoldLogData, load_cv_fold_logs, resolve_epoch_windows
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 COMPONENT_NAMES = ("A", "C", "T")
+NOISE_GATE_CACHE_VERSION = "noise_gate_v3_rank_min_normalized_positive"
+METHOD_VERSION = "softplus_ratio_noise_gate_v1"
 
 
 def resolve_default_proxy_epochs(dataset_name: str) -> int:
@@ -97,6 +99,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=10000)
     parser.add_argument("--tol", type=float, default=1e-6)
+    parser.add_argument("--learn-window", type=int, default=10)
+    parser.add_argument("--learn-min-correct", type=int, default=8)
+    parser.add_argument("--gate-low", type=float, default=0.2)
+    parser.add_argument("--gate-high", type=float, default=0.8)
+    parser.add_argument("--ratio-lambda", type=float, default=1e-2)
+    parser.add_argument("--regression-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--regression-max-iter", type=int, default=10000)
+    parser.add_argument("--regression-tol", type=float, default=1e-8)
+    parser.add_argument(
+        "--use-noise-gate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to use the rank-min dynamic gate when building the regression target.",
+    )
+    parser.add_argument(
+        "--force-noise-gate",
+        action="store_true",
+        help="Recompute noise_gate.npz even if a valid cache exists.",
+    )
     parser.add_argument("--output", type=str, default="weights/scoring_weights.json")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--debug-prompts", action="store_true")
@@ -266,6 +287,316 @@ def fit_ridge_regression_nonnegative(
         bias = next_bias
 
     return weights.astype(np.float64), float(bias)
+
+
+def _cross_entropy_from_logits(logits: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int64)
+    if logits.ndim != 3:
+        raise ValueError("logits must have shape (epochs, samples, classes).")
+    if labels.shape != (logits.shape[1],):
+        raise ValueError("labels shape mismatch for logits.")
+    if np.any(labels < 0) or np.any(labels >= logits.shape[2]):
+        raise ValueError("labels out of range for logits.")
+
+    max_logits = np.max(logits, axis=2)
+    shifted = logits - max_logits[:, :, None]
+    logsumexp = np.log(np.sum(np.exp(shifted), axis=2)) + max_logits
+    true_logits = np.take_along_axis(logits, labels.reshape(1, -1, 1), axis=2).squeeze(2)
+    losses = logsumexp - true_logits
+    return np.nan_to_num(losses, nan=0.0, posinf=1.0e6, neginf=0.0).astype(np.float64)
+
+
+def _percentile_rank_tie_aware(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1:
+        raise ValueError("values must be one-dimensional.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("values contains NaN/inf values.")
+    n = int(values.shape[0])
+    if n <= 1:
+        return np.zeros(n, dtype=np.float64)
+
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.zeros(n, dtype=np.float64)
+    sorted_values = values[order]
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and sorted_values[j] == sorted_values[i]:
+            j += 1
+        ranks[order[i:j]] = (0.5 * float(i + j - 1)) / float(n - 1)
+        i = j
+    return ranks.astype(np.float64)
+
+
+def _validate_gate_thresholds(gate_low: float, gate_high: float) -> tuple[float, float]:
+    gate_low = float(gate_low)
+    gate_high = float(gate_high)
+    if not (0.0 <= gate_low < gate_high <= 1.0):
+        raise ValueError("gate_low and gate_high must satisfy 0 <= gate_low < gate_high <= 1.")
+    return gate_low, gate_high
+
+
+def _build_gate_from_final_risk(final_risk: np.ndarray, gate_low: float, gate_high: float) -> np.ndarray:
+    gate_low, gate_high = _validate_gate_thresholds(gate_low, gate_high)
+    final_risk = np.asarray(final_risk, dtype=np.float64)
+    if final_risk.ndim != 1 or not np.all(np.isfinite(final_risk)):
+        raise ValueError("final_risk must be a finite one-dimensional array.")
+    gate = np.where(
+        final_risk <= gate_low,
+        1.0,
+        np.where(final_risk >= gate_high, 0.0, 1.0 - (final_risk - gate_low) / (gate_high - gate_low)),
+    )
+    return np.clip(gate, 0.0, 1.0).astype(np.float64)
+
+
+def _softmax_logits(logits: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits, dtype=np.float64)
+    shifted = logits - np.max(logits, axis=-1, keepdims=True)
+    exp = np.exp(np.clip(shifted, -50.0, 50.0))
+    denom = np.sum(exp, axis=-1, keepdims=True)
+    denom = np.where(denom > 0.0, denom, 1.0)
+    return (exp / denom).astype(np.float64)
+
+
+def _compute_final_noise_risk(
+    folds: list[FoldLogData],
+    labels_all: np.ndarray,
+    learn_window: int,
+    learn_min_correct: int,
+) -> np.ndarray:
+    labels_all = np.asarray(labels_all, dtype=np.int64)
+    num_samples = int(labels_all.shape[0])
+    learn_window = int(learn_window)
+    learn_min_correct = int(learn_min_correct)
+    if learn_window <= 0:
+        raise ValueError("learn_window must be positive.")
+    if learn_min_correct <= 0 or learn_min_correct > learn_window:
+        raise ValueError("learn_min_correct must be in [1, learn_window].")
+
+    learn_sum = np.zeros(num_samples, dtype=np.float64)
+    learn_count = np.zeros(num_samples, dtype=np.int64)
+    loss_var_sum = np.zeros(num_samples, dtype=np.float64)
+    loss_var_count = np.zeros(num_samples, dtype=np.int64)
+    val_bias_raw = np.full(num_samples, np.nan, dtype=np.float64)
+
+    for fold in tqdm(folds, desc="compute noise gate", unit="fold", leave=False):
+        train_idx = np.asarray(fold.train_indices, dtype=np.int64)
+        y_train = labels_all[train_idx]
+        train_logits = np.asarray(fold.train_logits, dtype=np.float64)
+        train_preds = np.argmax(train_logits, axis=2)
+        correct = train_preds == y_train.reshape(1, -1)
+        num_epochs = int(correct.shape[0])
+        for local_i, sample_idx in enumerate(train_idx):
+            seq = correct[:, local_i].astype(np.int64)
+            learned_time = None
+            if num_epochs >= learn_window:
+                window_sum = np.convolve(seq, np.ones(learn_window, dtype=np.int64), mode="valid")
+                hit = np.flatnonzero(window_sum >= learn_min_correct)
+                if hit.size:
+                    learned_time = int(hit[0] + learn_window - 1)
+            if learned_time is None:
+                learn_risk = 1.0
+            else:
+                prev_correct = correct[:-1, local_i]
+                next_wrong = ~correct[1:, local_i]
+                forget_frequency = float(np.sum(prev_correct & next_wrong)) / float(max(1, int(np.sum(prev_correct))))
+                learn_time_norm = float(learned_time) / float(max(1, num_epochs - 1))
+                learn_risk = max(learn_time_norm, forget_frequency)
+            learn_sum[int(sample_idx)] += float(learn_risk)
+            learn_count[int(sample_idx)] += 1
+
+        losses = _cross_entropy_from_logits(train_logits, y_train)
+        _, mid_idx, late_idx = resolve_epoch_windows(num_epochs)
+        mid_late_idx = np.concatenate([mid_idx, late_idx]).astype(np.int64)
+        loss_var_sum[train_idx] += np.var(losses[mid_late_idx], axis=0).astype(np.float64)
+        loss_var_count[train_idx] += 1
+
+        val_idx = np.asarray(fold.val_indices, dtype=np.int64)
+        y_val = labels_all[val_idx]
+        val_logits = np.asarray(fold.val_logits, dtype=np.float64)
+        _, val_mid_idx, val_late_idx = resolve_epoch_windows(int(val_logits.shape[0]))
+        val_mid_late_idx = np.concatenate([val_mid_idx, val_late_idx]).astype(np.int64)
+        probs = _softmax_logits(val_logits[val_mid_late_idx])
+        preds = np.argmax(probs, axis=2)
+        for local_i, sample_idx in enumerate(val_idx):
+            label = int(y_val[local_i])
+            other_preds = preds[:, local_i]
+            other_mask = other_preds != label
+            if not np.any(other_mask):
+                val_bias_raw[int(sample_idx)] = 0.0
+                continue
+            counts = np.bincount(other_preds[other_mask], minlength=probs.shape[2]).astype(np.int64)
+            counts[label] = -1
+            c_star = int(np.argmax(counts))
+            stable_freq = float(np.sum(other_preds == c_star)) / float(len(val_mid_late_idx))
+            margin = np.maximum(probs[:, local_i, c_star] - probs[:, local_i, label], 0.0)
+            val_bias_raw[int(sample_idx)] = stable_freq * float(np.mean(margin))
+
+    if np.any(learn_count <= 0) or np.any(loss_var_count <= 0) or np.any(~np.isfinite(val_bias_raw)):
+        missing = np.where((learn_count <= 0) | (loss_var_count <= 0) | (~np.isfinite(val_bias_raw)))[0]
+        raise ValueError(f"Some samples lack noise gate metrics: {missing[:10]}.")
+
+    learn_risk_rank = _percentile_rank_tie_aware(learn_sum / learn_count)
+    loss_var_rank = _percentile_rank_tie_aware(loss_var_sum / loss_var_count)
+    val_bias_rank = _percentile_rank_tie_aware(val_bias_raw)
+    return np.minimum.reduce([learn_risk_rank, loss_var_rank, val_bias_rank]).astype(np.float64)
+
+
+def _noise_gate_cache_path(dataset: str, proxy_model: str, proxy_training_seed: int, epochs: int) -> Path:
+    return resolve_dynamic_component_cache_dir(dataset, proxy_model, proxy_training_seed, epochs) / "noise_gate.npz"
+
+
+def _load_noise_gate_cache_if_valid(
+    cache_path: Path,
+    dataset: str,
+    proxy_model: str,
+    proxy_training_seed: int,
+    epochs: int,
+    labels_all: np.ndarray,
+    learn_window: int,
+    learn_min_correct: int,
+    gate_low: float,
+    gate_high: float,
+) -> dict[str, np.ndarray] | None:
+    if not cache_path.is_file():
+        return None
+    try:
+        with np.load(cache_path, allow_pickle=False) as data:
+            if str(np.asarray(data["cache_version"]).item()) != NOISE_GATE_CACHE_VERSION:
+                return None
+            if str(np.asarray(data["dataset"]).item()) != str(dataset):
+                return None
+            if str(np.asarray(data["proxy_model"]).item()) != str(proxy_model):
+                return None
+            if int(np.asarray(data["proxy_training_seed"]).item()) != int(proxy_training_seed):
+                return None
+            if int(np.asarray(data["epochs"]).item()) != int(epochs):
+                return None
+            if int(np.asarray(data["learn_window"]).item()) != int(learn_window):
+                return None
+            if int(np.asarray(data["learn_min_correct"]).item()) != int(learn_min_correct):
+                return None
+            labels_cached = np.asarray(data["labels"], dtype=np.int64)
+            if not np.array_equal(labels_cached, labels_all.astype(np.int64, copy=False)):
+                return None
+            final_risk = np.asarray(data["final_risk"], dtype=np.float64)
+    except Exception:
+        return None
+    if final_risk.shape != (int(labels_all.shape[0]),) or not np.all(np.isfinite(final_risk)):
+        return None
+    return {"final_risk": final_risk, "gate": _build_gate_from_final_risk(final_risk, gate_low, gate_high)}
+
+
+def _save_noise_gate_cache(
+    cache_path: Path,
+    dataset: str,
+    proxy_model: str,
+    proxy_training_seed: int,
+    epochs: int,
+    labels_all: np.ndarray,
+    learn_window: int,
+    learn_min_correct: int,
+    final_risk: np.ndarray,
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        cache_version=np.array(NOISE_GATE_CACHE_VERSION, dtype=np.str_),
+        dataset=np.array(dataset, dtype=np.str_),
+        proxy_model=np.array(proxy_model, dtype=np.str_),
+        proxy_training_seed=np.array(int(proxy_training_seed), dtype=np.int64),
+        epochs=np.array(int(epochs), dtype=np.int64),
+        labels=np.asarray(labels_all, dtype=np.int64),
+        learn_window=np.array(int(learn_window), dtype=np.int64),
+        learn_min_correct=np.array(int(learn_min_correct), dtype=np.int64),
+        final_risk=np.asarray(final_risk, dtype=np.float64),
+    )
+
+
+def get_or_compute_noise_gate(
+    *,
+    folds: list[FoldLogData],
+    dataset: str,
+    proxy_model: str,
+    proxy_training_seed: int,
+    epochs: int,
+    labels_all: np.ndarray,
+    learn_window: int,
+    learn_min_correct: int,
+    gate_low: float,
+    gate_high: float,
+    force: bool = False,
+) -> dict[str, np.ndarray]:
+    _validate_gate_thresholds(gate_low, gate_high)
+    cache_path = _noise_gate_cache_path(dataset, proxy_model, proxy_training_seed, epochs)
+    if not force:
+        cached = _load_noise_gate_cache_if_valid(
+            cache_path, dataset, proxy_model, proxy_training_seed, epochs,
+            labels_all, learn_window, learn_min_correct, gate_low, gate_high,
+        )
+        if cached is not None:
+            print(f"Noise gate cache HIT: {cache_path}")
+            return cached
+    final_risk = _compute_final_noise_risk(folds, labels_all, learn_window, learn_min_correct)
+    _save_noise_gate_cache(cache_path, dataset, proxy_model, proxy_training_seed, epochs, labels_all, learn_window, learn_min_correct, final_risk)
+    print(f"Noise gate cache {'FORCE->RECOMPUTED' if force else 'MISS->COMPUTED'}: {cache_path}")
+    return {"final_risk": final_risk, "gate": _build_gate_from_final_risk(final_risk, gate_low, gate_high)}
+
+
+def fit_softplus_ratio_regression(
+    features: np.ndarray,
+    targets: np.ndarray,
+    ratio_lambda: float,
+    learning_rate: float,
+    max_iter: int,
+    tol: float,
+    device: torch.device,
+) -> dict[str, object]:
+    if features.ndim != 2 or targets.ndim != 1 or features.shape[0] != targets.shape[0]:
+        raise ValueError("features/targets shape mismatch.")
+    features_t = torch.as_tensor(features, dtype=torch.float64, device=device)
+    targets_t = torch.as_tensor(targets, dtype=torch.float64, device=device)
+    theta = torch.zeros(features.shape[1], dtype=torch.float64, device=device, requires_grad=True)
+    bias = torch.tensor(float(np.mean(targets)), dtype=torch.float64, device=device, requires_grad=True)
+    optimizer = torch.optim.Adam([theta, bias], lr=float(learning_rate))
+    prev_loss: float | None = None
+    iterations = 0
+    final_mse = 0.0
+    final_ratio = 0.0
+    for iteration in tqdm(range(int(max_iter)), desc="fit softplus-ratio", unit="iter", leave=False):
+        optimizer.zero_grad()
+        raw_weights = torch.nn.functional.softplus(theta) + 1e-8
+        pred = features_t @ raw_weights + bias
+        mse = torch.mean((pred - targets_t) ** 2)
+        ratio_reg = torch.var(raw_weights, unbiased=False) / (torch.mean(raw_weights) ** 2 + 1e-8)
+        loss = mse + float(ratio_lambda) * ratio_reg
+        loss.backward()
+        optimizer.step()
+        loss_value = float(loss.detach().cpu())
+        final_mse = float(mse.detach().cpu())
+        final_ratio = float(ratio_reg.detach().cpu())
+        iterations = iteration + 1
+        if prev_loss is not None and abs(prev_loss - loss_value) < float(tol):
+            break
+        prev_loss = loss_value
+
+    with torch.no_grad():
+        raw_weights_t = torch.nn.functional.softplus(theta) + 1e-8
+        pred_t = features_t @ raw_weights_t + bias
+        raw_weights_np = raw_weights_t.detach().cpu().numpy().astype(np.float64)
+        normalized_weights = raw_weights_np / float(np.sum(raw_weights_np))
+        pred_np = pred_t.detach().cpu().numpy().astype(np.float64)
+    return {
+        "raw_weights": raw_weights_np,
+        "normalized_weights": normalized_weights.astype(np.float64),
+        "bias": float(bias.detach().cpu()),
+        "mse": final_mse,
+        "ratio_regularizer": final_ratio,
+        "iterations": iterations,
+        "pred": pred_np,
+    }
 
 def build_output_path(base_path: str) -> Path:
     return Path(base_path)
@@ -499,16 +830,19 @@ def _try_load_all_dynamic_components_from_cache(
         )
         if result is None or labels is None:
             component_reasons[component_name] = reason
-            return None, component_cache_paths, None, component_reasons
+            continue
 
         if labels_ref is None:
             labels_ref = labels
         elif not np.array_equal(labels_ref, labels):
             component_reasons[component_name] = "labels mismatch with previously loaded component caches"
-            return None, component_cache_paths, None, component_reasons
+            continue
 
         component_results[component_name] = result
         component_reasons[component_name] = "ok"
+
+    if len(component_results) != len(COMPONENT_NAMES):
+        return None, component_cache_paths, labels_ref, component_reasons
 
     return component_results, component_cache_paths, labels_ref, component_reasons
 
@@ -553,11 +887,42 @@ def get_or_compute_dynamic_component(
     return computed, False, cache_path
 
 
+def load_proxy_folds_for_dynamic_seed(
+    args: argparse.Namespace,
+    proxy_training_seed: int,
+    resolved_proxy_epochs: int,
+    *,
+    reason: str,
+) -> tuple[list[FoldLogData], np.ndarray, Path]:
+    proxy_log = resolve_proxy_log_path(
+        args.proxy_log,
+        args.dataset,
+        proxy_training_seed,
+        proxy_model=args.proxy_model,
+        max_epoch=resolved_proxy_epochs,
+    )
+    if not proxy_log.is_dir():
+        raise FileNotFoundError(
+            f"{reason}\n"
+            f"原始代理日志期望路径: {proxy_log}\n"
+            "请先生成对应 proxy logs，或提供完整且匹配当前参数的动态缓存。"
+        )
+
+    folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
+    actual_proxy_epochs = int(folds[0].train_logits.shape[0])
+    if actual_proxy_epochs != resolved_proxy_epochs:
+        print(
+            f"INFO: requested proxy epochs={resolved_proxy_epochs}, "
+            f"but loaded logs contain {actual_proxy_epochs} epochs; cache will use requested epochs tag."
+        )
+    return folds, np.asarray(labels_all, dtype=np.int64), proxy_log
+
+
 def load_or_compute_dynamic_components_for_seed(
     args: argparse.Namespace,
     proxy_training_seed: int,
     resolved_proxy_epochs: int,
-) -> tuple[dict[str, DynamicComponentResult], np.ndarray, Path | None, dict[str, Path]]:
+) -> tuple[dict[str, DynamicComponentResult], np.ndarray, Path | None, dict[str, Path], list[FoldLogData] | None]:
     cached_bundle, component_cache_paths, labels_all, cache_reasons = _try_load_all_dynamic_components_from_cache(
         dataset=args.dataset,
         proxy_model=args.proxy_model,
@@ -569,38 +934,28 @@ def load_or_compute_dynamic_components_for_seed(
         print(f"Dynamic component caches HIT for seed={proxy_training_seed}; proxy logs are not required.")
         for name in COMPONENT_NAMES:
             print(f"Dynamic component cache HIT: {name} @ {component_cache_paths[name]}")
-        return cached_bundle, labels_all, None, component_cache_paths
+        return cached_bundle, labels_all, None, component_cache_paths, None
 
-    print(f"Dynamic cache set is not fully usable for seed={proxy_training_seed}. Reasons:")
+    missing_components = [name for name in COMPONENT_NAMES if cache_reasons.get(name) != "ok"]
+    print(f"Dynamic cache set is not fully usable for seed={proxy_training_seed}. Missing/invalid components: {missing_components}")
+    print("Dynamic cache reasons:")
     for name in COMPONENT_NAMES:
         print(f"  - {name}: {cache_reasons.get(name, 'not attempted')}")
 
-    proxy_log = resolve_proxy_log_path(
-        args.proxy_log,
-        args.dataset,
-        proxy_training_seed,
-        proxy_model=args.proxy_model,
-        max_epoch=resolved_proxy_epochs,
+    reason_lines = "\n".join(
+        f"  - {name}: {cache_reasons.get(name, 'unknown')}" for name in COMPONENT_NAMES
     )
-    if not proxy_log.is_dir():
-        reason_lines = "\n".join(
-            f"  - {name}: {cache_reasons.get(name, 'unknown')}" for name in COMPONENT_NAMES
-        )
-        raise FileNotFoundError(
-            "未能直接使用保存的动态分量缓存，且也找不到原始代理训练日志。\n"
+    folds, labels_all, proxy_log = load_proxy_folds_for_dynamic_seed(
+        args,
+        proxy_training_seed,
+        resolved_proxy_epochs,
+        reason=(
+            "未能直接使用完整动态分量缓存，需要加载原始代理训练日志来补算未命中的分量。\n"
             f"动态缓存目录: {resolve_dynamic_component_cache_dir(args.dataset, args.proxy_model, proxy_training_seed, resolved_proxy_epochs)}\n"
-            f"原始代理日志期望路径: {proxy_log}\n"
             "缓存不匹配的具体原因如下：\n"
             f"{reason_lines}"
-        )
-
-    folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
-    actual_proxy_epochs = int(folds[0].train_logits.shape[0])
-    if actual_proxy_epochs != resolved_proxy_epochs:
-        print(
-            f"INFO: requested proxy epochs={resolved_proxy_epochs}, "
-            f"but loaded logs contain {actual_proxy_epochs} epochs; cache will use requested epochs tag."
-        )
+        ),
+    )
 
     component_compute_fns: dict[str, Callable[[], DynamicComponentResult]] = {
         "A": lambda: AbsorptionGainScore().compute(folds=folds, labels_all=labels_all),
@@ -623,10 +978,14 @@ def load_or_compute_dynamic_components_for_seed(
         component_cache_paths[name] = cache_path
         print(f"Dynamic component cache {'HIT' if from_cache else 'MISS->RECOMPUTED'}: {name} @ {cache_path}")
 
-    return component_results, labels_all, proxy_log, component_cache_paths
+    return component_results, labels_all, proxy_log, component_cache_paths, folds
 
 
-def build_dynamic_target(component_results: dict[str, DynamicComponentResult]) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+def build_dynamic_target(
+    component_results: dict[str, DynamicComponentResult],
+    gate: np.ndarray | None = None,
+    use_noise_gate: bool = True,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     a_result = component_results["A"]
     c_result = component_results["C"]
     t_result = component_results["T"]
@@ -642,11 +1001,25 @@ def build_dynamic_target(component_results: dict[str, DynamicComponentResult]) -
         if not np.all(np.isfinite(arr)):
             raise ValueError(f"{name} contains NaN/inf values.")
 
-    utility_raw = (
-        a_result.final_normalized
-        + c_result.final_normalized
-        + t_result.final_normalized
-    ).astype(np.float32) / 3.0
+    if use_noise_gate and gate is not None:
+        gate = np.asarray(gate, dtype=np.float64)
+        if gate.shape != (num_samples,) or not np.all(np.isfinite(gate)):
+            raise ValueError(f"gate shape/finite mismatch: {gate.shape}")
+
+        def split_gate_positive_part(values: np.ndarray) -> np.ndarray:
+            values = np.asarray(values, dtype=np.float64)
+            return np.minimum(values, 0.0) + gate * np.maximum(values, 0.0)
+
+        gated_a = split_gate_positive_part(a_result.final_normalized)
+        gated_c = split_gate_positive_part(c_result.final_normalized)
+        gated_t = split_gate_positive_part(t_result.final_normalized)
+        utility_raw = (gated_a + gated_c + gated_t) / 3.0
+    else:
+        utility_raw = (
+            a_result.final_normalized
+            + c_result.final_normalized
+            + t_result.final_normalized
+        ).astype(np.float64) / 3.0
     u_scores = standard_zscore(utility_raw)
     dynamic_component_values = {
         "A": a_result.final_normalized,
@@ -711,12 +1084,83 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             f"proxy_training_seed={proxy_training_seed}, proxy_epochs={resolved_proxy_epochs} ==="
         )
 
-        component_results, labels_all, proxy_log, component_cache_paths = load_or_compute_dynamic_components_for_seed(
+        component_results, labels_all, proxy_log, component_cache_paths, folds = load_or_compute_dynamic_components_for_seed(
             args,
             proxy_training_seed=proxy_training_seed,
             resolved_proxy_epochs=resolved_proxy_epochs,
         )
-        dynamic_scores, dynamic_component_values = build_dynamic_target(component_results)
+        noise_gate_data: dict[str, np.ndarray] | None = None
+        if args.use_noise_gate:
+            if folds is not None:
+                noise_gate_data = get_or_compute_noise_gate(
+                    folds=folds,
+                    dataset=args.dataset,
+                    proxy_model=args.proxy_model,
+                    proxy_training_seed=proxy_training_seed,
+                    epochs=resolved_proxy_epochs,
+                    labels_all=labels_all,
+                    learn_window=args.learn_window,
+                    learn_min_correct=args.learn_min_correct,
+                    gate_low=args.gate_low,
+                    gate_high=args.gate_high,
+                    force=args.force_noise_gate,
+                )
+            else:
+                gate_cache_path = _noise_gate_cache_path(args.dataset, args.proxy_model, proxy_training_seed, resolved_proxy_epochs)
+                noise_gate_data = None if args.force_noise_gate else _load_noise_gate_cache_if_valid(
+                    gate_cache_path,
+                    args.dataset,
+                    args.proxy_model,
+                    proxy_training_seed,
+                    resolved_proxy_epochs,
+                    labels_all,
+                    args.learn_window,
+                    args.learn_min_correct,
+                    args.gate_low,
+                    args.gate_high,
+                )
+                if noise_gate_data is None:
+                    print(
+                        "Noise gate cache is missing/invalid while dynamic component caches are usable; "
+                        "loading proxy logs to compute only noise_gate.npz."
+                    )
+                    folds, gate_labels_all, gate_proxy_log = load_proxy_folds_for_dynamic_seed(
+                        args,
+                        proxy_training_seed,
+                        resolved_proxy_epochs,
+                        reason=(
+                            "Dynamic component caches were usable without proxy logs, but the noise gate cache is missing/invalid.\n"
+                            f"Expected gate cache: {gate_cache_path}"
+                        ),
+                    )
+                    if not np.array_equal(gate_labels_all, labels_all.astype(np.int64, copy=False)):
+                        raise ValueError(
+                            "Labels from proxy logs do not match labels stored in dynamic component caches; "
+                            f"cannot safely compute noise gate from {gate_proxy_log}."
+                        )
+                    noise_gate_data = get_or_compute_noise_gate(
+                        folds=folds,
+                        dataset=args.dataset,
+                        proxy_model=args.proxy_model,
+                        proxy_training_seed=proxy_training_seed,
+                        epochs=resolved_proxy_epochs,
+                        labels_all=labels_all,
+                        learn_window=args.learn_window,
+                        learn_min_correct=args.learn_min_correct,
+                        gate_low=args.gate_low,
+                        gate_high=args.gate_high,
+                        force=True,
+                    )
+                else:
+                    print(f"Noise gate cache HIT: {gate_cache_path}")
+        dynamic_scores, dynamic_component_values = build_dynamic_target(
+            component_results,
+            gate=None if noise_gate_data is None else noise_gate_data["gate"],
+            use_noise_gate=bool(args.use_noise_gate),
+        )
+        if noise_gate_data is not None:
+            dynamic_component_values["noise_gate"] = noise_gate_data["gate"]
+            dynamic_component_values["noise_final_risk"] = noise_gate_data["final_risk"]
         num_samples = labels_all.shape[0]
 
         image_adapter, text_adapter, adapter_paths = load_adapters_for_seed(
@@ -769,14 +1213,17 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         dds_z = standard_zscore_by_class(static_scores["dds"], static_scores["labels"])
 
         static_features = np.stack([sa_z, div_z, dds_z], axis=1).astype(np.float64)
-        weights, bias = fit_ridge_regression_nonnegative(
+        fit_result = fit_softplus_ratio_regression(
             static_features,
             dynamic_scores,
-            args.ridge_lambda,
-            args.learning_rate,
-            args.max_iter,
-            args.tol,
+            args.ratio_lambda,
+            args.regression_learning_rate,
+            args.regression_max_iter,
+            args.regression_tol,
+            device,
         )
+        weights = np.asarray(fit_result["normalized_weights"], dtype=np.float64)
+        bias = float(fit_result["bias"])
 
         static_component_values = {
             "SA": sa_z,
@@ -816,7 +1263,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "div": float(weights[1]),
             "dds": float(weights[2]),
             "bias": float(bias),
-            "ridge_lambda": float(args.ridge_lambda),
+            "method_version": METHOD_VERSION,
+            "ratio_lambda": float(args.ratio_lambda),
             "proxy_log": str(proxy_log) if proxy_log is not None else "",
             "dynamic_components": list(COMPONENT_NAMES),
             "dynamic_cache_path": str(dynamic_cache_dir),
@@ -828,7 +1276,12 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "adapter_seed": seed,
             "diagnostics": {
                 "dynamic_static_pearson": correlation_matrix,
-                "weight_solver": "positive_simplex_ridge_softmax",
+                "weight_solver": "softplus_ratio_no_simplex",
+                "method_version": METHOD_VERSION,
+                "raw_weights": [float(x) for x in np.asarray(fit_result["raw_weights"], dtype=np.float64)],
+                "mse": float(fit_result["mse"]),
+                "ratio_regularizer": float(fit_result["ratio_regularizer"]),
+                "iterations": int(fit_result["iterations"]),
                 "weights_sum": float(np.sum(weights)),
                 "weights_min": float(np.min(weights)),
                 "sa_gt_one_third_warning": sa_warning,

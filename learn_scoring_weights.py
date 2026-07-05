@@ -830,16 +830,19 @@ def _try_load_all_dynamic_components_from_cache(
         )
         if result is None or labels is None:
             component_reasons[component_name] = reason
-            return None, component_cache_paths, None, component_reasons
+            continue
 
         if labels_ref is None:
             labels_ref = labels
         elif not np.array_equal(labels_ref, labels):
             component_reasons[component_name] = "labels mismatch with previously loaded component caches"
-            return None, component_cache_paths, None, component_reasons
+            continue
 
         component_results[component_name] = result
         component_reasons[component_name] = "ok"
+
+    if len(component_results) != len(COMPONENT_NAMES):
+        return None, component_cache_paths, labels_ref, component_reasons
 
     return component_results, component_cache_paths, labels_ref, component_reasons
 
@@ -884,6 +887,37 @@ def get_or_compute_dynamic_component(
     return computed, False, cache_path
 
 
+def load_proxy_folds_for_dynamic_seed(
+    args: argparse.Namespace,
+    proxy_training_seed: int,
+    resolved_proxy_epochs: int,
+    *,
+    reason: str,
+) -> tuple[list[FoldLogData], np.ndarray, Path]:
+    proxy_log = resolve_proxy_log_path(
+        args.proxy_log,
+        args.dataset,
+        proxy_training_seed,
+        proxy_model=args.proxy_model,
+        max_epoch=resolved_proxy_epochs,
+    )
+    if not proxy_log.is_dir():
+        raise FileNotFoundError(
+            f"{reason}\n"
+            f"原始代理日志期望路径: {proxy_log}\n"
+            "请先生成对应 proxy logs，或提供完整且匹配当前参数的动态缓存。"
+        )
+
+    folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
+    actual_proxy_epochs = int(folds[0].train_logits.shape[0])
+    if actual_proxy_epochs != resolved_proxy_epochs:
+        print(
+            f"INFO: requested proxy epochs={resolved_proxy_epochs}, "
+            f"but loaded logs contain {actual_proxy_epochs} epochs; cache will use requested epochs tag."
+        )
+    return folds, np.asarray(labels_all, dtype=np.int64), proxy_log
+
+
 def load_or_compute_dynamic_components_for_seed(
     args: argparse.Namespace,
     proxy_training_seed: int,
@@ -902,36 +936,26 @@ def load_or_compute_dynamic_components_for_seed(
             print(f"Dynamic component cache HIT: {name} @ {component_cache_paths[name]}")
         return cached_bundle, labels_all, None, component_cache_paths, None
 
-    print(f"Dynamic cache set is not fully usable for seed={proxy_training_seed}. Reasons:")
+    missing_components = [name for name in COMPONENT_NAMES if cache_reasons.get(name) != "ok"]
+    print(f"Dynamic cache set is not fully usable for seed={proxy_training_seed}. Missing/invalid components: {missing_components}")
+    print("Dynamic cache reasons:")
     for name in COMPONENT_NAMES:
         print(f"  - {name}: {cache_reasons.get(name, 'not attempted')}")
 
-    proxy_log = resolve_proxy_log_path(
-        args.proxy_log,
-        args.dataset,
-        proxy_training_seed,
-        proxy_model=args.proxy_model,
-        max_epoch=resolved_proxy_epochs,
+    reason_lines = "\n".join(
+        f"  - {name}: {cache_reasons.get(name, 'unknown')}" for name in COMPONENT_NAMES
     )
-    if not proxy_log.is_dir():
-        reason_lines = "\n".join(
-            f"  - {name}: {cache_reasons.get(name, 'unknown')}" for name in COMPONENT_NAMES
-        )
-        raise FileNotFoundError(
-            "未能直接使用保存的动态分量缓存，且也找不到原始代理训练日志。\n"
+    folds, labels_all, proxy_log = load_proxy_folds_for_dynamic_seed(
+        args,
+        proxy_training_seed,
+        resolved_proxy_epochs,
+        reason=(
+            "未能直接使用完整动态分量缓存，需要加载原始代理训练日志来补算未命中的分量。\n"
             f"动态缓存目录: {resolve_dynamic_component_cache_dir(args.dataset, args.proxy_model, proxy_training_seed, resolved_proxy_epochs)}\n"
-            f"原始代理日志期望路径: {proxy_log}\n"
             "缓存不匹配的具体原因如下：\n"
             f"{reason_lines}"
-        )
-
-    folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
-    actual_proxy_epochs = int(folds[0].train_logits.shape[0])
-    if actual_proxy_epochs != resolved_proxy_epochs:
-        print(
-            f"INFO: requested proxy epochs={resolved_proxy_epochs}, "
-            f"but loaded logs contain {actual_proxy_epochs} epochs; cache will use requested epochs tag."
-        )
+        ),
+    )
 
     component_compute_fns: dict[str, Callable[[], DynamicComponentResult]] = {
         "A": lambda: AbsorptionGainScore().compute(folds=folds, labels_all=labels_all),
@@ -1096,11 +1120,39 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
                     args.gate_high,
                 )
                 if noise_gate_data is None:
-                    raise FileNotFoundError(
-                        "Dynamic component caches were usable without proxy logs, but the noise gate cache is missing/invalid. "
-                        f"Expected gate cache: {gate_cache_path}. Recompute with proxy logs available."
+                    print(
+                        "Noise gate cache is missing/invalid while dynamic component caches are usable; "
+                        "loading proxy logs to compute only noise_gate.npz."
                     )
-                print(f"Noise gate cache HIT: {gate_cache_path}")
+                    folds, gate_labels_all, gate_proxy_log = load_proxy_folds_for_dynamic_seed(
+                        args,
+                        proxy_training_seed,
+                        resolved_proxy_epochs,
+                        reason=(
+                            "Dynamic component caches were usable without proxy logs, but the noise gate cache is missing/invalid.\n"
+                            f"Expected gate cache: {gate_cache_path}"
+                        ),
+                    )
+                    if not np.array_equal(gate_labels_all, labels_all.astype(np.int64, copy=False)):
+                        raise ValueError(
+                            "Labels from proxy logs do not match labels stored in dynamic component caches; "
+                            f"cannot safely compute noise gate from {gate_proxy_log}."
+                        )
+                    noise_gate_data = get_or_compute_noise_gate(
+                        folds=folds,
+                        dataset=args.dataset,
+                        proxy_model=args.proxy_model,
+                        proxy_training_seed=proxy_training_seed,
+                        epochs=resolved_proxy_epochs,
+                        labels_all=labels_all,
+                        learn_window=args.learn_window,
+                        learn_min_correct=args.learn_min_correct,
+                        gate_low=args.gate_low,
+                        gate_high=args.gate_high,
+                        force=True,
+                    )
+                else:
+                    print(f"Noise gate cache HIT: {gate_cache_path}")
         dynamic_scores, dynamic_component_values = build_dynamic_target(
             component_results,
             gate=None if noise_gate_data is None else noise_gate_data["gate"],

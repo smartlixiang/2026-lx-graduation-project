@@ -951,6 +951,8 @@ def run_weight_learning_stage(args: argparse.Namespace, seed: int, device: torch
             cli += ["--device", str(device)]
         if args.debug_prompts:
             cli += ["--debug-prompts"]
+        if args.force:
+            cli += ["--force-noise-gate"]
         call_module_main(learn_weights_mod, cli)
 
 

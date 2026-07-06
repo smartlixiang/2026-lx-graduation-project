@@ -46,7 +46,7 @@ from weights.dynamic_utils import DynamicComponentResult, FoldLogData, load_cv_f
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 COMPONENT_NAMES = ("A", "C", "T")
-NOISE_GATE_CACHE_VERSION = "noise_gate_v3_rank_min_normalized_positive"
+NOISE_GATE_CACHE_VERSION = "noise_gate_v4_learn_after_val_margin"
 METHOD_VERSION = "softplus_ratio_noise_gate_v1"
 
 
@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learn-window", type=int, default=10)
     parser.add_argument("--learn-min-correct", type=int, default=8)
     parser.add_argument("--gate-low", type=float, default=0.2)
-    parser.add_argument("--gate-high", type=float, default=0.8)
+    parser.add_argument("--gate-high", type=float, default=0.95)
     parser.add_argument("--ratio-lambda", type=float, default=1e-2)
     parser.add_argument("--regression-learning-rate", type=float, default=1e-3)
     parser.add_argument("--regression-max-iter", type=int, default=10000)
@@ -397,13 +397,19 @@ def _compute_final_noise_risk(
                 if hit.size:
                     learned_time = int(hit[0] + learn_window - 1)
             if learned_time is None:
+                learn_time_norm = 1.0
+                forget_frequency = 1.0
                 learn_risk = 1.0
             else:
-                prev_correct = correct[:-1, local_i]
-                next_wrong = ~correct[1:, local_i]
-                forget_frequency = float(np.sum(prev_correct & next_wrong)) / float(max(1, int(np.sum(prev_correct))))
-                learn_time_norm = float(learned_time) / float(max(1, num_epochs - 1))
-                learn_risk = max(learn_time_norm, forget_frequency)
+                learn_time_norm = float(learned_time - learn_window + 1) / float(max(1, num_epochs - learn_window))
+                learn_time_norm = float(np.clip(learn_time_norm, 0.0, 1.0))
+                remaining = correct[learned_time + 1 :, local_i]
+                if remaining.size == 0:
+                    forget_frequency = 1.0
+                else:
+                    forget_frequency = float(np.mean(~remaining))
+                learn_risk = 1.0 - (1.0 - learn_time_norm) * (1.0 - forget_frequency)
+                learn_risk = float(np.clip(learn_risk, 0.0, 1.0))
             learn_sum[int(sample_idx)] += float(learn_risk)
             learn_count[int(sample_idx)] += 1
 
@@ -419,20 +425,15 @@ def _compute_final_noise_risk(
         _, val_mid_idx, val_late_idx = resolve_epoch_windows(int(val_logits.shape[0]))
         val_mid_late_idx = np.concatenate([val_mid_idx, val_late_idx]).astype(np.int64)
         probs = _softmax_logits(val_logits[val_mid_late_idx])
-        preds = np.argmax(probs, axis=2)
         for local_i, sample_idx in enumerate(val_idx):
             label = int(y_val[local_i])
-            other_preds = preds[:, local_i]
-            other_mask = other_preds != label
-            if not np.any(other_mask):
-                val_bias_raw[int(sample_idx)] = 0.0
-                continue
-            counts = np.bincount(other_preds[other_mask], minlength=probs.shape[2]).astype(np.int64)
-            counts[label] = -1
-            c_star = int(np.argmax(counts))
-            stable_freq = float(np.sum(other_preds == c_star)) / float(len(val_mid_late_idx))
-            margin = np.maximum(probs[:, local_i, c_star] - probs[:, local_i, label], 0.0)
-            val_bias_raw[int(sample_idx)] = stable_freq * float(np.mean(margin))
+            probs_i = probs[:, local_i, :]
+            label_probs = probs_i[:, label]
+            positive_margins = np.maximum(probs_i - label_probs[:, None], 0.0)
+            positive_margins[:, label] = 0.0
+            class_scores = np.mean(positive_margins, axis=0)
+            class_scores[label] = 0.0
+            val_bias_raw[int(sample_idx)] = float(np.max(class_scores))
 
     if np.any(learn_count <= 0) or np.any(loss_var_count <= 0) or np.any(~np.isfinite(val_bias_raw)):
         missing = np.where((learn_count <= 0) | (loss_var_count <= 0) | (~np.isfinite(val_bias_raw)))[0]

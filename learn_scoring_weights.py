@@ -888,6 +888,61 @@ def get_or_compute_dynamic_component(
     return computed, False, cache_path
 
 
+
+def validate_saved_weight_entry(entry: object) -> tuple[bool, dict[str, float] | None, str]:
+    if not isinstance(entry, dict):
+        return False, None, "entry is not a dict"
+    values: dict[str, float] = {}
+    for key in ("sa", "div", "dds"):
+        if key not in entry:
+            return False, None, f"missing required field: {key}"
+        try:
+            value = float(entry[key])
+        except (TypeError, ValueError):
+            return False, None, f"field {key} is not convertible to float"
+        if not np.isfinite(value):
+            return False, None, f"field {key} is not finite"
+        if value <= 0.0:
+            return False, None, f"field {key} is not > 0"
+        values[key] = value
+    weight_sum = values["sa"] + values["div"] + values["dds"]
+    if abs(weight_sum - 1.0) > 1e-4:
+        return False, None, f"weights sum is not approximately 1: sum={weight_sum:.10f}"
+    return True, values, "ok"
+
+
+def report_existing_weight_entry(
+    data: dict,
+    dataset: str,
+    seed: int,
+    output_path: Path,
+) -> None:
+    if not output_path.exists():
+        print(f"[weights] no existing scoring_weights file: {output_path}")
+        return
+    dataset_entry = data.get(dataset)
+    if not isinstance(dataset_entry, dict):
+        print(f"[weights] no existing dataset entry: dataset={dataset}")
+        return
+    seed_entry = dataset_entry.get(str(seed))
+    if seed_entry is None:
+        print(f"[weights] no existing weights for dataset={dataset} seed={seed}")
+        return
+    valid, weights, reason = validate_saved_weight_entry(seed_entry)
+    if valid and weights is not None:
+        weight_sum = weights["sa"] + weights["div"] + weights["dds"]
+        print(
+            "[weights] existing weights are valid and will be overwritten: "
+            f"dataset={dataset} seed={seed} "
+            f"SA={weights['sa']:.6f}, Div={weights['div']:.6f}, "
+            f"DDS={weights['dds']:.6f}, sum={weight_sum:.6f}"
+        )
+    else:
+        print(
+            "[weights] existing weights are invalid and will be overwritten: "
+            f"dataset={dataset} seed={seed} reason={reason}"
+        )
+
 def load_proxy_folds_for_dynamic_seed(
     args: argparse.Namespace,
     proxy_training_seed: int,
@@ -919,11 +974,18 @@ def load_proxy_folds_for_dynamic_seed(
     return folds, np.asarray(labels_all, dtype=np.int64), proxy_log
 
 
-def load_or_compute_dynamic_components_for_seed(
+def load_or_compute_dynamic_supervision_for_seed(
     args: argparse.Namespace,
     proxy_training_seed: int,
     resolved_proxy_epochs: int,
-) -> tuple[dict[str, DynamicComponentResult], np.ndarray, Path | None, dict[str, Path], list[FoldLogData] | None]:
+) -> tuple[
+    dict[str, DynamicComponentResult],
+    dict[str, np.ndarray] | None,
+    np.ndarray,
+    Path | None,
+    dict[str, Path],
+    dict[str, str],
+]:
     cached_bundle, component_cache_paths, labels_all, cache_reasons = _try_load_all_dynamic_components_from_cache(
         dataset=args.dataset,
         proxy_model=args.proxy_model,
@@ -931,27 +993,52 @@ def load_or_compute_dynamic_components_for_seed(
         epochs=resolved_proxy_epochs,
     )
 
-    if cached_bundle is not None and labels_all is not None:
-        print(f"Dynamic component caches HIT for seed={proxy_training_seed}; proxy logs are not required.")
+    reasons: dict[str, str] = {name: cache_reasons.get(name, "not attempted") for name in COMPONENT_NAMES}
+    gate_cache_path = _noise_gate_cache_path(args.dataset, args.proxy_model, proxy_training_seed, resolved_proxy_epochs)
+    noise_gate_data: dict[str, np.ndarray] | None = None
+    if args.use_noise_gate:
+        if labels_all is not None and not args.force_noise_gate:
+            noise_gate_data = _load_noise_gate_cache_if_valid(
+                gate_cache_path,
+                args.dataset,
+                args.proxy_model,
+                proxy_training_seed,
+                resolved_proxy_epochs,
+                labels_all,
+                args.learn_window,
+                args.learn_min_correct,
+                args.gate_low,
+                args.gate_high,
+            )
+            reasons["gate"] = "ok" if noise_gate_data is not None else f"missing/invalid gate cache: {gate_cache_path}"
+        elif labels_all is not None and args.force_noise_gate:
+            reasons["gate"] = "forced recompute by --force-noise-gate"
+        else:
+            reasons["gate"] = "cannot validate gate before labels are loaded because A/C/T caches are incomplete"
+    else:
+        reasons["gate"] = "disabled by --no-use-noise-gate"
+
+    print(f"Dynamic supervision cache status for seed={proxy_training_seed}")
+    for name in (*COMPONENT_NAMES, "gate"):
+        print(f"  - {name}: {reasons.get(name, 'not attempted')}")
+
+    all_components_ok = cached_bundle is not None and labels_all is not None
+    gate_ok = (not args.use_noise_gate) or (noise_gate_data is not None)
+    if all_components_ok and gate_ok:
+        print(f"Dynamic supervision caches HIT for seed={proxy_training_seed}; proxy logs are not required.")
         for name in COMPONENT_NAMES:
             print(f"Dynamic component cache HIT: {name} @ {component_cache_paths[name]}")
-        return cached_bundle, labels_all, None, component_cache_paths, None
+        if noise_gate_data is not None:
+            print(f"Noise gate cache HIT: {gate_cache_path}")
+        return cached_bundle, noise_gate_data, labels_all, None, component_cache_paths, reasons
 
-    missing_components = [name for name in COMPONENT_NAMES if cache_reasons.get(name) != "ok"]
-    print(f"Dynamic cache set is not fully usable for seed={proxy_training_seed}. Missing/invalid components: {missing_components}")
-    print("Dynamic cache reasons:")
-    for name in COMPONENT_NAMES:
-        print(f"  - {name}: {cache_reasons.get(name, 'not attempted')}")
-
-    reason_lines = "\n".join(
-        f"  - {name}: {cache_reasons.get(name, 'unknown')}" for name in COMPONENT_NAMES
-    )
+    reason_lines = "\n".join(f"  - {name}: {reasons.get(name, 'unknown')}" for name in (*COMPONENT_NAMES, "gate"))
     folds, labels_all, proxy_log = load_proxy_folds_for_dynamic_seed(
         args,
         proxy_training_seed,
         resolved_proxy_epochs,
         reason=(
-            "未能直接使用完整动态分量缓存，需要加载原始代理训练日志来补算未命中的分量。\n"
+            "未能直接使用完整动态伪标签缓存，需要加载原始代理训练日志来补算未命中的分量。\n"
             f"动态缓存目录: {resolve_dynamic_component_cache_dir(args.dataset, args.proxy_model, proxy_training_seed, resolved_proxy_epochs)}\n"
             "缓存不匹配的具体原因如下：\n"
             f"{reason_lines}"
@@ -977,10 +1064,26 @@ def load_or_compute_dynamic_components_for_seed(
         )
         component_results[name] = result
         component_cache_paths[name] = cache_path
+        reasons[name] = "ok" if from_cache else "recomputed and saved"
         print(f"Dynamic component cache {'HIT' if from_cache else 'MISS->RECOMPUTED'}: {name} @ {cache_path}")
 
-    return component_results, labels_all, proxy_log, component_cache_paths, folds
+    if args.use_noise_gate:
+        noise_gate_data = get_or_compute_noise_gate(
+            folds=folds,
+            dataset=args.dataset,
+            proxy_model=args.proxy_model,
+            proxy_training_seed=proxy_training_seed,
+            epochs=resolved_proxy_epochs,
+            labels_all=labels_all,
+            learn_window=args.learn_window,
+            learn_min_correct=args.learn_min_correct,
+            gate_low=args.gate_low,
+            gate_high=args.gate_high,
+            force=bool(args.force_noise_gate),
+        )
+        reasons["gate"] = "ok" if reasons.get("gate") == "ok" and not args.force_noise_gate else "recomputed and saved"
 
+    return component_results, noise_gate_data, labels_all, proxy_log, component_cache_paths, reasons
 
 def build_dynamic_target(
     component_results: dict[str, DynamicComponentResult],
@@ -1085,75 +1188,11 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             f"proxy_training_seed={proxy_training_seed}, proxy_epochs={resolved_proxy_epochs} ==="
         )
 
-        component_results, labels_all, proxy_log, component_cache_paths, folds = load_or_compute_dynamic_components_for_seed(
+        component_results, noise_gate_data, labels_all, proxy_log, component_cache_paths, cache_reasons = load_or_compute_dynamic_supervision_for_seed(
             args,
             proxy_training_seed=proxy_training_seed,
             resolved_proxy_epochs=resolved_proxy_epochs,
         )
-        noise_gate_data: dict[str, np.ndarray] | None = None
-        if args.use_noise_gate:
-            if folds is not None:
-                noise_gate_data = get_or_compute_noise_gate(
-                    folds=folds,
-                    dataset=args.dataset,
-                    proxy_model=args.proxy_model,
-                    proxy_training_seed=proxy_training_seed,
-                    epochs=resolved_proxy_epochs,
-                    labels_all=labels_all,
-                    learn_window=args.learn_window,
-                    learn_min_correct=args.learn_min_correct,
-                    gate_low=args.gate_low,
-                    gate_high=args.gate_high,
-                    force=args.force_noise_gate,
-                )
-            else:
-                gate_cache_path = _noise_gate_cache_path(args.dataset, args.proxy_model, proxy_training_seed, resolved_proxy_epochs)
-                noise_gate_data = None if args.force_noise_gate else _load_noise_gate_cache_if_valid(
-                    gate_cache_path,
-                    args.dataset,
-                    args.proxy_model,
-                    proxy_training_seed,
-                    resolved_proxy_epochs,
-                    labels_all,
-                    args.learn_window,
-                    args.learn_min_correct,
-                    args.gate_low,
-                    args.gate_high,
-                )
-                if noise_gate_data is None:
-                    print(
-                        "Noise gate cache is missing/invalid while dynamic component caches are usable; "
-                        "loading proxy logs to compute only noise_gate.npz."
-                    )
-                    folds, gate_labels_all, gate_proxy_log = load_proxy_folds_for_dynamic_seed(
-                        args,
-                        proxy_training_seed,
-                        resolved_proxy_epochs,
-                        reason=(
-                            "Dynamic component caches were usable without proxy logs, but the noise gate cache is missing/invalid.\n"
-                            f"Expected gate cache: {gate_cache_path}"
-                        ),
-                    )
-                    if not np.array_equal(gate_labels_all, labels_all.astype(np.int64, copy=False)):
-                        raise ValueError(
-                            "Labels from proxy logs do not match labels stored in dynamic component caches; "
-                            f"cannot safely compute noise gate from {gate_proxy_log}."
-                        )
-                    noise_gate_data = get_or_compute_noise_gate(
-                        folds=folds,
-                        dataset=args.dataset,
-                        proxy_model=args.proxy_model,
-                        proxy_training_seed=proxy_training_seed,
-                        epochs=resolved_proxy_epochs,
-                        labels_all=labels_all,
-                        learn_window=args.learn_window,
-                        learn_min_correct=args.learn_min_correct,
-                        gate_low=args.gate_low,
-                        gate_high=args.gate_high,
-                        force=True,
-                    )
-                else:
-                    print(f"Noise gate cache HIT: {gate_cache_path}")
         dynamic_scores, dynamic_component_values = build_dynamic_target(
             component_results,
             gate=None if noise_gate_data is None else noise_gate_data["gate"],
@@ -1163,6 +1202,8 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             dynamic_component_values["noise_gate"] = noise_gate_data["gate"]
             dynamic_component_values["noise_final_risk"] = noise_gate_data["final_risk"]
         num_samples = labels_all.shape[0]
+
+        report_existing_weight_entry(data, args.dataset, seed, output_path)
 
         image_adapter, text_adapter, adapter_paths = load_adapters_for_seed(
             args, args.dataset, dds_metric.extractor.embed_dim, seed, device

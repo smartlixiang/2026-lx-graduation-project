@@ -33,7 +33,6 @@ from weights.dynamic_utils import (
     FoldLogData,
     load_cv_fold_logs,
     resolve_epoch_windows,
-    standard_zscore_dynamic,
 )
 
 EPS = 1e-8
@@ -46,8 +45,8 @@ CLEAN_PROXY_LOG_ROOT = PROJECT_ROOT / "weights" / "proxy_logs"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Test gate v5 pseudo-labels with clean/noise modes. Gate v5 computes the same "
-            "rank-based risk gate on either normal clean proxy dynamics or noisy-label proxy dynamics, and estimates a global noise-risk factor by fitting a one-dimensional Gaussian mixture to gate values."
+            "Diagnose the current normalized-space positive-part noise gate with clean/noise modes. "
+            "The script computes the same rank-min risk gate used by the formal dynamic target flow."
         )
     )
     parser.add_argument("--dataset", type=str, default=CIFAR100, choices=AVAILABLE_DATASETS)
@@ -79,12 +78,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learn-window", type=int, default=10)
     parser.add_argument("--learn-min-correct", type=int, default=8)
     parser.add_argument("--gate-low", type=float, default=0.2)
-    parser.add_argument("--gate-high", type=float, default=0.8)
+    parser.add_argument("--gate-high", type=float, default=0.95)
     parser.add_argument("--sample-chunk-size", type=int, default=1024)
     parser.add_argument(
         "--cache-only",
         action="store_true",
-        help="Only read A/C/T dynamic component caches; gate v5 still requires proxy fold logs.",
+        help="Only read A/C/T dynamic component caches; the gate still requires proxy fold logs.",
     )
     return parser.parse_args()
 
@@ -333,7 +332,7 @@ def compute_learning_window(correct: np.ndarray, window: int, min_correct: int) 
     return True, int(hit[0] + window - 1)
 
 
-def compute_gate5_risk_metrics(
+def compute_gate_risk_metrics(
     folds: list[FoldLogData],
     labels_for_metric: np.ndarray,
     *,
@@ -356,7 +355,7 @@ def compute_gate5_risk_metrics(
     val_bias_raw = np.zeros(num_samples, dtype=np.float64)
     val_seen = np.zeros(num_samples, dtype=np.int64)
 
-    for fold in tqdm(folds, desc="Computing gate-5 risk metrics", unit="fold"):
+    for fold in tqdm(folds, desc="compute noise gate", unit="fold"):
         train_idx = fold.train_indices.astype(np.int64)
         val_idx = fold.val_indices.astype(np.int64)
 
@@ -375,12 +374,15 @@ def compute_gate5_risk_metrics(
                 min_correct=learn_min_correct,
             )
             if learned:
-                learn_time = learn_epoch / float(max(1, num_epochs - 1))
-                prev_correct = correct[:-1, local_j]
-                next_wrong = ~correct[1:, local_j]
-                denom = int(np.sum(prev_correct))
-                forget_freq = float(np.sum(prev_correct & next_wrong) / max(1, denom))
-                learn_risk = max(learn_time, forget_freq)
+                learn_time = float(learn_epoch - learn_window + 1) / float(max(1, num_epochs - learn_window))
+                learn_time = float(np.clip(learn_time, 0.0, 1.0))
+                remaining = correct[learn_epoch + 1 :, local_j]
+                if remaining.size == 0:
+                    forget_freq = 1.0
+                else:
+                    forget_freq = float(np.mean(~remaining))
+                learn_risk = 1.0 - (1.0 - learn_time) * (1.0 - forget_freq)
+                learn_risk = float(np.clip(learn_risk, 0.0, 1.0))
             else:
                 learn_time = 1.0
                 forget_freq = 1.0
@@ -403,39 +405,28 @@ def compute_gate5_risk_metrics(
             loss_var_sum[chunk_indices] += np.var(losses, axis=0)
             loss_var_count[chunk_indices] += 1
 
-        # Validation-view stable bias to one non-label class.
+        # Validation-view maximum average positive margin to any non-label class.
         val_logits = np.asarray(fold.val_logits, dtype=np.float64)
         y_val = labels_for_metric[val_idx]
         val_epochs = int(val_logits.shape[0])
         _, val_mid_idx, val_late_idx = resolve_epoch_windows(val_epochs)
         val_mid_late_idx = np.concatenate([val_mid_idx, val_late_idx]).astype(np.int64)
-        num_classes = int(val_logits.shape[2])
-
         for start in range(0, val_idx.shape[0], sample_chunk_size):
             end = min(start + sample_chunk_size, val_idx.shape[0])
             chunk_global = val_idx[start:end]
             chunk_labels = y_val[start:end]
             chunk_logits = val_logits[val_mid_late_idx, start:end, :]
-            chunk_preds = np.argmax(chunk_logits, axis=2).astype(np.int64)
             chunk_probs = softmax_logits(chunk_logits)
-            t_len = int(chunk_preds.shape[0])
 
             for local_j, global_i in enumerate(chunk_global):
                 label = int(chunk_labels[local_j])
-                preds_j = chunk_preds[:, local_j]
-                other_preds = preds_j[preds_j != label]
-                if other_preds.size == 0:
-                    val_bias_raw[global_i] = 0.0
-                    val_seen[global_i] += 1
-                    continue
-
-                counts = np.bincount(other_preds, minlength=num_classes).astype(np.float64)
-                counts[label] = 0.0
-                c_star = int(np.argmax(counts))
-                stability = float(counts[c_star] / max(1, t_len))
-                margin = chunk_probs[:, local_j, c_star] - chunk_probs[:, local_j, label]
-                positive_margin = float(np.mean(np.maximum(margin, 0.0)))
-                val_bias_raw[global_i] = stability * positive_margin
+                probs_j = chunk_probs[:, local_j, :]
+                label_probs = probs_j[:, label]
+                positive_margins = np.maximum(probs_j - label_probs[:, None], 0.0)
+                positive_margins[:, label] = 0.0
+                class_scores = np.mean(positive_margins, axis=0)
+                class_scores[label] = 0.0
+                val_bias_raw[global_i] = float(np.max(class_scores))
                 val_seen[global_i] += 1
 
     if np.any(train_count == 0):
@@ -504,46 +495,11 @@ def split_gate_positive_part(values: np.ndarray, gate: np.ndarray) -> np.ndarray
     return negative + gate * positive
 
 
-def aggregate_foldwise_by_finite_mean(fold_values: np.ndarray) -> np.ndarray:
-    fold_values = np.asarray(fold_values, dtype=np.float64)
-    finite = np.isfinite(fold_values)
-    count = np.sum(finite, axis=0)
-    if np.any(count <= 0):
-        missing = np.where(count <= 0)[0]
-        raise ValueError(f"Some samples have no finite fold values: {missing[:10]}")
-    summed = np.nansum(np.where(finite, fold_values, 0.0), axis=0)
-    return (summed / np.maximum(count, 1)).astype(np.float32)
 
-
-def raw_gate_nonnegative_component(
-    component: DynamicComponentResult,
-    gate: np.ndarray,
-    component_name: str,
-) -> np.ndarray:
-    raw_foldwise = np.asarray(component.raw_foldwise, dtype=np.float64)
-    if raw_foldwise.ndim != 2 or raw_foldwise.shape[1] != gate.shape[0]:
-        raise ValueError(f"{component_name}: raw_foldwise shape mismatch: {raw_foldwise.shape}")
-
-    fold_normalized = np.full(raw_foldwise.shape, np.nan, dtype=np.float32)
-    for f_idx in range(raw_foldwise.shape[0]):
-        finite = np.isfinite(raw_foldwise[f_idx])
-        if int(np.sum(finite)) < 1:
-            continue
-        raw = np.maximum(raw_foldwise[f_idx, finite], 0.0)
-        gated_raw = raw * gate[finite]
-        fold_normalized[f_idx, finite] = standard_zscore_dynamic(gated_raw.astype(np.float32))
-
-    aggregated = aggregate_foldwise_by_finite_mean(fold_normalized)
-    final_normalized = standard_zscore_dynamic(aggregated).astype(np.float64)
-    if not np.all(np.isfinite(final_normalized)):
-        raise ValueError(f"{component_name}: raw-gated final values contain NaN/inf.")
-    return final_normalized
-
-
-def build_pseudo_labels_v5(
+def build_pseudo_labels(
     component_results: dict[str, DynamicComponentResult],
     gate: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     a = component_results["A"].final_normalized.astype(np.float64)
     c = component_results["C"].final_normalized.astype(np.float64)
     t = component_results["T"].final_normalized.astype(np.float64)
@@ -556,183 +512,22 @@ def build_pseudo_labels_v5(
 
     original_raw = (a + c + t) / 3.0
 
-    # Baseline: gate positive parts after final normalization for A/C/T.
     a_gate_after_norm = split_gate_positive_part(a, gate)
     c_gate_after_norm = split_gate_positive_part(c, gate)
     t_gate_after_norm = split_gate_positive_part(t, gate)
-    normalized_gate_raw = (a_gate_after_norm + c_gate_after_norm + t_gate_after_norm) / 3.0
-
-    # Gate-5 pseudo-label construction keeps gate-2 component handling:
-    # A: gate positive normalized values; C/T: gate nonnegative raw values before normalization.
-    c_raw_gate = raw_gate_nonnegative_component(component_results["C"], gate, "C")
-    t_raw_gate = raw_gate_nonnegative_component(component_results["T"], gate, "T")
-    gate5_raw = (a_gate_after_norm + c_raw_gate + t_raw_gate) / 3.0
+    gated_raw = (a_gate_after_norm + c_gate_after_norm + t_gate_after_norm) / 3.0
 
     original_target = standard_zscore(original_raw).astype(np.float64)
-    normalized_gate_target = standard_zscore(normalized_gate_raw).astype(np.float64)
-    gate5_target = standard_zscore(gate5_raw).astype(np.float64)
+    gated_target = standard_zscore(gated_raw).astype(np.float64)
 
     component_values = {
-        "A normalized-gated": a_gate_after_norm,
-        "C raw-gated": c_raw_gate,
-        "T raw-gated": t_raw_gate,
+        "A normalized positive-part gated": a_gate_after_norm,
+        "C normalized positive-part gated": c_gate_after_norm,
+        "T normalized positive-part gated": t_gate_after_norm,
     }
-    return original_target, normalized_gate_target, gate5_target, component_values
+    return original_target, gated_target, component_values
 
 
-
-def _normal_pdf_1d(x: np.ndarray, mean: float, var: float) -> np.ndarray:
-    var = float(max(var, 1e-12))
-    coef = 1.0 / np.sqrt(2.0 * np.pi * var)
-    return coef * np.exp(-0.5 * ((x - mean) ** 2) / var)
-
-
-def _single_gaussian_loglik(x: np.ndarray) -> tuple[float, float, float, float]:
-    x = np.asarray(x, dtype=np.float64)
-    mean = float(np.mean(x))
-    var = float(np.var(x) + 1e-12)
-    loglik = float(np.sum(np.log(_normal_pdf_1d(x, mean, var) + 1e-300)))
-    n = int(x.shape[0])
-    bic = 2.0 * np.log(max(n, 2)) - 2.0 * loglik
-    return mean, var, loglik, bic
-
-
-def _fit_two_gaussian_1d_once(
-    x: np.ndarray,
-    mean_a: float,
-    mean_b: float,
-    *,
-    max_iter: int = 200,
-    tol: float = 1e-7,
-) -> dict[str, object]:
-    x = np.asarray(x, dtype=np.float64)
-    n = int(x.shape[0])
-    global_var = float(np.var(x) + 1e-8)
-    means = np.asarray([mean_a, mean_b], dtype=np.float64)
-    vars_ = np.asarray([global_var, global_var], dtype=np.float64)
-    weights = np.asarray([0.5, 0.5], dtype=np.float64)
-    var_floor = max(global_var * 1e-6, 1e-10)
-    last_loglik = -np.inf
-
-    for _ in range(max_iter):
-        p0 = weights[0] * _normal_pdf_1d(x, means[0], vars_[0])
-        p1 = weights[1] * _normal_pdf_1d(x, means[1], vars_[1])
-        denom = p0 + p1 + 1e-300
-        resp0 = p0 / denom
-        resp1 = 1.0 - resp0
-
-        n0 = float(np.sum(resp0))
-        n1 = float(np.sum(resp1))
-        if n0 <= 1e-8 or n1 <= 1e-8:
-            break
-
-        weights = np.asarray([n0 / n, n1 / n], dtype=np.float64)
-        means = np.asarray([
-            float(np.sum(resp0 * x) / n0),
-            float(np.sum(resp1 * x) / n1),
-        ], dtype=np.float64)
-        vars_ = np.asarray([
-            float(np.sum(resp0 * (x - means[0]) ** 2) / n0),
-            float(np.sum(resp1 * (x - means[1]) ** 2) / n1),
-        ], dtype=np.float64)
-        vars_ = np.maximum(vars_, var_floor)
-
-        mixture = weights[0] * _normal_pdf_1d(x, means[0], vars_[0]) + weights[1] * _normal_pdf_1d(x, means[1], vars_[1])
-        loglik = float(np.sum(np.log(mixture + 1e-300)))
-        if np.isfinite(last_loglik) and abs(loglik - last_loglik) <= tol * max(1.0, abs(last_loglik)):
-            last_loglik = loglik
-            break
-        last_loglik = loglik
-
-    order = np.argsort(means)
-    means = means[order]
-    vars_ = vars_[order]
-    weights = weights[order]
-    mixture = weights[0] * _normal_pdf_1d(x, means[0], vars_[0]) + weights[1] * _normal_pdf_1d(x, means[1], vars_[1])
-    loglik = float(np.sum(np.log(mixture + 1e-300)))
-    bic = 5.0 * np.log(max(n, 2)) - 2.0 * loglik
-    return {
-        "weights": weights,
-        "means": means,
-        "vars": vars_,
-        "loglik": loglik,
-        "bic": float(bic),
-    }
-
-
-def fit_two_gaussian_gate_risk(gate: np.ndarray) -> dict[str, object]:
-    """Estimate a global noise-risk factor from one-dimensional gate values.
-
-    The rank-based gate mean is not a reliable clean/noise indicator. This
-    diagnostic only asks whether gate values contain a separated low-gate
-    subpopulation. Two components are accepted only when they beat one Gaussian
-    under BIC and are separated by Ashman's D > 2; otherwise the distribution is
-    treated as one population and cluster_noise_risk is set to zero.
-    """
-    x = np.asarray(gate, dtype=np.float64)
-    x = x[np.isfinite(x)]
-    if x.size < 10:
-        raise ValueError("Too few finite gate values for Gaussian mixture risk estimation.")
-    x = np.clip(x, 0.0, 1.0)
-
-    single_mean, single_var, _, bic1 = _single_gaussian_loglik(x)
-    percentiles = np.percentile(x, [10, 25, 50, 75, 90]).astype(np.float64)
-    init_pairs = [
-        (float(percentiles[1]), float(percentiles[3])),
-        (float(percentiles[0]), float(percentiles[4])),
-        (float(np.min(x)), float(np.max(x))),
-    ]
-    if np.any(x > percentiles[2]) and np.any(x <= percentiles[2]):
-        init_pairs.append((float(np.mean(x[x <= percentiles[2]])), float(np.mean(x[x > percentiles[2]]))))
-
-    candidates = [
-        _fit_two_gaussian_1d_once(x, a, b)
-        for a, b in init_pairs
-        if np.isfinite(a) and np.isfinite(b) and abs(a - b) > 1e-12
-    ]
-    best = min(candidates, key=lambda item: float(item["bic"]))
-    weights = np.asarray(best["weights"], dtype=np.float64)
-    means = np.asarray(best["means"], dtype=np.float64)
-    vars_ = np.asarray(best["vars"], dtype=np.float64)
-    stds = np.sqrt(np.maximum(vars_, 1e-12))
-    ashman_d = float(np.sqrt(2.0) * abs(means[1] - means[0]) / np.sqrt(vars_[0] + vars_[1]))
-    bic2 = float(best["bic"])
-
-    two_component = bool((bic2 < bic1) and (ashman_d > 2.0))
-    low_gate_weight = float(weights[0])
-    high_gate_weight = float(weights[1])
-    minority_weight = float(np.min(weights))
-    cluster_noise_risk = low_gate_weight if two_component else 0.0
-
-    return {
-        "single_mean": float(single_mean),
-        "single_std": float(np.sqrt(single_var)),
-        "bic1": float(bic1),
-        "bic2": bic2,
-        "ashman_d": ashman_d,
-        "two_component": two_component,
-        "weights": weights,
-        "means": means,
-        "stds": stds,
-        "low_gate_weight": low_gate_weight,
-        "high_gate_weight": high_gate_weight,
-        "minority_weight": minority_weight,
-        "cluster_noise_risk": float(cluster_noise_risk),
-    }
-
-
-def print_gate_mixture_summary(gmm: dict[str, object]) -> None:
-    weights = np.asarray(gmm["weights"], dtype=np.float64)
-    means = np.asarray(gmm["means"], dtype=np.float64)
-    stds = np.asarray(gmm["stds"], dtype=np.float64)
-    print("\n[Gate distribution mixture risk]")
-    print(f"  one-Gaussian: mean={float(gmm['single_mean']):.6f}, std={float(gmm['single_std']):.6f}, BIC={float(gmm['bic1']):.3f}")
-    print(f"  two-Gaussian: BIC={float(gmm['bic2']):.3f}, AshmanD={float(gmm['ashman_d']):.6f}")
-    print(f"  component_low_gate:  weight={weights[0]:.6f}, mean={means[0]:.6f}, std={stds[0]:.6f}")
-    print(f"  component_high_gate: weight={weights[1]:.6f}, mean={means[1]:.6f}, std={stds[1]:.6f}")
-    print(f"  accepted_two_component={bool(gmm['two_component'])}")
-    print(f"  minority_component_ratio={float(gmm['minority_weight']):.6f}")
-    print(f"  cluster_noise_risk(low-gate component ratio if separated, else 0)={float(gmm['cluster_noise_risk']):.6f}")
 
 
 def summarize(values: np.ndarray, mask: np.ndarray) -> tuple[float, float, float, int]:
@@ -795,9 +590,9 @@ def plot_pseudo_label_histogram(
     plt.figure(figsize=(8, 5))
     plt.hist(negative_values, bins=hist_bins, density=True, alpha=0.55, color="blue", label=negative_label)
     plt.hist(positive_values, bins=hist_bins, density=True, alpha=0.55, color="red", label=positive_label)
-    plt.xlabel("Gate-5 dynamic pseudo-label")
+    plt.xlabel("Gated dynamic pseudo-label")
     plt.ylabel("Density")
-    plt.title("Pseudo-label distribution after gate-5 risk gating")
+    plt.title("Pseudo-label distribution after noise risk gating")
     plt.legend()
     plt.tight_layout()
     plt.savefig(output_path, dpi=300)
@@ -836,7 +631,7 @@ def main() -> None:
         resolved_proxy_epochs,
     )
 
-    print("=== Gate-5 risk diagnostic ===")
+    print("=== Noise gate risk diagnostic ===")
     print(f"mode={args.mode}, dataset={args.dataset}, seed={args.seed}, proxy_model={args.proxy_model}, proxy_epochs={resolved_proxy_epochs}")
     print(f"dynamic_cache={cache_dir}")
     print(f"proxy_log_root={Path(args.proxy_log) if args.proxy_log is not None else default_proxy_log_root(args.mode)}")
@@ -848,7 +643,7 @@ def main() -> None:
         print("Clean mode: metrics use original labels and normal caches/logs; marked group is only the seed's noise-list reference subset.")
 
     folds = load_folds(args, resolved_proxy_epochs, clean_labels.shape[0])
-    risk_metrics = compute_gate5_risk_metrics(
+    risk_metrics = compute_gate_risk_metrics(
         folds,
         labels_for_metric,
         learn_window=args.learn_window,
@@ -866,7 +661,7 @@ def main() -> None:
     else:
         print("[cache] A/C/T HIT")
 
-    original_target, normalized_gate_target, gate5_target, component_values = build_pseudo_labels_v5(
+    original_target, gated_target, component_values = build_pseudo_labels(
         component_results,
         gate,
     )
@@ -875,10 +670,6 @@ def main() -> None:
     gate_suppression = 1.0 - mean_gate
     print(f"\n[Gate suppression summary]")
     print(f"  mean_gate={mean_gate:.6f}, r_gate=1-mean_gate={gate_suppression:.6f}")
-    print("  mean_gate is only average suppression; Gate-5 uses the mixture estimate below as the global noise-risk factor.")
-
-    gate_gmm = fit_two_gaussian_gate_risk(gate)
-    print_gate_mixture_summary(gate_gmm)
 
     print_group_stats("LearnedRate(window)", risk_metrics["learned_rate"], reference_mask, positive_label=positive_label, negative_label=negative_label)
     print_group_stats("LearnTime(window-normalized)", risk_metrics["learn_time"], reference_mask, positive_label=positive_label, negative_label=negative_label)
@@ -897,11 +688,10 @@ def main() -> None:
         print_group_stats(name, values, reference_mask, positive_label=positive_label, negative_label=negative_label)
 
     print_group_stats("Original pseudo-label", original_target, reference_mask, positive_label=positive_label, negative_label=negative_label)
-    print_group_stats("Normalized-space gated pseudo-label", normalized_gate_target, reference_mask, positive_label=positive_label, negative_label=negative_label)
-    print_group_stats("Gate-5 pseudo-label", gate5_target, reference_mask, positive_label=positive_label, negative_label=negative_label)
+    print_group_stats("Gated pseudo-label", gated_target, reference_mask, positive_label=positive_label, negative_label=negative_label)
 
-    output_path = Path(__file__).resolve().parent / f"gate5_{args.mode}_pseudolabel_hist_{args.dataset}_seed{args.seed}.png"
-    plot_pseudo_label_histogram(gate5_target, reference_mask, output_path, args.bins, positive_label=positive_label, negative_label=negative_label)
+    output_path = Path(__file__).resolve().parent / f"test_gate_pseudolabel_hist_{args.mode}_{args.dataset}_seed{args.seed}.png"
+    plot_pseudo_label_histogram(gated_target, reference_mask, output_path, args.bins, positive_label=positive_label, negative_label=negative_label)
     print(f"\nSaved histogram to: {output_path}")
 
 

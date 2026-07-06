@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learn-window", type=int, default=10)
     parser.add_argument("--learn-min-correct", type=int, default=8)
     parser.add_argument("--gate-low", type=float, default=0.2)
-    parser.add_argument("--gate-high", type=float, default=0.8)
+    parser.add_argument("--gate-high", type=float, default=0.95)
 
     # 与 learn_scoring_weights.py 中的 softmax-simplex ridge 拟合保持一致。
     parser.add_argument("--simplex-ridge-lambda", type=float, default=1e-2)
@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--simplex-tol", type=float, default=1e-6)
 
     # 原版 test_regression.py 中的 softplus 非 simplex + ratio regularizer 拟合。
-    parser.add_argument("--ratio-lambda", type=float, default=1e-2)
+    parser.add_argument("--ratio-lambda", type=float, default=5e-3)
     parser.add_argument("--ratio-learning-rate", type=float, default=2e-3)
     parser.add_argument("--ratio-max-iter", type=int, default=10000)
     parser.add_argument("--ratio-tol", type=float, default=1e-8)

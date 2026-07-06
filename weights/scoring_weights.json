@@ -49,12 +49,13 @@
       }
     },
     "42": {
-      "sa": 0.2898154647265614,
-      "div": 0.4091287385733862,
-      "dds": 0.3010557967000525,
-      "bias": -2.0307076843408787e-10,
-      "ridge_lambda": 1.0,
-      "proxy_log": "weights/proxy_logs/cifar100/resnet18/42/200",
+      "sa": 0.2800021238753027,
+      "div": 0.47122371847363925,
+      "dds": 0.24877415765105806,
+      "bias": -9.482939058772762e-05,
+      "method_version": "softplus_ratio_noise_gate_v1",
+      "ratio_lambda": 0.01,
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -87,11 +88,30 @@
             "SA": 0.024776157157267286,
             "Div": -0.025674293056708423,
             "DDS": 0.010313091906155343
+          },
+          "noise_gate": {
+            "SA": 0.4667684610841866,
+            "Div": -0.38293393585969987,
+            "DDS": -0.1373290419689438
+          },
+          "noise_final_risk": {
+            "SA": -0.48486049870924197,
+            "Div": 0.39628721475796896,
+            "DDS": 0.14433076585859897
           }
         },
-        "weight_solver": "positive_simplex_ridge_softmax",
+        "weight_solver": "softplus_ratio_no_simplex",
+        "method_version": "softplus_ratio_noise_gate_v1",
+        "raw_weights": [
+          0.11734946613088429,
+          0.19749082980427055,
+          0.10426176124475851
+        ],
+        "mse": 0.9766018743225866,
+        "ratio_regularizer": 0.08702016405227535,
+        "iterations": 7307,
         "weights_sum": 1.0,
-        "weights_min": 0.2898154647265614,
+        "weights_min": 0.24877415765105806,
         "sa_gt_one_third_warning": false,
         "div_is_lowest_warning": false
       }
@@ -303,12 +323,13 @@
   },
   "tiny-imagenet": {
     "22": {
-      "sa": 0.3289821060178164,
-      "div": 0.38582309734888426,
-      "dds": 0.2851947966332994,
-      "bias": 6.073933615056147e-11,
-      "ridge_lambda": 1.0,
-      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/22/90",
+      "sa": 0.3923459499227095,
+      "div": 0.3995459143394461,
+      "dds": 0.20810813573784429,
+      "bias": -4.0833506339207876e-10,
+      "method_version": "softplus_ratio_noise_gate_v1",
+      "ratio_lambda": 0.01,
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -341,22 +362,42 @@
             "SA": -0.04423144743318302,
             "Div": 0.033617436347914254,
             "DDS": 0.026118801123495964
+          },
+          "noise_gate": {
+            "SA": 0.49080529541688384,
+            "Div": -0.4672954954195621,
+            "DDS": -0.13769805891615766
+          },
+          "noise_final_risk": {
+            "SA": -0.5041305734584194,
+            "Div": 0.47940064977008845,
+            "DDS": 0.14063829485884533
           }
         },
-        "weight_solver": "positive_simplex_ridge_softmax",
-        "weights_sum": 1.0,
-        "weights_min": 0.2851947966332994,
-        "sa_gt_one_third_warning": false,
+        "weight_solver": "softplus_ratio_no_simplex",
+        "method_version": "softplus_ratio_noise_gate_v1",
+        "raw_weights": [
+          0.1394331754539527,
+          0.14199192214670897,
+          0.07395814385097159
+        ],
+        "mse": 0.988453089301187,
+        "ratio_regularizer": 0.07063935425040342,
+        "iterations": 8523,
+        "weights_sum": 0.9999999999999998,
+        "weights_min": 0.20810813573784429,
+        "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }
     },
     "42": {
-      "sa": 0.3281446528073894,
-      "div": 0.38478718281050606,
-      "dds": 0.2870681643821046,
-      "bias": -1.390726770253534e-10,
-      "ridge_lambda": 1.0,
-      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/42/90",
+      "sa": 0.3921538669660463,
+      "div": 0.3909770881081531,
+      "dds": 0.21686904492580056,
+      "bias": -0.00020567075312849194,
+      "method_version": "softplus_ratio_noise_gate_v1",
+      "ratio_lambda": 0.01,
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -389,22 +430,42 @@
             "SA": -0.0478663814299103,
             "Div": 0.03561371635476742,
             "DDS": 0.0300848821957427
+          },
+          "noise_gate": {
+            "SA": 0.4931530556730917,
+            "Div": -0.47039617160619324,
+            "DDS": -0.14084008360335976
+          },
+          "noise_final_risk": {
+            "SA": -0.5055852887139964,
+            "Div": 0.48190784049108937,
+            "DDS": 0.14320231550338355
           }
         },
-        "weight_solver": "positive_simplex_ridge_softmax",
+        "weight_solver": "softplus_ratio_no_simplex",
+        "method_version": "softplus_ratio_noise_gate_v1",
+        "raw_weights": [
+          0.14122289412344946,
+          0.14079911119013122,
+          0.07809912575173379
+        ],
+        "mse": 0.9882158174633553,
+        "ratio_regularizer": 0.06103475377112069,
+        "iterations": 8157,
         "weights_sum": 1.0,
-        "weights_min": 0.2870681643821046,
-        "sa_gt_one_third_warning": false,
+        "weights_min": 0.21686904492580056,
+        "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }
     },
     "96": {
-      "sa": 0.3305870008444737,
-      "div": 0.3839063632068733,
-      "dds": 0.28550663594865294,
-      "bias": -1.4077619801611264e-11,
-      "ridge_lambda": 1.0,
-      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/96/90",
+      "sa": 0.4024830237481644,
+      "div": 0.3907545956233407,
+      "dds": 0.20676238062849495,
+      "bias": 0.00011142447518418373,
+      "method_version": "softplus_ratio_noise_gate_v1",
+      "ratio_lambda": 0.01,
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -437,12 +498,31 @@
             "SA": -0.03930751183123484,
             "Div": 0.032969762512907695,
             "DDS": 0.025442727613660673
+          },
+          "noise_gate": {
+            "SA": 0.4915315191140208,
+            "Div": -0.4672752427858883,
+            "DDS": -0.1377073275555528
+          },
+          "noise_final_risk": {
+            "SA": -0.5039884840916414,
+            "Div": 0.47891376166516486,
+            "DDS": 0.14075990936748844
           }
         },
-        "weight_solver": "positive_simplex_ridge_softmax",
+        "weight_solver": "softplus_ratio_no_simplex",
+        "method_version": "softplus_ratio_noise_gate_v1",
+        "raw_weights": [
+          0.1469214684502221,
+          0.14264015028016638,
+          0.07547605933613188
+        ],
+        "mse": 0.9879239668755735,
+        "ratio_regularizer": 0.07229229111930986,
+        "iterations": 8369,
         "weights_sum": 1.0,
-        "weights_min": 0.28550663594865294,
-        "sa_gt_one_third_warning": false,
+        "weights_min": 0.20676238062849495,
+        "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }
     },

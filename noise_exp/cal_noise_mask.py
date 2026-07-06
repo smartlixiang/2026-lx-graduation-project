@@ -1238,7 +1238,7 @@ def select_group_mask_local(
 
     class_budgets = _allocate_class_budgets()
     candidate_pool_size = max(1, int(group_candidate_pool_size))
-    base_dist_weight_max = max(0.0, 0.8 - 0.005 * keep_ratio) * 0.25
+    base_dist_weight_max = max(0.0, 0.8 - 0.005 * keep_ratio)
     # 标签注噪实验中分布修正项可能放大错误标签结构，因此按先验噪声风险因子降低其强度。
     dist_weight_max = base_dist_weight_max * NOISE_RISK_FACTOR
     dist_weight_min = 0.5 * dist_weight_max

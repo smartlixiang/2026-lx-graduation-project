@@ -146,7 +146,7 @@ def compute_dist_weight(
     min_ratio: float = 0.5,
     power: float = 1.0,
 ) -> tuple[float, float, float]:
-    dist_weight_max = max(0.0, 0.8 - 0.005 * float(keep_ratio))
+    dist_weight_max = max(0.0, 0.7 - 0.004 * float(keep_ratio))
     min_ratio = float(np.clip(min_ratio, 0.0, 1.0))
     progress = 1.0 if class_budget <= 0 else float(np.clip(current_count / float(class_budget), 0.0, 1.0))
     power = max(float(power), 1e-8)
@@ -323,7 +323,7 @@ def make_group_mask(
 
     pbar.close()
 
-    dist_weight_max = max(0.0, 0.8 - 0.005 * float(keep_ratio))
+    dist_weight_max = max(0.0, 0.7 - 0.004 * float(keep_ratio))
     stats = {
         "dist_weight_strategy": "increase_from_min_ratio_to_kr_linear_max",
         "dist_weight_max": float(dist_weight_max),

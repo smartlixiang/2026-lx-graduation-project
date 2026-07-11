@@ -414,8 +414,8 @@ def select_group_mask(
 
     class_budgets = _allocate_class_budgets()
     candidate_pool_size = max(1, int(group_candidate_pool_size))
-    # dist_weight_max = max(0.0, 1.0 - 0.01 * float(keep_ratio))
-    dist_weight_max = max(0.0, 0.8 - 0.005 * keep_ratio)
+
+    dist_weight_max = max(0.0, 0.7 - 0.004 * keep_ratio)
     dist_weight_min = 0.5 * dist_weight_max
 
     selected_mask = np.zeros(num_samples, dtype=np.uint8)

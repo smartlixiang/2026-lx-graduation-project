@@ -141,8 +141,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learn-min-correct", type=int, default=8)
     parser.add_argument("--gate-low", type=float, default=0.2)
     parser.add_argument("--gate-high", type=float, default=0.95)
-    parser.add_argument("--ratio-lambda", type=float, default=1e-2)
-    parser.add_argument("--regression-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--ratio-lambda", type=float, default=5e-3)
+    parser.add_argument("--regression-learning-rate", type=float, default=2e-3)
     parser.add_argument("--regression-max-iter", type=int, default=10000)
     parser.add_argument("--regression-tol", type=float, default=1e-8)
     return parser.parse_args()
@@ -872,7 +872,7 @@ def select_group_mask_local(
 
     class_budgets = _allocate_class_budgets()
     candidate_pool_size = max(1, int(group_candidate_pool_size))
-    base_dist_weight_max = max(0.0, 0.8 - 0.005 * keep_ratio)
+    base_dist_weight_max = max(0.0, 0.7 - 0.004 * keep_ratio)
     # 标签注噪实验中分布修正项可能放大错误标签结构，因此按先验噪声风险因子降低其强度。
     dist_weight_max = base_dist_weight_max * NOISE_RISK_FACTOR
     dist_weight_min = 0.5 * dist_weight_max

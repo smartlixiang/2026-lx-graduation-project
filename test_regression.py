@@ -19,7 +19,7 @@ from utils.seed import set_seed
 from weights.dynamic_utils import load_cv_fold_logs
 
 # 直接复用正式噪声实验脚本中的新版门控定义，避免诊断脚本与正式脚本分叉。
-from noise_exp.cal_noise_mask import (  # noqa: E402
+from learn_scoring_weights import (  # noqa: E402
     NOISE_GATE_CACHE_VERSION,
     _build_gate_from_final_risk,
     _compute_final_noise_risk,
@@ -266,10 +266,12 @@ def compute_or_load_gate(
         labels,
         learn_window,
         learn_min_correct,
+        gate_low,
+        gate_high,
     )
     if cached is not None:
         final_risk = np.asarray(cached["final_risk"], dtype=np.float64)
-        gate = _build_gate_from_final_risk(final_risk, gate_low, gate_high)
+        gate = np.asarray(cached["gate"], dtype=np.float64)
         print(f"[{case_name}] gate cache HIT: {cache_path}")
         return final_risk, gate, cache_path
 

@@ -20,3 +20,7 @@ unseen_result/static_scores/
 unseen_result/weights/
 weights/dynamic_cache/
 noise_exp/weights/
+corruption_exp/weights/
+corruption_exp/static_scores/
+corruption_exp/adapters/
+corruption_exp/contexts/

@@ -60,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=str, default="data")
     parser.add_argument("--learn-window", type=int, default=10)
     parser.add_argument("--learn-min-correct", type=int, default=8)
-    parser.add_argument("--gate-low", type=float, default=0.2)
-    parser.add_argument("--gate-high", type=float, default=0.95)
+    parser.add_argument("--gate-low", type=float, default=0.1)
+    parser.add_argument("--gate-high", type=float, default=0.9)
 
     # 与 learn_scoring_weights.py 中的 softmax-simplex ridge 拟合保持一致。
     parser.add_argument("--simplex-ridge-lambda", type=float, default=1e-2)

@@ -58,6 +58,8 @@ WEIGHTS_PATH = WEIGHTS_ROOT / "scoring_weights.json"
 SUPPORTED_DATASETS = ("cifar100", "tiny-imagenet")
 DATASET_NUMERIC_ID = {"cifar100": 100, "tiny-imagenet": 200}
 EXPECTED_TRAIN_SIZES = {"cifar100": 50_000, "tiny-imagenet": 100_000}
+CORRUPTION_PRIOR_RATIO = 0.2
+CORRUPTION_RISK_FACTOR = float(1.0 - np.sqrt(CORRUPTION_PRIOR_RATIO))
 
 from corruption_exp import corruption_opt  # noqa: E402
 from dataset.dataset_config import CIFAR100, TINY_IMAGENET  # noqa: E402
@@ -298,6 +300,12 @@ def build_context(info: CorruptionInfo, args: argparse.Namespace) -> dict[str, A
         "num_corrupted": int(info.is_corrupted.sum()), "corruption_ratio": float(info.is_corrupted.mean()),
         "corruption_list_hash": info.list_hash, "corruption_type_counts": info.type_counts,
         "proxy_model": args.proxy_model, "proxy_epochs": int(cfg["epochs"]), "clip_model": args.clip_model,
+        "use_noise_gate": True,
+        "noise_gate_cache_version": learn_weights_mod.NOISE_GATE_CACHE_VERSION,
+        "learn_window": int(args.learn_window),
+        "learn_min_correct": int(args.learn_min_correct),
+        "gate_low": float(args.gate_low),
+        "gate_high": float(args.gate_high),
     }
 
 
@@ -426,7 +434,7 @@ def load_valid_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict
     vals = {k: float(entry.get(k, np.nan)) for k in ("sa", "div", "dds")}
     if not all(np.isfinite(v) and v > 0 for v in vals.values()) or abs(sum(vals.values()) - 1.0) > 1e-4: return None
     ectx = entry.get("corruption_context")
-    ok, _ = context_matches(ectx if isinstance(ectx, dict) else None, ctx, keys=("dataset", "seed", "corruption_list_hash", "proxy_model", "proxy_epochs", "clip_model", "adapter_image_sha1", "adapter_text_sha1"))
+    ok, _ = context_matches(ectx if isinstance(ectx, dict) else None, ctx, keys=("dataset", "seed", "corruption_list_hash", "proxy_model", "proxy_epochs", "clip_model", "adapter_image_sha1", "adapter_text_sha1", "use_noise_gate", "noise_gate_cache_version", "learn_window", "learn_min_correct", "gate_low", "gate_high"))
     return vals if ok else None
 
 
@@ -438,9 +446,9 @@ def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str,
         valid = load_valid_weights(args, info, ctx)
         if valid is not None:
             tqdm.write(f"Learned weights cache HIT: {WEIGHTS_PATH}"); return valid
-    tqdm.write("Learned weights cache MISS→LEARN (with --no-use-noise-gate)")
+    tqdm.write("Learned weights cache MISS→LEARN (with noise gate)")
     img_p, txt_p = adapter_paths(info.dataset, info.seed)
-    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), proxy_log=str(PROXY_LOG_ROOT), proxy_model=args.proxy_model, proxy_epochs=int(ctx["proxy_epochs"]), adapter_image_path=str(img_p), adapter_text_path=str(txt_p), clip_model=args.clip_model, batch_size=args.batch_size, num_workers=args.num_workers, div_k=0.05, dds_k=5, dds_important_eigval_ratio=0.8, coverage_tau_g=0.15, coverage_s_g=0.07, coverage_k_pct=0.05, coverage_q_low=0.002, coverage_q_high=0.998, ridge_lambda=0.01, learning_rate=1e-2, max_iter=10000, tol=1e-6, learn_window=10, learn_min_correct=8, gate_low=0.1, gate_high=0.9, ratio_lambda=5e-3, regression_learning_rate=2e-3, regression_max_iter=10000, regression_tol=1e-8, use_noise_gate=False, force_noise_gate=False, output=str(WEIGHTS_PATH), device=args.device, debug_prompts=args.debug_prompts, seed=str(info.seed), proxy_training_seed=None)
+    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), proxy_log=str(PROXY_LOG_ROOT), proxy_model=args.proxy_model, proxy_epochs=int(ctx["proxy_epochs"]), adapter_image_path=str(img_p), adapter_text_path=str(txt_p), clip_model=args.clip_model, batch_size=args.batch_size, num_workers=args.num_workers, div_k=0.05, dds_k=5, dds_important_eigval_ratio=0.8, coverage_tau_g=0.15, coverage_s_g=0.07, coverage_k_pct=0.05, coverage_q_low=0.002, coverage_q_high=0.998, ridge_lambda=0.01, learning_rate=1e-2, max_iter=10000, tol=1e-6, learn_window=args.learn_window, learn_min_correct=args.learn_min_correct, gate_low=args.gate_low, gate_high=args.gate_high, ratio_lambda=5e-3, regression_learning_rate=2e-3, regression_max_iter=10000, regression_tol=1e-8, use_noise_gate=True, force_noise_gate=bool(args.force), output=str(WEIGHTS_PATH), device=args.device, debug_prompts=args.debug_prompts, seed=str(info.seed), proxy_training_seed=None)
     with patched_project_paths(), patched_training_corruption(info.dataset, info):
         learn_weights_mod.run_once(ns, [info.seed])
     data = load_json(WEIGHTS_PATH) or {}; data.setdefault(info.dataset, {}).setdefault(str(info.seed), {})["corruption_context"] = ctx
@@ -500,7 +508,7 @@ def save_mask(path: Path, mask: np.ndarray, selected_by_class: dict[int, int], s
     np.savez_compressed(path, mask=m, selected_indices=selected, corruption_types=info.corruption_types, is_corrupted=info.is_corrupted, weights=np.array([weights["sa"], weights["div"], weights["dds"]], dtype=np.float64), selected_by_class=np.array(json.dumps(selected_by_class), dtype=np.str_), group_stats=np.array(json.dumps(group_stats), dtype=np.str_), **{k: np.array(v) for k, v in scalar.items()})
     summary = {**scalar, "weights": weights, "selected_by_class": {str(k): int(v) for k, v in selected_by_class.items()}, "group_stats": group_stats, "mask_path": str(path)}
     path.with_suffix(".json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    tqdm.write(f"mask saved to: {path}")
+    tqdm.write(f"mask saved to: {path} | corrupted={scalar['num_corrupted_selected']}/{scalar['num_selected']} | corruption_ratio={scalar['corruption_ratio_in_mask']:.4f} ({scalar['corruption_ratio_in_mask'] * 100:.2f}%)")
 
 
 def validate_in_memory_mask(mask: np.ndarray, num_samples: int, keep_ratio: int) -> tuple[bool, str]:
@@ -525,10 +533,14 @@ def stage_masks(args: argparse.Namespace, info: CorruptionInfo, scores: dict[str
         out = mask_path(args.mode_name, info.dataset, info.seed, kr)
         valid, reason = validate_mask_file(out, info, kr, args.weight_group)
         if args.skip_saved and valid:
-            tqdm.write(f"Mask cache HIT (--skip-saved): {out}"); continue
+            with np.load(out, allow_pickle=False) as data:
+                num_corrupted_selected = int(np.asarray(data["num_corrupted_selected"]).item())
+                num_selected = int(np.asarray(data["num_selected"]).item())
+                ratio = float(np.asarray(data["corruption_ratio_in_mask"]).item())
+            tqdm.write(f"Mask cache HIT (--skip-saved): {out} | corrupted={num_corrupted_selected}/{num_selected} | corruption_ratio={ratio:.4f} ({ratio * 100:.2f}%)"); continue
         if args.skip_saved and not valid:
             tqdm.write(f"Mask cache MISS→COMPUTE ({reason})")
-        mask, selected_by_class, stats = mask_mod.select_group_mask(np.asarray(scores["sa"], dtype=np.float32), div_metric=div, div_loader=div_loader, image_adapter=image_adapter, labels=labels, weights=weights, num_classes=len(class_names), keep_ratio=kr, device=device, dataset_name=info.dataset, seed=info.seed, weight_group=args.weight_group, clip_model=args.clip_model, adapter_image_path=str(img_p), div_static_scores=np.asarray(scores["div"], dtype=np.float32), dds_static_scores=np.asarray(scores["dds"], dtype=np.float32), group_candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count)
+        mask, selected_by_class, stats = mask_mod.select_group_mask(np.asarray(scores["sa"], dtype=np.float32), div_metric=div, div_loader=div_loader, image_adapter=image_adapter, labels=labels, weights=weights, num_classes=len(class_names), keep_ratio=kr, device=device, dataset_name=info.dataset, seed=info.seed, weight_group=args.weight_group, clip_model=args.clip_model, adapter_image_path=str(img_p), div_static_scores=np.asarray(scores["div"], dtype=np.float32), dds_static_scores=np.asarray(scores["dds"], dtype=np.float32), group_candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count, dist_weight_factor=CORRUPTION_RISK_FACTOR)
         save_mask(out, mask, selected_by_class, stats, weights, args, info, kr)
 
 
@@ -550,6 +562,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--group-init-count", type=int, default=10)
     p.add_argument("--debug-prompts", action="store_true")
     p.add_argument("--skip-saved", action="store_true")
+    p.add_argument("--learn-window", type=int, default=10)
+    p.add_argument("--learn-min-correct", type=int, default=8)
+    p.add_argument("--gate-low", type=float, default=0.2)
+    p.add_argument("--gate-high", type=float, default=0.95)
     p.add_argument("--force", action="store_true")
     return p.parse_args()
 

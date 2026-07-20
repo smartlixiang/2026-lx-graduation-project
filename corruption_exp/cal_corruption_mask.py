@@ -28,6 +28,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,8 @@ WEIGHTS_PATH = WEIGHTS_ROOT / "scoring_weights.json"
 SUPPORTED_DATASETS = ("cifar100", "tiny-imagenet")
 DATASET_NUMERIC_ID = {"cifar100": 100, "tiny-imagenet": 200}
 EXPECTED_TRAIN_SIZES = {"cifar100": 50_000, "tiny-imagenet": 100_000}
+CORRUPTION_PRIOR_RATIO = 0.2
+CORRUPTION_DIST_WEIGHT_SCALE = 1.0 - CORRUPTION_PRIOR_RATIO
 
 from corruption_exp import corruption_opt  # noqa: E402
 from dataset.dataset_config import CIFAR100, TINY_IMAGENET  # noqa: E402
@@ -243,13 +246,17 @@ def patched_training_corruption(dataset_name: str, corruption_info: CorruptionIn
 
 
 @contextlib.contextmanager
-def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iterator[None]:
+def patched_project_paths(corruption_info: CorruptionInfo) -> Iterator[None]:
+    if corruption_info is None or not corruption_info.list_hash:
+        raise ValueError("patched_project_paths requires non-empty CorruptionInfo")
+    corruption_tag = f"corruption_{corruption_info.list_hash[:12]}"
     old_adapter_resolve = train_adapter_mod.resolve_adapter_dir
     old_proxy_resolve = train_proxy_mod.resolve_proxy_log_dir
     old_learn_project = learn_weights_mod.PROJECT_ROOT
     old_dyn_dir = learn_weights_mod.resolve_dynamic_component_cache_dir
     old_dyn_path = learn_weights_mod.resolve_dynamic_component_cache_path
     old_gate_path = learn_weights_mod._noise_gate_cache_path
+    old_static_scores = learn_weights_mod.get_or_compute_static_scores
     old_mask_mean = mask_mod._mean_stats_cache_path
 
     def adapter_dir(dataset_name: str, seed: int) -> Path:
@@ -258,11 +265,14 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
         if seed is None: raise ValueError("seed required")
         return PROXY_LOG_ROOT / dataset / proxy_model / str(int(seed)) / str(int(epochs))
     def dyn_dir(dataset: str, proxy_model: str, seed: int, epochs: int) -> Path:
-        return DYNAMIC_CACHE_ROOT / dataset / proxy_model / str(int(seed)) / str(int(epochs))
+        return DYNAMIC_CACHE_ROOT / dataset / proxy_model / str(int(seed)) / str(int(epochs)) / corruption_tag
     def dyn_path(dataset: str, proxy_model: str, seed: int, epochs: int, component_name: str) -> Path:
         return dyn_dir(dataset, proxy_model, seed, epochs) / f"{component_name.strip().upper()}.npz"
     def gate_path(dataset: str, proxy_model: str, seed: int, epochs: int) -> Path:
         return dyn_dir(dataset, proxy_model, seed, epochs) / "noise_gate.npz"
+    def static_scores_wrapper(*, cache_root: Path, dataset: str, seed: int, **kwargs):
+        forced_root = STATIC_SCORE_ROOT / dataset / str(int(seed)) / corruption_tag
+        return old_static_scores(cache_root=forced_root, dataset=dataset, seed=seed, **kwargs)
     def mean_path(dataset_name: str, clip_model: str, adapter_image_path: str) -> Path:
         tag = clip_model.replace("/", "-").replace(" ", "_")
         h = sha1_file(Path(adapter_image_path))
@@ -274,6 +284,7 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
     learn_weights_mod.resolve_dynamic_component_cache_dir = dyn_dir
     learn_weights_mod.resolve_dynamic_component_cache_path = dyn_path
     learn_weights_mod._noise_gate_cache_path = gate_path
+    learn_weights_mod.get_or_compute_static_scores = static_scores_wrapper
     mask_mod._mean_stats_cache_path = mean_path
     try:
         yield
@@ -284,6 +295,7 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
         learn_weights_mod.resolve_dynamic_component_cache_dir = old_dyn_dir
         learn_weights_mod.resolve_dynamic_component_cache_path = old_dyn_path
         learn_weights_mod._noise_gate_cache_path = old_gate_path
+        learn_weights_mod.get_or_compute_static_scores = old_static_scores
         mask_mod._mean_stats_cache_path = old_mask_mean
 
 
@@ -298,6 +310,12 @@ def build_context(info: CorruptionInfo, args: argparse.Namespace) -> dict[str, A
         "num_corrupted": int(info.is_corrupted.sum()), "corruption_ratio": float(info.is_corrupted.mean()),
         "corruption_list_hash": info.list_hash, "corruption_type_counts": info.type_counts,
         "proxy_model": args.proxy_model, "proxy_epochs": int(cfg["epochs"]), "clip_model": args.clip_model,
+        "use_noise_gate": True,
+        "noise_gate_cache_version": learn_weights_mod.NOISE_GATE_CACHE_VERSION,
+        "learn_window": int(args.learn_window),
+        "learn_min_correct": int(args.learn_min_correct),
+        "gate_low": float(args.gate_low),
+        "gate_high": float(args.gate_high),
     }
 
 
@@ -341,7 +359,7 @@ def stage_adapter(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str,
     if not valid:
         tqdm.write(f"Adapter cache MISS→TRAIN ({reason})")
         ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), clip_model=args.clip_model, prompt_template="a photo of a {}", batch_size=args.batch_size, num_workers=args.num_workers, epochs=30, lr=1e-4, weight_decay=0.0, hidden_dim=256, temperature=0.07, step_size=30, gamma=0.1, device=args.device, seed=str(info.seed), debug_prompts=args.debug_prompts)
-        with patched_project_paths(), patched_training_corruption(info.dataset, info):
+        with patched_project_paths(info), patched_training_corruption(info.dataset, info):
             train_adapter_mod.train_for_seed(ns, info.seed, False)
     adapter_hashes = {"adapter_image_sha1": sha1_file(image_p), "adapter_text_sha1": sha1_file(text_p)}
     ctx.update(adapter_hashes); save_context(ctx)
@@ -404,19 +422,31 @@ def validate_proxy_logs(log_dir: Path, args: argparse.Namespace, info: Corruptio
     return True, "ok"
 
 
-def stage_proxy(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> Path:
+def stage_proxy(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> tuple[Path, bool]:
     log_dir = PROXY_LOG_ROOT / info.dataset / args.proxy_model / str(info.seed) / str(ctx["proxy_epochs"])
     valid, reason = validate_proxy_logs(log_dir, args, info, ctx)
     if args.force: valid = False; reason = "forced by --force"
     if valid:
-        tqdm.write(f"Proxy CV cache HIT: {log_dir}"); return log_dir
+        tqdm.write(f"Proxy CV cache HIT: {log_dir}"); return log_dir, False
     tqdm.write(f"Proxy CV cache MISS→TRAIN ({reason})")
     ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), model=args.proxy_model, epochs=int(ctx["proxy_epochs"]), batch_size=args.batch_size, num_workers=args.num_workers, lr=None, momentum=None, weight_decay=None, lr_milestones=None, lr_gamma=None, device=args.device or "", k_folds=args.k_folds, seed=info.seed)
     ns = train_proxy_mod.apply_dataset_defaults(ns)
-    with patched_project_paths(), patched_training_corruption(info.dataset, info):
+    with patched_project_paths(info), patched_training_corruption(info.dataset, info):
         train_proxy_mod.run_for_seed(ns, info.seed)
     (log_dir / "context.json").write_text(json.dumps(ctx, ensure_ascii=False, indent=2), encoding="utf-8")
-    return log_dir
+    return log_dir, True
+
+
+def validate_weight_context(args: argparse.Namespace, ctx: dict[str, Any], ectx: dict[str, Any] | None) -> tuple[bool, str]:
+    keys = ("dataset", "seed", "corruption_list_hash", "proxy_model", "proxy_epochs", "clip_model", "adapter_image_sha1", "adapter_text_sha1", "use_noise_gate", "noise_gate_cache_version", "learn_window", "learn_min_correct")
+    ok, reason = context_matches(ectx, ctx, keys=keys)
+    if not ok:
+        return ok, reason
+    if not np.isclose(float(ectx.get("gate_low", np.nan)), float(ctx["gate_low"])):
+        return False, "context mismatch: gate_low"
+    if not np.isclose(float(ectx.get("gate_high", np.nan)), float(ctx["gate_high"])):
+        return False, "context mismatch: gate_high"
+    return True, "ok"
 
 
 def load_valid_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> dict[str, float] | None:
@@ -426,32 +456,72 @@ def load_valid_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict
     vals = {k: float(entry.get(k, np.nan)) for k in ("sa", "div", "dds")}
     if not all(np.isfinite(v) and v > 0 for v in vals.values()) or abs(sum(vals.values()) - 1.0) > 1e-4: return None
     ectx = entry.get("corruption_context")
-    ok, _ = context_matches(ectx if isinstance(ectx, dict) else None, ctx, keys=("dataset", "seed", "corruption_list_hash", "proxy_model", "proxy_epochs", "clip_model", "adapter_image_sha1", "adapter_text_sha1"))
+    ok, _ = validate_weight_context(args, ctx, ectx if isinstance(ectx, dict) else None)
     return vals if ok else None
 
 
-def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> dict[str, float]:
+def dynamic_cache_dir(info: CorruptionInfo, args: argparse.Namespace, ctx: dict[str, Any]) -> Path:
+    return DYNAMIC_CACHE_ROOT / info.dataset / args.proxy_model / str(int(info.seed)) / str(int(ctx["proxy_epochs"])) / f"corruption_{info.list_hash[:12]}"
+
+
+def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any], proxy_retrained: bool = False) -> dict[str, float]:
     if args.weight_group == "naive":
         tqdm.write("skip proxy/dynamic/weight-learning for naive weights")
         return {"sa": 1/3, "div": 1/3, "dds": 1/3}
-    if not args.force:
+    if not args.force and not proxy_retrained:
         valid = load_valid_weights(args, info, ctx)
         if valid is not None:
             tqdm.write(f"Learned weights cache HIT: {WEIGHTS_PATH}"); return valid
-    tqdm.write("Learned weights cache MISS→LEARN (with --no-use-noise-gate)")
+    tqdm.write("Learned weights cache MISS→LEARN (A/C/T with dynamic noise gate)")
+    if args.force or proxy_retrained:
+        dyn = dynamic_cache_dir(info, args, ctx)
+        if dyn.exists():
+            shutil.rmtree(dyn)
+            tqdm.write(f"Dynamic cache invalidated: {dyn}")
     img_p, txt_p = adapter_paths(info.dataset, info.seed)
-    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), proxy_log=str(PROXY_LOG_ROOT), proxy_model=args.proxy_model, proxy_epochs=int(ctx["proxy_epochs"]), adapter_image_path=str(img_p), adapter_text_path=str(txt_p), clip_model=args.clip_model, batch_size=args.batch_size, num_workers=args.num_workers, div_k=0.05, dds_k=5, dds_important_eigval_ratio=0.8, coverage_tau_g=0.15, coverage_s_g=0.07, coverage_k_pct=0.05, coverage_q_low=0.002, coverage_q_high=0.998, ridge_lambda=0.01, learning_rate=1e-2, max_iter=10000, tol=1e-6, learn_window=10, learn_min_correct=8, gate_low=0.1, gate_high=0.9, ratio_lambda=5e-3, regression_learning_rate=2e-3, regression_max_iter=10000, regression_tol=1e-8, use_noise_gate=False, force_noise_gate=False, output=str(WEIGHTS_PATH), device=args.device, debug_prompts=args.debug_prompts, seed=str(info.seed), proxy_training_seed=None)
-    with patched_project_paths(), patched_training_corruption(info.dataset, info):
+    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), proxy_log=str(PROXY_LOG_ROOT), proxy_model=args.proxy_model, proxy_epochs=int(ctx["proxy_epochs"]), adapter_image_path=str(img_p), adapter_text_path=str(txt_p), clip_model=args.clip_model, batch_size=args.batch_size, num_workers=args.num_workers, div_k=0.05, dds_k=5, dds_important_eigval_ratio=0.8, coverage_tau_g=0.15, coverage_s_g=0.07, coverage_k_pct=0.05, coverage_q_low=0.002, coverage_q_high=0.998, ridge_lambda=0.01, learning_rate=1e-2, max_iter=10000, tol=1e-6, learn_window=args.learn_window, learn_min_correct=args.learn_min_correct, gate_low=args.gate_low, gate_high=args.gate_high, ratio_lambda=5e-3, regression_learning_rate=2e-3, regression_max_iter=10000, regression_tol=1e-8, use_noise_gate=True, force_noise_gate=args.force, output=str(WEIGHTS_PATH), device=args.device, debug_prompts=args.debug_prompts, seed=str(info.seed), proxy_training_seed=None)
+    with patched_project_paths(info), patched_training_corruption(info.dataset, info):
         learn_weights_mod.run_once(ns, [info.seed])
     data = load_json(WEIGHTS_PATH) or {}; data.setdefault(info.dataset, {}).setdefault(str(info.seed), {})["corruption_context"] = ctx
     WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True); WEIGHTS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     valid = load_valid_weights(args, info, ctx)
     if valid is None: raise RuntimeError("learned weights were saved but failed validation")
+    verify_learned_weight_outputs(valid, info, args, ctx)
     return valid
 
 
+def verify_learned_weight_outputs(weights: dict[str, float], info: CorruptionInfo, args: argparse.Namespace, ctx: dict[str, Any]) -> None:
+    vals = np.array([weights["sa"], weights["div"], weights["dds"]], dtype=np.float64)
+    if not np.all(np.isfinite(vals)) or not np.all(vals > 0) or not np.isclose(vals.sum(), 1.0, atol=1e-4):
+        raise RuntimeError(f"invalid learned weights: {weights}")
+    data = load_json(WEIGHTS_PATH) or {}
+    ectx = (((data.get(info.dataset) or {}).get(str(info.seed)) or {}).get("corruption_context") if isinstance(data.get(info.dataset), dict) else None)
+    ok, reason = validate_weight_context(args, ctx, ectx if isinstance(ectx, dict) else None)
+    if not ok:
+        raise RuntimeError(f"invalid learned weight context: {reason}")
+    gate_file = dynamic_cache_dir(info, args, ctx) / "noise_gate.npz"
+    if not gate_file.is_file():
+        raise RuntimeError(f"missing noise gate cache: {gate_file}")
+    with np.load(gate_file, allow_pickle=False) as data_np:
+        checks = {
+            "cache_version": str(np.asarray(data_np["cache_version"]).item()) == learn_weights_mod.NOISE_GATE_CACHE_VERSION,
+            "dataset": str(np.asarray(data_np["dataset"]).item()) == info.dataset,
+            "proxy_model": str(np.asarray(data_np["proxy_model"]).item()) == args.proxy_model,
+            "proxy_training_seed": int(np.asarray(data_np["proxy_training_seed"]).item()) == int(info.seed),
+            "epochs": int(np.asarray(data_np["epochs"]).item()) == int(ctx["proxy_epochs"]),
+            "learn_window": int(np.asarray(data_np["learn_window"]).item()) == int(args.learn_window),
+            "learn_min_correct": int(np.asarray(data_np["learn_min_correct"]).item()) == int(args.learn_min_correct),
+        }
+        bad = [k for k, v in checks.items() if not v]
+        if bad:
+            raise RuntimeError(f"invalid noise gate cache fields: {bad}")
+        final_risk = np.asarray(data_np["final_risk"], dtype=np.float64)
+    if final_risk.shape != (info.num_samples,) or not np.all(np.isfinite(final_risk)):
+        raise RuntimeError("invalid noise gate final_risk")
+
+
 def slim_group_stats(stats: dict[str, Any]) -> dict[str, Any]:
-    keep = ("solver", "final_rate", "dist_weight", "subset_comprehensive_score", "distribution_shift", "candidate_pool_size", "group_init_count")
+    keep = ("solver", "final_rate", "dist_weight", "base_dist_weight_max", "dist_weight_scale", "dist_weight_max", "dist_weight_min", "subset_comprehensive_score", "distribution_shift", "candidate_pool_size", "group_init_count")
     out = {k: stats[k] for k in keep if k in stats}
     if "candidate_pool_size" not in out and "candidate_pool_size" in stats: out["candidate_pool_size"] = int(stats["candidate_pool_size"])
     return out
@@ -461,7 +531,38 @@ def mask_path(mode_name: str, dataset: str, seed: int, keep_ratio: int) -> Path:
     return MASK_ROOT / mode_name / dataset / str(int(seed)) / f"mask_{int(keep_ratio)}.npz"
 
 
-def validate_mask_file(path: Path, info: CorruptionInfo, keep_ratio: int, weight_group: str) -> tuple[bool, str]:
+def compute_selected_corruption_stats(mask: np.ndarray, info: CorruptionInfo) -> dict[str, int | float]:
+    m = np.asarray(mask, dtype=np.uint8)
+    selected = np.flatnonzero(m)
+    csel = info.corruption_types[selected]
+    num_selected = int(selected.size)
+    num_corrupted_selected = int(np.sum(csel >= 0))
+    return {
+        "num_selected": num_selected,
+        "num_corrupted_selected": num_corrupted_selected,
+        "corruption_ratio_in_mask": float(num_corrupted_selected / num_selected) if num_selected else 0.0,
+        "num_selected_gaussian": int(np.sum(csel == 0)),
+        "num_selected_occlusion": int(np.sum(csel == 1)),
+        "num_selected_resolution": int(np.sum(csel == 2)),
+        "num_selected_fog": int(np.sum(csel == 3)),
+        "num_selected_motion_blur": int(np.sum(csel == 4)),
+    }
+
+
+def print_selected_corruption_stats(dataset: str, seed: int, keep_ratio: int, stats: dict[str, int | float]) -> None:
+    tqdm.write(
+        f"[mask] dataset={dataset} seed={int(seed)} kr={int(keep_ratio)} "
+        f"selected={int(stats['num_selected'])} corrupted={int(stats['num_corrupted_selected'])} "
+        f"corruption_ratio={float(stats['corruption_ratio_in_mask']) * 100.0:.2f}% | "
+        f"gaussian={int(stats['num_selected_gaussian'])} "
+        f"occlusion={int(stats['num_selected_occlusion'])} "
+        f"resolution={int(stats['num_selected_resolution'])} "
+        f"fog={int(stats['num_selected_fog'])} "
+        f"motion_blur={int(stats['num_selected_motion_blur'])}"
+    )
+
+
+def validate_mask_file(path: Path, info: CorruptionInfo, keep_ratio: int, weight_group: str, weights: dict[str, float], group_candidate_pool_size: int, group_init_count: int) -> tuple[bool, str]:
     if not path.is_file(): return False, "missing mask file"
     try:
         with np.load(path, allow_pickle=False) as data:
@@ -470,10 +571,16 @@ def validate_mask_file(path: Path, info: CorruptionInfo, keep_ratio: int, weight
             if not set(np.unique(mask).tolist()).issubset({0, 1}): return False, "mask contains non-binary values"
             expected = int(round(info.num_samples * keep_ratio / 100.0))
             if int(mask.sum()) != expected or selected.size != expected: return False, "selected count mismatch"
+            if not np.array_equal(selected, np.flatnonzero(mask).astype(np.int64)): return False, "selected_indices mismatch mask"
             if not np.array_equal(np.asarray(data["corruption_types"], dtype=np.int16), info.corruption_types): return False, "corruption_types mismatch"
             if str(np.asarray(data["dataset"]).item()) != info.dataset or str(np.asarray(data["weight_group"]).item()) != weight_group: return False, "dataset/weight_group mismatch"
             if int(np.asarray(data["seed"]).item()) != info.seed or int(np.asarray(data["keep_ratio"]).item()) != int(keep_ratio): return False, "seed/keep_ratio mismatch"
             if str(np.asarray(data["corruption_list_hash"]).item()) != info.list_hash: return False, "corruption hash mismatch"
+            if not np.allclose(np.asarray(data["weights"], dtype=np.float64), np.array([weights["sa"], weights["div"], weights["dds"]], dtype=np.float64)): return False, "weights mismatch"
+            if not np.isclose(float(np.asarray(data["corruption_prior_ratio"]).item()), CORRUPTION_PRIOR_RATIO): return False, "corruption_prior_ratio mismatch"
+            if not np.isclose(float(np.asarray(data["dist_weight_scale"]).item()), CORRUPTION_DIST_WEIGHT_SCALE): return False, "dist_weight_scale mismatch"
+            if int(np.asarray(data["group_candidate_pool_size"]).item()) != int(group_candidate_pool_size): return False, "group_candidate_pool_size mismatch"
+            if int(np.asarray(data["group_init_count"]).item()) != int(group_init_count): return False, "group_init_count mismatch"
     except Exception as exc:
         return False, f"mask load failed: {exc}"
     return True, "ok"
@@ -484,22 +591,20 @@ def save_mask(path: Path, mask: np.ndarray, selected_by_class: dict[int, int], s
     ok, reason = validate_in_memory_mask(m, info.num_samples, keep_ratio)
     if not ok: raise ValueError(reason)
     selected = np.flatnonzero(m).astype(np.int64)
-    csel = info.corruption_types[selected]
-    counts = {f"num_selected_{corruption_opt.CORRUPTION_ID_TO_NAME[i].replace('partial_', '').replace('resolution_degradation', 'resolution')}": int(np.sum(csel == i)) for i in range(corruption_opt.NUM_CORRUPTION_TYPES)}
-    # User requested exact legacy-ish names.
-    counts = {
-        "num_selected_gaussian": int(np.sum(csel == 0)),
-        "num_selected_occlusion": int(np.sum(csel == 1)),
-        "num_selected_resolution": int(np.sum(csel == 2)),
-        "num_selected_fog": int(np.sum(csel == 3)),
-        "num_selected_motion_blur": int(np.sum(csel == 4)),
-    }
-    scalar = dict(dataset=info.dataset, method=args.mode_name, weight_group=args.weight_group, seed=int(info.seed), keep_ratio=int(keep_ratio), num_selected=int(selected.size), num_corrupted_total=int(info.is_corrupted.sum()), num_corrupted_selected=int(np.sum(csel >= 0)), corruption_ratio_total=float(info.is_corrupted.mean()), corruption_ratio_in_mask=float(np.mean(csel >= 0)) if selected.size else 0.0, corruption_list_hash=info.list_hash, **counts)
+    selected_stats = compute_selected_corruption_stats(m, info)
+    scalar = dict(
+        dataset=info.dataset, method=args.mode_name, weight_group=args.weight_group, seed=int(info.seed), keep_ratio=int(keep_ratio),
+        num_corrupted_total=int(info.is_corrupted.sum()), corruption_ratio_total=float(info.is_corrupted.mean()),
+        corruption_list_hash=info.list_hash, corruption_prior_ratio=float(CORRUPTION_PRIOR_RATIO), dist_weight_scale=float(CORRUPTION_DIST_WEIGHT_SCALE),
+        group_candidate_pool_size=int(args.group_candidate_pool_size), group_init_count=int(args.group_init_count),
+        **selected_stats,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     group_stats = slim_group_stats(stats); group_stats["group_init_count"] = int(args.group_init_count); group_stats["candidate_pool_size"] = int(args.group_candidate_pool_size)
     np.savez_compressed(path, mask=m, selected_indices=selected, corruption_types=info.corruption_types, is_corrupted=info.is_corrupted, weights=np.array([weights["sa"], weights["div"], weights["dds"]], dtype=np.float64), selected_by_class=np.array(json.dumps(selected_by_class), dtype=np.str_), group_stats=np.array(json.dumps(group_stats), dtype=np.str_), **{k: np.array(v) for k, v in scalar.items()})
     summary = {**scalar, "weights": weights, "selected_by_class": {str(k): int(v) for k, v in selected_by_class.items()}, "group_stats": group_stats, "mask_path": str(path)}
     path.with_suffix(".json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print_selected_corruption_stats(info.dataset, info.seed, keep_ratio, selected_stats)
     tqdm.write(f"mask saved to: {path}")
 
 
@@ -523,12 +628,15 @@ def stage_masks(args: argparse.Namespace, info: CorruptionInfo, scores: dict[str
     div_loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=device.type == "cuda")
     for kr in keep_ratios:
         out = mask_path(args.mode_name, info.dataset, info.seed, kr)
-        valid, reason = validate_mask_file(out, info, kr, args.weight_group)
-        if args.skip_saved and valid:
+        valid, reason = validate_mask_file(out, info, kr, args.weight_group, weights, args.group_candidate_pool_size, args.group_init_count)
+        if args.skip_saved and not args.force and valid:
+            with np.load(out, allow_pickle=False) as data:
+                saved_mask = np.asarray(data["mask"], dtype=np.uint8)
+            print_selected_corruption_stats(info.dataset, info.seed, kr, compute_selected_corruption_stats(saved_mask, info))
             tqdm.write(f"Mask cache HIT (--skip-saved): {out}"); continue
-        if args.skip_saved and not valid:
+        if args.skip_saved and not args.force and not valid:
             tqdm.write(f"Mask cache MISS→COMPUTE ({reason})")
-        mask, selected_by_class, stats = mask_mod.select_group_mask(np.asarray(scores["sa"], dtype=np.float32), div_metric=div, div_loader=div_loader, image_adapter=image_adapter, labels=labels, weights=weights, num_classes=len(class_names), keep_ratio=kr, device=device, dataset_name=info.dataset, seed=info.seed, weight_group=args.weight_group, clip_model=args.clip_model, adapter_image_path=str(img_p), div_static_scores=np.asarray(scores["div"], dtype=np.float32), dds_static_scores=np.asarray(scores["dds"], dtype=np.float32), group_candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count)
+        mask, selected_by_class, stats = mask_mod.select_group_mask(np.asarray(scores["sa"], dtype=np.float32), div_metric=div, div_loader=div_loader, image_adapter=image_adapter, labels=labels, weights=weights, num_classes=len(class_names), keep_ratio=kr, device=device, dataset_name=info.dataset, seed=info.seed, weight_group=args.weight_group, clip_model=args.clip_model, adapter_image_path=str(img_p), div_static_scores=np.asarray(scores["div"], dtype=np.float32), dds_static_scores=np.asarray(scores["dds"], dtype=np.float32), group_candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count, dist_weight_scale=CORRUPTION_DIST_WEIGHT_SCALE)
         save_mask(out, mask, selected_by_class, stats, weights, args, info, kr)
 
 
@@ -551,6 +659,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--debug-prompts", action="store_true")
     p.add_argument("--skip-saved", action="store_true")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--learn-window", type=int, default=10)
+    p.add_argument("--learn-min-correct", type=int, default=8)
+    p.add_argument("--gate-low", type=float, default=0.1)
+    p.add_argument("--gate-high", type=float, default=0.9)
     return p.parse_args()
 
 
@@ -568,9 +680,9 @@ def run_seed(args: argparse.Namespace, seed: int, keep_ratios: list[int]) -> Non
         scores = stage_static_scores(args, info, ctx); bar.update(1)
         if args.weight_group == "learned":
             tqdm.write(f"[3/{len(stages)}] Proxy CV")
-            stage_proxy(args, info, ctx); bar.update(1)
+            _, proxy_retrained = stage_proxy(args, info, ctx); bar.update(1)
             tqdm.write(f"[4/{len(stages)}] Dynamic supervision and weights")
-            weights = stage_weights(args, info, ctx); bar.update(1)
+            weights = stage_weights(args, info, ctx, proxy_retrained=proxy_retrained); bar.update(1)
         else:
             weights = stage_weights(args, info, ctx)
         tqdm.write(f"[{len(stages)}/{len(stages)}] Group masks")

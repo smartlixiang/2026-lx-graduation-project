@@ -260,7 +260,10 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
         if seed is None: raise ValueError("seed required")
         return PROXY_LOG_ROOT / dataset / proxy_model / str(int(seed)) / str(int(epochs))
     def dyn_dir(dataset: str, proxy_model: str, seed: int, epochs: int) -> Path:
-        return DYNAMIC_CACHE_ROOT / dataset / proxy_model / str(int(seed)) / str(int(epochs))
+        base = DYNAMIC_CACHE_ROOT / dataset / proxy_model / str(int(seed)) / str(int(epochs))
+        if corruption_info is not None:
+            return base / f"corruption_{corruption_info.list_hash}"
+        return base
     def dyn_path(dataset: str, proxy_model: str, seed: int, epochs: int, component_name: str) -> Path:
         return dyn_dir(dataset, proxy_model, seed, epochs) / f"{component_name.strip().upper()}.npz"
     def gate_path(dataset: str, proxy_model: str, seed: int, epochs: int) -> Path:
@@ -469,7 +472,7 @@ def mask_path(mode_name: str, dataset: str, seed: int, keep_ratio: int) -> Path:
     return MASK_ROOT / mode_name / dataset / str(int(seed)) / f"mask_{int(keep_ratio)}.npz"
 
 
-def validate_mask_file(path: Path, info: CorruptionInfo, keep_ratio: int, weight_group: str) -> tuple[bool, str]:
+def validate_mask_file(path: Path, info: CorruptionInfo, keep_ratio: int, weight_group: str, weights: dict[str, float], dist_weight_factor: float) -> tuple[bool, str]:
     if not path.is_file(): return False, "missing mask file"
     try:
         with np.load(path, allow_pickle=False) as data:
@@ -482,6 +485,13 @@ def validate_mask_file(path: Path, info: CorruptionInfo, keep_ratio: int, weight
             if str(np.asarray(data["dataset"]).item()) != info.dataset or str(np.asarray(data["weight_group"]).item()) != weight_group: return False, "dataset/weight_group mismatch"
             if int(np.asarray(data["seed"]).item()) != info.seed or int(np.asarray(data["keep_ratio"]).item()) != int(keep_ratio): return False, "seed/keep_ratio mismatch"
             if str(np.asarray(data["corruption_list_hash"]).item()) != info.list_hash: return False, "corruption hash mismatch"
+            saved_weights = np.asarray(data["weights"], dtype=np.float64)
+            if saved_weights.shape != (3,): return False, "weights shape mismatch"
+            expected_weights = np.array([weights["sa"], weights["div"], weights["dds"]], dtype=np.float64)
+            if not np.allclose(saved_weights, expected_weights): return False, "weights mismatch"
+            if "dist_weight_factor" not in data: return False, "missing dist_weight_factor"
+            saved_factor = float(np.asarray(data["dist_weight_factor"]).item())
+            if not np.allclose(saved_factor, float(dist_weight_factor)): return False, "dist_weight_factor mismatch"
     except Exception as exc:
         return False, f"mask load failed: {exc}"
     return True, "ok"
@@ -502,7 +512,7 @@ def save_mask(path: Path, mask: np.ndarray, selected_by_class: dict[int, int], s
         "num_selected_fog": int(np.sum(csel == 3)),
         "num_selected_motion_blur": int(np.sum(csel == 4)),
     }
-    scalar = dict(dataset=info.dataset, method=args.mode_name, weight_group=args.weight_group, seed=int(info.seed), keep_ratio=int(keep_ratio), num_selected=int(selected.size), num_corrupted_total=int(info.is_corrupted.sum()), num_corrupted_selected=int(np.sum(csel >= 0)), corruption_ratio_total=float(info.is_corrupted.mean()), corruption_ratio_in_mask=float(np.mean(csel >= 0)) if selected.size else 0.0, corruption_list_hash=info.list_hash, **counts)
+    scalar = dict(dataset=info.dataset, method=args.mode_name, weight_group=args.weight_group, seed=int(info.seed), keep_ratio=int(keep_ratio), num_selected=int(selected.size), num_corrupted_total=int(info.is_corrupted.sum()), num_corrupted_selected=int(np.sum(csel >= 0)), corruption_ratio_total=float(info.is_corrupted.mean()), corruption_ratio_in_mask=float(np.mean(csel >= 0)) if selected.size else 0.0, corruption_list_hash=info.list_hash, dist_weight_factor=float(CORRUPTION_RISK_FACTOR), **counts)
     path.parent.mkdir(parents=True, exist_ok=True)
     group_stats = slim_group_stats(stats); group_stats["group_init_count"] = int(args.group_init_count); group_stats["candidate_pool_size"] = int(args.group_candidate_pool_size)
     np.savez_compressed(path, mask=m, selected_indices=selected, corruption_types=info.corruption_types, is_corrupted=info.is_corrupted, weights=np.array([weights["sa"], weights["div"], weights["dds"]], dtype=np.float64), selected_by_class=np.array(json.dumps(selected_by_class), dtype=np.str_), group_stats=np.array(json.dumps(group_stats), dtype=np.str_), **{k: np.array(v) for k, v in scalar.items()})
@@ -531,7 +541,7 @@ def stage_masks(args: argparse.Namespace, info: CorruptionInfo, scores: dict[str
     div_loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=device.type == "cuda")
     for kr in keep_ratios:
         out = mask_path(args.mode_name, info.dataset, info.seed, kr)
-        valid, reason = validate_mask_file(out, info, kr, args.weight_group)
+        valid, reason = validate_mask_file(out, info, kr, args.weight_group, weights, CORRUPTION_RISK_FACTOR)
         if args.skip_saved and valid:
             with np.load(out, allow_pickle=False) as data:
                 num_corrupted_selected = int(np.asarray(data["num_corrupted_selected"]).item())

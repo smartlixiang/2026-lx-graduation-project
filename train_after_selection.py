@@ -1,16 +1,33 @@
 """Train after data selection and save evaluation results.
 
-The default behavior is the standard data-selection training experiment.  When
-``--exp label_noise`` is used, the script first applies the fixed label-noise
-mapping under ``noise/{dataset}/noise_list_{seed}.txt`` to the training split,
-keeps the test split clean, and then trains on the selected subset.
+Supported modes:
+  1. Default clean-data experiment: train on the selected clean training subset
+     and evaluate on the clean test split.
+  2. ``--exp label_noise``: read ``noise/<dataset>/noise_list_<seed>.txt``,
+     modify training labels only, keep the test split clean, and write outputs
+     under ``result_label_noise/`` and ``checkpoint_label_noise/``.
+  3. ``--exp corruption``: read
+     ``corruption_data/<dataset>/corruption_list_<seed>.txt``, apply fixed image
+     corruptions to listed training samples before the training transform, keep
+     labels correct and the test split clean, read selection masks from
+     ``corruption_exp/mask`` by default, and write outputs under
+     ``result_corruption/`` and ``checkpoint_corruption/``.
 
-Result roots:
-  - default: result/
-  - --exp label_noise: result_label_noise/
+Examples:
+  python train_after_selection.py \
+      --exp corruption \
+      --dataset cifar100 \
+      --mode corruption_learned_group \
+      --kr 30,50,70 \
+      --seed 22,42,96
 
-Checkpoint roots are separated in the same way to avoid accidentally resuming a
-clean experiment checkpoint in a label-noise run.
+  python train_after_selection.py \
+      --exp corruption \
+      --dataset tiny-imagenet \
+      --mode corruption_naive_group \
+      --kr 30,50,70 \
+      --seed 22 \
+      --device cuda:0
 """
 from __future__ import annotations
 
@@ -19,15 +36,18 @@ import json
 import time
 from pathlib import Path
 
+from PIL import Image
+
 import numpy as np
 import torch
 from torch import nn
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import SGD
 from torch.optim.lr_scheduler import MultiStepLR
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
+from corruption_exp import corruption_opt
 from dataset.dataset import BaseDataLoader
 from dataset.dataset_config import AVAILABLE_DATASETS
 from model.model_config import get_model
@@ -38,7 +58,10 @@ from utils.seed import parse_seed_list, set_seed
 from utils.training_defaults import apply_dataset_training_defaults
 
 
-SUPPORTED_EXPERIMENTS = {"label_noise"}
+SUPPORTED_EXPERIMENTS = {"label_noise", "corruption"}
+CORRUPTION_SUPPORTED_DATASETS = {"cifar100", "tiny-imagenet"}
+EXPECTED_TRAIN_SIZES = {"cifar100": 50000, "tiny-imagenet": 100000}
+DATASET_NUMERIC_ID = {"cifar100": 100, "tiny-imagenet": 200}
 
 
 def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
@@ -93,7 +116,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         choices=sorted(SUPPORTED_EXPERIMENTS),
-        help="实验设置。默认 None；当前仅支持 label_noise。",
+        help="实验设置。None 为正常数据实验；label_noise 为标签噪声实验；corruption 为图像破坏实验。",
     )
     parser.add_argument(
         "--noise_root",
@@ -106,6 +129,24 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="标签噪声实验中是否严格检查注噪表合法性。",
+    )
+    parser.add_argument(
+        "--corruption_root",
+        type=str,
+        default=str(Path("corruption_data")),
+        help="图像破坏清单根目录，仅在 --exp corruption 时使用。",
+    )
+    parser.add_argument(
+        "--corruption_mask_root",
+        type=str,
+        default=str(Path("corruption_exp") / "mask"),
+        help="图像破坏实验的 mask 根目录，仅在 --exp corruption 时使用。",
+    )
+    parser.add_argument(
+        "--strict_corruption_check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="图像破坏实验中是否严格检查 corruption list 的数量和类型分布。",
     )
     parser.add_argument("--result_root", type=str, default="result")
     parser.add_argument(
@@ -249,6 +290,147 @@ def apply_label_noise_to_dataset(
     }
 
 
+
+def read_corruption_list(corruption_path: Path) -> np.ndarray:
+    if not corruption_path.exists():
+        raise FileNotFoundError(f"未找到图像破坏清单文件: {corruption_path}")
+    mapping = np.loadtxt(corruption_path, dtype=np.int64)
+    if mapping.ndim == 1:
+        mapping = mapping.reshape(1, 2)
+    if mapping.ndim != 2 or mapping.shape[1] != 2:
+        raise ValueError(
+            f"图像破坏清单文件必须是两列 txt: {corruption_path}, 当前 shape={mapping.shape}"
+        )
+    return mapping
+
+
+def _corruption_type_counts(type_ids: np.ndarray) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for type_id, name in corruption_opt.CORRUPTION_ID_TO_NAME.items():
+        counts[name] = int(np.sum(type_ids == int(type_id)))
+    return counts
+
+
+def load_corruption_info(
+    dataset_name: str,
+    seed: int,
+    corruption_root: Path,
+    num_samples: int,
+    strict: bool = True,
+) -> dict[str, object]:
+    if dataset_name not in CORRUPTION_SUPPORTED_DATASETS:
+        supported = ", ".join(sorted(CORRUPTION_SUPPORTED_DATASETS))
+        raise ValueError(f"--exp corruption 仅支持数据集: {supported}; 当前 dataset={dataset_name}")
+
+    corruption_path = corruption_root / dataset_name / f"corruption_list_{seed}.txt"
+    mapping = read_corruption_list(corruption_path)
+    sample_ids = mapping[:, 0].astype(np.int64)
+    type_ids = mapping[:, 1].astype(np.int64)
+
+    if np.any(sample_ids < 0) or np.any(sample_ids >= num_samples):
+        raise ValueError(
+            f"图像破坏清单存在越界 sample_id: {corruption_path}, train_size={num_samples}"
+        )
+    if np.any(type_ids < 0) or np.any(type_ids >= corruption_opt.NUM_CORRUPTION_TYPES):
+        raise ValueError(
+            f"图像破坏清单存在非法 corruption_type: {corruption_path}, "
+            f"valid=[0, {corruption_opt.NUM_CORRUPTION_TYPES})"
+        )
+    if len(np.unique(sample_ids)) != len(sample_ids):
+        raise ValueError(f"图像破坏清单存在重复 sample_id: {corruption_path}")
+
+    if strict:
+        expected_train_size = EXPECTED_TRAIN_SIZES[dataset_name]
+        if num_samples != expected_train_size:
+            raise ValueError(
+                f"严格检查要求 {dataset_name} 训练集大小为 {expected_train_size}, "
+                f"当前为 {num_samples}"
+            )
+        expected_corrupted = expected_train_size // 5
+        if sample_ids.shape[0] != expected_corrupted:
+            raise ValueError(
+                f"严格检查要求图像破坏样本数为训练集 20% ({expected_corrupted}), "
+                f"当前为 {sample_ids.shape[0]}: {corruption_path}"
+            )
+        expected_per_type = expected_corrupted // corruption_opt.NUM_CORRUPTION_TYPES
+        counts = _corruption_type_counts(type_ids)
+        bad_counts = {name: count for name, count in counts.items() if count != expected_per_type}
+        if bad_counts:
+            raise ValueError(
+                f"严格检查要求五种图像破坏类型各 {expected_per_type} 个, "
+                f"当前 type_counts={counts}: {corruption_path}"
+            )
+
+    corruption_types = np.full(num_samples, -1, dtype=np.int16)
+    corruption_types[sample_ids] = type_ids.astype(np.int16)
+    is_corrupted = corruption_types >= 0
+
+    return {
+        "corruption_path": str(corruption_path),
+        "num_total": int(num_samples),
+        "num_corrupted": int(sample_ids.shape[0]),
+        "corruption_ratio": float(sample_ids.shape[0] / num_samples) if num_samples else 0.0,
+        "corrupted_indices": sample_ids,
+        "corruption_types": corruption_types,
+        "is_corrupted": is_corrupted,
+        "type_counts": _corruption_type_counts(type_ids),
+    }
+
+
+class FixedCorruptionDataset(Dataset):
+    """Apply deterministic image corruption before the original train transform."""
+
+    def __init__(
+        self,
+        base_dataset: torch.utils.data.Dataset,
+        corruption_types: np.ndarray,
+        dataset_name: str,
+        seed: int,
+    ) -> None:
+        self.base_dataset = base_dataset
+        self.corruption_types = np.asarray(corruption_types, dtype=np.int16)
+        self.dataset_name = dataset_name
+        self.seed = int(seed)
+        self.transform = getattr(base_dataset, "transform", None)
+        self.target_transform = getattr(base_dataset, "target_transform", None)
+        if hasattr(base_dataset, "transform"):
+            base_dataset.transform = None
+        if hasattr(base_dataset, "target_transform"):
+            base_dataset.target_transform = None
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx: int):
+        image, target = self.base_dataset[idx]
+        if not isinstance(image, Image.Image):
+            image = Image.fromarray(np.asarray(image))
+
+        corruption_type = int(self.corruption_types[idx])
+        if corruption_type >= 0:
+            seed_sequence = np.random.SeedSequence(
+                [
+                    int(self.seed),
+                    int(idx),
+                    int(corruption_type),
+                    DATASET_NUMERIC_ID[self.dataset_name],
+                ]
+            )
+            rng = np.random.default_rng(seed_sequence)
+            image = corruption_opt.apply_corruption(image, corruption_type, rng=rng)
+
+        if self.transform is not None:
+            image = self.transform(image)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+        return image, target
+
+    def __getattr__(self, name: str):
+        if name == "base_dataset":
+            raise AttributeError(name)
+        return getattr(self.base_dataset, name)
+
+
 def select_random_indices_by_class(
     labels: np.ndarray,
     num_classes: int,
@@ -281,6 +463,7 @@ def load_selection_mask(
     keep_ratio: int,
     seed: int,
     model_name: str,
+    mask_root: str | Path | None = None,
 ) -> np.ndarray:
     """Load a 0/1 mask for a selection method.
 
@@ -294,6 +477,7 @@ def load_selection_mask(
         model=model_name,
         seed=mask_seed,
         keep_ratio=keep_ratio,
+        root=mask_root,
     )
     if not mask_path.exists():
         raise FileNotFoundError(f"未找到 mask 文件: {mask_path}")
@@ -380,12 +564,13 @@ def prepare_selection_indices(
     dataset: torch.utils.data.Dataset,
     num_classes: int,
     model_name: str,
+    mask_root: str | Path | None = None,
 ) -> np.ndarray:
     if mode == "random":
         labels = _extract_labels(dataset)
         return select_random_indices_by_class(labels, num_classes, keep_ratio, seed)
 
-    mask = load_selection_mask(dataset_name, mode, keep_ratio, seed, model_name)
+    mask = load_selection_mask(dataset_name, mode, keep_ratio, seed, model_name, mask_root=mask_root)
     if mask.shape[0] != len(dataset):
         raise ValueError(
             f"mask 长度与训练集长度不一致: mask={mask.shape[0]}, train={len(dataset)}, "
@@ -409,6 +594,29 @@ def _selected_noise_stats(selected_indices: np.ndarray, noise_info: dict[str, ob
     }
 
 
+
+def _selected_corruption_stats(
+    selected_indices: np.ndarray,
+    corruption_info: dict[str, object] | None,
+) -> dict[str, object]:
+    if corruption_info is None:
+        return {}
+
+    is_corrupted = np.asarray(corruption_info["is_corrupted"], dtype=bool)
+    corruption_types = np.asarray(corruption_info["corruption_types"], dtype=np.int16)
+    selected_is_corrupted = is_corrupted[selected_indices]
+    selected_types = corruption_types[selected_indices][selected_is_corrupted]
+    num_selected = int(selected_indices.shape[0])
+    num_corrupted_selected = int(np.sum(selected_is_corrupted))
+    return {
+        "num_corrupted_selected": num_corrupted_selected,
+        "corruption_ratio_in_selection": (
+            float(num_corrupted_selected / num_selected) if num_selected else 0.0
+        ),
+        "selected_corruption_type_counts": _corruption_type_counts(selected_types),
+    }
+
+
 def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     del multi_seed  # kept for backward-compatible function signature
 
@@ -427,6 +635,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     train_dataset = train_loader.dataset
 
     noise_info: dict[str, object] | None = None
+    corruption_info: dict[str, object] | None = None
     if args.exp == "label_noise":
         noise_info = apply_label_noise_to_dataset(
             dataset=train_dataset,
@@ -441,6 +650,27 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             f"num_noisy={noise_info['num_noisy']}/{noise_info['num_total']} "
             f"({noise_info['noise_ratio']:.4f}), path={noise_info['noise_path']}"
         )
+    elif args.exp == "corruption":
+        corruption_info = load_corruption_info(
+            dataset_name=args.dataset,
+            seed=seed,
+            corruption_root=Path(args.corruption_root),
+            num_samples=len(train_dataset),
+            strict=args.strict_corruption_check,
+        )
+        train_dataset = FixedCorruptionDataset(
+            base_dataset=train_dataset,
+            corruption_types=np.asarray(corruption_info["corruption_types"], dtype=np.int16),
+            dataset_name=args.dataset,
+            seed=seed,
+        )
+        tqdm.write(
+            f"Applied image corruption: dataset={args.dataset}, seed={seed}, "
+            f"num_corrupted={corruption_info['num_corrupted']}/{corruption_info['num_total']}, "
+            f"ratio={corruption_info['corruption_ratio']:.4f}, "
+            f"path={corruption_info['corruption_path']}, "
+            f"type_counts={corruption_info['type_counts']}"
+        )
 
     model_name = args.model
     keep_ratios = parse_ratio_list(args.kr)
@@ -448,6 +678,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
     result_root = _root_for_exp(args.result_root, args.exp)
     checkpoint_root = _root_for_exp(args.checkpoint_root, args.exp)
+    selection_mask_root = Path(args.corruption_mask_root) if args.exp == "corruption" else None
 
     for keep_ratio in keep_ratios:
         # Result files are model-sensitive and therefore include the model name.
@@ -481,14 +712,25 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             train_dataset,
             data_loader.num_classes,
             model_name,
+            mask_root=selection_mask_root,
         )
         noise_selection_stats = _selected_noise_stats(selected_indices, noise_info)
+        corruption_selection_stats = _selected_corruption_stats(selected_indices, corruption_info)
         if noise_selection_stats:
             tqdm.write(
                 f"Selection stats: mode={args.mode}, kr={keep_ratio}, "
                 f"num_selected={len(selected_indices)}, "
                 f"noisy_selected={noise_selection_stats['num_noisy_selected']}, "
                 f"noise_ratio_in_selection={noise_selection_stats['noise_ratio_in_selection']:.4f}"
+            )
+        if corruption_selection_stats:
+            tqdm.write(
+                f"Selection stats: mode={args.mode}, kr={keep_ratio}, "
+                f"num_selected={len(selected_indices)}, "
+                f"corrupted_selected={corruption_selection_stats['num_corrupted_selected']}, "
+                f"corruption_ratio_in_selection="
+                f"{corruption_selection_stats['corruption_ratio_in_selection']:.4f}, "
+                f"type_counts={corruption_selection_stats['selected_corruption_type_counts']}"
             )
 
         subset = Subset(train_dataset, selected_indices.tolist())
@@ -594,6 +836,9 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 }
                 if noise_info is not None:
                     checkpoint_payload["noise_path"] = noise_info["noise_path"]
+                if corruption_info is not None:
+                    checkpoint_payload["corruption_path"] = corruption_info["corruption_path"]
+                    checkpoint_payload["num_corrupted"] = corruption_info["num_corrupted"]
                 torch.save(checkpoint_payload, checkpoint_path)
             epoch_bar.update(1)
 
@@ -644,6 +889,26 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                     "noise_ratio_in_selection": float(noise_selection_stats["noise_ratio_in_selection"]),
                 }
             )
+        if corruption_info is not None:
+            metadata.update(
+                {
+                    "corruption_root": str(Path(args.corruption_root)),
+                    "corruption_mask_root": str(Path(args.corruption_mask_root)),
+                    "corruption_path": corruption_info["corruption_path"],
+                    "corruption_rate": corruption_info["corruption_ratio"],
+                    "num_corrupted_total": int(corruption_info["num_corrupted"]),
+                    "corruption_type_counts": corruption_info["type_counts"],
+                    "num_corrupted_selected": int(
+                        corruption_selection_stats["num_corrupted_selected"]
+                    ),
+                    "corruption_ratio_in_selection": float(
+                        corruption_selection_stats["corruption_ratio_in_selection"]
+                    ),
+                    "selected_corruption_type_counts": corruption_selection_stats[
+                        "selected_corruption_type_counts"
+                    ],
+                }
+            )
 
         result_payload = {
             "metadata": metadata,
@@ -670,6 +935,9 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.exp == "corruption" and args.dataset not in CORRUPTION_SUPPORTED_DATASETS:
+        supported = ", ".join(sorted(CORRUPTION_SUPPORTED_DATASETS))
+        raise ValueError(f"--exp corruption 仅支持数据集: {supported}; 当前 dataset={args.dataset}")
     args = apply_dataset_defaults(args)
     seeds = parse_seed_list(args.seed)
     multi_seed = len(seeds) > 1

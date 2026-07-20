@@ -452,7 +452,7 @@ def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str,
     tqdm.write("Learned weights cache MISS→LEARN (with noise gate)")
     img_p, txt_p = adapter_paths(info.dataset, info.seed)
     ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), proxy_log=str(PROXY_LOG_ROOT), proxy_model=args.proxy_model, proxy_epochs=int(ctx["proxy_epochs"]), adapter_image_path=str(img_p), adapter_text_path=str(txt_p), clip_model=args.clip_model, batch_size=args.batch_size, num_workers=args.num_workers, div_k=0.05, dds_k=5, dds_important_eigval_ratio=0.8, coverage_tau_g=0.15, coverage_s_g=0.07, coverage_k_pct=0.05, coverage_q_low=0.002, coverage_q_high=0.998, ridge_lambda=0.01, learning_rate=1e-2, max_iter=10000, tol=1e-6, learn_window=args.learn_window, learn_min_correct=args.learn_min_correct, gate_low=args.gate_low, gate_high=args.gate_high, ratio_lambda=5e-3, regression_learning_rate=2e-3, regression_max_iter=10000, regression_tol=1e-8, use_noise_gate=True, force_noise_gate=bool(args.force), output=str(WEIGHTS_PATH), device=args.device, debug_prompts=args.debug_prompts, seed=str(info.seed), proxy_training_seed=None)
-    with patched_project_paths(info), patched_training_corruption(info.dataset, info):
+    with patched_project_paths(), patched_training_corruption(info.dataset, info):
         learn_weights_mod.run_once(ns, [info.seed])
     data = load_json(WEIGHTS_PATH) or {}; data.setdefault(info.dataset, {}).setdefault(str(info.seed), {})["corruption_context"] = ctx
     WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True); WEIGHTS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

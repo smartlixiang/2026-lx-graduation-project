@@ -346,6 +346,7 @@ def select_group_mask(
     dds_static_scores: np.ndarray | None = None,
     group_candidate_pool_size: int = 1,
     group_init_count: int = 2,
+    dist_weight_factor: float = 1.0,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
         raise ValueError("kr 必须在 1-100 之间。")
@@ -414,8 +415,11 @@ def select_group_mask(
 
     class_budgets = _allocate_class_budgets()
     candidate_pool_size = max(1, int(group_candidate_pool_size))
+    if not np.isfinite(dist_weight_factor) or float(dist_weight_factor) < 0.0:
+        raise ValueError("dist_weight_factor must be finite and non-negative.")
 
-    dist_weight_max = max(0.0, 0.7 - 0.004 * keep_ratio)
+    base_dist_weight_max = max(0.0, 0.7 - 0.004 * keep_ratio)
+    dist_weight_max = base_dist_weight_max * float(dist_weight_factor)
     dist_weight_min = 0.5 * dist_weight_max
 
     selected_mask = np.zeros(num_samples, dtype=np.uint8)

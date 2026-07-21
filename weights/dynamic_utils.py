@@ -176,8 +176,8 @@ def resolve_epoch_windows(num_epochs: int) -> tuple[np.ndarray, np.ndarray, np.n
     if num_epochs == 2:
         return np.array([0], dtype=np.int64), np.array([0, 1], dtype=np.int64), np.array([1], dtype=np.int64)
 
-    early_n = max(1, int(round(0.3 * num_epochs)))
-    mid_n = max(1, int(round(0.4 * num_epochs)))
+    early_n = max(1, int(round(0.4 * num_epochs)))
+    mid_n = max(1, int(round(0.3 * num_epochs)))
     late_n = max(1, num_epochs - early_n - mid_n)
 
     while early_n + mid_n + late_n > num_epochs:

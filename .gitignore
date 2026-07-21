@@ -24,3 +24,5 @@ corruption_exp/weights/
 corruption_exp/static_scores/
 corruption_exp/adapters/
 corruption_exp/contexts/
+checkpoint_corruption/
+yyy/

@@ -37,19 +37,23 @@ Examples
 --------
 Run all datasets and all experiments:
 
-    python yyy/try.py
+    python yyy/try_1.py
 
 Run only CIFAR-100:
 
-    python yyy/try.py --dataset cifar100
+    python yyy/try_1.py --dataset cifar100
 
 Run only the label-noise and corruption variants on Tiny-ImageNet:
 
-    python yyy/try.py --dataset tiny-imagenet --experiment special
+    python yyy/try_1.py --dataset tiny-imagenet --experiment special
 
-Force recomputation of truncated dynamic caches:
+Keep selected dynamic definitions from the existing full-run caches:
 
-    python yyy/try.py --force-dynamic
+    python yyy/try_1.py --keep A,T,noise_gate
+
+Force recomputation of non-kept truncated dynamic caches:
+
+    python yyy/try_1.py --force-dynamic
 """
 from __future__ import annotations
 
@@ -127,6 +131,7 @@ PROXY_LOG_ROOTS = {
 }
 DYNAMIC_CACHE_VERSION = "yyy_truncated_dynamic_v1"
 COMPONENT_NAMES = ("A", "C", "T")
+KEEPABLE_METRICS = (*COMPONENT_NAMES, "noise_gate")
 
 
 @dataclass
@@ -181,8 +186,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dds-k", type=int, default=5)
     parser.add_argument("--dds-important-eigval-ratio", type=float, default=0.8)
 
-    parser.add_argument("--learn-window", type=int, default=5)
-    parser.add_argument("--learn-min-correct", type=int, default=4)
+    parser.add_argument("--learn-window", type=int, default=10)
+    parser.add_argument("--learn-min-correct", type=int, default=8)
     parser.add_argument(
         "--normal-gate-low",
         type=float,
@@ -218,11 +223,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hist-bins", type=int, default=60)
     parser.add_argument("--debug-prompts", action="store_true")
     parser.add_argument(
+        "--keep",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated dynamic metrics that keep their original full-run "
+            "definitions by reading existing experiment caches directly. "
+            "Supported: A,C,T,noise_gate; 'gate' is an alias of noise_gate."
+        ),
+    )
+    parser.add_argument(
         "--force-dynamic",
         action="store_true",
-        help="Ignore yyy dynamic caches and recompute A/C/T/noise_gate.",
+        help="Ignore yyy caches and recompute only non-kept truncated metrics.",
     )
     return parser.parse_args()
+
+
+def parse_keep_items(text: str) -> frozenset[str]:
+    aliases = {
+        "a": "A",
+        "c": "C",
+        "t": "T",
+        "gate": "noise_gate",
+        "noise_gate": "noise_gate",
+        "noise-gate": "noise_gate",
+    }
+    items = [item.strip().lower() for item in text.split(",") if item.strip()]
+    resolved: set[str] = set()
+    invalid: list[str] = []
+    for item in items:
+        canonical = aliases.get(item)
+        if canonical is None:
+            invalid.append(item)
+        else:
+            resolved.add(canonical)
+    if invalid:
+        raise ValueError(
+            "Unsupported --keep value(s): "
+            + ", ".join(invalid)
+            + ". Supported values: A,C,T,noise_gate."
+        )
+    return frozenset(resolved)
 
 
 def selected_datasets(name: str) -> list[str]:
@@ -487,6 +529,89 @@ def gate_cache_path(ctx: ExperimentContext, cutoff: int) -> Path:
     return dynamic_cache_dir(ctx, cutoff) / "noise_gate.npz"
 
 
+def original_dynamic_cache_dir(
+    ctx: ExperimentContext,
+    proxy_model: str,
+) -> Path:
+    """Resolve the repository's existing full-run cache directory.
+
+    Corruption caches intentionally use the same no-hash layout as the current
+    corruption experiment's weight-learning stage:
+    corruption_exp/weights/dynamic_cache/<dataset>/<model>/<seed>/<epochs>.
+    """
+    roots = {
+        "normal": PROJECT_ROOT / "weights" / "dynamic_cache",
+        "label_noise": noise_mod.DYNAMIC_CACHE_ROOT,
+        "corruption": corruption_mod.DYNAMIC_CACHE_ROOT,
+    }
+    epochs = SOURCE_PROXY_EPOCHS[ctx.dataset]
+    return (
+        roots[ctx.experiment]
+        / ctx.dataset
+        / proxy_model
+        / str(SEED)
+        / str(int(epochs))
+    )
+
+
+def load_original_component_cache(
+    ctx: ExperimentContext,
+    proxy_model: str,
+    component_name: str,
+) -> DynamicComponentResult:
+    epochs = SOURCE_PROXY_EPOCHS[ctx.dataset]
+    cache_path = original_dynamic_cache_dir(ctx, proxy_model) / f"{component_name}.npz"
+    result, labels, reason = weight_mod._load_dynamic_component_cache_with_reason(
+        cache_path=cache_path,
+        component_name=component_name,
+        dataset=ctx.dataset,
+        proxy_model=proxy_model,
+        proxy_training_seed=SEED,
+        epochs=epochs,
+    )
+    if result is None or labels is None:
+        raise FileNotFoundError(
+            f"--keep {component_name} requires a valid original cache: "
+            f"{cache_path} | validation failed: {reason}"
+        )
+    if not np.array_equal(np.asarray(labels, dtype=np.int64), ctx.labels):
+        raise ValueError(
+            f"Original {component_name} cache labels do not match "
+            f"{ctx.experiment}/{ctx.dataset}: {cache_path}"
+        )
+    tqdm.write(f"[dynamic] original cache HIT (--keep {component_name}): {cache_path}")
+    return result
+
+
+def load_original_gate_cache(
+    ctx: ExperimentContext,
+    proxy_model: str,
+    args: argparse.Namespace,
+) -> dict[str, np.ndarray]:
+    epochs = SOURCE_PROXY_EPOCHS[ctx.dataset]
+    cache_path = original_dynamic_cache_dir(ctx, proxy_model) / "noise_gate.npz"
+    gate_low, gate_high = gate_thresholds(ctx, args)
+    result = weight_mod._load_noise_gate_cache_if_valid(
+        cache_path,
+        ctx.dataset,
+        proxy_model,
+        SEED,
+        epochs,
+        ctx.labels,
+        int(args.learn_window),
+        int(args.learn_min_correct),
+        gate_low,
+        gate_high,
+    )
+    if result is None:
+        raise FileNotFoundError(
+            "--keep noise_gate requires a valid original cache matching the "
+            f"current labels and gate parameters: {cache_path}"
+        )
+    tqdm.write(f"[dynamic] original cache HIT (--keep noise_gate): {cache_path}")
+    return result
+
+
 def load_component_cache(
     path: Path,
     *,
@@ -694,23 +819,40 @@ def load_or_compute_dynamic_supervision(
     args: argparse.Namespace,
 ) -> tuple[dict[str, DynamicComponentResult], dict[str, np.ndarray], np.ndarray]:
     cutoff = DYNAMIC_EPOCHS[ctx.dataset]
-    source_log_dir = find_proxy_log_dir(
-        ctx.experiment, ctx.dataset, args.proxy_model, cutoff
-    )
+    kept = frozenset(args.keep_items)
+    non_kept_components = [name for name in COMPONENT_NAMES if name not in kept]
+    needs_truncated_gate = "noise_gate" not in kept
+    needs_truncated_source = bool(non_kept_components or needs_truncated_gate)
+
+    source_log_dir: Path | None = None
+    if needs_truncated_source:
+        source_log_dir = find_proxy_log_dir(
+            ctx.experiment, ctx.dataset, args.proxy_model, cutoff
+        )
 
     early, middle, late = resolve_epoch_windows(cutoff)
+    source_text = str(source_log_dir) if source_log_dir is not None else "not required (--keep all)"
     tqdm.write(
         f"[dynamic] experiment={ctx.experiment} dataset={ctx.dataset} "
-        f"source={source_log_dir} cutoff={cutoff} "
+        f"source={source_text} cutoff={cutoff} "
         f"windows=1-{early[-1] + 1},"
         f"{middle[0] + 1}-{middle[-1] + 1},"
-        f"{late[0] + 1}-{late[-1] + 1}"
+        f"{late[0] + 1}-{late[-1] + 1} "
+        f"keep={sorted(kept)}"
     )
 
     component_results: dict[str, DynamicComponentResult] = {}
     missing_components: list[str] = []
 
     for name in COMPONENT_NAMES:
+        if name in kept:
+            component_results[name] = load_original_component_cache(
+                ctx, args.proxy_model, name
+            )
+            continue
+
+        if source_log_dir is None:
+            raise RuntimeError("Internal error: truncated component requires proxy-log path.")
         path = component_cache_path(ctx, cutoff, name)
         result = None
         if not args.force_dynamic:
@@ -727,22 +869,30 @@ def load_or_compute_dynamic_supervision(
             component_results[name] = result
             tqdm.write(f"[dynamic] cache HIT: {path}")
 
-    gate_path = gate_cache_path(ctx, cutoff)
-    gate_data = None
-    if not args.force_dynamic:
-        gate_data = load_gate_cache(
-            gate_path,
-            ctx=ctx,
-            cutoff=cutoff,
-            source_log_dir=source_log_dir,
-            args=args,
-        )
-    if gate_data is None:
-        tqdm.write(f"[dynamic] cache MISS: {gate_path}")
+    gate_data: dict[str, np.ndarray] | None
+    if "noise_gate" in kept:
+        gate_data = load_original_gate_cache(ctx, args.proxy_model, args)
     else:
-        tqdm.write(f"[dynamic] cache HIT: {gate_path}")
+        if source_log_dir is None:
+            raise RuntimeError("Internal error: truncated noise gate requires proxy-log path.")
+        gate_path = gate_cache_path(ctx, cutoff)
+        gate_data = None
+        if not args.force_dynamic:
+            gate_data = load_gate_cache(
+                gate_path,
+                ctx=ctx,
+                cutoff=cutoff,
+                source_log_dir=source_log_dir,
+                args=args,
+            )
+        if gate_data is None:
+            tqdm.write(f"[dynamic] cache MISS: {gate_path}")
+        else:
+            tqdm.write(f"[dynamic] cache HIT: {gate_path}")
 
     if missing_components or gate_data is None:
+        if source_log_dir is None:
+            raise RuntimeError("Internal error: missing truncated metric without proxy logs.")
         # Label-noise proxy logits must be interpreted using the noisy labels.
         patch_context = (
             noise_mod.patched_training_label_noise(
@@ -790,14 +940,14 @@ def load_or_compute_dynamic_supervision(
             )
             gate_data = {"final_risk": final_risk, "gate": gate}
             save_gate_cache(
-                gate_path,
+                gate_cache_path(ctx, cutoff),
                 ctx=ctx,
                 cutoff=cutoff,
                 source_log_dir=source_log_dir,
                 args=args,
                 final_risk=final_risk,
             )
-            tqdm.write(f"[dynamic] saved: {gate_path}")
+            tqdm.write(f"[dynamic] saved: {gate_cache_path(ctx, cutoff)}")
 
         del folds
         gc.collect()
@@ -1270,7 +1420,7 @@ def run_task(
         )
         stages.update(1)
 
-        if experiment != "normal":
+        if experiment != "normal" and False:
             compute_in_memory_learned_group_mask(
                 ctx,
                 static=static,
@@ -1288,6 +1438,7 @@ def run_task(
 
 def main() -> None:
     args = parse_args()
+    args.keep_items = parse_keep_items(args.keep)
     if int(args.hist_bins) <= 1:
         raise ValueError("--hist-bins must be greater than 1.")
     if int(args.learn_window) <= 0:
@@ -1312,6 +1463,7 @@ def main() -> None:
     print(f"datasets={datasets_to_run}")
     print(f"experiments={experiments_to_run}")
     print(f"dynamic epochs={DYNAMIC_EPOCHS}")
+    print(f"keep original metrics={sorted(args.keep_items)}")
     print("=" * 100)
 
     with tqdm(total=len(tasks), desc="All experiment tasks", unit="task") as overall:

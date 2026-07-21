@@ -9,11 +9,25 @@ Supported modes:
   3. ``--exp corruption``: read
      ``corruption_data/<dataset>/corruption_list_<seed>.txt``, apply fixed image
      corruptions to listed training samples before the training transform, keep
-     labels correct and the test split clean, read selection masks from
-     ``corruption_exp/mask`` by default, and write outputs under
+     labels correct and the test split clean, and write outputs under
      ``result_corruption/`` and ``checkpoint_corruption/``.
 
+All non-random experiments read selection masks from the project-level
+``mask/`` directory via ``utils.path_rules.resolve_mask_path``. The common
+layout is ``mask/<mode>/<dataset>/<seed>/mask_<keep_ratio>.npz``. ``random``
+mode samples by class and does not read a mask file.
+
 Examples:
+  CUDA_VISIBLE_DEVICES=0 python train_after_selection.py \
+      --dataset tiny-imagenet \
+      --exp corruption \
+      --mode corruption_yangclip \
+      --seed 22 \
+      --kr 30
+
+  The command above reads:
+      mask/corruption_yangclip/tiny-imagenet/22/mask_30.npz
+
   python train_after_selection.py \
       --exp corruption \
       --dataset cifar100 \
@@ -135,12 +149,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=str(Path("corruption_data")),
         help="图像破坏清单根目录，仅在 --exp corruption 时使用。",
-    )
-    parser.add_argument(
-        "--corruption_mask_root",
-        type=str,
-        default=str(Path("corruption_exp") / "mask"),
-        help="图像破坏实验的 mask 根目录，仅在 --exp corruption 时使用。",
     )
     parser.add_argument(
         "--strict_corruption_check",
@@ -463,7 +471,6 @@ def load_selection_mask(
     keep_ratio: int,
     seed: int,
     model_name: str,
-    mask_root: str | Path | None = None,
 ) -> np.ndarray:
     """Load a 0/1 mask for a selection method.
 
@@ -477,7 +484,6 @@ def load_selection_mask(
         model=model_name,
         seed=mask_seed,
         keep_ratio=keep_ratio,
-        root=mask_root,
     )
     if not mask_path.exists():
         raise FileNotFoundError(f"未找到 mask 文件: {mask_path}")
@@ -564,13 +570,18 @@ def prepare_selection_indices(
     dataset: torch.utils.data.Dataset,
     num_classes: int,
     model_name: str,
-    mask_root: str | Path | None = None,
 ) -> np.ndarray:
     if mode == "random":
         labels = _extract_labels(dataset)
         return select_random_indices_by_class(labels, num_classes, keep_ratio, seed)
 
-    mask = load_selection_mask(dataset_name, mode, keep_ratio, seed, model_name, mask_root=mask_root)
+    mask = load_selection_mask(
+        dataset_name,
+        mode,
+        keep_ratio,
+        seed,
+        model_name,
+    )
     if mask.shape[0] != len(dataset):
         raise ValueError(
             f"mask 长度与训练集长度不一致: mask={mask.shape[0]}, train={len(dataset)}, "
@@ -678,8 +689,6 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
     result_root = _root_for_exp(args.result_root, args.exp)
     checkpoint_root = _root_for_exp(args.checkpoint_root, args.exp)
-    selection_mask_root = Path(args.corruption_mask_root) if args.exp == "corruption" else None
-
     for keep_ratio in keep_ratios:
         # Result files are model-sensitive and therefore include the model name.
         result_path = resolve_result_path(
@@ -712,7 +721,6 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             train_dataset,
             data_loader.num_classes,
             model_name,
-            mask_root=selection_mask_root,
         )
         noise_selection_stats = _selected_noise_stats(selected_indices, noise_info)
         corruption_selection_stats = _selected_corruption_stats(selected_indices, corruption_info)
@@ -893,7 +901,6 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             metadata.update(
                 {
                     "corruption_root": str(Path(args.corruption_root)),
-                    "corruption_mask_root": str(Path(args.corruption_mask_root)),
                     "corruption_path": corruption_info["corruption_path"],
                     "corruption_rate": corruption_info["corruption_ratio"],
                     "num_corrupted_total": int(corruption_info["num_corrupted"]),

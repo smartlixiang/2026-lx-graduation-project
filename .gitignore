@@ -25,4 +25,8 @@ corruption_exp/static_scores/
 corruption_exp/adapters/
 corruption_exp/contexts/
 checkpoint_corruption/
-yyy/
+yyy/a_balanced_gain_loss_stability_cache_v2/
+yyy/change_Ag_2_results/
+yyy/dynamic_cache/
+yyy/dynamic_cache/
+yyy/outputs/

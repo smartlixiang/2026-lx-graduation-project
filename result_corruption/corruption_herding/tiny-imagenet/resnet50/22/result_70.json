@@ -1,0 +1,69 @@
+{
+  "metadata": {
+    "dataset": "tiny-imagenet",
+    "data_root": "data",
+    "exp": "corruption",
+    "result_root": "result_corruption",
+    "model": "resnet50",
+    "keep_ratio": 70,
+    "selection_method": "corruption_herding",
+    "seed": 22,
+    "epochs": 90,
+    "batch_size": 64,
+    "physical_batch_size": 64,
+    "grad_accum_steps": 4,
+    "effective_batch_size": 256,
+    "reference_effective_batch_size": 256,
+    "optimizer": "SGD",
+    "momentum": 0.9,
+    "weight_decay": 0.0001,
+    "init_lr": 0.1,
+    "use_amp": true,
+    "lr_schedule": {
+      "type": "MultiStepLR",
+      "milestones": [
+        30,
+        60
+      ],
+      "gamma": 0.1
+    },
+    "num_selected": 70000,
+    "num_total": 100000,
+    "corruption_root": "corruption_data",
+    "corruption_path": "corruption_data/tiny-imagenet/corruption_list_22.txt",
+    "corruption_rate": 0.2,
+    "num_corrupted_total": 20000,
+    "corruption_type_counts": {
+      "gaussian_noise": 4000,
+      "partial_occlusion": 4000,
+      "resolution_degradation": 4000,
+      "fog": 4000,
+      "motion_blur": 4000
+    },
+    "num_corrupted_selected": 14021,
+    "corruption_ratio_in_selection": 0.2003,
+    "selected_corruption_type_counts": {
+      "gaussian_noise": 2781,
+      "partial_occlusion": 2812,
+      "resolution_degradation": 2771,
+      "fog": 2835,
+      "motion_blur": 2822
+    }
+  },
+  "accuracy": 0.5158,
+  "accuracy_mean": 0.5158,
+  "accuracy_std": 0.0011,
+  "accuracy_samples": [
+    0.5164,
+    0.517,
+    0.5154,
+    0.5159,
+    0.5147,
+    0.5144,
+    0.5156,
+    0.518,
+    0.5166,
+    0.5144
+  ],
+  "time_seconds": 8749.663461208344
+}

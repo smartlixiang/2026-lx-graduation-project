@@ -189,60 +189,7 @@ def load_class_names(dataset_name: str, data_root: str) -> list[str]:
     return list(resolve_class_names_for_prompts(dataset_name=dataset_name, data_root=data_root, class_names=dataset.classes))
 
 
-def _hash_file(path: Path) -> str:
-    import hashlib
-    hasher = hashlib.sha1()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def _mean_stats_cache_path(dataset_name: str, clip_model: str, adapter_image_path: str) -> Path:
-    adapter_sha1 = _hash_file(Path(adapter_image_path))
-    clip_tag = clip_model.replace("/", "-").replace(" ", "_")
-    return PROJECT_ROOT / "static_scores" / "group_mean_stats" / dataset_name / clip_tag / f"img_adapter_{adapter_sha1}.npz"
-
-
-def _get_or_compute_group_mean_stats(*, cache_path: Path, image_features: np.ndarray, labels: np.ndarray, num_classes: int) -> tuple[np.ndarray, np.ndarray]:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    n_samples = int(image_features.shape[0])
-    feat_dim = int(image_features.shape[1]) if image_features.ndim == 2 else 0
-    if cache_path.exists():
-        try:
-            cached = np.load(cache_path, allow_pickle=False)
-            cached_n = int(np.asarray(cached["n_samples"]).item())
-            cached_dim = int(np.asarray(cached["feat_dim"]).item())
-            cached_cls = int(np.asarray(cached["num_classes"]).item())
-            means = np.asarray(cached["full_class_mean"], dtype=np.float32)
-            vars_ = np.asarray(cached["full_class_var"], dtype=np.float32)
-            if cached_n == n_samples and cached_dim == feat_dim and cached_cls == int(num_classes) and means.shape == (num_classes, feat_dim) and vars_.shape == (num_classes,):
-                return means, vars_
-        except Exception:
-            pass
-
-    full_class_mean = np.zeros((num_classes, feat_dim), dtype=np.float32)
-    full_class_var = np.zeros((num_classes,), dtype=np.float32)
-    for class_id in range(num_classes):
-        class_mask = labels == class_id
-        class_feats = image_features[class_mask]
-        if class_feats.shape[0] == 0:
-            continue
-        class_mean = np.mean(class_feats, axis=0, dtype=np.float32)
-        diff = class_feats - class_mean
-        sigma2 = float(np.mean(np.sum(diff * diff, axis=1)))
-        full_class_mean[class_id] = class_mean
-        full_class_var[class_id] = np.float32(max(sigma2, 0.0))
-
-    np.savez_compressed(
-        cache_path,
-        full_class_mean=full_class_mean,
-        full_class_var=full_class_var,
-        n_samples=np.asarray(n_samples, dtype=np.int64),
-        feat_dim=np.asarray(feat_dim, dtype=np.int64),
-        num_classes=np.asarray(num_classes, dtype=np.int64),
-    )
-    return full_class_mean, full_class_var
+from calculate_my_mask import compute_full_class_means  # noqa: E402
 
 
 def select_topk_mask_two_metrics(sa_scores: np.ndarray, div_scores: np.ndarray, labels: np.ndarray, num_classes: int, keep_ratio: int, weights: dict[str, float]) -> tuple[np.ndarray, dict[int, int]]:
@@ -299,10 +246,7 @@ def select_group_mask_ablation_dds(
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
     div_features_np = (div_features.detach().cpu().numpy() if isinstance(div_features, torch.Tensor) else np.asarray(div_features)).astype(np.float32)
 
-    mean_stats_cache_path = _mean_stats_cache_path(dataset_name=dataset_name, clip_model=clip_model, adapter_image_path=adapter_image_path)
-    full_class_mean, _ = _get_or_compute_group_mean_stats(
-        cache_path=mean_stats_cache_path, image_features=div_features_np, labels=labels_np, num_classes=num_classes)
-    full_class_mean_f32 = full_class_mean.astype(np.float32, copy=False)
+    full_class_mean_f32 = compute_full_class_means(div_features_np, labels_np, num_classes)
 
     def _quantile_minmax(values: np.ndarray, low_q: float = 0.002, high_q: float = 0.998) -> np.ndarray:
         if values.size == 0:

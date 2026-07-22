@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import json
 import os
 import sys
@@ -433,11 +432,6 @@ def patched_weight_learning_paths() -> Iterator[None]:
             learn_weights_mod.get_or_compute_static_scores = old_static_cache  # type: ignore[attr-defined]
 
 
-@contextlib.contextmanager
-def patched_group_mean_cache() -> Iterator[None]:
-    """Kept for backward-compatible structure; group mean cache is local now."""
-    yield
-
 
 # ---------------------------------------------------------------------------
 # Helpers for invoking existing scripts in-process
@@ -708,74 +702,6 @@ def load_scoring_weights(
     raise ValueError("weight-group 仅支持 {'naive', 'learned'}")
 
 
-def _hash_file(path: Path) -> str:
-    hasher = hashlib.sha1()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def _mean_stats_cache_path(dataset_name: str, clip_model: str, adapter_image_path: str) -> Path:
-    adapter_sha1 = _hash_file(Path(adapter_image_path))
-    clip_tag = clip_model.replace("/", "-").replace(" ", "_")
-    return STATIC_SCORE_ROOT / "group_mean_stats" / dataset_name / clip_tag / f"img_adapter_{adapter_sha1}.npz"
-
-
-def _get_or_compute_group_mean_stats(
-    *,
-    cache_path: Path,
-    image_features: np.ndarray,
-    labels: np.ndarray,
-    num_classes: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    n_samples = int(image_features.shape[0])
-    feat_dim = int(image_features.shape[1]) if image_features.ndim == 2 else 0
-
-    if cache_path.exists():
-        try:
-            cached = np.load(cache_path, allow_pickle=False)
-            cached_n = int(np.asarray(cached["n_samples"]).item())
-            cached_dim = int(np.asarray(cached["feat_dim"]).item())
-            cached_cls = int(np.asarray(cached["num_classes"]).item())
-            means = np.asarray(cached["full_class_mean"], dtype=np.float32)
-            vars_ = np.asarray(cached["full_class_var"], dtype=np.float32)
-            if (
-                cached_n == n_samples
-                and cached_dim == feat_dim
-                and cached_cls == int(num_classes)
-                and means.shape == (num_classes, feat_dim)
-                and vars_.shape == (num_classes,)
-            ):
-                return means, vars_
-        except Exception:
-            pass
-
-    full_class_mean = np.zeros((num_classes, feat_dim), dtype=np.float32)
-    full_class_var = np.zeros((num_classes,), dtype=np.float32)
-    for class_id in range(num_classes):
-        class_mask = labels == class_id
-        class_feats = image_features[class_mask]
-        if class_feats.shape[0] == 0:
-            continue
-        class_mean = np.mean(class_feats, axis=0, dtype=np.float32)
-        diff = class_feats - class_mean
-        sigma2 = float(np.mean(np.sum(diff * diff, axis=1)))
-        full_class_mean[class_id] = class_mean
-        full_class_var[class_id] = np.float32(max(sigma2, 0.0))
-
-    np.savez_compressed(
-        cache_path,
-        full_class_mean=full_class_mean,
-        full_class_var=full_class_var,
-        n_samples=np.asarray(n_samples, dtype=np.int64),
-        feat_dim=np.asarray(feat_dim, dtype=np.int64),
-        num_classes=np.asarray(num_classes, dtype=np.int64),
-    )
-    return full_class_mean, full_class_var
-
-
 def load_weights_for_stage(args: argparse.Namespace, seed: int) -> dict[str, float]:
     weights_path = WEIGHTS_ROOT / "scoring_weights.json"
     all_weights = ensure_scoring_weights(weights_path, args.dataset)
@@ -902,83 +828,77 @@ def run_mask_stage(args: argparse.Namespace, seed: int, device: torch.device, im
     if not np.array_equal(labels_np, noisy_targets.astype(np.int64)):
         raise RuntimeError("Static-score labels are not identical to noisy targets; abort to avoid invalid mask.")
 
-    with patched_group_mean_cache():
-        for kr, mask_path in zip(keep_ratios, target_paths):
-            if args.skip_saved and mask_path.exists():
-                print(f"[mask] skip existing: {mask_path}")
-                continue
+    for kr, mask_path in zip(keep_ratios, target_paths):
+        if args.skip_saved and mask_path.exists():
+            print(f"[mask] skip existing: {mask_path}")
+            continue
 
-            mask, selected_by_class, group_stats = mask_mod.select_group_mask_by_center_repair(
-                sa_scores_np,
-                div_metric=div_metric,
-                div_loader=div_loader,
-                image_adapter=image_adapter,
-                labels=labels_np,
-                weights=weights,
-                num_classes=num_classes,
-                keep_ratio=kr,
-                device=device,
-                dataset_name=args.dataset,
-                seed=seed,
-                weight_group=args.weight_group,
-                clip_model=args.clip_model,
-                adapter_image_path=str(image_path),
-                div_static_scores=div_scores_np,
-                dds_static_scores=dds_scores_np,
-                group_candidate_pool_size=args.group_candidate_pool_size,
-                group_init_count=args.group_init_count,
-            )
+        mask, selected_by_class, group_stats = mask_mod.select_group_mask_by_center_repair(
+            sa_scores_np,
+            div_metric=div_metric,
+            div_loader=div_loader,
+            image_adapter=image_adapter,
+            labels=labels_np,
+            weights=weights,
+            num_classes=num_classes,
+            keep_ratio=kr,
+            device=device,
+            seed=seed,
+            dds_static_scores=dds_scores_np,
+            group_candidate_pool_size=args.group_candidate_pool_size,
+            group_init_count=args.group_init_count,
+        )
 
-            selected = mask.astype(bool)
-            num_selected = int(mask.sum())
-            num_noisy_selected = int(is_noisy[selected].sum())
-            noise_ratio_in_mask = float(num_noisy_selected / max(1, num_selected))
+        selected = mask.astype(bool)
+        num_selected = int(mask.sum())
+        num_noisy_selected = int(is_noisy[selected].sum())
+        noise_ratio_in_mask = float(num_noisy_selected / max(1, num_selected))
 
-            mask_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(
-                mask_path,
-                mask=mask.astype(np.uint8),
-                selected_indices=np.flatnonzero(mask).astype(np.int64),
-                clean_targets=clean_targets.astype(np.int64),
-                noisy_targets=noisy_targets.astype(np.int64),
-                is_noisy=is_noisy.astype(np.uint8),
-                weights=json.dumps(weights, ensure_ascii=False),
-                selected_by_class=json.dumps(selected_by_class, ensure_ascii=False),
-                group_stats=json.dumps(group_stats, ensure_ascii=False),
-                dataset=np.array(args.dataset),
-                method=np.array(mode_name),
-                weight_group=np.array(args.weight_group),
-                seed=np.array(seed, dtype=np.int64),
-                keep_ratio=np.array(kr, dtype=np.int64),
-                num_selected=np.array(num_selected, dtype=np.int64),
-                num_noisy_total=np.array(int(is_noisy.sum()), dtype=np.int64),
-                num_noisy_selected=np.array(num_noisy_selected, dtype=np.int64),
-                noise_ratio_total=np.array(float(is_noisy.mean()), dtype=np.float32),
-                noise_ratio_in_mask=np.array(noise_ratio_in_mask, dtype=np.float32),
-            )
+        mask_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            mask_path,
+            mask=mask.astype(np.uint8),
+            selected_indices=np.flatnonzero(mask).astype(np.int64),
+            clean_targets=clean_targets.astype(np.int64),
+            noisy_targets=noisy_targets.astype(np.int64),
+            is_noisy=is_noisy.astype(np.uint8),
+            weights=json.dumps(weights, ensure_ascii=False),
+            selected_by_class=json.dumps(selected_by_class, ensure_ascii=False),
+            group_stats=json.dumps(group_stats, ensure_ascii=False),
+            dataset=np.array(args.dataset),
+            method=np.array(mode_name),
+            weight_group=np.array(args.weight_group),
+            seed=np.array(seed, dtype=np.int64),
+            keep_ratio=np.array(kr, dtype=np.int64),
+            num_selected=np.array(num_selected, dtype=np.int64),
+            num_noisy_total=np.array(int(is_noisy.sum()), dtype=np.int64),
+            num_noisy_selected=np.array(num_noisy_selected, dtype=np.int64),
+            noise_ratio_total=np.array(float(is_noisy.mean()), dtype=np.float32),
+            noise_ratio_in_mask=np.array(noise_ratio_in_mask, dtype=np.float32),
+        )
 
-            summary_path = mask_path.with_suffix(".json")
-            summary = {
-                "dataset": args.dataset,
-                "method": mode_name,
-                "weight_group": args.weight_group,
-                "seed": int(seed),
-                "keep_ratio": int(kr),
-                "num_selected": num_selected,
-                "num_noisy_total": int(is_noisy.sum()),
-                "num_noisy_selected": num_noisy_selected,
-                "noise_ratio_total": float(is_noisy.mean()),
-                "noise_ratio_in_mask": noise_ratio_in_mask,
-                "weights": weights,
-                "mask_path": str(mask_path),
-            }
-            summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        summary_path = mask_path.with_suffix(".json")
+        summary = {
+            "dataset": args.dataset,
+            "method": mode_name,
+            "weight_group": args.weight_group,
+            "seed": int(seed),
+            "keep_ratio": int(kr),
+            "num_selected": num_selected,
+            "num_noisy_total": int(is_noisy.sum()),
+            "num_noisy_selected": num_noisy_selected,
+            "noise_ratio_total": float(is_noisy.mean()),
+            "noise_ratio_in_mask": noise_ratio_in_mask,
+            "weights": weights,
+            "mask_path": str(mask_path),
+        }
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
-            print(
-                f"[mask] saved {mask_path} | selected={num_selected} "
-                f"noisy_selected={num_noisy_selected} "
-                f"noise_ratio={noise_ratio_in_mask:.4f}"
-            )
+        print(
+            f"[mask] saved {mask_path} | selected={num_selected} "
+            f"noisy_selected={num_noisy_selected} "
+            f"noise_ratio={noise_ratio_in_mask:.4f}"
+        )
 
 
 def run_one_seed(args: argparse.Namespace, seed: int, device: torch.device) -> None:

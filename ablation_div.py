@@ -171,7 +171,7 @@ def select_group_mask_without_div_component(
     features for the existing mean-matching correction, which is treated as group
     optimization machinery rather than the static Div component itself.
     """
-    from calculate_my_mask import _get_or_compute_group_mean_stats, _mean_stats_cache_path
+    from calculate_my_mask import compute_full_class_means
 
     if keep_ratio <= 0 or keep_ratio > 100:
         raise ValueError("kr 必须在 1-100 之间。")
@@ -189,14 +189,7 @@ def select_group_mask_without_div_component(
 
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
     div_features_np = div_features.detach().cpu().numpy().astype(np.float32)
-    mean_stats_cache_path = _mean_stats_cache_path(dataset_name, clip_model, adapter_image_path)
-    full_class_mean, _ = _get_or_compute_group_mean_stats(
-        cache_path=mean_stats_cache_path,
-        image_features=div_features_np,
-        labels=labels_np,
-        num_classes=num_classes,
-    )
-    full_class_mean = full_class_mean.astype(np.float32, copy=False)
+    full_class_mean = compute_full_class_means(div_features_np, labels_np, num_classes)
 
     class_sizes = np.asarray([idx.size for idx in class_indices_list], dtype=np.int64)
     raw = class_sizes.astype(np.float64) * sr

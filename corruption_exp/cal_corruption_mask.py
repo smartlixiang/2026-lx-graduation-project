@@ -58,9 +58,6 @@ WEIGHTS_PATH = WEIGHTS_ROOT / "scoring_weights.json"
 SUPPORTED_DATASETS = ("cifar100", "tiny-imagenet")
 DATASET_NUMERIC_ID = {"cifar100": 100, "tiny-imagenet": 200}
 EXPECTED_TRAIN_SIZES = {"cifar100": 50_000, "tiny-imagenet": 100_000}
-CORRUPTION_PRIOR_RATIO = 0.2
-CORRUPTION_RISK_FACTOR = float(1.0 - np.sqrt(CORRUPTION_PRIOR_RATIO))
-
 from corruption_exp import corruption_opt  # noqa: E402
 from dataset.dataset_config import CIFAR100, TINY_IMAGENET  # noqa: E402
 from model.adapter import CLIPFeatureExtractor, load_trained_adapters  # noqa: E402
@@ -251,7 +248,6 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
     old_learn_project = learn_weights_mod.PROJECT_ROOT
     old_dyn_dir = learn_weights_mod.resolve_dynamic_component_cache_dir
     old_dyn_path = learn_weights_mod.resolve_dynamic_component_cache_path
-    old_mask_mean = mask_mod._mean_stats_cache_path
 
     def adapter_dir(dataset_name: str, seed: int) -> Path:
         p = ADAPTER_ROOT / dataset_name / str(int(seed)); p.mkdir(parents=True, exist_ok=True); return p
@@ -265,17 +261,13 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
         return base
     def dyn_path(dataset: str, proxy_model: str, seed: int, epochs: int, component_name: str) -> Path:
         return dyn_dir(dataset, proxy_model, seed, epochs) / f"{component_name.strip().upper()}.npz"
-    def mean_path(dataset_name: str, clip_model: str, adapter_image_path: str) -> Path:
-        tag = clip_model.replace("/", "-").replace(" ", "_")
-        h = sha1_file(Path(adapter_image_path))
-        return STATIC_SCORE_ROOT / "group_mean_stats" / dataset_name / tag / f"img_adapter_{h}.npz"
+
 
     train_adapter_mod.resolve_adapter_dir = adapter_dir
     train_proxy_mod.resolve_proxy_log_dir = proxy_dir
     learn_weights_mod.PROJECT_ROOT = CORRUPTION_EXP_ROOT
     learn_weights_mod.resolve_dynamic_component_cache_dir = dyn_dir
     learn_weights_mod.resolve_dynamic_component_cache_path = dyn_path
-    mask_mod._mean_stats_cache_path = mean_path
     try:
         yield
     finally:
@@ -284,7 +276,6 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
         learn_weights_mod.PROJECT_ROOT = old_learn_project
         learn_weights_mod.resolve_dynamic_component_cache_dir = old_dyn_dir
         learn_weights_mod.resolve_dynamic_component_cache_path = old_dyn_path
-        mask_mod._mean_stats_cache_path = old_mask_mean
 
 
 def context_path(dataset: str, seed: int) -> Path:
@@ -451,7 +442,7 @@ def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str,
 
 
 def slim_group_stats(stats: dict[str, Any]) -> dict[str, Any]:
-    keep = ("solver", "final_rate", "dist_weight", "subset_comprehensive_score", "distribution_shift", "candidate_pool_size", "group_init_count")
+    keep = ("solver", "final_rate", "subset_comprehensive_score", "distribution_shift", "candidate_pool_size", "group_init_count")
     out = {k: stats[k] for k in keep if k in stats}
     if "candidate_pool_size" not in out and "candidate_pool_size" in stats: out["candidate_pool_size"] = int(stats["candidate_pool_size"])
     return out
@@ -496,20 +487,10 @@ def save_mask(path: Path, mask: np.ndarray, selected_by_class: dict[int, int], s
     if not ok: raise ValueError(reason)
     selected = np.flatnonzero(m).astype(np.int64)
     csel = info.corruption_types[selected]
-    counts = {f"num_selected_{corruption_opt.CORRUPTION_ID_TO_NAME[i].replace('partial_', '').replace('resolution_degradation', 'resolution')}": int(np.sum(csel == i)) for i in range(corruption_opt.NUM_CORRUPTION_TYPES)}
-    # User requested exact legacy-ish names.
-    counts = {
-        "num_selected_gaussian": int(np.sum(csel == 0)),
-        "num_selected_occlusion": int(np.sum(csel == 1)),
-        "num_selected_resolution": int(np.sum(csel == 2)),
-        "num_selected_fog": int(np.sum(csel == 3)),
-        "num_selected_motion_blur": int(np.sum(csel == 4)),
-    }
-    scalar = dict(dataset=info.dataset, method=args.mode_name, weight_group=args.weight_group, seed=int(info.seed), keep_ratio=int(keep_ratio), num_selected=int(selected.size), num_corrupted_total=int(info.is_corrupted.sum()), num_corrupted_selected=int(np.sum(csel >= 0)), corruption_ratio_total=float(info.is_corrupted.mean()), corruption_ratio_in_mask=float(np.mean(csel >= 0)) if selected.size else 0.0, corruption_list_hash=info.list_hash, **counts)
+    scalar = dict(dataset=info.dataset, method=args.mode_name, weight_group=args.weight_group, seed=int(info.seed), keep_ratio=int(keep_ratio), num_selected=int(selected.size), num_corrupted_total=int(info.is_corrupted.sum()), num_corrupted_selected=int(np.sum(csel >= 0)), corruption_ratio_total=float(info.is_corrupted.mean()), corruption_ratio_in_mask=float(np.mean(csel >= 0)) if selected.size else 0.0, corruption_list_hash=info.list_hash)
     path.parent.mkdir(parents=True, exist_ok=True)
     group_stats = slim_group_stats(stats); group_stats["group_init_count"] = int(args.group_init_count); group_stats["candidate_pool_size"] = int(args.group_candidate_pool_size)
     np.savez_compressed(path, mask=m, selected_indices=selected, corruption_types=info.corruption_types, is_corrupted=info.is_corrupted, weights=np.array([weights["sa"], weights["div"], weights["dds"]], dtype=np.float64), selected_by_class=np.array(json.dumps(selected_by_class), dtype=np.str_), group_stats=np.array(json.dumps(group_stats), dtype=np.str_), **{k: np.array(v) for k, v in scalar.items()})
-    summary = {**scalar, "weights": weights, "selected_by_class": {str(k): int(v) for k, v in selected_by_class.items()}, "group_stats": group_stats, "mask_path": str(path)}
     _print_corruption_type_counts(path, m, info.corruption_types)
 
 
@@ -540,7 +521,7 @@ def stage_masks(args: argparse.Namespace, info: CorruptionInfo, scores: dict[str
             _print_corruption_type_counts(out, cached_mask, info.corruption_types); continue
         if args.skip_saved and not valid:
             tqdm.write(f"Mask cache MISS→COMPUTE ({reason})")
-        mask, selected_by_class, stats = mask_mod.select_group_mask_by_center_repair(np.asarray(scores["sa"], dtype=np.float32), div_metric=div, div_loader=div_loader, image_adapter=image_adapter, labels=labels, weights=weights, num_classes=len(class_names), keep_ratio=kr, device=device, dataset_name=info.dataset, seed=info.seed, weight_group=args.weight_group, clip_model=args.clip_model, adapter_image_path=str(img_p), div_static_scores=np.asarray(scores["div"], dtype=np.float32), dds_static_scores=np.asarray(scores["dds"], dtype=np.float32), group_candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count)
+        mask, selected_by_class, stats = mask_mod.select_group_mask_by_center_repair(np.asarray(scores["sa"], dtype=np.float32), div_metric=div, div_loader=div_loader, image_adapter=image_adapter, labels=labels, weights=weights, num_classes=len(class_names), keep_ratio=kr, device=device, seed=info.seed, dds_static_scores=np.asarray(scores["dds"], dtype=np.float32), group_candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count)
         save_mask(out, mask, selected_by_class, stats, weights, args, info, kr)
 
 

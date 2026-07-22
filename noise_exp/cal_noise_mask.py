@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -83,6 +84,7 @@ from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
+from utils.proxy_log_utils import resolve_seed_epoch_proxy_log_dir  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
 from utils.score_utils import standard_zscore, standard_zscore_by_class  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
@@ -468,17 +470,84 @@ def proxy_epochs_for_dataset(dataset_name: str) -> int:
     return int(get_proxy_training_config(dataset_name)["epochs"])
 
 
+def noise_file_sha1(path: Path) -> str:
+    h = hashlib.sha1()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def noise_context(dataset_name: str, seed: int) -> dict[str, object]:
+    path = NOISE_ROOT / dataset_name / f"noise_list_{int(seed)}.txt"
+    return {
+        "dataset": dataset_name,
+        "seed": int(seed),
+        "noise_list_hash": noise_file_sha1(path) if path.is_file() else None,
+    }
+
+
+def proxy_noise_context_path(log_dir: Path) -> Path:
+    return log_dir / "context.json"
+
+
+def write_proxy_noise_context(log_dir: Path, dataset_name: str, seed: int) -> None:
+    proxy_noise_context_path(log_dir).write_text(json.dumps(noise_context(dataset_name, seed), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def validate_noise_proxy_logs(
+    log_dir: Path,
+    dataset_name: str,
+    proxy_model: str,
+    seed: int,
+    epochs: int,
+    k_folds: int = 5,
+) -> tuple[bool, str, int | None]:
+    meta_path = log_dir / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False, "missing/invalid proxy meta.json", None
+    source_epochs = int(meta.get("epochs", -1))
+    if meta.get("dataset") != dataset_name or meta.get("model") != proxy_model or int(meta.get("seed", -1)) != int(seed):
+        return False, "proxy meta dataset/model/seed mismatch", source_epochs
+    if source_epochs < int(epochs) or int(meta.get("k_folds", -1)) != int(k_folds):
+        return False, "proxy meta epochs/folds mismatch", source_epochs
+    try:
+        side = json.loads(proxy_noise_context_path(log_dir).read_text(encoding="utf-8"))
+    except Exception:
+        return False, "missing/invalid noise context", source_epochs
+    if side != noise_context(dataset_name, seed):
+        return False, "noise context mismatch", source_epochs
+    for fold in range(1, int(k_folds) + 1):
+        p = log_dir / f"fold_{fold}.npz"
+        if not p.is_file():
+            return False, f"missing {p.name}", source_epochs
+        try:
+            with np.load(p, allow_pickle=True) as data:
+                if "train_logits" not in data or "val_logits" not in data:
+                    return False, f"missing logits in {p.name}", source_epochs
+                if int(data["train_logits"].shape[0]) < int(epochs) or int(data["val_logits"].shape[0]) < int(epochs):
+                    return False, f"insufficient epochs in {p.name}", source_epochs
+        except Exception as exc:
+            return False, f"cannot load {p.name}: {exc}", source_epochs
+    return True, "ok", source_epochs
+
+
 def all_proxy_logs_exist(
     dataset_name: str,
     proxy_model: str,
     seed: int,
     epochs: int,
     k_folds: int = 5,
-) -> bool:
-    log_dir = PROXY_LOG_ROOT / dataset_name / proxy_model / str(int(seed)) / str(int(epochs))
-    meta_path = log_dir / "meta.json"
-    fold_paths = [log_dir / f"fold_{i}.npz" for i in range(1, k_folds + 1)]
-    return meta_path.is_file() and all(path.is_file() for path in fold_paths)
+) -> tuple[bool, Path, str, int | None]:
+    seed_dir = PROXY_LOG_ROOT / dataset_name / proxy_model / str(int(seed))
+    try:
+        log_dir = resolve_seed_epoch_proxy_log_dir(seed_dir, int(epochs))
+    except FileNotFoundError as exc:
+        return False, seed_dir / str(int(epochs)), str(exc), None
+    valid, reason, source_epochs = validate_noise_proxy_logs(log_dir, dataset_name, proxy_model, seed, epochs, k_folds)
+    return valid, log_dir, reason, source_epochs
 
 
 # ---------------------------------------------------------------------------
@@ -514,9 +583,12 @@ def run_adapter_stage(args: argparse.Namespace, seed: int, device: torch.device)
 
 def run_proxy_stage(args: argparse.Namespace, seed: int, device: torch.device) -> None:
     epochs = proxy_epochs_for_dataset(args.dataset)
-    log_dir = PROXY_LOG_ROOT / args.dataset / args.proxy_model / str(int(seed)) / str(epochs)
-    if all_proxy_logs_exist(args.dataset, args.proxy_model, seed, epochs, args.k_folds) and not args.force:
-        print(f"[proxy] skip existing proxy logs: {log_dir}")
+    valid, log_dir, reason, source_epochs = all_proxy_logs_exist(args.dataset, args.proxy_model, seed, epochs, args.k_folds)
+    if valid and not args.force:
+        if int(source_epochs or epochs) == int(epochs):
+            print(f"[proxy] exact log hit: epochs={epochs}, path={log_dir}")
+        else:
+            print(f"[proxy] reuse longer log: source_epochs={source_epochs}, target_epochs={epochs}, path={log_dir}")
         return
 
     print(f"[proxy] train noisy-label CV proxy | dataset={args.dataset} seed={seed} model={args.proxy_model}")
@@ -532,6 +604,7 @@ def run_proxy_stage(args: argparse.Namespace, seed: int, device: torch.device) -
         if args.device is not None:
             cli += ["--device", str(device)]
         call_module_main(train_proxy_mod, cli)
+    write_proxy_noise_context(PROXY_LOG_ROOT / args.dataset / args.proxy_model / str(int(seed)) / str(epochs), args.dataset, seed)
 
 
 def run_weight_learning_stage(args: argparse.Namespace, seed: int, device: torch.device, image_path: Path, text_path: Path) -> None:

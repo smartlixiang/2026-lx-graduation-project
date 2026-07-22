@@ -685,12 +685,25 @@ def load_proxy_folds_for_dynamic_seed(
             "请先生成对应 proxy logs，或提供完整且匹配当前参数的动态缓存。"
         )
 
-    folds, labels_all = load_cv_fold_logs(proxy_log, args.dataset, args.data_root)
-    actual_proxy_epochs = int(folds[0].train_logits.shape[0])
-    if actual_proxy_epochs != resolved_proxy_epochs:
+    source_proxy_epochs: int | None = None
+    first_fold = next(iter(sorted(proxy_log.glob("fold_*.npz"))), None)
+    if first_fold is not None:
+        with np.load(first_fold) as data:
+            if "train_logits" in data:
+                source_proxy_epochs = int(data["train_logits"].shape[0])
+    folds, labels_all = load_cv_fold_logs(
+        proxy_log,
+        args.dataset,
+        args.data_root,
+        max_epochs=resolved_proxy_epochs,
+    )
+    source_proxy_epochs = source_proxy_epochs or int(folds[0].train_logits.shape[0])
+    if source_proxy_epochs == resolved_proxy_epochs:
+        print(f"[proxy] exact log hit: epochs={resolved_proxy_epochs}, path={proxy_log}")
+    else:
         print(
-            f"INFO: requested proxy epochs={resolved_proxy_epochs}, "
-            f"but loaded logs contain {actual_proxy_epochs} epochs; cache will use requested epochs tag."
+            f"[proxy] reuse longer log: source_epochs={source_proxy_epochs}, "
+            f"target_epochs={resolved_proxy_epochs}, path={proxy_log}"
         )
     return folds, np.asarray(labels_all, dtype=np.int64), proxy_log
 

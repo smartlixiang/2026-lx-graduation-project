@@ -94,6 +94,37 @@ def _assemble_logits_from_folds(log_dir: Path, labels_all: np.ndarray) -> tuple[
     return logits_full, indices
 
 
+def _numeric_epoch_dirs(seed_base_dir: Path) -> list[tuple[int, Path]]:
+    if not seed_base_dir.exists() or not seed_base_dir.is_dir():
+        return []
+    out: list[tuple[int, Path]] = []
+    for path in seed_base_dir.iterdir():
+        if path.is_dir() and path.name.isdigit():
+            out.append((int(path.name), path))
+    return sorted(out, key=lambda item: item[0])
+
+
+def resolve_seed_epoch_proxy_log_dir(seed_base_dir: str | Path, required_epochs: int) -> Path:
+    """Return exact epoch dir or the smallest longer seed-aware proxy log dir."""
+    base = Path(seed_base_dir)
+    required = int(required_epochs)
+    exact = base / str(required)
+    if exact.exists():
+        return exact
+
+    available = _numeric_epoch_dirs(base)
+    valid = [(epochs, path) for epochs, path in available if epochs >= required]
+    if valid:
+        return valid[0][1]
+
+    available_epochs = [epochs for epochs, _ in available]
+    print(f"[proxy] insufficient log: required={required}, available={available_epochs}")
+    raise FileNotFoundError(
+        f"No seed-aware proxy log with enough epochs under {base}: "
+        f"required={required}, available={available_epochs}."
+    )
+
+
 def resolve_proxy_log_path(
     proxy_log_root: str | Path,
     dataset_name: str,
@@ -103,13 +134,10 @@ def resolve_proxy_log_path(
 ) -> Path:
     """Resolve proxy log directory under the seed-aware path rule.
 
-    Canonical directory:
-        [proxy_log_root]/[dataset_name]/[proxy_model]/[seed]/[max_epoch]
-
-    Direct file/dir inputs are still accepted, but the automatic search no
-    longer falls back to the old seed-free directory.  This is intentional:
-    silently loading weights/proxy_logs/[dataset]/[model]/[epochs] would make
-    different seeds share the same dynamic supervision again.
+    If ``max_epoch`` is provided, the exact seed-aware epoch directory is
+    preferred; otherwise the smallest numeric epoch directory with at least the
+    requested epochs is returned.  The resolver never falls back to seed-free
+    paths and never copies, links, or creates proxy log directories.
     """
     candidate = Path(proxy_log_root)
     proxy_training_seed = CONFIG.global_seed if seed is None else int(seed)
@@ -122,21 +150,11 @@ def resolve_proxy_log_path(
 
     seed_base_dir = candidate / dataset_name / proxy_model / str(proxy_training_seed)
     if max_epoch is not None:
-        epoch_dir = seed_base_dir / str(int(max_epoch))
-        if epoch_dir.exists():
-            return epoch_dir
-        legacy_seed_free = candidate / dataset_name / proxy_model / str(int(max_epoch))
-        raise FileNotFoundError(
-            f"未找到代理训练日志路径: {epoch_dir}. "
-            f"如果你要复用旧缓存，请手动将旧目录 {legacy_seed_free} "
-            f"移动到 {epoch_dir}."
-        )
+        return resolve_seed_epoch_proxy_log_dir(seed_base_dir, int(max_epoch))
 
-    if seed_base_dir.exists() and seed_base_dir.is_dir():
-        epoch_dirs = [p for p in seed_base_dir.iterdir() if p.is_dir() and p.name.isdigit()]
-        if epoch_dirs:
-            epoch_dirs.sort(key=lambda p: int(p.name))
-            return epoch_dirs[-1]
+    epoch_dirs = _numeric_epoch_dirs(seed_base_dir)
+    if epoch_dirs:
+        return epoch_dirs[-1][1]
 
     raise FileNotFoundError(
         f"未找到代理训练日志路径: {proxy_log_root}. "
@@ -182,4 +200,4 @@ def load_proxy_log(proxy_log_path: str | Path, dataset_name: str, data_root: str
     return {"logits": logits, "labels": labels, "indices": indices, "loss": loss}
 
 
-__all__ = ["load_proxy_log", "resolve_proxy_log_path"]
+__all__ = ["load_proxy_log", "resolve_proxy_log_path", "resolve_seed_epoch_proxy_log_dir"]

@@ -48,11 +48,7 @@ DATASET_DEFAULT_TRAINING_CONFIGS = {
 }
 
 
-def get_default_training_config(dataset_name: str) -> dict[str, int | float | list[int]]:
-    try:
-        config = DATASET_DEFAULT_TRAINING_CONFIGS[dataset_name]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported dataset for training config: {dataset_name}") from exc
+def _config_payload(config: dict) -> dict[str, int | float | list[int]]:
     return {
         "epochs": int(config["epochs"]),
         "batch_size": int(config["batch_size"]),
@@ -62,6 +58,39 @@ def get_default_training_config(dataset_name: str) -> dict[str, int | float | li
         "lr_milestones": list(config["lr_milestones"]),
         "lr_gamma": float(config["lr_gamma"]),
     }
+
+
+def get_default_training_config(dataset_name: str) -> dict[str, int | float | list[int]]:
+    try:
+        config = DATASET_DEFAULT_TRAINING_CONFIGS[dataset_name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported dataset for training config: {dataset_name}") from exc
+    return _config_payload(config)
+
+
+
+def get_proxy_training_config(dataset_name: str) -> dict[str, int | float | list[int]]:
+    """Return proxy-only training defaults without changing target-model recipes."""
+    base = get_default_training_config(dataset_name)
+    if dataset_name in {"cifar10", "cifar100"}:
+        base["epochs"] = 160
+        base["lr_milestones"] = [60, 120]
+    elif dataset_name == "tiny-imagenet":
+        base["epochs"] = 80
+        base["lr_milestones"] = [30, 60]
+    else:
+        raise ValueError(f"Unsupported dataset for proxy training config: {dataset_name}")
+    return base
+
+
+def apply_proxy_training_defaults(args: argparse.Namespace, *, lr_attr: str = "lr") -> argparse.Namespace:
+    proxy_defaults = get_proxy_training_config(args.dataset)
+    original_getter = globals()["get_default_training_config"]
+    try:
+        globals()["get_default_training_config"] = lambda dataset_name: proxy_defaults if dataset_name == args.dataset else original_getter(dataset_name)
+        return apply_dataset_training_defaults(args, lr_attr=lr_attr)
+    finally:
+        globals()["get_default_training_config"] = original_getter
 
 
 def apply_dataset_training_defaults(

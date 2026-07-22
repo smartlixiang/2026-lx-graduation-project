@@ -6,7 +6,7 @@ Cache-first behavior:
 2. A cache file is usable as long as its final outputs are self-consistent and
    finite. NaN in raw_foldwise / fold_normalized is allowed because those arrays
    may deliberately use NaN as undefined fold-slot markers.
-3. If all four caches are available for that seed, continue without requiring
+3. If all three component caches are available for that seed, continue without requiring
    original proxy logs.
 4. Otherwise, load proxy logs from
    weights/proxy_logs/[dataset]/[proxy_model]/[seed]/[epochs], recompute/save
@@ -29,6 +29,7 @@ from torchvision import datasets
 from tqdm import tqdm
 
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET
+from utils.training_defaults import get_proxy_training_config
 from model.adapter import AdapterMLP, load_trained_adapters
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.class_name_utils import resolve_class_names_for_prompts
@@ -46,19 +47,11 @@ from weights.dynamic_utils import DynamicComponentResult, FoldLogData, load_cv_f
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 COMPONENT_NAMES = ("A", "C", "T")
-NOISE_GATE_CACHE_VERSION = "noise_gate_v4_learn_after_val_margin"
-METHOD_VERSION = "softplus_ratio_noise_gate_v1"
+METHOD_VERSION = "softplus_ratio"
 
 
 def resolve_default_proxy_epochs(dataset_name: str) -> int:
-    mapping = {
-        CIFAR10: 200,
-        CIFAR100: 200,
-        TINY_IMAGENET: 90,
-    }
-    if dataset_name not in mapping:
-        raise ValueError(f"Unsupported dataset for default proxy epochs: {dataset_name}")
-    return mapping[dataset_name]
+    return int(get_proxy_training_config(dataset_name)["epochs"])
 
 
 def resolve_dynamic_component_cache_dir(dataset: str, proxy_model: str, seed: int, epochs: int) -> Path:
@@ -99,25 +92,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=10000)
     parser.add_argument("--tol", type=float, default=1e-6)
-    parser.add_argument("--learn-window", type=int, default=10)
-    parser.add_argument("--learn-min-correct", type=int, default=8)
-    parser.add_argument("--gate-low", type=float, default=0.1)
-    parser.add_argument("--gate-high", type=float, default=0.9)
     parser.add_argument("--ratio-lambda", type=float, default=5e-3)
     parser.add_argument("--regression-learning-rate", type=float, default=2e-3)
     parser.add_argument("--regression-max-iter", type=int, default=10000)
     parser.add_argument("--regression-tol", type=float, default=1e-8)
-    parser.add_argument(
-        "--use-noise-gate",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Whether to use the rank-min dynamic gate when building the regression target.",
-    )
-    parser.add_argument(
-        "--force-noise-gate",
-        action="store_true",
-        help="Recompute noise_gate.npz even if a valid cache exists.",
-    )
     parser.add_argument("--output", type=str, default="weights/scoring_weights.json")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--debug-prompts", action="store_true")
@@ -287,263 +265,6 @@ def fit_ridge_regression_nonnegative(
         bias = next_bias
 
     return weights.astype(np.float64), float(bias)
-
-
-def _cross_entropy_from_logits(logits: np.ndarray, labels: np.ndarray) -> np.ndarray:
-    logits = np.asarray(logits, dtype=np.float64)
-    labels = np.asarray(labels, dtype=np.int64)
-    if logits.ndim != 3:
-        raise ValueError("logits must have shape (epochs, samples, classes).")
-    if labels.shape != (logits.shape[1],):
-        raise ValueError("labels shape mismatch for logits.")
-    if np.any(labels < 0) or np.any(labels >= logits.shape[2]):
-        raise ValueError("labels out of range for logits.")
-
-    max_logits = np.max(logits, axis=2)
-    shifted = logits - max_logits[:, :, None]
-    logsumexp = np.log(np.sum(np.exp(shifted), axis=2)) + max_logits
-    true_logits = np.take_along_axis(logits, labels.reshape(1, -1, 1), axis=2).squeeze(2)
-    losses = logsumexp - true_logits
-    return np.nan_to_num(losses, nan=0.0, posinf=1.0e6, neginf=0.0).astype(np.float64)
-
-
-def _percentile_rank_tie_aware(values: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64)
-    if values.ndim != 1:
-        raise ValueError("values must be one-dimensional.")
-    if not np.all(np.isfinite(values)):
-        raise ValueError("values contains NaN/inf values.")
-    n = int(values.shape[0])
-    if n <= 1:
-        return np.zeros(n, dtype=np.float64)
-
-    order = np.argsort(values, kind="mergesort")
-    ranks = np.zeros(n, dtype=np.float64)
-    sorted_values = values[order]
-    i = 0
-    while i < n:
-        j = i + 1
-        while j < n and sorted_values[j] == sorted_values[i]:
-            j += 1
-        ranks[order[i:j]] = (0.5 * float(i + j - 1)) / float(n - 1)
-        i = j
-    return ranks.astype(np.float64)
-
-
-def _validate_gate_thresholds(gate_low: float, gate_high: float) -> tuple[float, float]:
-    gate_low = float(gate_low)
-    gate_high = float(gate_high)
-    if not (0.0 <= gate_low < gate_high <= 1.0):
-        raise ValueError("gate_low and gate_high must satisfy 0 <= gate_low < gate_high <= 1.")
-    return gate_low, gate_high
-
-
-def _build_gate_from_final_risk(final_risk: np.ndarray, gate_low: float, gate_high: float) -> np.ndarray:
-    gate_low, gate_high = _validate_gate_thresholds(gate_low, gate_high)
-    final_risk = np.asarray(final_risk, dtype=np.float64)
-    if final_risk.ndim != 1 or not np.all(np.isfinite(final_risk)):
-        raise ValueError("final_risk must be a finite one-dimensional array.")
-    gate = np.where(
-        final_risk <= gate_low,
-        1.0,
-        np.where(final_risk >= gate_high, 0.0, 1.0 - (final_risk - gate_low) / (gate_high - gate_low)),
-    )
-    return np.clip(gate, 0.0, 1.0).astype(np.float64)
-
-
-def _softmax_logits(logits: np.ndarray) -> np.ndarray:
-    logits = np.asarray(logits, dtype=np.float64)
-    shifted = logits - np.max(logits, axis=-1, keepdims=True)
-    exp = np.exp(np.clip(shifted, -50.0, 50.0))
-    denom = np.sum(exp, axis=-1, keepdims=True)
-    denom = np.where(denom > 0.0, denom, 1.0)
-    return (exp / denom).astype(np.float64)
-
-
-def _compute_final_noise_risk(
-    folds: list[FoldLogData],
-    labels_all: np.ndarray,
-    learn_window: int,
-    learn_min_correct: int,
-) -> np.ndarray:
-    labels_all = np.asarray(labels_all, dtype=np.int64)
-    num_samples = int(labels_all.shape[0])
-    learn_window = int(learn_window)
-    learn_min_correct = int(learn_min_correct)
-    if learn_window <= 0:
-        raise ValueError("learn_window must be positive.")
-    if learn_min_correct <= 0 or learn_min_correct > learn_window:
-        raise ValueError("learn_min_correct must be in [1, learn_window].")
-
-    learn_sum = np.zeros(num_samples, dtype=np.float64)
-    learn_count = np.zeros(num_samples, dtype=np.int64)
-    loss_var_sum = np.zeros(num_samples, dtype=np.float64)
-    loss_var_count = np.zeros(num_samples, dtype=np.int64)
-    val_bias_raw = np.full(num_samples, np.nan, dtype=np.float64)
-
-    for fold in tqdm(folds, desc="compute noise gate", unit="fold", leave=False):
-        train_idx = np.asarray(fold.train_indices, dtype=np.int64)
-        y_train = labels_all[train_idx]
-        train_logits = np.asarray(fold.train_logits, dtype=np.float64)
-        train_preds = np.argmax(train_logits, axis=2)
-        correct = train_preds == y_train.reshape(1, -1)
-        num_epochs = int(correct.shape[0])
-        for local_i, sample_idx in enumerate(train_idx):
-            seq = correct[:, local_i].astype(np.int64)
-            learned_time = None
-            if num_epochs >= learn_window:
-                window_sum = np.convolve(seq, np.ones(learn_window, dtype=np.int64), mode="valid")
-                hit = np.flatnonzero(window_sum >= learn_min_correct)
-                if hit.size:
-                    learned_time = int(hit[0] + learn_window - 1)
-            if learned_time is None:
-                learn_time_norm = 1.0
-                forget_frequency = 1.0
-                learn_risk = 1.0
-            else:
-                learn_time_norm = float(learned_time - learn_window + 1) / float(max(1, num_epochs - learn_window))
-                learn_time_norm = float(np.clip(learn_time_norm, 0.0, 1.0))
-                remaining = correct[learned_time + 1 :, local_i]
-                if remaining.size == 0:
-                    forget_frequency = 1.0
-                else:
-                    forget_frequency = float(np.mean(~remaining))
-                learn_risk = 1.0 - (1.0 - learn_time_norm) * (1.0 - forget_frequency)
-                learn_risk = float(np.clip(learn_risk, 0.0, 1.0))
-            learn_sum[int(sample_idx)] += float(learn_risk)
-            learn_count[int(sample_idx)] += 1
-
-        losses = _cross_entropy_from_logits(train_logits, y_train)
-        _, mid_idx, late_idx = resolve_epoch_windows(num_epochs)
-        mid_late_idx = np.concatenate([mid_idx, late_idx]).astype(np.int64)
-        loss_var_sum[train_idx] += np.var(losses[mid_late_idx], axis=0).astype(np.float64)
-        loss_var_count[train_idx] += 1
-
-        val_idx = np.asarray(fold.val_indices, dtype=np.int64)
-        y_val = labels_all[val_idx]
-        val_logits = np.asarray(fold.val_logits, dtype=np.float64)
-        _, val_mid_idx, val_late_idx = resolve_epoch_windows(int(val_logits.shape[0]))
-        val_mid_late_idx = np.concatenate([val_mid_idx, val_late_idx]).astype(np.int64)
-        probs = _softmax_logits(val_logits[val_mid_late_idx])
-        for local_i, sample_idx in enumerate(val_idx):
-            label = int(y_val[local_i])
-            probs_i = probs[:, local_i, :]
-            label_probs = probs_i[:, label]
-            positive_margins = np.maximum(probs_i - label_probs[:, None], 0.0)
-            positive_margins[:, label] = 0.0
-            class_scores = np.mean(positive_margins, axis=0)
-            class_scores[label] = 0.0
-            val_bias_raw[int(sample_idx)] = float(np.max(class_scores))
-
-    if np.any(learn_count <= 0) or np.any(loss_var_count <= 0) or np.any(~np.isfinite(val_bias_raw)):
-        missing = np.where((learn_count <= 0) | (loss_var_count <= 0) | (~np.isfinite(val_bias_raw)))[0]
-        raise ValueError(f"Some samples lack noise gate metrics: {missing[:10]}.")
-
-    learn_risk_rank = _percentile_rank_tie_aware(learn_sum / learn_count)
-    loss_var_rank = _percentile_rank_tie_aware(loss_var_sum / loss_var_count)
-    val_bias_rank = _percentile_rank_tie_aware(val_bias_raw)
-    return np.minimum.reduce([learn_risk_rank, loss_var_rank, val_bias_rank]).astype(np.float64)
-
-
-def _noise_gate_cache_path(dataset: str, proxy_model: str, proxy_training_seed: int, epochs: int) -> Path:
-    return resolve_dynamic_component_cache_dir(dataset, proxy_model, proxy_training_seed, epochs) / "noise_gate.npz"
-
-
-def _load_noise_gate_cache_if_valid(
-    cache_path: Path,
-    dataset: str,
-    proxy_model: str,
-    proxy_training_seed: int,
-    epochs: int,
-    labels_all: np.ndarray,
-    learn_window: int,
-    learn_min_correct: int,
-    gate_low: float,
-    gate_high: float,
-) -> dict[str, np.ndarray] | None:
-    if not cache_path.is_file():
-        return None
-    try:
-        with np.load(cache_path, allow_pickle=False) as data:
-            if str(np.asarray(data["cache_version"]).item()) != NOISE_GATE_CACHE_VERSION:
-                return None
-            if str(np.asarray(data["dataset"]).item()) != str(dataset):
-                return None
-            if str(np.asarray(data["proxy_model"]).item()) != str(proxy_model):
-                return None
-            if int(np.asarray(data["proxy_training_seed"]).item()) != int(proxy_training_seed):
-                return None
-            if int(np.asarray(data["epochs"]).item()) != int(epochs):
-                return None
-            if int(np.asarray(data["learn_window"]).item()) != int(learn_window):
-                return None
-            if int(np.asarray(data["learn_min_correct"]).item()) != int(learn_min_correct):
-                return None
-            labels_cached = np.asarray(data["labels"], dtype=np.int64)
-            if not np.array_equal(labels_cached, labels_all.astype(np.int64, copy=False)):
-                return None
-            final_risk = np.asarray(data["final_risk"], dtype=np.float64)
-    except Exception:
-        return None
-    if final_risk.shape != (int(labels_all.shape[0]),) or not np.all(np.isfinite(final_risk)):
-        return None
-    return {"final_risk": final_risk, "gate": _build_gate_from_final_risk(final_risk, gate_low, gate_high)}
-
-
-def _save_noise_gate_cache(
-    cache_path: Path,
-    dataset: str,
-    proxy_model: str,
-    proxy_training_seed: int,
-    epochs: int,
-    labels_all: np.ndarray,
-    learn_window: int,
-    learn_min_correct: int,
-    final_risk: np.ndarray,
-) -> None:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        cache_path,
-        cache_version=np.array(NOISE_GATE_CACHE_VERSION, dtype=np.str_),
-        dataset=np.array(dataset, dtype=np.str_),
-        proxy_model=np.array(proxy_model, dtype=np.str_),
-        proxy_training_seed=np.array(int(proxy_training_seed), dtype=np.int64),
-        epochs=np.array(int(epochs), dtype=np.int64),
-        labels=np.asarray(labels_all, dtype=np.int64),
-        learn_window=np.array(int(learn_window), dtype=np.int64),
-        learn_min_correct=np.array(int(learn_min_correct), dtype=np.int64),
-        final_risk=np.asarray(final_risk, dtype=np.float64),
-    )
-
-
-def get_or_compute_noise_gate(
-    *,
-    folds: list[FoldLogData],
-    dataset: str,
-    proxy_model: str,
-    proxy_training_seed: int,
-    epochs: int,
-    labels_all: np.ndarray,
-    learn_window: int,
-    learn_min_correct: int,
-    gate_low: float,
-    gate_high: float,
-    force: bool = False,
-) -> dict[str, np.ndarray]:
-    _validate_gate_thresholds(gate_low, gate_high)
-    cache_path = _noise_gate_cache_path(dataset, proxy_model, proxy_training_seed, epochs)
-    if not force:
-        cached = _load_noise_gate_cache_if_valid(
-            cache_path, dataset, proxy_model, proxy_training_seed, epochs,
-            labels_all, learn_window, learn_min_correct, gate_low, gate_high,
-        )
-        if cached is not None:
-            print(f"Noise gate cache HIT: {cache_path}")
-            return cached
-    final_risk = _compute_final_noise_risk(folds, labels_all, learn_window, learn_min_correct)
-    _save_noise_gate_cache(cache_path, dataset, proxy_model, proxy_training_seed, epochs, labels_all, learn_window, learn_min_correct, final_risk)
-    print(f"Noise gate cache {'FORCE->RECOMPUTED' if force else 'MISS->COMPUTED'}: {cache_path}")
-    return {"final_risk": final_risk, "gate": _build_gate_from_final_risk(final_risk, gate_low, gate_high)}
 
 
 def fit_softplus_ratio_regression(
@@ -980,7 +701,6 @@ def load_or_compute_dynamic_supervision_for_seed(
     resolved_proxy_epochs: int,
 ) -> tuple[
     dict[str, DynamicComponentResult],
-    dict[str, np.ndarray] | None,
     np.ndarray,
     Path | None,
     dict[str, Path],
@@ -994,45 +714,18 @@ def load_or_compute_dynamic_supervision_for_seed(
     )
 
     reasons: dict[str, str] = {name: cache_reasons.get(name, "not attempted") for name in COMPONENT_NAMES}
-    gate_cache_path = _noise_gate_cache_path(args.dataset, args.proxy_model, proxy_training_seed, resolved_proxy_epochs)
-    noise_gate_data: dict[str, np.ndarray] | None = None
-    if args.use_noise_gate:
-        if labels_all is not None and not args.force_noise_gate:
-            noise_gate_data = _load_noise_gate_cache_if_valid(
-                gate_cache_path,
-                args.dataset,
-                args.proxy_model,
-                proxy_training_seed,
-                resolved_proxy_epochs,
-                labels_all,
-                args.learn_window,
-                args.learn_min_correct,
-                args.gate_low,
-                args.gate_high,
-            )
-            reasons["gate"] = "ok" if noise_gate_data is not None else f"missing/invalid gate cache: {gate_cache_path}"
-        elif labels_all is not None and args.force_noise_gate:
-            reasons["gate"] = "forced recompute by --force-noise-gate"
-        else:
-            reasons["gate"] = "cannot validate gate before labels are loaded because A/C/T caches are incomplete"
-    else:
-        reasons["gate"] = "disabled by --no-use-noise-gate"
-
     print(f"Dynamic supervision cache status for seed={proxy_training_seed}")
-    for name in (*COMPONENT_NAMES, "gate"):
+    for name in COMPONENT_NAMES:
         print(f"  - {name}: {reasons.get(name, 'not attempted')}")
 
     all_components_ok = cached_bundle is not None and labels_all is not None
-    gate_ok = (not args.use_noise_gate) or (noise_gate_data is not None)
-    if all_components_ok and gate_ok:
+    if all_components_ok:
         print(f"Dynamic supervision caches HIT for seed={proxy_training_seed}; proxy logs are not required.")
         for name in COMPONENT_NAMES:
             print(f"Dynamic component cache HIT: {name} @ {component_cache_paths[name]}")
-        if noise_gate_data is not None:
-            print(f"Noise gate cache HIT: {gate_cache_path}")
-        return cached_bundle, noise_gate_data, labels_all, None, component_cache_paths, reasons
+        return cached_bundle, labels_all, None, component_cache_paths, reasons
 
-    reason_lines = "\n".join(f"  - {name}: {reasons.get(name, 'unknown')}" for name in (*COMPONENT_NAMES, "gate"))
+    reason_lines = "\n".join(f"  - {name}: {reasons.get(name, 'unknown')}" for name in COMPONENT_NAMES)
     folds, labels_all, proxy_log = load_proxy_folds_for_dynamic_seed(
         args,
         proxy_training_seed,
@@ -1067,28 +760,10 @@ def load_or_compute_dynamic_supervision_for_seed(
         reasons[name] = "ok" if from_cache else "recomputed and saved"
         print(f"Dynamic component cache {'HIT' if from_cache else 'MISS->RECOMPUTED'}: {name} @ {cache_path}")
 
-    if args.use_noise_gate:
-        noise_gate_data = get_or_compute_noise_gate(
-            folds=folds,
-            dataset=args.dataset,
-            proxy_model=args.proxy_model,
-            proxy_training_seed=proxy_training_seed,
-            epochs=resolved_proxy_epochs,
-            labels_all=labels_all,
-            learn_window=args.learn_window,
-            learn_min_correct=args.learn_min_correct,
-            gate_low=args.gate_low,
-            gate_high=args.gate_high,
-            force=bool(args.force_noise_gate),
-        )
-        reasons["gate"] = "ok" if reasons.get("gate") == "ok" and not args.force_noise_gate else "recomputed and saved"
-
-    return component_results, noise_gate_data, labels_all, proxy_log, component_cache_paths, reasons
+    return component_results, labels_all, proxy_log, component_cache_paths, reasons
 
 def build_dynamic_target(
     component_results: dict[str, DynamicComponentResult],
-    gate: np.ndarray | None = None,
-    use_noise_gate: bool = True,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     a_result = component_results["A"]
     c_result = component_results["C"]
@@ -1105,25 +780,11 @@ def build_dynamic_target(
         if not np.all(np.isfinite(arr)):
             raise ValueError(f"{name} contains NaN/inf values.")
 
-    if use_noise_gate and gate is not None:
-        gate = np.asarray(gate, dtype=np.float64)
-        if gate.shape != (num_samples,) or not np.all(np.isfinite(gate)):
-            raise ValueError(f"gate shape/finite mismatch: {gate.shape}")
-
-        def split_gate_positive_part(values: np.ndarray) -> np.ndarray:
-            values = np.asarray(values, dtype=np.float64)
-            return np.minimum(values, 0.0) + gate * np.maximum(values, 0.0)
-
-        gated_a = split_gate_positive_part(a_result.final_normalized)
-        gated_c = split_gate_positive_part(c_result.final_normalized)
-        gated_t = split_gate_positive_part(t_result.final_normalized)
-        utility_raw = (gated_a + gated_c + gated_t) / 3.0
-    else:
-        utility_raw = (
-            a_result.final_normalized
-            + c_result.final_normalized
-            + t_result.final_normalized
-        ).astype(np.float64) / 3.0
+    utility_raw = (
+        a_result.final_normalized
+        + c_result.final_normalized
+        + t_result.final_normalized
+    ).astype(np.float64) / 3.0
     u_scores = standard_zscore(utility_raw)
     dynamic_component_values = {
         "A": a_result.final_normalized,
@@ -1188,19 +849,12 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             f"proxy_training_seed={proxy_training_seed}, proxy_epochs={resolved_proxy_epochs} ==="
         )
 
-        component_results, noise_gate_data, labels_all, proxy_log, component_cache_paths, cache_reasons = load_or_compute_dynamic_supervision_for_seed(
+        component_results, labels_all, proxy_log, component_cache_paths, cache_reasons = load_or_compute_dynamic_supervision_for_seed(
             args,
             proxy_training_seed=proxy_training_seed,
             resolved_proxy_epochs=resolved_proxy_epochs,
         )
-        dynamic_scores, dynamic_component_values = build_dynamic_target(
-            component_results,
-            gate=None if noise_gate_data is None else noise_gate_data["gate"],
-            use_noise_gate=bool(args.use_noise_gate),
-        )
-        if noise_gate_data is not None:
-            dynamic_component_values["noise_gate"] = noise_gate_data["gate"]
-            dynamic_component_values["noise_final_risk"] = noise_gate_data["final_risk"]
+        dynamic_scores, dynamic_component_values = build_dynamic_target(component_results)
         num_samples = labels_all.shape[0]
 
         report_existing_weight_entry(data, args.dataset, seed, output_path)

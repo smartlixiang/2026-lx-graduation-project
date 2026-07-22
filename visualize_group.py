@@ -33,8 +33,7 @@ from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 
 # Reuse the exact helper logic from calculate_my_mask.py where possible.
 from calculate_my_mask import (  # noqa: E402
-    _get_or_compute_group_mean_stats,
-    _mean_stats_cache_path,
+    compute_full_class_means,
     ensure_scoring_weights,
     load_scoring_weights,
 )
@@ -518,17 +517,7 @@ def main() -> None:
     div_features, _ = div_metric._encode_images(div_loader, image_adapter)
     div_features_np = div_features.detach().cpu().numpy().astype(np.float32)
 
-    mean_stats_cache_path = _mean_stats_cache_path(
-        dataset_name=dataset_name,
-        clip_model=args.clip_model,
-        adapter_image_path=str(adapter_paths["image_path"]),
-    )
-    full_class_mean, _ = _get_or_compute_group_mean_stats(
-        cache_path=mean_stats_cache_path,
-        image_features=div_features_np,
-        labels=labels,
-        num_classes=num_classes,
-    )
+    full_class_mean = compute_full_class_means(div_features_np, labels, num_classes)
 
     class_budgets = allocate_class_budgets(labels, num_classes, args.keep_ratio)
     class_indices_list = [np.flatnonzero(labels == c).astype(np.int64) for c in range(num_classes)]

@@ -176,6 +176,19 @@ def resolve_epoch_windows(num_epochs: int) -> tuple[np.ndarray, np.ndarray, np.n
     if num_epochs == 2:
         return np.array([0], dtype=np.int64), np.array([0, 1], dtype=np.int64), np.array([1], dtype=np.int64)
 
+    if num_epochs == 160:
+        return (
+            np.arange(0, 60, dtype=np.int64),
+            np.arange(60, 120, dtype=np.int64),
+            np.arange(120, 160, dtype=np.int64),
+        )
+    if num_epochs == 80:
+        return (
+            np.arange(0, 30, dtype=np.int64),
+            np.arange(30, 60, dtype=np.int64),
+            np.arange(60, 80, dtype=np.int64),
+        )
+
     early_n = max(1, int(round(0.3 * num_epochs)))
     mid_n = max(1, int(round(0.4 * num_epochs)))
     late_n = max(1, num_epochs - early_n - mid_n)

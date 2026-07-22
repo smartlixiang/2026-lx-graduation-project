@@ -16,7 +16,7 @@ from .dynamic_utils import (
 
 
 class AbsorptionGainScore:
-    """A: Absorption Gain with early boundary information and late-stage stability.
+    """A: Absorption Gain with early boundary information and loss-variance stability.
 
     This component keeps the original role of A as the training-view absorbability
     signal, but it no longer only rewards the increase from early to mid training.
@@ -24,7 +24,7 @@ class AbsorptionGainScore:
     forms:
       1. early boundary information: the sample is informative before it is saturated;
       2. absorption gain: the sample is progressively absorbed by the proxy model;
-      3. late stability: the learned state does not fluctuate heavily near the end.
+      3. loss-variance stability: compare late and middle true-label CE volatility.
 
     Each sub-signal is standardized inside the fold and then combined with equal
     weights. No extra manually tuned coefficient is introduced.
@@ -45,19 +45,24 @@ class AbsorptionGainScore:
 
             early_mean = np.mean(r[early_idx], axis=0)
             mid_mean = np.mean(r[mid_idx], axis=0)
-            late_var = np.var(r[late_idx], axis=0)
 
             # Early boundary information. This avoids simply favoring either
             # already-saturated easy samples or persistently unlearnable samples.
             boundary_info = np.mean(r[early_idx] * (1.0 - r[early_idx]), axis=0)
 
-            # Original absorption-gain signal: whether the proxy model increases
-            # its true-class belief from the early stage to the middle stage.
-            gain = mid_mean - early_mean
+            # Double-ended support weighted gain: a mid-stage increase is trusted
+            # most when both early and middle true-label probabilities are supported.
+            support = np.sqrt(np.clip(early_mean * mid_mean, 0.0, 1.0))
+            gain = support * (mid_mean - early_mean)
 
-            # Late-stage stability. Lower late variance indicates a more stable
-            # learned state, so the sign is reversed before standardization.
-            stability = -late_var
+            logits = fold.train_logits.astype(np.float64, copy=False)
+            max_logits = np.max(logits, axis=2, keepdims=True)
+            logsumexp = np.squeeze(max_logits, axis=2) + np.log(np.sum(np.exp(logits - max_logits), axis=2))
+            true_logits = np.take_along_axis(logits, y_train[None, :, None], axis=2).squeeze(axis=2)
+            loss = logsumexp - true_logits
+            middle_loss_var = np.var(loss[mid_idx], axis=0)
+            late_loss_var = np.var(loss[late_idx], axis=0)
+            stability = late_loss_var - middle_loss_var
 
             raw = (
                 safe_standardize(boundary_info)

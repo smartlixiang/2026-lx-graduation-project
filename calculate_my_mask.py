@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 import time
@@ -212,7 +211,6 @@ def load_scoring_weights(
 
 def build_score_loader(
     preprocess,
-    dataset_name: str,
     device: torch.device,
     batch_size: int,
     num_workers: int,
@@ -227,104 +225,25 @@ def build_score_loader(
     )
 
 
-def _hash_file(path: Path) -> str:
-    hasher = hashlib.sha1()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def _mean_stats_cache_path(
-    dataset_name: str,
-    clip_model: str,
-    adapter_image_path: str,
-) -> Path:
-    adapter_sha1 = _hash_file(Path(adapter_image_path))
-    clip_tag = clip_model.replace("/", "-").replace(" ", "_")
-    return PROJECT_ROOT / "static_scores" / "group_mean_stats" / dataset_name / clip_tag / f"img_adapter_{adapter_sha1}.npz"
-
-
-def _get_or_compute_group_mean_stats(
-    *,
-    cache_path: Path,
+def compute_full_class_means(
     image_features: np.ndarray,
     labels: np.ndarray,
     num_classes: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    n_samples = int(image_features.shape[0])
-    feat_dim = int(image_features.shape[1]) if image_features.ndim == 2 else 0
-    if cache_path.exists():
-        try:
-            cached = np.load(cache_path, allow_pickle=False)
-            cached_n = int(np.asarray(cached["n_samples"]).item())
-            cached_dim = int(np.asarray(cached["feat_dim"]).item())
-            cached_cls = int(np.asarray(cached["num_classes"]).item())
-            means = np.asarray(cached["full_class_mean"], dtype=np.float32)
-            vars_ = np.asarray(cached["full_class_var"], dtype=np.float32)
-            if (
-                cached_n == n_samples
-                and cached_dim == feat_dim
-                and cached_cls == int(num_classes)
-                and means.shape == (num_classes, feat_dim)
-                and vars_.shape == (num_classes,)
-            ):
-                return means, vars_
-        except Exception:
-            pass
-
-    full_class_mean = np.zeros((num_classes, feat_dim), dtype=np.float32)
-    full_class_var = np.zeros((num_classes,), dtype=np.float32)
-    for class_id in range(num_classes):
-        class_mask = labels == class_id
-        class_feats = image_features[class_mask]
-        if class_feats.shape[0] == 0:
-            continue
-        class_mean = np.mean(class_feats, axis=0, dtype=np.float32)
-        diff = class_feats - class_mean
-        sigma2 = float(np.mean(np.sum(diff * diff, axis=1)))
-        full_class_mean[class_id] = class_mean
-        full_class_var[class_id] = np.float32(max(sigma2, 0.0))
-
-    np.savez_compressed(
-        cache_path,
-        full_class_mean=full_class_mean,
-        full_class_var=full_class_var,
-        n_samples=np.asarray(n_samples, dtype=np.int64),
-        feat_dim=np.asarray(feat_dim, dtype=np.int64),
-        num_classes=np.asarray(num_classes, dtype=np.int64),
-    )
-    return full_class_mean, full_class_var
-
-
-def select_topk_mask(
-    scores: np.ndarray,
-    labels: np.ndarray,
-    num_classes: int,
-    keep_ratio: int,
-) -> tuple[np.ndarray, dict[int, int]]:
-    if keep_ratio <= 0 or keep_ratio > 100:
-        raise ValueError("kr 必须在 1-100 之间。")
-    mask = np.zeros(scores.shape[0], dtype=np.uint8)
-    selected_by_class: dict[int, int] = {}
-    ratio = keep_ratio / 100.0
-    for class_id in range(num_classes):
-        class_indices = np.flatnonzero(labels == class_id)
-        if class_indices.size == 0:
-            selected_by_class[class_id] = 0
-            continue
-        if keep_ratio == 100:
-            num_select = class_indices.size
-        else:
-            num_select = max(1, int(class_indices.size * ratio))
-        class_scores = scores[class_indices]
-        topk_indices = class_indices[
-            np.argpartition(-class_scores, num_select - 1)[:num_select]
-        ]
-        mask[topk_indices] = 1
-        selected_by_class[class_id] = int(num_select)
-    return mask, selected_by_class
+) -> np.ndarray:
+    features = np.asarray(image_features, dtype=np.float32)
+    labels_np = np.asarray(labels, dtype=np.int64)
+    if features.ndim != 2:
+        raise ValueError("image_features must be a 2D array.")
+    if labels_np.shape != (features.shape[0],):
+        raise ValueError("labels length must match image_features sample count.")
+    if int(num_classes) <= 0:
+        raise ValueError("num_classes must be positive.")
+    means = np.zeros((int(num_classes), features.shape[1]), dtype=np.float32)
+    for class_id in range(int(num_classes)):
+        class_features = features[labels_np == class_id]
+        if class_features.shape[0] > 0:
+            means[class_id] = np.mean(class_features, axis=0, dtype=np.float32)
+    return means
 
 
 def select_group_mask(
@@ -337,11 +256,8 @@ def select_group_mask(
     num_classes: int,
     keep_ratio: int,
     device: torch.device,
-    dataset_name: str,
     seed: int,
     weight_group: str,
-    clip_model: str,
-    adapter_image_path: str,
     div_static_scores: np.ndarray | None = None,
     dds_static_scores: np.ndarray | None = None,
     group_candidate_pool_size: int = 1,
@@ -378,18 +294,7 @@ def select_group_mask(
         else np.asarray(div_features)
     ).astype(np.float32)
 
-    mean_stats_cache_path = _mean_stats_cache_path(
-        dataset_name=dataset_name,
-        clip_model=clip_model,
-        adapter_image_path=adapter_image_path,
-    )
-    full_class_mean, _ = _get_or_compute_group_mean_stats(
-        cache_path=mean_stats_cache_path,
-        image_features=div_features_np,
-        labels=labels_np,
-        num_classes=num_classes,
-    )
-    full_class_mean_f32 = full_class_mean.astype(np.float32, copy=False)
+    full_class_mean_f32 = compute_full_class_means(div_features_np, labels_np, num_classes)
 
     def _allocate_class_budgets() -> np.ndarray:
         class_sizes = np.asarray([idx.size for idx in class_indices_list], dtype=np.int64)
@@ -585,6 +490,231 @@ def select_group_mask(
     }
     return final_mask, selected_by_class, stats
 
+
+
+def select_group_mask_by_center_repair(
+    sa_raw_scores: np.ndarray,
+    div_metric: Div,
+    div_loader: DataLoader,
+    image_adapter,
+    labels: np.ndarray,
+    weights: dict[str, float],
+    num_classes: int,
+    keep_ratio: int,
+    device: torch.device,
+    seed: int,
+    dds_static_scores: np.ndarray | None = None,
+    group_candidate_pool_size: int = 1,
+    group_init_count: int = 2,
+) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
+    if keep_ratio <= 0 or keep_ratio > 100:
+        raise ValueError("kr 必须在 1-100 之间。")
+
+    num_samples = sa_raw_scores.shape[0]
+    labels_np = np.asarray(labels, dtype=np.int64)
+    sa_raw_np = np.asarray(sa_raw_scores, dtype=np.float32)
+    dds_raw_np = np.asarray(dds_static_scores, dtype=np.float32) if dds_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
+    if labels_np.shape[0] != num_samples or dds_raw_np.shape[0] != num_samples:
+        raise ValueError("样本数不一致，无法执行 group。")
+
+    sr = float(keep_ratio) / 100.0
+    target_size = int(round(sr * num_samples))
+    target_size = min(num_samples, max(1, target_size)) if num_samples > 0 else 0
+    if target_size <= 0:
+        raise ValueError("target_size 必须大于 0。")
+
+    class_indices_list = [np.flatnonzero(labels_np == c).astype(np.int64) for c in range(num_classes)]
+    labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
+    if int(group_init_count) < 1:
+        raise ValueError("group_init_count must be >= 1 for center-repair group selection.")
+    class_rngs = [
+        np.random.default_rng(int(seed) + 9176 * int(keep_ratio) + 104729 * int(class_id))
+        for class_id in range(num_classes)
+    ]
+
+    div_features, _ = div_metric._encode_images(div_loader, image_adapter)
+    div_features_np = (
+        div_features.detach().cpu().numpy()
+        if isinstance(div_features, torch.Tensor)
+        else np.asarray(div_features)
+    ).astype(np.float32)
+
+    full_class_mean_f32 = compute_full_class_means(div_features_np, labels_np, num_classes)
+
+    def _allocate_class_budgets() -> np.ndarray:
+        class_sizes = np.asarray([idx.size for idx in class_indices_list], dtype=np.int64)
+        raw = class_sizes.astype(np.float64) * sr
+        floor_budget = np.floor(raw).astype(np.int64)
+        floor_budget = np.minimum(floor_budget, class_sizes)
+        need = int(target_size - np.sum(floor_budget))
+        if need <= 0:
+            return floor_budget
+        frac = raw - floor_budget.astype(np.float64)
+        order = np.lexsort((np.arange(num_classes, dtype=np.int64), -frac))
+        budgets = floor_budget.copy()
+        for class_id in order:
+            if need <= 0:
+                break
+            if budgets[class_id] >= class_sizes[class_id]:
+                continue
+            budgets[class_id] += 1
+            need -= 1
+        if need != 0:
+            raise RuntimeError("类别预算分配失败，无法满足目标总样本数。")
+        return budgets
+
+    class_budgets = _allocate_class_budgets()
+    candidate_pool_floor = max(1, int(group_candidate_pool_size))
+
+    selected_mask = np.zeros(num_samples, dtype=np.uint8)
+    class_selected_counts = np.zeros(num_classes, dtype=np.int64)
+    class_selected_sum = np.zeros((num_classes, div_features_np.shape[1]), dtype=np.float32)
+    init_per_class = np.zeros(num_classes, dtype=np.int64)
+    requested_init_count = int(group_init_count)
+
+
+    for class_id, class_indices in enumerate(class_indices_list):
+        budget = int(class_budgets[class_id])
+        if class_indices.size == 0 or budget <= 0 or requested_init_count <= 0:
+            continue
+        init_count = min(requested_init_count, budget, int(class_indices.size))
+        init_per_class[class_id] = init_count
+        class_rng = class_rngs[class_id]
+        init_indices = class_rng.choice(class_indices, size=init_count, replace=False).astype(np.int64)
+        selected_mask[init_indices] = 1
+        class_selected_counts[class_id] = init_count
+        class_selected_sum[class_id] = np.sum(div_features_np[init_indices], axis=0, dtype=np.float32)
+
+    selected_count_history: list[int] = [int(np.sum(selected_mask))]
+    total_to_add = int(np.sum(class_budgets) - np.sum(init_per_class))
+    pbar = tqdm(total=total_to_add, desc="[group] center repair add", unit="sample")
+    total_score_acc = 0.0
+
+    for class_id in range(num_classes):
+        class_rng = class_rngs[class_id]
+        while int(class_selected_counts[class_id]) < int(class_budgets[class_id]):
+            class_indices = class_indices_list[int(class_id)]
+            unselected_mask = selected_mask[class_indices] == 0
+            candidate_indices = class_indices[unselected_mask]
+            if candidate_indices.size == 0:
+                continue
+
+            current_count = int(class_selected_counts[class_id])
+            if current_count <= 0:
+                break
+            remaining_slots = int(class_budgets[class_id] - class_selected_counts[class_id])
+            current_sum = class_selected_sum[class_id]
+            mu_full = full_class_mean_f32[class_id]
+            old_dist = float(np.linalg.norm(current_sum / float(current_count) - mu_full))
+            dynamic_k = max(3, int(ceil(0.05 * current_count)))
+
+            candidate_features_t = torch.as_tensor(div_features_np[candidate_indices], dtype=torch.float32, device=device)
+            reference_indices = class_indices[selected_mask[class_indices] > 0]
+            reference_features_t = torch.as_tensor(div_features_np[reference_indices], dtype=torch.float32, device=device)
+            div_raw = div_metric._knn_mean_distance_to_reference(
+                query_features=candidate_features_t,
+                reference_features=reference_features_t,
+                k=float(dynamic_k),
+                query_indices=torch.as_tensor(candidate_indices, dtype=torch.long, device=device),
+                reference_indices=torch.as_tensor(reference_indices, dtype=torch.long, device=device),
+            ).detach().cpu().numpy().astype(np.float32)
+            div_local = standard_zscore(div_raw)
+            sa_local = standard_zscore(sa_raw_np[candidate_indices])
+            dds_local = standard_zscore(dds_raw_np[candidate_indices])
+            combined_scores = (weights["sa"] * sa_local + weights["dds"] * dds_local + weights["div"] * div_local).astype(np.float32)
+            rank = np.argsort(-combined_scores, kind="mergesort")
+            pool_n = min(candidate_indices.size, max(candidate_pool_floor, int(ceil(np.sqrt(candidate_indices.size)))))
+            pool_indices = candidate_indices[rank[:pool_n]]
+            pool_features = div_features_np[pool_indices]
+
+            def _repair_probs(repair_values: np.ndarray) -> np.ndarray:
+                repair_values = np.asarray(repair_values, dtype=np.float64)
+                finite = np.isfinite(repair_values)
+                if finite.any():
+                    min_finite = float(np.min(repair_values[finite]))
+                    repair_values = np.where(finite, repair_values, min_finite)
+                else:
+                    repair_values = np.zeros_like(repair_values, dtype=np.float64)
+                std = float(np.std(repair_values))
+                z = (repair_values - float(np.mean(repair_values))) / std if std > 1e-12 else np.zeros_like(repair_values)
+                exp = np.exp(z - float(np.max(z)))
+                probs = exp / np.sum(exp) if np.sum(exp) > 0 and np.all(np.isfinite(exp)) else np.full(z.shape, 1.0 / max(1, z.size))
+                return probs.astype(np.float64)
+
+            if remaining_slots >= 2 and pool_indices.size >= 2:
+                pairs = np.array([(i, j) for i in range(pool_indices.size) for j in range(i + 1, pool_indices.size)], dtype=np.int64)
+                pair_sums = pool_features[pairs[:, 0]] + pool_features[pairs[:, 1]]
+                new_mean = (current_sum[None, :] + pair_sums) / float(current_count + 2)
+                repair = old_dist - np.linalg.norm(new_mean - mu_full[None, :], axis=1)
+                pair = pairs[int(class_rng.choice(np.arange(pairs.shape[0]), p=_repair_probs(repair)))]
+                picked_indices = [int(pool_indices[pair[0]]), int(pool_indices[pair[1]])]
+            else:
+                new_mean = (current_sum[None, :] + pool_features) / float(current_count + 1)
+                repair = old_dist - np.linalg.norm(new_mean - mu_full[None, :], axis=1)
+                picked_indices = [int(pool_indices[int(class_rng.choice(np.arange(pool_indices.size), p=_repair_probs(repair)))])]
+
+            for picked_idx in picked_indices[:remaining_slots]:
+                selected_mask[picked_idx] = 1
+                class_selected_counts[class_id] += 1
+                class_selected_sum[class_id] += div_features_np[picked_idx]
+                total_score_acc += float(np.max(combined_scores))
+                selected_count_history.append(int(np.sum(selected_mask)))
+                pbar.update(1)
+                pbar.set_postfix(class_id=int(class_id))
+    pbar.close()
+
+    final_mask = selected_mask.astype(np.uint8)
+    selected_by_class: dict[int, int] = {}
+    for class_id in range(num_classes):
+        class_indices = class_indices_list[class_id]
+        selected_by_class[class_id] = int(final_mask[class_indices].sum()) if class_indices.size > 0 else 0
+
+    final_div_scores = np.asarray(
+        div_metric.score_dataset_dynamic(
+            div_loader,
+            adapter=image_adapter,
+            selected_mask=final_mask,
+            image_features=div_features,
+            labels=labels_t,
+        ).scores,
+        dtype=np.float32,
+    )
+    selected_bool = final_mask.astype(bool)
+    final_div_z = standard_zscore_by_class(final_div_scores, labels_np)
+    subset_comprehensive_score = float(
+        np.sum(
+            (
+                weights["sa"] * standard_zscore_by_class(sa_raw_np, labels_np)
+                + weights["dds"] * standard_zscore_by_class(dds_raw_np, labels_np)
+                + weights["div"] * final_div_z
+            )[selected_bool],
+            dtype=np.float64,
+        )
+    )
+
+    class_shift_values: list[float] = []
+    for class_id in range(num_classes):
+        if class_selected_counts[class_id] <= 0:
+            continue
+        mu_sub = class_selected_sum[class_id] / float(class_selected_counts[class_id])
+        mu_full = full_class_mean_f32[class_id]
+        class_shift_values.append(float(np.linalg.norm(mu_sub - mu_full)))
+    distribution_shift = float(np.mean(class_shift_values)) if class_shift_values else 0.0
+
+    stats: dict[str, object] = {
+        "solver": "group_center_repair",
+        "sr": float(sr),
+        "final_rate": float(final_mask.mean()),
+        "selected_by_class": selected_by_class,
+        "class_budgets": {int(c): int(v) for c, v in enumerate(class_budgets.tolist())},
+        "init_per_class": {int(c): int(v) for c, v in enumerate(init_per_class.tolist())},
+        "candidate_pool_size": int(candidate_pool_floor),
+        "selected_count_history": selected_count_history,
+        "accumulated_greedy_score": float(total_score_acc),
+        "subset_comprehensive_score": subset_comprehensive_score,
+        "distribution_shift": distribution_shift,
+    }
+    return final_mask, selected_by_class, stats
 
 def main() -> None:
     total_start = time.perf_counter()
@@ -783,11 +913,8 @@ def main() -> None:
                     num_classes=len(class_names),
                     keep_ratio=keep_ratio,
                     device=device,
-                    dataset_name=dataset_name,
                     seed=seed,
                     weight_group=weight_group,
-                    clip_model=args.clip_model,
-                    adapter_image_path=str(adapter_paths["image_path"]),
                     div_static_scores=div_raw_np,
                     dds_static_scores=dds_raw_np,
                     group_candidate_pool_size=args.group_candidate_pool_size,

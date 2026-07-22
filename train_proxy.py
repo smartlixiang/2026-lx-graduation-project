@@ -22,11 +22,11 @@ from utils.global_config import CONFIG
 from utils.path_rules import resolve_proxy_log_dir
 from utils.progress import PersistentStatusLine, create_persistent_bar, create_transient_batch_bar
 from utils.seed import set_seed
-from utils.training_defaults import apply_dataset_training_defaults
+from utils.training_defaults import apply_proxy_training_defaults
 
 
 def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
-    return apply_dataset_training_defaults(args, lr_attr="lr")
+    return apply_proxy_training_defaults(args, lr_attr="lr")
 
 
 class IndexedDataset(torch.utils.data.Dataset):

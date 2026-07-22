@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET
+from utils.training_defaults import get_proxy_training_config  # noqa: E402
 from utils.proxy_log_utils import resolve_proxy_log_path
 from utils.score_utils import standard_zscore
 from utils.seed import set_seed

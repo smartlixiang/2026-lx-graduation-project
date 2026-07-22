@@ -251,8 +251,17 @@ def aggregate_val_fold_component(fold_values: np.ndarray, folds: list[FoldLogDat
     return aggregated
 
 
-def load_cv_fold_logs(proxy_log_dir: str | Path, dataset_name: str, data_root: str) -> tuple[list[FoldLogData], np.ndarray]:
-    """Load fold_*.npz proxy logs and dataset labels aligned to global sample indices."""
+def load_cv_fold_logs(
+    proxy_log_dir: str | Path,
+    dataset_name: str,
+    data_root: str,
+    max_epochs: int | None = None,
+) -> tuple[list[FoldLogData], np.ndarray]:
+    """Load fold_*.npz proxy logs and dataset labels aligned to global sample indices.
+
+    When max_epochs is provided, longer logs are sliced in memory to the
+    requested epoch count; on-disk NPZ files are never modified.
+    """
     log_dir = Path(proxy_log_dir)
     if not log_dir.exists() or not log_dir.is_dir():
         raise FileNotFoundError(f"Proxy log directory not found: {log_dir}")
@@ -291,6 +300,16 @@ def load_cv_fold_logs(proxy_log_dir: str | Path, dataset_name: str, data_root: s
             raise ValueError(f"val_logits sample dimension mismatch in {fold_path}")
         if train_logits.shape[0] != val_logits.shape[0] or train_logits.shape[2] != val_logits.shape[2]:
             raise ValueError(f"train/val logits shape mismatch in {fold_path}")
+        actual_epochs = int(train_logits.shape[0])
+        if max_epochs is not None:
+            target_epochs = int(max_epochs)
+            if actual_epochs < target_epochs:
+                raise ValueError(
+                    f"Proxy fold log has insufficient epochs in {fold_path}: "
+                    f"required={target_epochs}, actual={actual_epochs}."
+                )
+            train_logits = train_logits[:target_epochs]
+            val_logits = val_logits[:target_epochs]
 
         seen_val[val_indices] += 1
         folds.append(
@@ -305,6 +324,11 @@ def load_cv_fold_logs(proxy_log_dir: str | Path, dataset_name: str, data_root: s
 
     if not np.all(seen_val == 1):
         raise ValueError("Validation indices across folds must cover each sample exactly once.")
+
+    fold_epochs = {int(fold.train_logits.shape[0]) for fold in folds}
+    fold_epochs.update(int(fold.val_logits.shape[0]) for fold in folds)
+    if len(fold_epochs) != 1:
+        raise ValueError(f"Loaded fold logs do not share one epoch count: {sorted(fold_epochs)}")
 
     return folds, labels_all.astype(np.int64)
 

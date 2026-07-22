@@ -64,6 +64,7 @@ from model.adapter import CLIPFeatureExtractor, load_trained_adapters  # noqa: E
 from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
+from utils.proxy_log_utils import resolve_seed_epoch_proxy_log_dir  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 from utils.training_defaults import get_proxy_training_config  # noqa: E402
@@ -379,28 +380,41 @@ def validate_proxy_logs(log_dir: Path, args: argparse.Namespace, info: Corruptio
     meta = load_json(log_dir / "meta.json")
     if meta is None: return False, "missing/invalid proxy meta.json"
     if meta.get("dataset") != info.dataset or int(meta.get("seed", -1)) != info.seed: return False, "proxy meta dataset/seed mismatch"
-    if int(meta.get("epochs", -1)) != int(ctx["proxy_epochs"]) or int(meta.get("k_folds", -1)) != int(args.k_folds): return False, "proxy meta epochs/folds mismatch"
+    if int(meta.get("epochs", -1)) < int(ctx["proxy_epochs"]) or int(meta.get("k_folds", -1)) != int(args.k_folds): return False, "proxy meta epochs/folds mismatch"
     side = load_json(log_dir / "context.json")
-    ok, reason = context_matches(side, ctx, keys=("dataset", "seed", "corruption_list_hash", "proxy_model", "proxy_epochs"))
+    ok, reason = context_matches(side, ctx, keys=("dataset", "seed", "corruption_list_hash", "proxy_model"))
+    if ok and int(side.get("proxy_epochs", -1)) < int(ctx["proxy_epochs"]): return False, "context proxy_epochs too short"
     if not ok: return False, reason
     for fold in range(1, int(args.k_folds) + 1):
         p = log_dir / f"fold_{fold}.npz"
         if not p.is_file(): return False, f"missing {p.name}"
         try:
             with np.load(p, allow_pickle=True) as data:
-                if "train_indices" not in data or "val_indices" not in data or int(data["train_logits"].shape[0]) != int(ctx["proxy_epochs"]):
+                if "train_indices" not in data or "val_indices" not in data or "train_logits" not in data or "val_logits" not in data:
                     return False, f"invalid {p.name}"
+                if int(data["train_logits"].shape[0]) < int(ctx["proxy_epochs"]) or int(data["val_logits"].shape[0]) < int(ctx["proxy_epochs"]):
+                    return False, f"insufficient epochs in {p.name}"
         except Exception as exc:
             return False, f"cannot load {p.name}: {exc}"
     return True, "ok"
 
 
 def stage_proxy(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> Path:
-    log_dir = PROXY_LOG_ROOT / info.dataset / args.proxy_model / str(info.seed) / str(ctx["proxy_epochs"])
-    valid, reason = validate_proxy_logs(log_dir, args, info, ctx)
+    seed_dir = PROXY_LOG_ROOT / info.dataset / args.proxy_model / str(info.seed)
+    try:
+        log_dir = resolve_seed_epoch_proxy_log_dir(seed_dir, int(ctx["proxy_epochs"]))
+        valid, reason = validate_proxy_logs(log_dir, args, info, ctx)
+    except FileNotFoundError as exc:
+        log_dir = seed_dir / str(ctx["proxy_epochs"]); valid = False; reason = str(exc)
     if args.force: valid = False; reason = "forced by --force"
     if valid:
+        source_epochs = int(log_dir.name) if log_dir.name.isdigit() else int(ctx["proxy_epochs"])
+        if source_epochs == int(ctx["proxy_epochs"]):
+            tqdm.write(f"[proxy] exact log hit: epochs={ctx['proxy_epochs']}, path={log_dir}")
+        else:
+            tqdm.write(f"[proxy] reuse longer log: source_epochs={source_epochs}, target_epochs={ctx['proxy_epochs']}, path={log_dir}")
         tqdm.write(f"Proxy CV cache HIT: {log_dir}"); return log_dir
+    log_dir = seed_dir / str(ctx["proxy_epochs"])
     tqdm.write(f"Proxy CV cache MISS→TRAIN ({reason})")
     ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), model=args.proxy_model, epochs=int(ctx["proxy_epochs"]), batch_size=args.batch_size, num_workers=args.num_workers, lr=None, momentum=None, weight_decay=None, lr_milestones=None, lr_gamma=None, device=args.device or "", k_folds=args.k_folds, seed=info.seed)
     ns = train_proxy_mod.apply_dataset_defaults(ns)

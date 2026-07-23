@@ -211,6 +211,7 @@ def load_scoring_weights(
 
 def build_score_loader(
     preprocess,
+    dataset_name: str,
     device: torch.device,
     batch_size: int,
     num_workers: int,

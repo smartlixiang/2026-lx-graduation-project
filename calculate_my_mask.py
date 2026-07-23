@@ -247,6 +247,60 @@ def compute_full_class_means(
     return means
 
 
+def select_topk_mask(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    num_classes: int,
+    keep_ratio: int,
+) -> tuple[np.ndarray, dict[int, int]]:
+    if keep_ratio <= 0 or keep_ratio > 100:
+        raise ValueError("kr 必须在 1-100 之间。")
+
+    scores_np = np.asarray(scores)
+    labels_np = np.asarray(labels)
+
+    if scores_np.ndim != 1:
+        raise ValueError("scores 必须是一维数组。")
+    if labels_np.ndim != 1:
+        raise ValueError("labels 必须是一维数组。")
+    if scores_np.shape[0] != labels_np.shape[0]:
+        raise ValueError("scores 与 labels 的样本数不一致。")
+    if num_classes <= 0:
+        raise ValueError("num_classes 必须大于 0。")
+
+    mask = np.zeros(scores_np.shape[0], dtype=np.uint8)
+    selected_by_class: dict[int, int] = {}
+    ratio = keep_ratio / 100.0
+
+    for class_id in range(num_classes):
+        class_indices = np.flatnonzero(labels_np == class_id)
+
+        if class_indices.size == 0:
+            selected_by_class[class_id] = 0
+            continue
+
+        if keep_ratio == 100:
+            num_select = int(class_indices.size)
+        else:
+            num_select = max(1, int(class_indices.size * ratio))
+
+        class_scores = scores_np[class_indices]
+
+        if num_select == class_indices.size:
+            selected_indices = class_indices
+        else:
+            local_topk = np.argpartition(
+                -class_scores,
+                num_select - 1,
+            )[:num_select]
+            selected_indices = class_indices[local_topk]
+
+        mask[selected_indices] = 1
+        selected_by_class[class_id] = int(num_select)
+
+    return mask, selected_by_class
+
+
 def select_group_mask(
     sa_raw_scores: np.ndarray,
     div_metric: Div,

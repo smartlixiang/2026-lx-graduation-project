@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import json
 import os
 import sys
@@ -84,7 +83,6 @@ from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
 from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
-from utils.proxy_log_utils import resolve_seed_epoch_proxy_log_dir  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
 from utils.score_utils import standard_zscore, standard_zscore_by_class  # noqa: E402
 from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
@@ -470,31 +468,6 @@ def proxy_epochs_for_dataset(dataset_name: str) -> int:
     return int(get_proxy_training_config(dataset_name)["epochs"])
 
 
-def noise_file_sha1(path: Path) -> str:
-    h = hashlib.sha1()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def noise_context(dataset_name: str, seed: int) -> dict[str, object]:
-    path = NOISE_ROOT / dataset_name / f"noise_list_{int(seed)}.txt"
-    return {
-        "dataset": dataset_name,
-        "seed": int(seed),
-        "noise_list_hash": noise_file_sha1(path) if path.is_file() else None,
-    }
-
-
-def proxy_noise_context_path(log_dir: Path) -> Path:
-    return log_dir / "context.json"
-
-
-def write_proxy_noise_context(log_dir: Path, dataset_name: str, seed: int) -> None:
-    proxy_noise_context_path(log_dir).write_text(json.dumps(noise_context(dataset_name, seed), ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def validate_noise_proxy_logs(
     log_dir: Path,
     dataset_name: str,
@@ -503,35 +476,81 @@ def validate_noise_proxy_logs(
     epochs: int,
     k_folds: int = 5,
 ) -> tuple[bool, str, int | None]:
+    if not log_dir.is_dir():
+        return False, "missing log directory", None
+
     meta_path = log_dir / "meta.json"
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception:
         return False, "missing/invalid proxy meta.json", None
-    source_epochs = int(meta.get("epochs", -1))
-    if meta.get("dataset") != dataset_name or meta.get("model") != proxy_model or int(meta.get("seed", -1)) != int(seed):
-        return False, "proxy meta dataset/model/seed mismatch", source_epochs
-    if source_epochs < int(epochs) or int(meta.get("k_folds", -1)) != int(k_folds):
-        return False, "proxy meta epochs/folds mismatch", source_epochs
+
     try:
-        side = json.loads(proxy_noise_context_path(log_dir).read_text(encoding="utf-8"))
-    except Exception:
-        return False, "missing/invalid noise context", source_epochs
-    if side != noise_context(dataset_name, seed):
-        return False, "noise context mismatch", source_epochs
+        source_epochs = int(meta.get("epochs", -1))
+    except (TypeError, ValueError):
+        return False, "invalid proxy meta epochs", None
+
+    if meta.get("dataset") != dataset_name:
+        return False, "proxy meta dataset mismatch", source_epochs
+    if meta.get("model") != proxy_model:
+        return False, "proxy meta model mismatch", source_epochs
+    try:
+        meta_seed = int(meta.get("seed", -1))
+    except (TypeError, ValueError):
+        return False, "invalid proxy meta seed", source_epochs
+    if meta_seed != int(seed):
+        return False, "proxy meta seed mismatch", source_epochs
+    try:
+        meta_k_folds = int(meta.get("k_folds", -1))
+    except (TypeError, ValueError):
+        return False, "invalid proxy meta k_folds", source_epochs
+    if meta_k_folds != int(k_folds):
+        return False, "proxy meta k_folds mismatch", source_epochs
+    if source_epochs < int(epochs):
+        return False, "proxy meta epochs below target", source_epochs
+
     for fold in range(1, int(k_folds) + 1):
         p = log_dir / f"fold_{fold}.npz"
         if not p.is_file():
             return False, f"missing {p.name}", source_epochs
         try:
             with np.load(p, allow_pickle=True) as data:
-                if "train_logits" not in data or "val_logits" not in data:
-                    return False, f"missing logits in {p.name}", source_epochs
-                if int(data["train_logits"].shape[0]) < int(epochs) or int(data["val_logits"].shape[0]) < int(epochs):
+                required = ("train_indices", "val_indices", "train_logits", "val_logits")
+                missing = [key for key in required if key not in data]
+                if missing:
+                    return False, f"missing {', '.join(missing)} in {p.name}", source_epochs
+
+                train_indices = data["train_indices"]
+                val_indices = data["val_indices"]
+                train_logits = data["train_logits"]
+                val_logits = data["val_logits"]
+
+                if train_logits.ndim != 3 or val_logits.ndim != 3:
+                    return False, f"logits must be 3D in {p.name}", source_epochs
+                if int(train_logits.shape[0]) != int(val_logits.shape[0]):
+                    return False, f"epoch dimension mismatch in {p.name}", source_epochs
+                if int(train_logits.shape[0]) < int(epochs):
                     return False, f"insufficient epochs in {p.name}", source_epochs
+                if int(train_logits.shape[1]) != len(train_indices):
+                    return False, f"train sample dimension mismatch in {p.name}", source_epochs
+                if int(val_logits.shape[1]) != len(val_indices):
+                    return False, f"val sample dimension mismatch in {p.name}", source_epochs
         except Exception as exc:
             return False, f"cannot load {p.name}: {exc}", source_epochs
     return True, "ok", source_epochs
+
+
+def _candidate_proxy_log_dirs(seed_dir: Path, target_epochs: int) -> list[tuple[int, Path]]:
+    if not seed_dir.is_dir():
+        return []
+
+    candidates: list[tuple[int, Path]] = []
+    for child in seed_dir.iterdir():
+        if child.is_dir() and child.name.isdigit():
+            candidate_epochs = int(child.name)
+            if candidate_epochs >= int(target_epochs):
+                candidates.append((candidate_epochs, child))
+    return sorted(candidates, key=lambda item: (item[0] != int(target_epochs), item[0]))
 
 
 def all_proxy_logs_exist(
@@ -542,12 +561,19 @@ def all_proxy_logs_exist(
     k_folds: int = 5,
 ) -> tuple[bool, Path, str, int | None]:
     seed_dir = PROXY_LOG_ROOT / dataset_name / proxy_model / str(int(seed))
-    try:
-        log_dir = resolve_seed_epoch_proxy_log_dir(seed_dir, int(epochs))
-    except FileNotFoundError as exc:
-        return False, seed_dir / str(int(epochs)), str(exc), None
-    valid, reason, source_epochs = validate_noise_proxy_logs(log_dir, dataset_name, proxy_model, seed, epochs, k_folds)
-    return valid, log_dir, reason, source_epochs
+    target_dir = seed_dir / str(int(epochs))
+    last_reason = "no candidate proxy log directory"
+    last_source_epochs: int | None = None
+
+    for source_epochs, log_dir in _candidate_proxy_log_dirs(seed_dir, int(epochs)):
+        valid, reason, meta_epochs = validate_noise_proxy_logs(log_dir, dataset_name, proxy_model, seed, epochs, k_folds)
+        if valid:
+            return True, log_dir, reason, meta_epochs if meta_epochs is not None else source_epochs
+        print(f"[proxy] reject log: epochs={source_epochs}, reason={reason}")
+        last_reason = reason
+        last_source_epochs = meta_epochs if meta_epochs is not None else source_epochs
+
+    return False, target_dir, last_reason, last_source_epochs
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +607,7 @@ def run_adapter_stage(args: argparse.Namespace, seed: int, device: torch.device)
     return image_path, text_path
 
 
-def run_proxy_stage(args: argparse.Namespace, seed: int, device: torch.device) -> None:
+def run_proxy_stage(args: argparse.Namespace, seed: int, device: torch.device) -> Path:
     epochs = proxy_epochs_for_dataset(args.dataset)
     valid, log_dir, reason, source_epochs = all_proxy_logs_exist(args.dataset, args.proxy_model, seed, epochs, args.k_folds)
     if valid and not args.force:
@@ -589,8 +615,10 @@ def run_proxy_stage(args: argparse.Namespace, seed: int, device: torch.device) -
             print(f"[proxy] exact log hit: epochs={epochs}, path={log_dir}")
         else:
             print(f"[proxy] reuse longer log: source_epochs={source_epochs}, target_epochs={epochs}, path={log_dir}")
-        return
+        return log_dir
 
+    if not args.force:
+        print(f"[proxy] no valid reusable log; train target_epochs={epochs}")
     print(f"[proxy] train noisy-label CV proxy | dataset={args.dataset} seed={seed} model={args.proxy_model}")
     with patched_training_label_noise(args.dataset, seed, verbose_once=True), patched_proxy_output():
         cli = [
@@ -604,10 +632,10 @@ def run_proxy_stage(args: argparse.Namespace, seed: int, device: torch.device) -
         if args.device is not None:
             cli += ["--device", str(device)]
         call_module_main(train_proxy_mod, cli)
-    write_proxy_noise_context(PROXY_LOG_ROOT / args.dataset / args.proxy_model / str(int(seed)) / str(epochs), args.dataset, seed)
+    return PROXY_LOG_ROOT / args.dataset / args.proxy_model / str(int(seed)) / str(epochs)
 
 
-def run_weight_learning_stage(args: argparse.Namespace, seed: int, device: torch.device, image_path: Path, text_path: Path) -> None:
+def run_weight_learning_stage(args: argparse.Namespace, seed: int, device: torch.device, image_path: Path, text_path: Path, proxy_log_dir: Path) -> None:
     weights_path = WEIGHTS_ROOT / "scoring_weights.json"
     epochs = proxy_epochs_for_dataset(args.dataset)
 
@@ -623,7 +651,7 @@ def run_weight_learning_stage(args: argparse.Namespace, seed: int, device: torch
         cli = [
             "--dataset", args.dataset,
             "--data-root", str(DATA_ROOT),
-            "--proxy-log", str(PROXY_LOG_ROOT),
+            "--proxy-log", str(proxy_log_dir),
             "--proxy-model", args.proxy_model,
             "--proxy-epochs", str(epochs),
             "--adapter-image-path", str(image_path),
@@ -987,8 +1015,8 @@ def run_one_seed(args: argparse.Namespace, seed: int, device: torch.device) -> N
     image_path, text_path = run_adapter_stage(args, seed, device)
 
     if args.weight_group == "learned":
-        run_proxy_stage(args, seed, device)
-        run_weight_learning_stage(args, seed, device, image_path, text_path)
+        proxy_log_dir = run_proxy_stage(args, seed, device)
+        run_weight_learning_stage(args, seed, device, image_path, text_path, proxy_log_dir)
     else:
         ensure_scoring_weights(WEIGHTS_ROOT / "scoring_weights.json", args.dataset)
         print("[weights] skip proxy and weight learning for weight_group=naive; use equal DDS/Div/SA weights.")

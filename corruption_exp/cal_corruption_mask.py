@@ -240,6 +240,7 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
     old_learn_project = learn_weights_mod.PROJECT_ROOT
     old_dyn_dir = learn_weights_mod.resolve_dynamic_component_cache_dir
     old_dyn_path = learn_weights_mod.resolve_dynamic_component_cache_path
+    old_static_cache = getattr(learn_weights_mod, "get_or_compute_static_scores", None)
 
     def adapter_dir(dataset_name: str, seed: int) -> Path:
         p = ADAPTER_ROOT / dataset_name / str(int(seed)); p.mkdir(parents=True, exist_ok=True); return p
@@ -251,12 +252,19 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
     def dyn_path(dataset: str, proxy_model: str, seed: int, epochs: int, component_name: str) -> Path:
         return dyn_dir(dataset, proxy_model, seed, epochs) / f"{component_name.strip().upper()}.npz"
 
+    def static_cache_wrapper(**kwargs):
+        kwargs["cache_root"] = STATIC_SCORE_ROOT
+        kwargs["use_file_hashes"] = False
+        return get_or_compute_static_scores(**kwargs)
+
 
     train_adapter_mod.resolve_adapter_dir = adapter_dir
     train_proxy_mod.resolve_proxy_log_dir = proxy_dir
     learn_weights_mod.PROJECT_ROOT = CORRUPTION_EXP_ROOT
     learn_weights_mod.resolve_dynamic_component_cache_dir = dyn_dir
     learn_weights_mod.resolve_dynamic_component_cache_path = dyn_path
+    if old_static_cache is not None:
+        learn_weights_mod.get_or_compute_static_scores = static_cache_wrapper
     try:
         yield
     finally:
@@ -265,6 +273,8 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
         learn_weights_mod.PROJECT_ROOT = old_learn_project
         learn_weights_mod.resolve_dynamic_component_cache_dir = old_dyn_dir
         learn_weights_mod.resolve_dynamic_component_cache_path = old_dyn_path
+        if old_static_cache is not None:
+            learn_weights_mod.get_or_compute_static_scores = old_static_cache
 
 
 def build_context(info: CorruptionInfo, args: argparse.Namespace) -> dict[str, Any]:
@@ -476,6 +486,7 @@ def stage_static_scores(args: argparse.Namespace, info: CorruptionInfo, ctx: dic
 
 
 
+
 def validate_proxy_logs(log_dir: Path, args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> tuple[bool, str]:
     meta = load_json(log_dir / "meta.json")
     if meta is None:
@@ -490,24 +501,29 @@ def validate_proxy_logs(log_dir: Path, args: argparse.Namespace, info: Corruptio
         if not p.is_file():
             return False, f"missing {p.name}"
         try:
-            with np.load(p, allow_pickle=True) as data:
+            with np.load(p, allow_pickle=False) as data:
                 required = {"train_indices", "val_indices", "train_logits", "val_logits"}
                 if not required.issubset(set(data.files)):
                     return False, f"invalid {p.name}"
                 train_indices = np.asarray(data["train_indices"])
                 val_indices = np.asarray(data["val_indices"])
-                train_logits = np.asarray(data["train_logits"])
-                val_logits = np.asarray(data["val_logits"])
-                if train_logits.ndim != 3 or val_logits.ndim != 3:
+                if train_indices.ndim != 1 or val_indices.ndim != 1:
+                    return False, f"indices must be 1D in {p.name}"
+                train_shape = data["train_logits"].shape
+                val_shape = data["val_logits"].shape
+                if len(train_shape) != 3 or len(val_shape) != 3:
                     return False, f"invalid logits rank in {p.name}"
-                if train_logits.shape[1] != train_indices.shape[0] or val_logits.shape[1] != val_indices.shape[0]:
+                if train_shape[0] != val_shape[0]:
+                    return False, f"train/val epoch mismatch in {p.name}"
+                if train_shape[2] != val_shape[2] or train_shape[2] <= 0:
+                    return False, f"train/val class dimension mismatch in {p.name}"
+                if train_shape[1] != train_indices.shape[0] or val_shape[1] != val_indices.shape[0]:
                     return False, f"logits/index length mismatch in {p.name}"
-                if train_logits.shape[0] < target_epochs or val_logits.shape[0] < target_epochs:
+                if train_shape[0] < target_epochs or val_shape[0] < target_epochs:
                     return False, f"insufficient epochs in {p.name}"
         except Exception as exc:
             return False, f"cannot load {p.name}: {exc}"
     return True, "ok"
-
 
 
 def stage_proxy(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> Path:
@@ -545,8 +561,8 @@ def stage_proxy(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, A
 
 
 
+
 def load_valid_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> dict[str, float] | None:
-    del args
     data = load_json(WEIGHTS_PATH) or {}
     entry = ((data.get(info.dataset) or {}).get(str(info.seed)) if isinstance(data.get(info.dataset), dict) else None)
     if not isinstance(entry, dict):
@@ -556,7 +572,12 @@ def load_valid_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict
         return None
     if entry.get("transferability_component") != "TransferabilityScore":
         return None
-    if abs(float(entry.get("ratio_lambda", np.nan)) - 1e-3) > 1e-12:
+    expected_ratio_lambda = float(args.ratio_lambda)
+    try:
+        saved_ratio_lambda = float(entry.get("ratio_lambda", np.nan))
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(saved_ratio_lambda) or abs(saved_ratio_lambda - expected_ratio_lambda) > 1e-12:
         return None
     ectx = entry.get("corruption_context")
     if isinstance(ectx, dict):
@@ -566,10 +587,14 @@ def load_valid_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict
     return vals
 
 
-def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> dict[str, float]:
+def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any], proxy_log_dir: Path | None = None) -> dict[str, float]:
     if args.weight_group == "naive":
         tqdm.write("skip proxy/dynamic/weight-learning for naive weights")
         return {"sa": 1/3, "div": 1/3, "dds": 1/3}
+    if proxy_log_dir is None:
+        raise ValueError("proxy_log_dir is required for learned corruption weights.")
+    if not proxy_log_dir.is_dir():
+        raise FileNotFoundError(f"validated proxy log directory not found: {proxy_log_dir}")
     if not args.force:
         valid = load_valid_weights(args, info, ctx)
         if valid is not None:
@@ -578,7 +603,7 @@ def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str,
     tqdm.write("Learned weights cache MISS→LEARN")
     migrate_dynamic_caches(args, info)
     img_p, txt_p = adapter_paths(info.dataset, info.seed)
-    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), proxy_log=str(PROXY_LOG_ROOT), proxy_model=args.proxy_model, proxy_epochs=int(ctx["proxy_epochs"]), adapter_image_path=str(img_p), adapter_text_path=str(txt_p), clip_model=args.clip_model, batch_size=args.batch_size, num_workers=args.num_workers, div_k=0.05, dds_k=5, dds_important_eigval_ratio=0.8, coverage_tau_g=0.15, coverage_s_g=0.07, coverage_k_pct=0.05, coverage_q_low=0.002, coverage_q_high=0.998, ridge_lambda=0.01, learning_rate=1e-2, max_iter=10000, tol=1e-6, ratio_lambda=args.ratio_lambda, regression_learning_rate=2e-3, regression_max_iter=10000, regression_tol=1e-8, output=str(WEIGHTS_PATH), device=args.device, debug_prompts=args.debug_prompts, seed=str(info.seed), proxy_training_seed=None)
+    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), proxy_log=str(proxy_log_dir), proxy_model=args.proxy_model, proxy_epochs=int(ctx["proxy_epochs"]), adapter_image_path=str(img_p), adapter_text_path=str(txt_p), clip_model=args.clip_model, batch_size=args.batch_size, num_workers=args.num_workers, div_k=0.05, dds_k=5, dds_important_eigval_ratio=0.8, coverage_tau_g=0.15, coverage_s_g=0.07, coverage_k_pct=0.05, coverage_q_low=0.002, coverage_q_high=0.998, ridge_lambda=0.01, learning_rate=1e-2, max_iter=10000, tol=1e-6, ratio_lambda=args.ratio_lambda, regression_learning_rate=2e-3, regression_max_iter=10000, regression_tol=1e-8, output=str(WEIGHTS_PATH), device=args.device, debug_prompts=args.debug_prompts, seed=str(info.seed), proxy_training_seed=None)
     tqdm.write(f"[weights] ratio_lambda={float(args.ratio_lambda):.12g}")
     with patched_project_paths(), patched_training_corruption(info.dataset, info):
         learn_weights_mod.run_once(ns, [info.seed])
@@ -713,11 +738,11 @@ def run_seed(args: argparse.Namespace, seed: int, keep_ratios: list[int]) -> Non
         scores = stage_static_scores(args, info, ctx); bar.update(1)
         if args.weight_group == "learned":
             tqdm.write(f"[3/{len(stages)}] Proxy CV")
-            stage_proxy(args, info, ctx); bar.update(1)
+            proxy_log_dir = stage_proxy(args, info, ctx); bar.update(1)
             tqdm.write(f"[4/{len(stages)}] Dynamic supervision and weights")
-            weights = stage_weights(args, info, ctx); bar.update(1)
+            weights = stage_weights(args, info, ctx, proxy_log_dir=proxy_log_dir); bar.update(1)
         else:
-            weights = stage_weights(args, info, ctx)
+            weights = stage_weights(args, info, ctx, proxy_log_dir=None)
         tqdm.write(f"[{len(stages)}/{len(stages)}] Group masks")
         stage_masks(args, info, scores, weights, keep_ratios); bar.update(1)
 

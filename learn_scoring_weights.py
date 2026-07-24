@@ -41,7 +41,7 @@ from utils.static_score_cache import NORMALIZATION_VERSION, get_or_compute_stati
 from weights import (
     AbsorptionGainScore,
     ConfusionComplementarityScore,
-    TransferabilityAlignmentScore,
+    TransferabilityScore,
 )
 from weights.dynamic_utils import DynamicComponentResult, FoldLogData, load_cv_fold_logs, resolve_epoch_windows
 
@@ -402,8 +402,6 @@ def load_dynamic_component_cache_if_valid(
                 return None
             if int(data["epochs"].item()) != int(epochs):
                 return None
-            if str(data["proxy_log_path"].item()) != str(proxy_log_path):
-                return None
             if str(data["normalization"].item()) != NORMALIZATION_VERSION:
                 return None
             labels_cached = np.asarray(data["labels"], dtype=np.int64)
@@ -754,7 +752,7 @@ def load_or_compute_dynamic_supervision_for_seed(
     component_compute_fns: dict[str, Callable[[], DynamicComponentResult]] = {
         "A": lambda: AbsorptionGainScore().compute(folds=folds, labels_all=labels_all),
         "C": lambda: ConfusionComplementarityScore().compute(folds=folds, labels_all=labels_all),
-        "T": lambda: TransferabilityAlignmentScore().compute(folds=folds, labels_all=labels_all),
+        "T": lambda: TransferabilityScore().compute(folds=folds, labels_all=labels_all),
     }
     component_results: dict[str, DynamicComponentResult] = {}
     for name in COMPONENT_NAMES:
@@ -974,6 +972,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "bias": float(bias),
             "method_version": METHOD_VERSION,
             "ratio_lambda": float(args.ratio_lambda),
+            "transferability_component": "TransferabilityScore",
             "proxy_log": str(proxy_log) if proxy_log is not None else "",
             "dynamic_components": list(COMPONENT_NAMES),
             "dynamic_cache_path": str(dynamic_cache_dir),

@@ -48,6 +48,19 @@ def _parse_param_dir_name(name: str) -> dict[str, str] | None:
     return match.groupdict()
 
 
+def resolve_static_score_cache_dir(
+    cache_root: str | Path,
+    dataset: str,
+    seed: int,
+    div_k: float,
+    dds_eigval_lower_bound: float,
+    dds_eigval_upper_bound: float,
+) -> Path:
+    """Resolve the canonical static score cache directory without creating it."""
+    param_dir = _build_param_dir_name(div_k, dds_eigval_lower_bound, dds_eigval_upper_bound)
+    return Path(cache_root) / _sanitize(dataset) / str(int(seed)) / param_dir
+
+
 def _build_cache_dir(
     cache_root: Path,
     dataset: str,
@@ -56,8 +69,7 @@ def _build_cache_dir(
     dds_lower: float,
     dds_upper: float,
 ) -> Path:
-    param_dir = _build_param_dir_name(div_k, dds_lower, dds_upper)
-    cache_dir = cache_root / _sanitize(dataset) / str(int(seed)) / param_dir
+    cache_dir = resolve_static_score_cache_dir(cache_root, dataset, seed, div_k, dds_lower, dds_upper)
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -126,6 +138,7 @@ def get_or_compute_static_scores(
     prompt_template: str,
     num_samples: int,
     compute_fn: Callable[[], dict[str, np.ndarray]],
+    use_file_hashes: bool = True,
 ) -> dict[str, np.ndarray]:
     cache_root = Path(cache_root)
     cache_dir = _build_cache_dir(
@@ -143,8 +156,6 @@ def get_or_compute_static_scores(
         "clip_model": clip_model,
         "adapter_image_path": adapter_image_path or "",
         "adapter_text_path": adapter_text_path or "",
-        "adapter_image_sha1": _hash_file(Path(adapter_image_path)) if adapter_image_path else "",
-        "adapter_text_sha1": _hash_file(Path(adapter_text_path)) if adapter_text_path else "",
         "div_k": float(div_k),
         "dds_k": int(dds_k),
         "dds_eigval_lower_bound": float(dds_eigval_lower_bound),
@@ -154,6 +165,9 @@ def get_or_compute_static_scores(
         "score_storage": NORMALIZATION_VERSION,
         "score_version": NORMALIZATION_VERSION,
     }
+    if use_file_hashes:
+        meta["adapter_image_sha1"] = _hash_file(Path(adapter_image_path)) if adapter_image_path else ""
+        meta["adapter_text_sha1"] = _hash_file(Path(adapter_text_path)) if adapter_text_path else ""
 
     cached: dict[str, np.ndarray] = {}
     labels_ref: np.ndarray | None = None
@@ -205,4 +219,4 @@ def get_or_compute_static_scores(
     }
 
 
-__all__ = ["get_or_compute_static_scores", "NORMALIZATION_VERSION"]
+__all__ = ["get_or_compute_static_scores", "resolve_static_score_cache_dir", "NORMALIZATION_VERSION"]

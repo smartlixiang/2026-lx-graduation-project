@@ -5,8 +5,8 @@
     "exp": "corruption",
     "result_root": "result_corruption",
     "model": "resnet50",
-    "keep_ratio": 30,
-    "selection_method": "corruption_learned_group",
+    "keep_ratio": 50,
+    "selection_method": "corruption_GraNd",
     "seed": 22,
     "epochs": 90,
     "batch_size": 64,
@@ -27,7 +27,7 @@
       ],
       "gamma": 0.1
     },
-    "num_selected": 30000,
+    "num_selected": 50000,
     "num_total": 100000,
     "corruption_root": "corruption_data",
     "corruption_path": "corruption_data/tiny-imagenet/corruption_list_22.txt",
@@ -40,30 +40,30 @@
       "fog": 4000,
       "motion_blur": 4000
     },
-    "num_corrupted_selected": 776,
-    "corruption_ratio_in_selection": 0.025866666666666666,
+    "num_corrupted_selected": 13880,
+    "corruption_ratio_in_selection": 0.2776,
     "selected_corruption_type_counts": {
-      "gaussian_noise": 338,
-      "partial_occlusion": 144,
-      "resolution_degradation": 98,
-      "fog": 85,
-      "motion_blur": 111
+      "gaussian_noise": 2750,
+      "partial_occlusion": 2555,
+      "resolution_degradation": 2752,
+      "fog": 3219,
+      "motion_blur": 2604
     }
   },
-  "accuracy": 0.3932,
-  "accuracy_mean": 0.3932,
-  "accuracy_std": 0.0021,
+  "accuracy": 0.3044,
+  "accuracy_mean": 0.3044,
+  "accuracy_std": 0.0019,
   "accuracy_samples": [
-    0.3973,
-    0.3935,
-    0.394,
-    0.3955,
-    0.3932,
-    0.394,
-    0.3914,
-    0.3925,
-    0.3897,
-    0.3909
+    0.304,
+    0.3014,
+    0.3045,
+    0.308,
+    0.3061,
+    0.3039,
+    0.3068,
+    0.3033,
+    0.3026,
+    0.3037
   ],
-  "time_seconds": 3707.2781257629395
+  "time_seconds": 6132.333504199982
 }

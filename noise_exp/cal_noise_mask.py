@@ -73,8 +73,6 @@ PROXY_LOG_ROOT = WEIGHTS_ROOT / "proxy_logs"
 DYNAMIC_CACHE_ROOT = WEIGHTS_ROOT / "dynamic_cache"
 STATIC_SCORE_ROOT = NOISE_EXP_ROOT / "static_scores"
 MASK_ROOT = NOISE_EXP_ROOT / "mask"
-NOISE_PRIOR_RATIO = 0.2
-NOISE_RISK_FACTOR = float(1.0 - np.sqrt(NOISE_PRIOR_RATIO))
 
 # Project imports are intentionally placed after sys.path is set.
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET  # noqa: E402
@@ -136,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-prompts", action="store_true")
     parser.add_argument("--skip-saved", action="store_true", help="Skip existing final masks.")
     parser.add_argument("--force", action="store_true", help="Rerun intermediate stages even if files exist.")
-    parser.add_argument("--ratio-lambda", type=float, default=5e-3)
+    parser.add_argument("--ratio-lambda", type=float, default=1e-3)
     parser.add_argument("--regression-learning-rate", type=float, default=2e-3)
     parser.add_argument("--regression-max-iter", type=int, default=10000)
     parser.add_argument("--regression-tol", type=float, default=1e-8)
@@ -412,6 +410,7 @@ def patched_weight_learning_paths() -> Iterator[None]:
 
     def _static_cache_wrapper(**kwargs):
         kwargs["cache_root"] = STATIC_SCORE_ROOT
+        kwargs["use_file_hashes"] = False
         return get_or_compute_static_scores(**kwargs)
 
     if old_cache_dir is not None:
@@ -640,10 +639,7 @@ def run_weight_learning_stage(args: argparse.Namespace, seed: int, device: torch
     epochs = proxy_epochs_for_dataset(args.dataset)
 
     print(f"[weights] learn static-score weights | dataset={args.dataset} seed={seed}")
-    base_ratio_lambda = float(args.ratio_lambda)
-    scaled_ratio_lambda = base_ratio_lambda * (NOISE_RISK_FACTOR ** 2)
-    # 标签注噪实验中动态监督更不稳定，按先验噪声风险因子的平方降低 ratio 正则强度。
-    print(f"[weights] ratio_lambda scaled by noise factor: base={base_ratio_lambda}, scaled={scaled_ratio_lambda}")
+    print(f"[weights] ratio_lambda={float(args.ratio_lambda):.12g}")
     with (
         patched_training_label_noise(args.dataset, seed, verbose_once=True),
         patched_weight_learning_paths(),
@@ -662,7 +658,7 @@ def run_weight_learning_stage(args: argparse.Namespace, seed: int, device: torch
             "--output", str(weights_path),
             "--seed", str(seed),
             "--proxy-training-seed", str(seed),
-            "--ratio-lambda", f"{scaled_ratio_lambda:.12g}",
+            "--ratio-lambda", f"{float(args.ratio_lambda):.12g}",
             "--regression-learning-rate", str(args.regression_learning_rate),
             "--regression-max-iter", str(args.regression_max_iter),
             "--regression-tol", str(args.regression_tol),
@@ -919,6 +915,7 @@ def run_mask_stage(args: argparse.Namespace, seed: int, device: torch.device, im
         prompt_template=sa_metric.prompt_template,
         num_samples=num_samples,
         compute_fn=_compute_scores,
+        use_file_hashes=False,
     )
 
     sa_scores_np = np.asarray(static_scores["sa"], dtype=np.float32)

@@ -2,10 +2,10 @@
 
 from .AbsorptionGainScore import AbsorptionGainScore
 from .ConfusionComplementarityScore import ConfusionComplementarityScore
-from .TransferabilityAlignmentScore import TransferabilityAlignmentScore
+from .TransferabilityScore import TransferabilityScore
 
 __all__ = [
     "AbsorptionGainScore",
     "ConfusionComplementarityScore",
-    "TransferabilityAlignmentScore",
+    "TransferabilityScore",
 ]

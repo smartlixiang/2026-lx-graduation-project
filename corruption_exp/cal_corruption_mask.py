@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import json
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,7 +66,7 @@ from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.proxy_log_utils import resolve_seed_epoch_proxy_log_dir  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
-from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
+from utils.static_score_cache import get_or_compute_static_scores, resolve_static_score_cache_dir  # noqa: E402
 from utils.training_defaults import get_proxy_training_config  # noqa: E402
 import calculate_my_mask as mask_mod  # noqa: E402
 import learn_scoring_weights as learn_weights_mod  # noqa: E402
@@ -79,19 +79,10 @@ class CorruptionInfo:
     dataset: str
     seed: int
     list_path: Path
-    list_hash: str
     num_samples: int
     corruption_types: np.ndarray
     is_corrupted: np.ndarray
     type_counts: dict[str, int]
-
-
-def sha1_file(path: Path) -> str:
-    h = hashlib.sha1()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def parse_ratio_list(text: str) -> list[int]:
@@ -164,7 +155,7 @@ def load_corruption_info(dataset_name: str, seed: int, *, num_samples: int | Non
         raise ValueError(f"corruption type counts must be equal ({expected_per_type} each), got {counts}")
     corruption_types = np.full(num_samples, -1, dtype=np.int16)
     corruption_types[sample_ids] = type_ids.astype(np.int16)
-    return CorruptionInfo(dataset_name, int(seed), path, sha1_file(path), num_samples, corruption_types, corruption_types >= 0, counts)
+    return CorruptionInfo(dataset_name, int(seed), path, num_samples, corruption_types, corruption_types >= 0, counts)
 
 
 class FixedCorruptionDataset(Dataset):
@@ -256,10 +247,7 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
         if seed is None: raise ValueError("seed required")
         return PROXY_LOG_ROOT / dataset / proxy_model / str(int(seed)) / str(int(epochs))
     def dyn_dir(dataset: str, proxy_model: str, seed: int, epochs: int) -> Path:
-        base = DYNAMIC_CACHE_ROOT / dataset / proxy_model / str(int(seed)) / str(int(epochs))
-        if corruption_info is not None:
-            return base / f"corruption_{corruption_info.list_hash}"
-        return base
+        return DYNAMIC_CACHE_ROOT / dataset / proxy_model / str(int(seed)) / str(int(epochs))
     def dyn_path(dataset: str, proxy_model: str, seed: int, epochs: int, component_name: str) -> Path:
         return dyn_dir(dataset, proxy_model, seed, epochs) / f"{component_name.strip().upper()}.npz"
 
@@ -279,17 +267,20 @@ def patched_project_paths(corruption_info: CorruptionInfo | None = None) -> Iter
         learn_weights_mod.resolve_dynamic_component_cache_path = old_dyn_path
 
 
-def context_path(dataset: str, seed: int) -> Path:
-    return CORRUPTION_EXP_ROOT / "contexts" / dataset / str(int(seed)) / "context.json"
-
-
 def build_context(info: CorruptionInfo, args: argparse.Namespace) -> dict[str, Any]:
     cfg = get_proxy_training_config(info.dataset)
     return {
-        "dataset": info.dataset, "seed": int(info.seed), "num_samples": int(info.num_samples),
-        "num_corrupted": int(info.is_corrupted.sum()), "corruption_ratio": float(info.is_corrupted.mean()),
-        "corruption_list_hash": info.list_hash, "corruption_type_counts": info.type_counts,
-        "proxy_model": args.proxy_model, "proxy_epochs": int(cfg["epochs"]), "clip_model": args.clip_model,
+        "dataset": info.dataset,
+        "seed": int(info.seed),
+        "num_samples": int(info.num_samples),
+        "num_corrupted": int(info.is_corrupted.sum()),
+        "corruption_ratio": float(info.is_corrupted.mean()),
+        "corruption_type_counts": info.type_counts,
+        "proxy_model": args.proxy_model,
+        "proxy_epochs": int(cfg["epochs"]),
+        "clip_model": args.clip_model,
+        "ratio_lambda": float(args.ratio_lambda),
+        "transferability_component": "TransferabilityScore",
     }
 
 
@@ -300,50 +291,158 @@ def load_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def save_context(ctx: dict[str, Any]) -> None:
-    p = context_path(ctx["dataset"], int(ctx["seed"])); p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(ctx, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def context_matches(ctx: dict[str, Any] | None, expected: dict[str, Any], *, keys: tuple[str, ...] | None = None) -> tuple[bool, str]:
-    if ctx is None: return False, "missing context.json"
-    keys = keys or tuple(expected.keys())
-    for k in keys:
-        if ctx.get(k) != expected.get(k):
-            return False, f"context mismatch: {k}"
-    return True, "ok"
-
-
 def adapter_paths(dataset: str, seed: int) -> tuple[Path, Path]:
     d = ADAPTER_ROOT / dataset / str(int(seed)); return d / "adapter_image.pt", d / "adapter_context.pt"
 
 
-def stage_adapter(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> dict[str, str]:
+def stage_adapter(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> None:
+    del ctx
     image_p, text_p = adapter_paths(info.dataset, info.seed)
-    ok_ctx, reason = context_matches(load_json(context_path(info.dataset, info.seed)), ctx, keys=("dataset", "seed", "corruption_list_hash", "clip_model"))
-    valid = ok_ctx and image_p.is_file() and text_p.is_file()
+    valid = image_p.is_file() and text_p.is_file()
+    reason = "missing adapter files"
     if valid:
         try:
             extractor = CLIPFeatureExtractor(model_name=args.clip_model, device=torch.device(args.device) if args.device else CONFIG.global_device)
             load_trained_adapters(info.dataset, args.clip_model, extractor.embed_dim, info.seed, adapter_image_path=image_p, adapter_text_path=text_p, map_location="cpu")
             tqdm.write(f"Adapter cache HIT: {image_p.parent}")
         except Exception as exc:
-            valid = False; reason = f"adapter load failed: {exc}"
-    if args.force: valid = False; reason = "forced by --force"
+            valid = False
+            reason = f"adapter load failed: {exc}"
+    if args.force:
+        valid = False
+        reason = "forced by --force"
     if not valid:
         tqdm.write(f"Adapter cache MISS→TRAIN ({reason})")
         ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), clip_model=args.clip_model, prompt_template="a photo of a {}", batch_size=args.batch_size, num_workers=args.num_workers, epochs=30, lr=1e-4, weight_decay=0.0, hidden_dim=256, temperature=0.07, step_size=30, gamma=0.1, device=args.device, seed=str(info.seed), debug_prompts=args.debug_prompts)
         with patched_project_paths(), patched_training_corruption(info.dataset, info):
             train_adapter_mod.train_for_seed(ns, info.seed, False)
-    adapter_hashes = {"adapter_image_sha1": sha1_file(image_p), "adapter_text_sha1": sha1_file(text_p)}
-    ctx.update(adapter_hashes); save_context(ctx)
-    return adapter_hashes
 
 
 def build_class_names(dataset: str, data_root: Path = DATA_ROOT):
     ds = build_raw_train_dataset(dataset, data_root)
     return resolve_class_names_for_prompts(dataset_name=dataset, data_root=str(data_root), class_names=ds.classes)
 
+
+
+def _cleanup_empty_dirs(path: Path, stop: Path) -> None:
+    cur = path
+    stop = stop.resolve()
+    while cur.exists() and cur.resolve() != stop:
+        try:
+            cur.rmdir()
+        except OSError:
+            break
+        cur = cur.parent
+
+
+def migrate_dynamic_component_cache(dataset: str, proxy_model: str, seed: int, epochs: int, component_name: str, labels: np.ndarray) -> None:
+    if component_name not in {"A", "C"}:
+        return
+    base = DYNAMIC_CACHE_ROOT / dataset / proxy_model / str(int(seed)) / str(int(epochs))
+    canonical = base / f"{component_name}.npz"
+    if canonical.is_file() or not base.exists():
+        return
+    valid: list[Path] = []
+    for candidate in base.rglob(f"{component_name}.npz"):
+        if candidate == canonical:
+            continue
+        result, cached_labels, reason = learn_weights_mod._load_dynamic_component_cache_with_reason(
+            cache_path=candidate,
+            component_name=component_name,
+            dataset=dataset,
+            proxy_model=proxy_model,
+            proxy_training_seed=seed,
+            epochs=epochs,
+        )
+        if result is not None and cached_labels is not None and np.array_equal(cached_labels, labels):
+            valid.append(candidate)
+        else:
+            tqdm.write(f"Dynamic cache migration skip {candidate}: {reason}")
+    if not valid:
+        return
+    if len(valid) > 1:
+        raise RuntimeError(f"multiple valid {component_name} dynamic cache candidates under {base}: {valid}")
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(valid[0]), str(canonical))
+    tqdm.write(f"Dynamic cache migrated: {valid[0]} -> {canonical}")
+    _cleanup_empty_dirs(valid[0].parent, base)
+
+
+def migrate_dynamic_caches(args: argparse.Namespace, info: CorruptionInfo) -> None:
+    raw = build_raw_train_dataset(info.dataset)
+    labels = extract_labels(raw)
+    epochs = int(get_proxy_training_config(info.dataset)["epochs"])
+    for component_name in ("A", "C"):
+        migrate_dynamic_component_cache(info.dataset, args.proxy_model, info.seed, epochs, component_name, labels)
+
+
+def _static_bundle_valid(cache_dir: Path, expected: dict[str, object], labels: np.ndarray) -> bool:
+    required = ("SA_cache.npz", "Div_cache.npz", "DDS_cache.npz")
+    if not all((cache_dir / name).is_file() for name in required):
+        return False
+    for filename in required:
+        try:
+            with np.load(cache_dir / filename, allow_pickle=False) as data:
+                if not {"scores", "labels", "indices", "meta"}.issubset(set(data.files)):
+                    return False
+                meta = json.loads(str(data["meta"]))
+                for key, value in expected.items():
+                    if meta.get(key) != value:
+                        return False
+                cached_labels = np.asarray(data["labels"], dtype=np.int64)
+                indices = np.asarray(data["indices"])
+                scores = np.asarray(data["scores"])
+                if not np.array_equal(cached_labels, labels):
+                    return False
+                if scores.shape != labels.shape or indices.shape != labels.shape:
+                    return False
+                if not np.array_equal(indices, np.arange(labels.shape[0], dtype=indices.dtype)):
+                    return False
+        except Exception:
+            return False
+    return True
+
+
+def migrate_static_score_cache(args: argparse.Namespace, info: CorruptionInfo, div: Div, dds: DifficultyDirection, sa: SemanticAlignment, labels: np.ndarray, img_p: Path, txt_p: Path) -> Path:
+    canonical = resolve_static_score_cache_dir(STATIC_SCORE_ROOT, info.dataset, info.seed, div.k, dds.eigval_lower_bound, dds.eigval_upper_bound)
+    required = ("SA_cache.npz", "Div_cache.npz", "DDS_cache.npz")
+    if all((canonical / name).is_file() for name in required):
+        return canonical
+    expected = {
+        "dataset": info.dataset,
+        "seed": int(info.seed),
+        "clip_model": args.clip_model,
+        "adapter_image_path": str(img_p),
+        "adapter_text_path": str(txt_p),
+        "div_k": float(div.k),
+        "dds_k": int(dds.k),
+        "dds_eigval_lower_bound": float(dds.eigval_lower_bound),
+        "dds_eigval_upper_bound": float(dds.eigval_upper_bound),
+        "prompt_template": sa.prompt_template,
+        "num_samples": int(info.num_samples),
+        "score_storage": "raw_static_scores_v1",
+        "score_version": "raw_static_scores_v1",
+    }
+    root = STATIC_SCORE_ROOT / info.dataset / str(info.seed)
+    if not root.exists():
+        return canonical
+    valid = []
+    for sa_file in root.rglob("SA_cache.npz"):
+        candidate = sa_file.parent
+        if candidate == canonical:
+            continue
+        if _static_bundle_valid(candidate, expected, labels):
+            valid.append(candidate)
+    if not valid:
+        return canonical
+    if len(valid) > 1:
+        raise RuntimeError(f"multiple valid static cache bundles under {root}: {valid}")
+    canonical.mkdir(parents=True, exist_ok=True)
+    for name in required:
+        shutil.move(str(valid[0] / name), str(canonical / name))
+    tqdm.write(f"Static score cache migrated: {valid[0]} -> {canonical}")
+    _cleanup_empty_dirs(valid[0], root)
+    return canonical
 
 def stage_static_scores(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> dict[str, np.ndarray]:
     device = torch.device(args.device) if args.device else CONFIG.global_device
@@ -355,7 +454,6 @@ def stage_static_scores(args: argparse.Namespace, info: CorruptionInfo, ctx: dic
     image_adapter, text_adapter, _ = load_trained_adapters(info.dataset, args.clip_model, dds.extractor.embed_dim, info.seed, map_location=device, adapter_image_path=img_p, adapter_text_path=txt_p)
     image_adapter.to(device).eval(); text_adapter.to(device).eval()
     raw = build_raw_train_dataset(info.dataset); labels = extract_labels(raw)
-    cache_root = STATIC_SCORE_ROOT / info.dataset / str(info.seed) / f"corruption_{info.list_hash[:12]}"
 
     def loader(preprocess):
         ds = FixedCorruptionDataset(build_raw_train_dataset(info.dataset), preprocess, None, corruption_info=info)
@@ -367,72 +465,105 @@ def stage_static_scores(args: argparse.Namespace, info: CorruptionInfo, ctx: dic
             "sa": np.asarray(sa.score_dataset(tqdm(loader(sa.extractor.preprocess), desc="Scoring SA", unit="batch"), adapter_image=image_adapter, adapter_text=text_adapter).scores),
             "labels": labels,
         }
-    before = sorted(cache_root.rglob("*.npz")) if cache_root.exists() else []
-    scores = get_or_compute_static_scores(cache_root=cache_root, dataset=info.dataset, seed=info.seed, clip_model=args.clip_model, adapter_image_path=str(img_p), adapter_text_path=str(txt_p), div_k=div.k, dds_k=dds.k, dds_eigval_lower_bound=dds.eigval_lower_bound, dds_eigval_upper_bound=dds.eigval_upper_bound, prompt_template=sa.prompt_template, num_samples=info.num_samples, compute_fn=compute)
+    cache_dir = migrate_static_score_cache(args, info, div, dds, sa, labels, img_p, txt_p)
+    before = sorted(cache_dir.rglob("*.npz")) if cache_dir.exists() else []
+    scores = get_or_compute_static_scores(cache_root=STATIC_SCORE_ROOT, dataset=info.dataset, seed=info.seed, clip_model=args.clip_model, adapter_image_path=str(img_p), adapter_text_path=str(txt_p), div_k=div.k, dds_k=dds.k, dds_eigval_lower_bound=dds.eigval_lower_bound, dds_eigval_upper_bound=dds.eigval_upper_bound, prompt_template=sa.prompt_template, num_samples=info.num_samples, compute_fn=compute, use_file_hashes=False)
     if not np.array_equal(np.asarray(scores["labels"], dtype=np.int64), labels):
         raise ValueError("static score labels do not match original clean labels")
-    after = sorted(cache_root.rglob("*.npz")) if cache_root.exists() else []
-    tqdm.write(f"Static scores cache {'HIT' if before and before == after else 'MISS→COMPUTED'}: {cache_root}")
+    after = sorted(cache_dir.rglob("*.npz")) if cache_dir.exists() else []
+    tqdm.write(f"Static scores cache {'HIT' if before and before == after else 'MISS→COMPUTED'}: {cache_dir}")
     return scores
+
 
 
 def validate_proxy_logs(log_dir: Path, args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> tuple[bool, str]:
     meta = load_json(log_dir / "meta.json")
-    if meta is None: return False, "missing/invalid proxy meta.json"
-    if meta.get("dataset") != info.dataset or int(meta.get("seed", -1)) != info.seed: return False, "proxy meta dataset/seed mismatch"
-    if int(meta.get("epochs", -1)) < int(ctx["proxy_epochs"]) or int(meta.get("k_folds", -1)) != int(args.k_folds): return False, "proxy meta epochs/folds mismatch"
-    side = load_json(log_dir / "context.json")
-    ok, reason = context_matches(side, ctx, keys=("dataset", "seed", "corruption_list_hash", "proxy_model"))
-    if ok and int(side.get("proxy_epochs", -1)) < int(ctx["proxy_epochs"]): return False, "context proxy_epochs too short"
-    if not ok: return False, reason
+    if meta is None:
+        return False, "missing/invalid proxy meta.json"
+    target_epochs = int(ctx["proxy_epochs"])
+    if meta.get("dataset") != info.dataset or meta.get("model") != args.proxy_model or int(meta.get("seed", -1)) != info.seed:
+        return False, "proxy meta dataset/model/seed mismatch"
+    if int(meta.get("epochs", -1)) < target_epochs or int(meta.get("k_folds", -1)) != int(args.k_folds):
+        return False, "proxy meta epochs/folds mismatch"
     for fold in range(1, int(args.k_folds) + 1):
         p = log_dir / f"fold_{fold}.npz"
-        if not p.is_file(): return False, f"missing {p.name}"
+        if not p.is_file():
+            return False, f"missing {p.name}"
         try:
             with np.load(p, allow_pickle=True) as data:
-                if "train_indices" not in data or "val_indices" not in data or "train_logits" not in data or "val_logits" not in data:
+                required = {"train_indices", "val_indices", "train_logits", "val_logits"}
+                if not required.issubset(set(data.files)):
                     return False, f"invalid {p.name}"
-                if int(data["train_logits"].shape[0]) < int(ctx["proxy_epochs"]) or int(data["val_logits"].shape[0]) < int(ctx["proxy_epochs"]):
+                train_indices = np.asarray(data["train_indices"])
+                val_indices = np.asarray(data["val_indices"])
+                train_logits = np.asarray(data["train_logits"])
+                val_logits = np.asarray(data["val_logits"])
+                if train_logits.ndim != 3 or val_logits.ndim != 3:
+                    return False, f"invalid logits rank in {p.name}"
+                if train_logits.shape[1] != train_indices.shape[0] or val_logits.shape[1] != val_indices.shape[0]:
+                    return False, f"logits/index length mismatch in {p.name}"
+                if train_logits.shape[0] < target_epochs or val_logits.shape[0] < target_epochs:
                     return False, f"insufficient epochs in {p.name}"
         except Exception as exc:
             return False, f"cannot load {p.name}: {exc}"
     return True, "ok"
 
 
+
 def stage_proxy(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> Path:
     seed_dir = PROXY_LOG_ROOT / info.dataset / args.proxy_model / str(info.seed)
-    try:
-        log_dir = resolve_seed_epoch_proxy_log_dir(seed_dir, int(ctx["proxy_epochs"]))
-        valid, reason = validate_proxy_logs(log_dir, args, info, ctx)
-    except FileNotFoundError as exc:
-        log_dir = seed_dir / str(ctx["proxy_epochs"]); valid = False; reason = str(exc)
-    if args.force: valid = False; reason = "forced by --force"
-    if valid:
-        source_epochs = int(log_dir.name) if log_dir.name.isdigit() else int(ctx["proxy_epochs"])
-        if source_epochs == int(ctx["proxy_epochs"]):
-            tqdm.write(f"[proxy] exact log hit: epochs={ctx['proxy_epochs']}, path={log_dir}")
-        else:
-            tqdm.write(f"[proxy] reuse longer log: source_epochs={source_epochs}, target_epochs={ctx['proxy_epochs']}, path={log_dir}")
-        tqdm.write(f"Proxy CV cache HIT: {log_dir}"); return log_dir
-    log_dir = seed_dir / str(ctx["proxy_epochs"])
+    target_epochs = int(ctx["proxy_epochs"])
+    candidates: list[Path] = []
+    exact = seed_dir / str(target_epochs)
+    if exact.exists():
+        candidates.append(exact)
+    if seed_dir.exists():
+        longer = sorted((p for p in seed_dir.iterdir() if p.is_dir() and p.name.isdigit() and int(p.name) > target_epochs), key=lambda p: int(p.name))
+        candidates.extend([p for p in longer if p not in candidates])
+    reason = "no candidate proxy logs"
+    if not args.force:
+        for log_dir in candidates:
+            valid, reason = validate_proxy_logs(log_dir, args, info, ctx)
+            if valid:
+                source_epochs = int(log_dir.name) if log_dir.name.isdigit() else target_epochs
+                if source_epochs == target_epochs:
+                    tqdm.write(f"[proxy] exact log hit: epochs={target_epochs}, path={log_dir}")
+                else:
+                    tqdm.write(f"[proxy] reuse longer log: source_epochs={source_epochs}, target_epochs={target_epochs}, path={log_dir}")
+                tqdm.write(f"Proxy CV cache HIT: {log_dir}")
+                return log_dir
+            tqdm.write(f"Proxy CV candidate invalid: {log_dir} ({reason})")
+    else:
+        reason = "forced by --force"
+    log_dir = seed_dir / str(target_epochs)
     tqdm.write(f"Proxy CV cache MISS→TRAIN ({reason})")
-    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), model=args.proxy_model, epochs=int(ctx["proxy_epochs"]), batch_size=args.batch_size, num_workers=args.num_workers, lr=None, momentum=None, weight_decay=None, lr_milestones=None, lr_gamma=None, device=args.device or "", k_folds=args.k_folds, seed=info.seed)
+    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), model=args.proxy_model, epochs=target_epochs, batch_size=args.batch_size, num_workers=args.num_workers, lr=None, momentum=None, weight_decay=None, lr_milestones=None, lr_gamma=None, device=args.device or "", k_folds=args.k_folds, seed=info.seed)
     ns = train_proxy_mod.apply_dataset_defaults(ns)
     with patched_project_paths(), patched_training_corruption(info.dataset, info):
         train_proxy_mod.run_for_seed(ns, info.seed)
-    (log_dir / "context.json").write_text(json.dumps(ctx, ensure_ascii=False, indent=2), encoding="utf-8")
     return log_dir
 
 
+
 def load_valid_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> dict[str, float] | None:
+    del args
     data = load_json(WEIGHTS_PATH) or {}
     entry = ((data.get(info.dataset) or {}).get(str(info.seed)) if isinstance(data.get(info.dataset), dict) else None)
-    if not isinstance(entry, dict): return None
+    if not isinstance(entry, dict):
+        return None
     vals = {k: float(entry.get(k, np.nan)) for k in ("sa", "div", "dds")}
-    if not all(np.isfinite(v) and v > 0 for v in vals.values()) or abs(sum(vals.values()) - 1.0) > 1e-4: return None
+    if not all(np.isfinite(v) and v > 0 for v in vals.values()) or abs(sum(vals.values()) - 1.0) > 1e-4:
+        return None
+    if entry.get("transferability_component") != "TransferabilityScore":
+        return None
+    if abs(float(entry.get("ratio_lambda", np.nan)) - 1e-3) > 1e-12:
+        return None
     ectx = entry.get("corruption_context")
-    ok, _ = context_matches(ectx if isinstance(ectx, dict) else None, ctx, keys=("dataset", "seed", "corruption_list_hash", "proxy_model", "proxy_epochs", "clip_model", "adapter_image_sha1", "adapter_text_sha1"))
-    return vals if ok else None
+    if isinstance(ectx, dict):
+        for key in ("dataset", "seed", "proxy_model", "proxy_epochs", "clip_model", "num_samples", "ratio_lambda", "transferability_component"):
+            if ectx.get(key) != ctx.get(key):
+                return None
+    return vals
 
 
 def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> dict[str, float]:
@@ -442,16 +573,23 @@ def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str,
     if not args.force:
         valid = load_valid_weights(args, info, ctx)
         if valid is not None:
-            tqdm.write(f"Learned weights cache HIT: {WEIGHTS_PATH}"); return valid
+            tqdm.write(f"Learned weights cache HIT: {WEIGHTS_PATH}")
+            return valid
     tqdm.write("Learned weights cache MISS→LEARN")
+    migrate_dynamic_caches(args, info)
     img_p, txt_p = adapter_paths(info.dataset, info.seed)
-    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), proxy_log=str(PROXY_LOG_ROOT), proxy_model=args.proxy_model, proxy_epochs=int(ctx["proxy_epochs"]), adapter_image_path=str(img_p), adapter_text_path=str(txt_p), clip_model=args.clip_model, batch_size=args.batch_size, num_workers=args.num_workers, div_k=0.05, dds_k=5, dds_important_eigval_ratio=0.8, coverage_tau_g=0.15, coverage_s_g=0.07, coverage_k_pct=0.05, coverage_q_low=0.002, coverage_q_high=0.998, ridge_lambda=0.01, learning_rate=1e-2, max_iter=10000, tol=1e-6, ratio_lambda=5e-3, regression_learning_rate=2e-3, regression_max_iter=10000, regression_tol=1e-8, output=str(WEIGHTS_PATH), device=args.device, debug_prompts=args.debug_prompts, seed=str(info.seed), proxy_training_seed=None)
+    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), proxy_log=str(PROXY_LOG_ROOT), proxy_model=args.proxy_model, proxy_epochs=int(ctx["proxy_epochs"]), adapter_image_path=str(img_p), adapter_text_path=str(txt_p), clip_model=args.clip_model, batch_size=args.batch_size, num_workers=args.num_workers, div_k=0.05, dds_k=5, dds_important_eigval_ratio=0.8, coverage_tau_g=0.15, coverage_s_g=0.07, coverage_k_pct=0.05, coverage_q_low=0.002, coverage_q_high=0.998, ridge_lambda=0.01, learning_rate=1e-2, max_iter=10000, tol=1e-6, ratio_lambda=args.ratio_lambda, regression_learning_rate=2e-3, regression_max_iter=10000, regression_tol=1e-8, output=str(WEIGHTS_PATH), device=args.device, debug_prompts=args.debug_prompts, seed=str(info.seed), proxy_training_seed=None)
+    tqdm.write(f"[weights] ratio_lambda={float(args.ratio_lambda):.12g}")
     with patched_project_paths(), patched_training_corruption(info.dataset, info):
         learn_weights_mod.run_once(ns, [info.seed])
-    data = load_json(WEIGHTS_PATH) or {}; data.setdefault(info.dataset, {}).setdefault(str(info.seed), {})["corruption_context"] = ctx
-    WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True); WEIGHTS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    data = load_json(WEIGHTS_PATH) or {}
+    entry = data.setdefault(info.dataset, {}).setdefault(str(info.seed), {})
+    entry["corruption_context"] = {k: ctx[k] for k in ("dataset", "seed", "proxy_model", "proxy_epochs", "clip_model", "num_samples", "corruption_type_counts", "ratio_lambda", "transferability_component") if k in ctx}
+    WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WEIGHTS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     valid = load_valid_weights(args, info, ctx)
-    if valid is None: raise RuntimeError("learned weights were saved but failed validation")
+    if valid is None:
+        raise RuntimeError("learned weights were saved but failed validation")
     return valid
 
 
@@ -478,7 +616,6 @@ def validate_mask_file(path: Path, info: CorruptionInfo, keep_ratio: int, weight
             if not np.array_equal(np.asarray(data["corruption_types"], dtype=np.int16), info.corruption_types): return False, "corruption_types mismatch"
             if str(np.asarray(data["dataset"]).item()) != info.dataset or str(np.asarray(data["weight_group"]).item()) != weight_group: return False, "dataset/weight_group mismatch"
             if int(np.asarray(data["seed"]).item()) != info.seed or int(np.asarray(data["keep_ratio"]).item()) != int(keep_ratio): return False, "seed/keep_ratio mismatch"
-            if str(np.asarray(data["corruption_list_hash"]).item()) != info.list_hash: return False, "corruption hash mismatch"
             saved_weights = np.asarray(data["weights"], dtype=np.float64)
             if saved_weights.shape != (3,): return False, "weights shape mismatch"
             expected_weights = np.array([weights["sa"], weights["div"], weights["dds"]], dtype=np.float64)
@@ -501,7 +638,7 @@ def save_mask(path: Path, mask: np.ndarray, selected_by_class: dict[int, int], s
     if not ok: raise ValueError(reason)
     selected = np.flatnonzero(m).astype(np.int64)
     csel = info.corruption_types[selected]
-    scalar = dict(dataset=info.dataset, method=args.mode_name, weight_group=args.weight_group, seed=int(info.seed), keep_ratio=int(keep_ratio), num_selected=int(selected.size), num_corrupted_total=int(info.is_corrupted.sum()), num_corrupted_selected=int(np.sum(csel >= 0)), corruption_ratio_total=float(info.is_corrupted.mean()), corruption_ratio_in_mask=float(np.mean(csel >= 0)) if selected.size else 0.0, corruption_list_hash=info.list_hash)
+    scalar = dict(dataset=info.dataset, method=args.mode_name, weight_group=args.weight_group, seed=int(info.seed), keep_ratio=int(keep_ratio), num_selected=int(selected.size), num_corrupted_total=int(info.is_corrupted.sum()), num_corrupted_selected=int(np.sum(csel >= 0)), corruption_ratio_total=float(info.is_corrupted.mean()), corruption_ratio_in_mask=float(np.mean(csel >= 0)) if selected.size else 0.0)
     path.parent.mkdir(parents=True, exist_ok=True)
     group_stats = slim_group_stats(stats); group_stats["group_init_count"] = int(args.group_init_count); group_stats["candidate_pool_size"] = int(args.group_candidate_pool_size)
     np.savez_compressed(path, mask=m, selected_indices=selected, corruption_types=info.corruption_types, is_corrupted=info.is_corrupted, weights=np.array([weights["sa"], weights["div"], weights["dds"]], dtype=np.float64), selected_by_class=np.array(json.dumps(selected_by_class), dtype=np.str_), group_stats=np.array(json.dumps(group_stats), dtype=np.str_), **{k: np.array(v) for k, v in scalar.items()})
@@ -558,6 +695,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--debug-prompts", action="store_true")
     p.add_argument("--skip-saved", action="store_true")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--ratio-lambda", type=float, default=1e-3)
     return p.parse_args()
 
 

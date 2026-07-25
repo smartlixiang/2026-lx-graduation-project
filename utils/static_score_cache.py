@@ -1,4 +1,4 @@
-"""Utilities for caching static scores (SA/Div/DDS) with parameter-aware paths."""
+"""Utilities for caching static scores (SA/Div/SV) with parameter-aware paths."""
 from __future__ import annotations
 
 import hashlib
@@ -9,7 +9,7 @@ from typing import Callable
 
 import numpy as np
 
-NORMALIZATION_VERSION = "raw_static_scores_v1"
+NORMALIZATION_VERSION = "raw_static_scores_v2_sv"
 
 
 def _sanitize(text: str) -> str:
@@ -36,12 +36,12 @@ def _format_div_k(div_k: float) -> str:
     raise ValueError("Div k 仅支持 (0,1) 百分比或 >=1 的正整数。")
 
 
-def _build_param_dir_name(div_k: float, dds_lower: float, dds_upper: float) -> str:
-    return f"Div_{_format_div_k(div_k)}_DDS_[{_format_percent(dds_lower)}-{_format_percent(dds_upper)}]"
+def _build_param_dir_name(div_k: float, sv_lower: float, sv_upper: float) -> str:
+    return f"Div_{_format_div_k(div_k)}_SV_[{_format_percent(sv_lower)}-{_format_percent(sv_upper)}]"
 
 
 def _parse_param_dir_name(name: str) -> dict[str, str] | None:
-    pattern = re.compile(r"^Div_(?P<div>\d+%?|\d+)_DDS_\[(?P<low>\d+%)-(?P<high>\d+%)\]$")
+    pattern = re.compile(r"^Div_(?P<div>\d+%?|\d+)_SV_\[(?P<low>\d+%)-(?P<high>\d+%)\]$")
     match = pattern.match(name)
     if not match:
         return None
@@ -53,11 +53,11 @@ def resolve_static_score_cache_dir(
     dataset: str,
     seed: int,
     div_k: float,
-    dds_eigval_lower_bound: float,
-    dds_eigval_upper_bound: float,
+    sv_eigval_lower_bound: float,
+    sv_eigval_upper_bound: float,
 ) -> Path:
     """Resolve the canonical static score cache directory without creating it."""
-    param_dir = _build_param_dir_name(div_k, dds_eigval_lower_bound, dds_eigval_upper_bound)
+    param_dir = _build_param_dir_name(div_k, sv_eigval_lower_bound, sv_eigval_upper_bound)
     return Path(cache_root) / _sanitize(dataset) / str(int(seed)) / param_dir
 
 
@@ -66,10 +66,10 @@ def _build_cache_dir(
     dataset: str,
     seed: int,
     div_k: float,
-    dds_lower: float,
-    dds_upper: float,
+    sv_lower: float,
+    sv_upper: float,
 ) -> Path:
-    cache_dir = resolve_static_score_cache_dir(cache_root, dataset, seed, div_k, dds_lower, dds_upper)
+    cache_dir = resolve_static_score_cache_dir(cache_root, dataset, seed, div_k, sv_lower, sv_upper)
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -93,9 +93,9 @@ def _validate_metric_cache(
         return None
     if parsed["div"] != _format_div_k(float(expected_meta["div_k"])):
         return None
-    if parsed["low"] != _format_percent(float(expected_meta["dds_eigval_lower_bound"])):
+    if parsed["low"] != _format_percent(float(expected_meta["sv_eigval_lower_bound"])):
         return None
-    if parsed["high"] != _format_percent(float(expected_meta["dds_eigval_upper_bound"])):
+    if parsed["high"] != _format_percent(float(expected_meta["sv_eigval_upper_bound"])):
         return None
 
     data = np.load(score_path, allow_pickle=False)
@@ -132,9 +132,9 @@ def get_or_compute_static_scores(
     adapter_image_path: str | None,
     adapter_text_path: str | None,
     div_k: float,
-    dds_k: int,
-    dds_eigval_lower_bound: float,
-    dds_eigval_upper_bound: float,
+    sv_k: int,
+    sv_eigval_lower_bound: float,
+    sv_eigval_upper_bound: float,
     prompt_template: str,
     num_samples: int,
     compute_fn: Callable[[], dict[str, np.ndarray]],
@@ -146,8 +146,8 @@ def get_or_compute_static_scores(
         dataset,
         seed,
         div_k,
-        dds_eigval_lower_bound,
-        dds_eigval_upper_bound,
+        sv_eigval_lower_bound,
+        sv_eigval_upper_bound,
     )
 
     meta = {
@@ -157,9 +157,9 @@ def get_or_compute_static_scores(
         "adapter_image_path": adapter_image_path or "",
         "adapter_text_path": adapter_text_path or "",
         "div_k": float(div_k),
-        "dds_k": int(dds_k),
-        "dds_eigval_lower_bound": float(dds_eigval_lower_bound),
-        "dds_eigval_upper_bound": float(dds_eigval_upper_bound),
+        "sv_k": int(sv_k),
+        "sv_eigval_lower_bound": float(sv_eigval_lower_bound),
+        "sv_eigval_upper_bound": float(sv_eigval_upper_bound),
         "prompt_template": prompt_template,
         "num_samples": int(num_samples),
         "score_storage": NORMALIZATION_VERSION,
@@ -171,7 +171,7 @@ def get_or_compute_static_scores(
 
     cached: dict[str, np.ndarray] = {}
     labels_ref: np.ndarray | None = None
-    for metric_name, metric_key in (("SA", "sa"), ("Div", "div"), ("DDS", "dds")):
+    for metric_name, metric_key in (("SA", "sa"), ("Div", "div"), ("SV", "sv")):
         validated = _validate_metric_cache(cache_dir, metric_name, meta, num_samples)
         if validated is None:
             cached = {}
@@ -188,7 +188,7 @@ def get_or_compute_static_scores(
         return cached
 
     computed = compute_fn()
-    for key in ("sa", "div", "dds", "labels"):
+    for key in ("sa", "div", "sv", "labels"):
         if key not in computed:
             raise ValueError(f"computed static scores missing key: {key}")
         if np.asarray(computed[key]).shape != (num_samples,):
@@ -198,7 +198,7 @@ def get_or_compute_static_scores(
     metric_mapping = {
         "SA": np.asarray(computed["sa"]),
         "Div": np.asarray(computed["div"]),
-        "DDS": np.asarray(computed["dds"]),
+        "SV": np.asarray(computed["sv"]),
     }
     labels = np.asarray(computed["labels"])
 
@@ -214,7 +214,7 @@ def get_or_compute_static_scores(
     return {
         "sa": metric_mapping["SA"],
         "div": metric_mapping["Div"],
-        "dds": metric_mapping["DDS"],
+        "sv": metric_mapping["SV"],
         "labels": labels,
     }
 

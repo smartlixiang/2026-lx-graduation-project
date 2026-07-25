@@ -31,12 +31,12 @@ from utils.path_rules import resolve_mask_path  # noqa: E402
 from utils.seed import parse_seed_list, set_seed  # noqa: E402
 
 
-EXPERIMENT_KEY = "ablation_dds"
+EXPERIMENT_KEY = "ablation_sv"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Ablation script: remove DDS from learned_group / learned_topk pipeline."
+        description="Ablation script: remove SV from learned_group / learned_topk pipeline."
     )
     parser.add_argument("--dataset", type=str, default=CIFAR100, choices=AVAILABLE_DATASETS, help="Target dataset name.")
     parser.add_argument("--data-root", type=str, default=str(PROJECT_ROOT / "data"), help="Dataset root path.")
@@ -57,10 +57,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--div-k", type=float, default=0.05)
-    parser.add_argument("--dds-k", type=int, default=5)
-    parser.add_argument("--dds-important-eigval-ratio", type=float, default=0.8)
-    parser.add_argument("--dds-eigval-lower-bound", type=float, default=0.02)
-    parser.add_argument("--dds-eigval-upper-bound", type=float, default=0.20)
+    parser.add_argument("--sv-k", type=int, default=5)
+    parser.add_argument("--sv-important-eigval-ratio", type=float, default=0.8)
+    parser.add_argument("--sv-eigval-lower-bound", type=float, default=0.02)
+    parser.add_argument("--sv-eigval-upper-bound", type=float, default=0.20)
     parser.add_argument("--prompt-template", type=str, default="a photo of a {}")
     parser.add_argument("--ridge-lambda", type=float, default=1e-2)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
@@ -92,8 +92,8 @@ def _format_div_k(div_k: float) -> str:
     raise ValueError("div_k must be a positive integer or a ratio in (0,1).")
 
 
-def build_static_cache_dir(cache_root: Path, dataset: str, seed: int, div_k: float, dds_lower: float, dds_upper: float) -> Path:
-    param_dir = f"Div_{_format_div_k(div_k)}_DDS_[{_format_percent(dds_lower)}-{_format_percent(dds_upper)}]"
+def build_static_cache_dir(cache_root: Path, dataset: str, seed: int, div_k: float, sv_lower: float, sv_upper: float) -> Path:
+    param_dir = f"Div_{_format_div_k(div_k)}_SV_[{_format_percent(sv_lower)}-{_format_percent(sv_upper)}]"
     return cache_root / dataset / str(int(seed)) / param_dir
 
 
@@ -212,7 +212,7 @@ def select_topk_mask_two_metrics(sa_scores: np.ndarray, div_scores: np.ndarray, 
     return mask, selected_by_class
 
 
-def select_group_mask_ablation_dds(
+def select_group_mask_ablation_sv(
     sa_scores: np.ndarray,
     div_metric: Div,
     div_loader: DataLoader,
@@ -305,7 +305,7 @@ def select_group_mask_ablation_dds(
     total_to_add = int(np.sum(class_budgets) - np.sum(init_per_class))
     selected_count_history: list[int] = [int(np.sum(selected_mask))]
     total_score_acc = 0.0
-    pbar = tqdm(total=total_to_add, desc="[ablation_dds group] classwise greedy add", unit="sample")
+    pbar = tqdm(total=total_to_add, desc="[ablation_sv group] classwise greedy add", unit="sample")
     while True:
         remaining_by_class = class_budgets - class_selected_counts
         active_classes = np.flatnonzero(remaining_by_class > 0).astype(np.int64)
@@ -388,7 +388,7 @@ def select_group_mask_ablation_dds(
     distribution_shift = float(np.mean(class_shift_values)) if class_shift_values else 0.0
 
     stats: dict[str, object] = {
-        "solver": "group_classwise_greedy_add_ablation_dds",
+        "solver": "group_classwise_greedy_add_ablation_sv",
         "sr": float(sr),
         "dist_weight": float(dist_weight),
         "final_rate": float(final_mask.mean()),
@@ -409,7 +409,7 @@ def main() -> None:
     args = parse_args()
     dataset_name = args.dataset.strip().lower()
     if dataset_name != CIFAR100:
-        print(f"WARNING: ablation_dds.py is primarily designed for cifar100; current dataset={dataset_name}")
+        print(f"WARNING: ablation_sv.py is primarily designed for cifar100; current dataset={dataset_name}")
 
     device = torch.device(args.device) if args.device is not None else CONFIG.global_device
     method = args.method.strip().lower()
@@ -465,18 +465,18 @@ def main() -> None:
         set_seed(seed)
         print(f"\n===== Seed {seed} =====")
         static_cache_dir = build_static_cache_dir(static_cache_root, dataset_name, seed, args.div_k,
-                                                  args.dds_eigval_lower_bound, args.dds_eigval_upper_bound)
+                                                  args.sv_eigval_lower_bound, args.sv_eigval_upper_bound)
         if not static_cache_dir.is_dir():
             raise FileNotFoundError(
                 f"Static cache directory not found: {static_cache_dir}\n"
-                "This script loads SA/Div/DDS from local cache only and will not recompute them."
+                "This script loads SA/Div/SV from local cache only and will not recompute them."
             )
 
         sa_scores, labels_sa = load_metric_cache(static_cache_dir, "SA")
         div_scores, labels_div = load_metric_cache(static_cache_dir, "Div")
-        _dds_scores, labels_dds = load_metric_cache(static_cache_dir, "DDS")
-        if not np.array_equal(labels_sa, labels_div) or not np.array_equal(labels_sa, labels_dds):
-            raise RuntimeError("Static cache label mismatch among SA/Div/DDS.")
+        _sv_scores, labels_sv = load_metric_cache(static_cache_dir, "SV")
+        if not np.array_equal(labels_sa, labels_div) or not np.array_equal(labels_sa, labels_sv):
+            raise RuntimeError("Static cache label mismatch among SA/Div/SV.")
         if not np.array_equal(labels_sa, dynamic_labels):
             raise RuntimeError("Dynamic cache labels and static cache labels do not match.")
 
@@ -531,7 +531,7 @@ def main() -> None:
                     sa_scores=sa_scores, div_scores=div_scores, labels=labels_sa, num_classes=len(class_names), keep_ratio=keep_ratio, weights=weights)
                 group_stats = None
             else:
-                mask, selected_by_class, group_stats = select_group_mask_ablation_dds(
+                mask, selected_by_class, group_stats = select_group_mask_ablation_sv(
                     sa_scores=sa_scores,
                     div_metric=div_metric,
                     div_loader=div_loader,

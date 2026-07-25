@@ -1,4 +1,4 @@
-"""类内 DDS 评分实现（恢复为特征值占比区间筛选方向的旧版 DDS 语义）。"""
+"""类内 SV 评分实现（恢复为特征值占比区间筛选方向的旧版 SV 语义）。"""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ from utils.global_config import CONFIG
 
 
 @dataclass
-class DDSResult:
-    """DDS 计算结果容器。"""
+class SVResult:
+    """SV 计算结果容器。"""
 
     scores: torch.Tensor
     labels: torch.Tensor
@@ -26,7 +26,7 @@ class DDSResult:
     pca_cov_reg: float
 
     def classwise_mean(self) -> List[float]:
-        """按类别返回平均 DDS 分值。"""
+        """按类别返回平均 SV 分值。"""
         means = []
         for class_idx in range(len(self.class_names)):
             mask = self.labels == class_idx
@@ -37,16 +37,16 @@ class DDSResult:
         return means
 
 
-class DifficultyDirection:
-    """计算图像样本的类内 DDS 分数。
+class StructuralVariation:
+    """计算图像样本的类内 SV 分数。
 
-    当前版本恢复为旧版 DDS 语义：
+    当前版本恢复为旧版 SV 语义：
     - 按类别做 PCA；
     - 选择单个特征值占总特征值占比位于 [eigval_lower_bound, eigval_upper_bound] 的方向；
     - 以这些方向上的平均绝对投影作为原始分数。
 
     说明：
-    - 类名 / 文件名 / 返回字段继续保留 DDS / DifficultyDirection 的历史命名；
+    - 类名 / 文件名 / 返回字段继续保留 SV / StructuralVariation 的历史命名；
     - important_eigval_ratio 参数继续保留，仅用于兼容旧接口，当前主计算不再使用；
     - 若某个类别没有方向落入该区间，则退化为选择最接近区间中心的一个方向，避免分数完全失效。
     """
@@ -102,7 +102,7 @@ class DifficultyDirection:
             labels.append(batch_labels.to(target_device))
         return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
 
-    def _select_difficulty_dirs(
+    def _select_variation_dirs(
         self,
         eigenvalues: torch.Tensor,
         eigenvectors: torch.Tensor,
@@ -134,11 +134,11 @@ class DifficultyDirection:
         centered_features: torch.Tensor,
         selected_dirs: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute raw DDS as mean_j |projection_j| on selected directions."""
+        """Compute raw SV as mean_j |projection_j| on selected directions."""
         projections = centered_features @ selected_dirs
         return projections.abs().mean(dim=1)
 
-    def _dds_from_pca(self, class_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _sv_from_pca(self, class_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_samples, feat_dim = class_features.shape
         if num_samples <= 1:
             return (
@@ -155,13 +155,13 @@ class DifficultyDirection:
             dtype=class_features.dtype,
         )
         eigenvalues, eigenvectors = torch.linalg.eigh(cov)
-        selected_dirs, _ = self._select_difficulty_dirs(eigenvalues, eigenvectors)
+        selected_dirs, _ = self._select_variation_dirs(eigenvalues, eigenvectors)
         if selected_dirs.shape[1] == 0:
             return torch.zeros(num_samples, device=class_features.device), mean
         scores = self._compute_mean_abs_projection(centered, selected_dirs)
         return scores, mean
 
-    def _dds_from_reference_pca(
+    def _sv_from_reference_pca(
         self,
         class_features: torch.Tensor,
         reference_features: torch.Tensor,
@@ -186,7 +186,7 @@ class DifficultyDirection:
             dtype=class_features.dtype,
         )
         eigenvalues, eigenvectors = torch.linalg.eigh(cov)
-        selected_dirs, _ = self._select_difficulty_dirs(eigenvalues, eigenvectors)
+        selected_dirs, _ = self._select_variation_dirs(eigenvalues, eigenvectors)
         if selected_dirs.shape[1] == 0:
             return torch.zeros(num_samples, device=class_features.device)
         centered = class_features - ref_mean
@@ -215,7 +215,7 @@ class DifficultyDirection:
         total = eigvals.sum()
         ratios = eigvals / total if total.item() > 0 else torch.zeros_like(eigvals)
 
-        selected_dirs, selected_eigvals = self._select_difficulty_dirs(eigenvalues, eigenvectors)
+        selected_dirs, selected_eigvals = self._select_variation_dirs(eigenvalues, eigenvectors)
         selected_mask = (ratios >= self.eigval_lower_bound) & (ratios <= self.eigval_upper_bound)
 
         return {
@@ -238,7 +238,7 @@ class DifficultyDirection:
         self,
         dataloader: DataLoader,
         adapter: AdapterMLP | None = None,
-    ) -> DDSResult:
+    ) -> SVResult:
         if adapter is not None:
             adapter.eval()
         image_features, labels = self._encode_images(dataloader, adapter)
@@ -248,9 +248,9 @@ class DifficultyDirection:
             if not mask.any():
                 continue
             class_features = image_features[mask]
-            class_scores, _ = self._dds_from_pca(class_features)
+            class_scores, _ = self._sv_from_pca(class_features)
             scores[mask] = class_scores
-        return DDSResult(
+        return SVResult(
             scores=scores.detach().cpu(),
             labels=labels.detach().cpu(),
             image_features=image_features.detach().cpu(),
@@ -268,7 +268,7 @@ class DifficultyDirection:
         selected_mask: object | None = None,
         image_features: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
-    ) -> DDSResult:
+    ) -> SVResult:
         if adapter is not None:
             adapter.eval()
         if image_features is None or labels is None:
@@ -295,10 +295,10 @@ class DifficultyDirection:
                 ref_features = image_features[ref_mask]
             else:
                 ref_features = class_features
-            class_scores = self._dds_from_reference_pca(class_features, ref_features)
+            class_scores = self._sv_from_reference_pca(class_features, ref_features)
             scores[class_mask] = class_scores
 
-        return DDSResult(
+        return SVResult(
             scores=scores.detach().cpu(),
             labels=labels.detach().cpu(),
             image_features=image_features.detach().cpu(),
@@ -310,4 +310,4 @@ class DifficultyDirection:
         )
 
 
-__all__ = ["DDSResult", "DifficultyDirection"]
+__all__ = ["SVResult", "StructuralVariation"]

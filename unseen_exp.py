@@ -27,7 +27,7 @@ import weights.dynamic_utils as dynamic_utils
 
 from dataset.dataset_config import CIFAR10, CIFAR100
 from model.adapter import load_trained_adapters
-from scoring import DifficultyDirection, Div, SemanticAlignment
+from scoring import StructuralVariation, Div, SemanticAlignment
 from utils.class_name_utils import build_class_prompts, resolve_class_names_for_prompts
 from utils.global_config import CONFIG
 from utils.seed import set_seed
@@ -494,7 +494,7 @@ def compute_static_scores_for_known_weight_learning(
 
     if args.skip_saved and cache_path.exists():
         data = np.load(cache_path, allow_pickle=False)
-        required = {"sa", "div", "dds", "labels", "dataset", "seed", "known_num_samples"}
+        required = {"sa", "div", "sv", "labels", "dataset", "seed", "known_num_samples"}
         if required.issubset(set(data.files)):
             if (
                 str(data["dataset"].item()) == args.dataset
@@ -505,11 +505,11 @@ def compute_static_scores_for_known_weight_learning(
                 return {
                     "sa": np.asarray(data["sa"], dtype=np.float32),
                     "div": np.asarray(data["div"], dtype=np.float32),
-                    "dds": np.asarray(data["dds"], dtype=np.float32),
+                    "sv": np.asarray(data["sv"], dtype=np.float32),
                     "labels": np.asarray(data["labels"], dtype=np.int64),
                 }
 
-    dds_metric = DifficultyDirection(class_names=class_names, clip_model=args.clip_model, device=device)
+    sv_metric = StructuralVariation(class_names=class_names, clip_model=args.clip_model, device=device)
     div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
     sa_metric = SemanticAlignment(
         class_names=class_names,
@@ -523,7 +523,7 @@ def compute_static_scores_for_known_weight_learning(
     image_adapter, text_adapter, _ = load_trained_adapters(
         dataset_name=args.dataset,
         clip_model=args.clip_model,
-        input_dim=dds_metric.extractor.embed_dim,
+        input_dim=sv_metric.extractor.embed_dim,
         seed=args.seed,
         map_location=device,
         adapter_image_path=adapter_paths["image_path"],
@@ -532,8 +532,8 @@ def compute_static_scores_for_known_weight_learning(
     image_adapter.to(device).eval()
     text_adapter.to(device).eval()
 
-    dds_loader = build_known_score_loader(
-        args.dataset, args.data_root, dds_metric.extractor.preprocess, known_indices
+    sv_loader = build_known_score_loader(
+        args.dataset, args.data_root, sv_metric.extractor.preprocess, known_indices
     )
     div_loader = build_known_score_loader(
         args.dataset, args.data_root, div_metric.extractor.preprocess, known_indices
@@ -542,8 +542,8 @@ def compute_static_scores_for_known_weight_learning(
         args.dataset, args.data_root, sa_metric.extractor.preprocess, known_indices
     )
 
-    dds = dds_metric.score_dataset(
-        tqdm(dds_loader, desc="[Known static] DDS"),
+    sv = sv_metric.score_dataset(
+        tqdm(sv_loader, desc="[Known static] SV"),
         adapter=image_adapter,
     ).scores.numpy()
     div = div_metric.score_dataset(
@@ -566,7 +566,7 @@ def compute_static_scores_for_known_weight_learning(
         cache_path,
         sa=sa.astype(np.float32),
         div=div.astype(np.float32),
-        dds=dds.astype(np.float32),
+        sv=sv.astype(np.float32),
         labels=labels.astype(np.int64),
         dataset=np.asarray(args.dataset),
         seed=np.asarray(args.seed, dtype=np.int64),
@@ -574,7 +574,7 @@ def compute_static_scores_for_known_weight_learning(
     )
 
     print(f"[Known static] saved: {cache_path}")
-    return {"sa": sa, "div": div, "dds": dds, "labels": labels}
+    return {"sa": sa, "div": div, "sv": sv, "labels": labels}
 
 
 def project_to_simplex(vector: np.ndarray) -> np.ndarray:
@@ -650,7 +650,7 @@ def learn_weights_on_known(
         try:
             data = json.loads(weight_path.read_text(encoding="utf-8"))
             entry = data.get(args.dataset, {}).get(str(args.seed))
-            if isinstance(entry, dict) and all(k in entry for k in ("sa", "div", "dds")):
+            if isinstance(entry, dict) and all(k in entry for k in ("sa", "div", "sv")):
                 if (
                     entry.get("unseen_known_subset") is True
                     and entry.get("unseen_proxy_log_seed_specific") is True
@@ -660,7 +660,7 @@ def learn_weights_on_known(
                     return {
                         "sa": float(entry["sa"]),
                         "div": float(entry["div"]),
-                        "dds": float(entry["dds"]),
+                        "sv": float(entry["sv"]),
                     }
         except Exception:
             pass
@@ -708,7 +708,7 @@ def learn_weights_on_known(
         raise ValueError("Known-subset dynamic labels and known-subset static labels are inconsistent.")
 
     features = np.stack(
-        [static_scores["sa"], static_scores["div"], static_scores["dds"]],
+        [static_scores["sa"], static_scores["div"], static_scores["sv"]],
         axis=1,
     ).astype(np.float64)
 
@@ -734,7 +734,7 @@ def learn_weights_on_known(
     dataset_entry[str(args.seed)] = {
         "sa": float(weights[0]),
         "div": float(weights[1]),
-        "dds": float(weights[2]),
+        "sv": float(weights[2]),
         "bias": float(bias),
         "ridge_lambda": 1e-2,
         "dynamic_target": "(A+C+0.5*T+0.5*P)/3",
@@ -757,7 +757,7 @@ def learn_weights_on_known(
     weights_dict = {
         "sa": float(weights[0]),
         "div": float(weights[1]),
-        "dds": float(weights[2]),
+        "sv": float(weights[2]),
     }
     print(f"[Weight] learned on known subset and seed-specific proxy logs: {weights_dict}, bias={bias:.6f}")
     return weights_dict
@@ -782,7 +782,7 @@ def compute_all_static_scores_with_known_base(
 
     if args.skip_saved and cache_path.exists():
         data = np.load(cache_path, allow_pickle=False)
-        required = {"sa", "div", "dds", "labels", "dataset", "seed", "known_indices"}
+        required = {"sa", "div", "sv", "labels", "dataset", "seed", "known_indices"}
         if required.issubset(set(data.files)):
             if (
                 str(data["dataset"].item()) == args.dataset
@@ -793,11 +793,11 @@ def compute_all_static_scores_with_known_base(
                 return {
                     "sa": np.asarray(data["sa"], dtype=np.float32),
                     "div": np.asarray(data["div"], dtype=np.float32),
-                    "dds": np.asarray(data["dds"], dtype=np.float32),
+                    "sv": np.asarray(data["sv"], dtype=np.float32),
                     "labels": np.asarray(data["labels"], dtype=np.int64),
                 }
 
-    dds_metric = DifficultyDirection(class_names=class_names, clip_model=args.clip_model, device=device)
+    sv_metric = StructuralVariation(class_names=class_names, clip_model=args.clip_model, device=device)
     div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
     sa_metric = SemanticAlignment(
         class_names=class_names,
@@ -811,7 +811,7 @@ def compute_all_static_scores_with_known_base(
     image_adapter, text_adapter, _ = load_trained_adapters(
         dataset_name=args.dataset,
         clip_model=args.clip_model,
-        input_dim=dds_metric.extractor.embed_dim,
+        input_dim=sv_metric.extractor.embed_dim,
         seed=args.seed,
         map_location=device,
         adapter_image_path=adapter_paths["image_path"],
@@ -824,8 +824,8 @@ def compute_all_static_scores_with_known_base(
     labels_np = get_targets(all_dataset)
     num_classes = len(class_names)
 
-    all_loader = build_score_loader(args.dataset, args.data_root, dds_metric.extractor.preprocess)
-    image_features, labels_t = encode_all_images(dds_metric, all_loader, image_adapter, device)
+    all_loader = build_score_loader(args.dataset, args.data_root, sv_metric.extractor.preprocess)
+    image_features, labels_t = encode_all_images(sv_metric, all_loader, image_adapter, device)
     labels = labels_t.detach().cpu().numpy().astype(np.int64)
 
     if not np.array_equal(labels, labels_np):
@@ -886,9 +886,9 @@ def compute_all_static_scores_with_known_base(
 
     div = classwise_ref_normalize(div_raw, labels_np, known_indices, num_classes)
 
-    # DDS: PCA directions are fitted on known samples; all samples are scored by projection to known-base directions.
-    dds_raw = np.zeros(len(labels_np), dtype=np.float32)
-    for c in tqdm(range(num_classes), desc="[Static] DDS with known base", unit="class"):
+    # SV: PCA directions are fitted on known samples; all samples are scored by projection to known-base directions.
+    sv_raw = np.zeros(len(labels_np), dtype=np.float32)
+    for c in tqdm(range(num_classes), desc="[Static] SV with known base", unit="class"):
         class_idx = np.flatnonzero(labels_np == c)
         ref_idx = np.intersect1d(class_idx, known_indices, assume_unique=False)
 
@@ -897,17 +897,17 @@ def compute_all_static_scores_with_known_base(
 
         q_feat = image_features[class_idx].to(device)
         r_feat = image_features[ref_idx].to(device) if ref_idx.size > 0 else q_feat
-        raw = dds_metric._dds_from_reference_pca(q_feat, r_feat)
-        dds_raw[class_idx] = raw.detach().cpu().numpy().astype(np.float32)
+        raw = sv_metric._sv_from_reference_pca(q_feat, r_feat)
+        sv_raw[class_idx] = raw.detach().cpu().numpy().astype(np.float32)
 
-    dds = classwise_ref_normalize(dds_raw, labels_np, known_indices, num_classes)
+    sv = classwise_ref_normalize(sv_raw, labels_np, known_indices, num_classes)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         cache_path,
         sa=sa.astype(np.float32),
         div=div.astype(np.float32),
-        dds=dds.astype(np.float32),
+        sv=sv.astype(np.float32),
         labels=labels_np.astype(np.int64),
         known_indices=known_indices.astype(np.int64),
         dataset=np.asarray(args.dataset),
@@ -928,7 +928,7 @@ def compute_all_static_scores_with_known_base(
     )
 
     print(f"[Static] saved all-sample scores with known base: {cache_path}")
-    return {"sa": sa, "div": div, "dds": dds, "labels": labels_np}
+    return {"sa": sa, "div": div, "sv": sv, "labels": labels_np}
 
 
 def allocate_class_budgets(labels: np.ndarray, num_classes: int, keep_ratio: int) -> np.ndarray:
@@ -969,7 +969,7 @@ def select_group_mask_known_base(
     labels = np.asarray(static_scores["labels"], dtype=np.int64)
     sa = np.asarray(static_scores["sa"], dtype=np.float32)
     div = np.asarray(static_scores["div"], dtype=np.float32)
-    dds = np.asarray(static_scores["dds"], dtype=np.float32)
+    sv = np.asarray(static_scores["sv"], dtype=np.float32)
 
     n = labels.shape[0]
     budgets = allocate_class_budgets(labels, num_classes, keep_ratio)
@@ -977,7 +977,7 @@ def select_group_mask_known_base(
     selected = np.zeros(n, dtype=np.uint8)
     rng = np.random.default_rng(seed)
 
-    score = weights["sa"] * sa + weights["div"] * div + weights["dds"] * dds
+    score = weights["sa"] * sa + weights["div"] * div + weights["sv"] * sv
 
     selected_count_by_class = np.zeros(num_classes, dtype=np.int64)
 

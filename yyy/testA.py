@@ -397,16 +397,16 @@ def load_static_scores_readonly(
     for sa_path in sorted(paths.static_root.rglob("SA_cache.npz")):
         directory = sa_path.parent
         div_path = directory / "Div_cache.npz"
-        dds_path = directory / "DDS_cache.npz"
-        if not div_path.is_file() or not dds_path.is_file():
+        sv_path = directory / "SV_cache.npz"
+        if not div_path.is_file() or not sv_path.is_file():
             continue
         try:
             sa, labels_sa, indices_sa, meta_sa = _load_static_metric(sa_path)
             div, labels_div, indices_div, meta_div = _load_static_metric(div_path)
-            dds, labels_dds, indices_dds, meta_dds = _load_static_metric(dds_path)
+            sv, labels_sv, indices_sv, meta_sv = _load_static_metric(sv_path)
         except Exception:
             continue
-        metas = (meta_sa, meta_div, meta_dds)
+        metas = (meta_sa, meta_div, meta_sv)
         if any(meta.get("dataset") != dataset for meta in metas):
             continue
         if any(int(meta.get("seed", -1)) != seed for meta in metas):
@@ -417,7 +417,7 @@ def load_static_scores_readonly(
             continue
         if any(abs(float(meta.get("div_k", np.nan)) - 0.05) > 1e-12 for meta in metas):
             continue
-        if any(int(meta.get("dds_k", -1)) != 5 for meta in metas):
+        if any(int(meta.get("sv_k", -1)) != 5 for meta in metas):
             continue
         if any(not _same_path(meta.get("adapter_image_path", ""), expected_image_adapter) for meta in metas):
             continue
@@ -425,16 +425,16 @@ def load_static_scores_readonly(
             continue
         if not (
             np.array_equal(labels_sa, labels_div)
-            and np.array_equal(labels_sa, labels_dds)
+            and np.array_equal(labels_sa, labels_sv)
             and np.array_equal(indices_sa, indices_div)
-            and np.array_equal(indices_sa, indices_dds)
+            and np.array_equal(indices_sa, indices_sv)
         ):
             continue
-        if labels_sa.shape != (num_samples,) or any(x.shape != (num_samples,) for x in (sa, div, dds)):
+        if labels_sa.shape != (num_samples,) or any(x.shape != (num_samples,) for x in (sa, div, sv)):
             continue
         if not np.array_equal(indices_sa, np.arange(num_samples, dtype=indices_sa.dtype)):
             continue
-        matches.append((directory, {"sa": sa, "div": div, "dds": dds, "labels": labels_sa}))
+        matches.append((directory, {"sa": sa, "div": div, "sv": sv, "labels": labels_sa}))
 
     if not matches:
         raise FileNotFoundError(
@@ -446,7 +446,7 @@ def load_static_scores_readonly(
     if len(same_depth) > 1:
         raise RuntimeError("Multiple equally preferred static cache bundles:\n  " + "\n  ".join(str(x[0]) for x in same_depth))
     directory, scores = matches[0]
-    print(f"[static] SA/Div/DDS cache hit: {directory}")
+    print(f"[static] SA/Div/SV cache hit: {directory}")
     return scores, directory
 
 
@@ -813,7 +813,7 @@ def learn_weights_in_memory(
         [
             standard_zscore_by_class(np.asarray(static_scores["sa"], dtype=np.float32), labels),
             standard_zscore_by_class(np.asarray(static_scores["div"], dtype=np.float32), labels),
-            standard_zscore_by_class(np.asarray(static_scores["dds"], dtype=np.float32), labels),
+            standard_zscore_by_class(np.asarray(static_scores["sv"], dtype=np.float32), labels),
         ],
         axis=1,
     ).astype(np.float64)
@@ -827,7 +827,7 @@ def learn_weights_in_memory(
         device,
     )
     normalized = np.asarray(fit["normalized_weights"], dtype=np.float64)
-    return {"sa": float(normalized[0]), "div": float(normalized[1]), "dds": float(normalized[2])}, fit
+    return {"sa": float(normalized[0]), "div": float(normalized[1]), "sv": float(normalized[2])}, fit
 
 
 def print_a_component_corruption_means(
@@ -998,7 +998,7 @@ def run_normal_dataset(args: argparse.Namespace, dataset: str, device: torch.dev
         )
         print(
             f"[normal][A={variant}] weights: "
-            f"SA={weights['sa']:.6f}, Div={weights['div']:.6f}, DDS={weights['dds']:.6f}, "
+            f"SA={weights['sa']:.6f}, Div={weights['div']:.6f}, SV={weights['sv']:.6f}, "
             f"bias={float(fit['bias']):.6f}, mse={float(fit['mse']):.6e}"
         )
 
@@ -1084,7 +1084,7 @@ def run_corruption_dataset(args: argparse.Namespace, dataset: str, device: torch
             )
             print(
                 f"[corruption][A={variant}] weights: "
-                f"SA={weights['sa']:.6f}, Div={weights['div']:.6f}, DDS={weights['dds']:.6f}, "
+                f"SA={weights['sa']:.6f}, Div={weights['div']:.6f}, SV={weights['sv']:.6f}, "
                 f"bias={float(fit['bias']):.6f}, mse={float(fit['mse']):.6e}"
             )
             mask, selected_by_class, stats = mask_mod.select_group_mask_by_center_repair(
@@ -1098,7 +1098,7 @@ def run_corruption_dataset(args: argparse.Namespace, dataset: str, device: torch
                 keep_ratio=args.kr,
                 device=device,
                 seed=args.seed,
-                dds_static_scores=np.asarray(static_scores["dds"], dtype=np.float32),
+                sv_static_scores=np.asarray(static_scores["sv"], dtype=np.float32),
                 group_candidate_pool_size=args.group_candidate_pool_size,
                 group_init_count=args.group_init_count,
             )

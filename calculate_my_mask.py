@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from model.adapter import load_trained_adapters  # noqa: E402
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET  # noqa: E402
-from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
+from scoring import StructuralVariation, Div, SemanticAlignment  # noqa: E402
 from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
@@ -136,13 +136,13 @@ def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str,
         naive = {}
         updated = True
     default_weight = 1.0 / 3.0
-    for key in ("dds", "div", "sa"):
+    for key in ("sv", "div", "sa"):
         if key not in naive:
             naive[key] = default_weight
             updated = True
 
     naive_total = 0.0
-    for key in ("dds", "div", "sa"):
+    for key in ("sv", "div", "sa"):
         try:
             naive[key] = float(naive[key])
         except (TypeError, ValueError):
@@ -151,11 +151,11 @@ def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str,
         naive_total += naive[key]
 
     if naive_total <= 0:
-        for key in ("dds", "div", "sa"):
+        for key in ("sv", "div", "sa"):
             naive[key] = default_weight
         updated = True
     elif abs(naive_total - 1.0) > 1e-12:
-        for key in ("dds", "div", "sa"):
+        for key in ("sv", "div", "sa"):
             naive[key] /= naive_total
         updated = True
 
@@ -173,7 +173,7 @@ def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str,
 
 
 def _to_weight_triplet(selected: dict[str, object], group_name: str) -> dict[str, float]:
-    required = {"dds", "div", "sa"}
+    required = {"sv", "div", "sa"}
     missing = required - selected.keys()
     if missing:
         missing_str = ", ".join(sorted(missing))
@@ -314,7 +314,7 @@ def select_group_mask(
     seed: int,
     weight_group: str,
     div_static_scores: np.ndarray | None = None,
-    dds_static_scores: np.ndarray | None = None,
+    sv_static_scores: np.ndarray | None = None,
     group_candidate_pool_size: int = 1,
     group_init_count: int = 2,
     dist_weight_factor: float = 1.0,
@@ -326,10 +326,10 @@ def select_group_mask(
     labels_np = np.asarray(labels, dtype=np.int64)
     sa_raw_np = np.asarray(sa_raw_scores, dtype=np.float32)
     # Static cache stores raw metric scores. Static Div is retained for future use;
-    # current group scoring uses raw SA, raw DDS, dynamic raw Div, and distribution correction.
+    # current group scoring uses raw SA, raw SV, dynamic raw Div, and distribution correction.
     div_static_raw_np = np.asarray(div_static_scores, dtype=np.float32) if div_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
-    dds_raw_np = np.asarray(dds_static_scores, dtype=np.float32) if dds_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
-    if labels_np.shape[0] != num_samples or div_static_raw_np.shape[0] != num_samples or dds_raw_np.shape[0] != num_samples:
+    sv_raw_np = np.asarray(sv_static_scores, dtype=np.float32) if sv_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
+    if labels_np.shape[0] != num_samples or div_static_raw_np.shape[0] != num_samples or sv_raw_np.shape[0] != num_samples:
         raise ValueError("样本数不一致，无法执行 group。")
 
     sr = float(keep_ratio) / 100.0
@@ -463,11 +463,11 @@ def select_group_mask(
             dist_improve = (old_dist - new_dist).astype(np.float32)
             dist_local = standard_zscore(dist_improve)
             sa_local = standard_zscore(sa_raw_np[candidate_indices])
-            dds_local = standard_zscore(dds_raw_np[candidate_indices])
+            sv_local = standard_zscore(sv_raw_np[candidate_indices])
 
             combined_scores = (
                 weights["sa"] * sa_local
-                + weights["dds"] * dds_local
+                + weights["sv"] * sv_local
                 + weights["div"] * div_local
                 + dist_weight_t * dist_local
             ).astype(np.float32)
@@ -510,7 +510,7 @@ def select_group_mask(
         np.sum(
             (
                 weights["sa"] * standard_zscore_by_class(sa_raw_np, labels_np)
-                + weights["dds"] * standard_zscore_by_class(dds_raw_np, labels_np)
+                + weights["sv"] * standard_zscore_by_class(sv_raw_np, labels_np)
                 + weights["div"] * final_div_z
             )[selected_bool],
             dtype=np.float64,
@@ -558,7 +558,7 @@ def select_group_mask_by_center_repair(
     keep_ratio: int,
     device: torch.device,
     seed: int,
-    dds_static_scores: np.ndarray | None = None,
+    sv_static_scores: np.ndarray | None = None,
     group_candidate_pool_size: int = 1,
     group_init_count: int = 2,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
@@ -568,8 +568,8 @@ def select_group_mask_by_center_repair(
     num_samples = sa_raw_scores.shape[0]
     labels_np = np.asarray(labels, dtype=np.int64)
     sa_raw_np = np.asarray(sa_raw_scores, dtype=np.float32)
-    dds_raw_np = np.asarray(dds_static_scores, dtype=np.float32) if dds_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
-    if labels_np.shape[0] != num_samples or dds_raw_np.shape[0] != num_samples:
+    sv_raw_np = np.asarray(sv_static_scores, dtype=np.float32) if sv_static_scores is not None else np.zeros(num_samples, dtype=np.float32)
+    if labels_np.shape[0] != num_samples or sv_raw_np.shape[0] != num_samples:
         raise ValueError("样本数不一致，无法执行 group。")
 
     sr = float(keep_ratio) / 100.0
@@ -675,8 +675,8 @@ def select_group_mask_by_center_repair(
             ).detach().cpu().numpy().astype(np.float32)
             div_local = standard_zscore(div_raw)
             sa_local = standard_zscore(sa_raw_np[candidate_indices])
-            dds_local = standard_zscore(dds_raw_np[candidate_indices])
-            combined_scores = (weights["sa"] * sa_local + weights["dds"] * dds_local + weights["div"] * div_local).astype(np.float32)
+            sv_local = standard_zscore(sv_raw_np[candidate_indices])
+            combined_scores = (weights["sa"] * sa_local + weights["sv"] * sv_local + weights["div"] * div_local).astype(np.float32)
             rank = np.argsort(-combined_scores, kind="mergesort")
             pool_n = min(candidate_indices.size, max(candidate_pool_floor, int(ceil(np.sqrt(candidate_indices.size)))))
             pool_indices = candidate_indices[rank[:pool_n]]
@@ -740,7 +740,7 @@ def select_group_mask_by_center_repair(
         np.sum(
             (
                 weights["sa"] * standard_zscore_by_class(sa_raw_np, labels_np)
-                + weights["dds"] * standard_zscore_by_class(dds_raw_np, labels_np)
+                + weights["sv"] * standard_zscore_by_class(sv_raw_np, labels_np)
                 + weights["div"] * final_div_z
             )[selected_bool],
             dtype=np.float64,
@@ -800,7 +800,7 @@ def main() -> None:
     )
 
     metric_init_start = time.perf_counter()
-    dds_metric = DifficultyDirection(
+    sv_metric = StructuralVariation(
         class_names=class_names, clip_model=args.clip_model, device=device
     )
     div_metric = Div(
@@ -817,15 +817,15 @@ def main() -> None:
         debug_prompts=args.debug_prompts,
     )
     print(
-        f"[Init] Metrics ready (DDS/Div/SA) | elapsed={time.perf_counter() - metric_init_start:.2f}s"
+        f"[Init] Metrics ready (SV/Div/SA) | elapsed={time.perf_counter() - metric_init_start:.2f}s"
     )
 
     batch_size = 128
     num_workers = 4
 
     loader_build_start = time.perf_counter()
-    dds_loader = build_score_loader(
-        dds_metric.extractor.preprocess,
+    sv_loader = build_score_loader(
+        sv_metric.extractor.preprocess,
         dataset_name,
         device,
         batch_size,
@@ -846,7 +846,7 @@ def main() -> None:
         num_workers,
     )
     print(
-        f"[Init] DataLoaders ready (DDS/Div/SA) | elapsed={time.perf_counter() - loader_build_start:.2f}s"
+        f"[Init] DataLoaders ready (SV/Div/SA) | elapsed={time.perf_counter() - loader_build_start:.2f}s"
     )
 
     method_name = f"{weight_group}_{method}"
@@ -866,7 +866,7 @@ def main() -> None:
         image_adapter, text_adapter, adapter_paths = load_trained_adapters(
             dataset_name=dataset_name,
             clip_model=args.clip_model,
-            input_dim=dds_metric.extractor.embed_dim,
+            input_dim=sv_metric.extractor.embed_dim,
             seed=seed,
             map_location=device,
         )
@@ -876,8 +876,8 @@ def main() -> None:
         num_samples = len(dataset_for_names)
 
         def _compute_scores() -> dict[str, np.ndarray]:
-            dds_scores_local = dds_metric.score_dataset(
-                tqdm(dds_loader, desc="Scoring DDS", unit="batch"),
+            sv_scores_local = sv_metric.score_dataset(
+                tqdm(sv_loader, desc="Scoring SV", unit="batch"),
                 adapter=image_adapter,
             ).scores
             div_scores_local = div_metric.score_dataset(
@@ -892,7 +892,7 @@ def main() -> None:
             return {
                 "sa": np.asarray(sa_scores_local),
                 "div": np.asarray(div_scores_local),
-                "dds": np.asarray(dds_scores_local),
+                "sv": np.asarray(sv_scores_local),
                 "labels": np.asarray(dataset_for_names.targets),
             }
 
@@ -905,9 +905,9 @@ def main() -> None:
             adapter_image_path=str(adapter_paths["image_path"]),
             adapter_text_path=str(adapter_paths["text_path"]),
             div_k=div_metric.k,
-            dds_k=dds_metric.k,
-            dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
-            dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
+            sv_k=sv_metric.k,
+            sv_eigval_lower_bound=sv_metric.eigval_lower_bound,
+            sv_eigval_upper_bound=sv_metric.eigval_upper_bound,
             prompt_template=sa_metric.prompt_template,
             num_samples=num_samples,
             compute_fn=_compute_scores,
@@ -917,19 +917,19 @@ def main() -> None:
             f"[Seed {seed}] Static scores ready (cache/compute) | elapsed={static_score_seconds:.2f}s"
         )
 
-        dds_raw_np = np.asarray(static_scores["dds"], dtype=np.float32)
+        sv_raw_np = np.asarray(static_scores["sv"], dtype=np.float32)
         div_raw_np = np.asarray(static_scores["div"], dtype=np.float32)
         sa_raw_np = np.asarray(static_scores["sa"], dtype=np.float32)
         labels = np.asarray(dataset_for_names.targets)
 
-        if not (len(dds_raw_np) == len(div_raw_np) == len(sa_raw_np)):
+        if not (len(sv_raw_np) == len(div_raw_np) == len(sa_raw_np)):
             raise RuntimeError("三个指标的样本数不一致，无法合并。")
 
         sa_global_z = standard_zscore_by_class(sa_raw_np, labels)
         div_global_z = standard_zscore_by_class(div_raw_np, labels)
-        dds_global_z = standard_zscore_by_class(dds_raw_np, labels)
+        sv_global_z = standard_zscore_by_class(sv_raw_np, labels)
         total_scores_np = (
-            weights["dds"] * dds_global_z
+            weights["sv"] * sv_global_z
             + weights["div"] * div_global_z
             + weights["sa"] * sa_global_z
         )
@@ -971,7 +971,7 @@ def main() -> None:
                     seed=seed,
                     weight_group=weight_group,
                     div_static_scores=div_raw_np,
-                    dds_static_scores=dds_raw_np,
+                    sv_static_scores=sv_raw_np,
                     group_candidate_pool_size=args.group_candidate_pool_size,
                     group_init_count=args.group_init_count,
                 )

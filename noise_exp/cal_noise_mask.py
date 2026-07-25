@@ -32,11 +32,11 @@ For --weight-group learned, the full pipeline is:
   2. Train CLIP adapters on noisy labels.
   3. Train CV proxy models on noisy labels.
   4. Learn static-score weights from proxy dynamics and noisy-label static scores.
-  5. Compute SA/Div/DDS static scores on noisy labels.
+  5. Compute SA/Div/SV static scores on noisy labels.
   6. Run group-mode selection and save masks.
 
 For --weight-group naive, stages 3 and 4 are skipped.  The mask is computed
-with equal weights for DDS/Div/SA, following calculate_my_mask.py's naive weight
+with equal weights for SV/Div/SA, following calculate_my_mask.py's naive weight
 logic.
 """
 from __future__ import annotations
@@ -77,7 +77,7 @@ MASK_ROOT = NOISE_EXP_ROOT / "mask"
 # Project imports are intentionally placed after sys.path is set.
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET  # noqa: E402
 from model.adapter import load_trained_adapters  # noqa: E402
-from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
+from scoring import StructuralVariation, Div, SemanticAlignment  # noqa: E402
 from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
@@ -728,13 +728,13 @@ def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str,
         updated = True
 
     default_weight = 1.0 / 3.0
-    for key in ("dds", "div", "sa"):
+    for key in ("sv", "div", "sa"):
         if key not in naive:
             naive[key] = default_weight
             updated = True
 
     total = 0.0
-    for key in ("dds", "div", "sa"):
+    for key in ("sv", "div", "sa"):
         try:
             naive[key] = float(naive[key])
         except (TypeError, ValueError):
@@ -743,11 +743,11 @@ def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str,
         total += float(naive[key])
 
     if total <= 0:
-        for key in ("dds", "div", "sa"):
+        for key in ("sv", "div", "sa"):
             naive[key] = default_weight
         updated = True
     elif abs(total - 1.0) > 1e-12:
-        for key in ("dds", "div", "sa"):
+        for key in ("sv", "div", "sa"):
             naive[key] = float(naive[key]) / total
         updated = True
 
@@ -762,7 +762,7 @@ def ensure_scoring_weights(path: Path, dataset_name: str) -> dict[str, dict[str,
 
 
 def _to_weight_triplet(selected: dict[str, object], group_name: str) -> dict[str, float]:
-    required = {"dds", "div", "sa"}
+    required = {"sv", "div", "sa"}
     missing = required - set(selected.keys())
     if missing:
         raise ValueError(f"权重组 {group_name} 缺少必要键: {', '.join(sorted(missing))}")
@@ -776,7 +776,7 @@ def _to_weight_triplet(selected: dict[str, object], group_name: str) -> dict[str
 
     total = sum(weights.values())
     if total <= 0:
-        return {"dds": 1.0 / 3.0, "div": 1.0 / 3.0, "sa": 1.0 / 3.0}
+        return {"sv": 1.0 / 3.0, "div": 1.0 / 3.0, "sa": 1.0 / 3.0}
     return {key: float(value / total) for key, value in weights.items()}
 
 
@@ -838,7 +838,7 @@ def run_mask_stage(args: argparse.Namespace, seed: int, device: torch.device, im
     class_names = load_class_names_for_noisy_dataset(args.dataset)
     num_classes = len(class_names)
 
-    dds_metric = DifficultyDirection(class_names=class_names, clip_model=args.clip_model, device=device)
+    sv_metric = StructuralVariation(class_names=class_names, clip_model=args.clip_model, device=device)
     div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
     sa_metric = SemanticAlignment(
         class_names=class_names,
@@ -849,8 +849,8 @@ def run_mask_stage(args: argparse.Namespace, seed: int, device: torch.device, im
         debug_prompts=args.debug_prompts,
     )
 
-    dds_loader = build_noisy_score_loader(
-        dds_metric.extractor.preprocess, args.dataset, seed, device, args.batch_size, args.num_workers
+    sv_loader = build_noisy_score_loader(
+        sv_metric.extractor.preprocess, args.dataset, seed, device, args.batch_size, args.num_workers
     )
     div_loader = build_noisy_score_loader(
         div_metric.extractor.preprocess, args.dataset, seed, device, args.batch_size, args.num_workers
@@ -865,7 +865,7 @@ def run_mask_stage(args: argparse.Namespace, seed: int, device: torch.device, im
     image_adapter, text_adapter, _ = load_trained_adapters(
         dataset_name=args.dataset,
         clip_model=args.clip_model,
-        input_dim=dds_metric.extractor.embed_dim,
+        input_dim=sv_metric.extractor.embed_dim,
         seed=seed,
         map_location=device,
         adapter_image_path=image_path,
@@ -880,8 +880,8 @@ def run_mask_stage(args: argparse.Namespace, seed: int, device: torch.device, im
     num_samples = len(dataset_for_labels)
 
     def _compute_scores() -> dict[str, np.ndarray]:
-        dds_scores = dds_metric.score_dataset(
-            tqdm(dds_loader, desc="Scoring DDS", unit="batch"),
+        sv_scores = sv_metric.score_dataset(
+            tqdm(sv_loader, desc="Scoring SV", unit="batch"),
             adapter=image_adapter,
         ).scores
         div_scores = div_metric.score_dataset(
@@ -897,7 +897,7 @@ def run_mask_stage(args: argparse.Namespace, seed: int, device: torch.device, im
         return {
             "sa": np.asarray(sa_scores, dtype=np.float32),
             "div": np.asarray(div_scores, dtype=np.float32),
-            "dds": np.asarray(dds_scores, dtype=np.float32),
+            "sv": np.asarray(sv_scores, dtype=np.float32),
             "labels": extract_labels(dataset_for_labels).astype(np.int64),
         }
 
@@ -909,9 +909,9 @@ def run_mask_stage(args: argparse.Namespace, seed: int, device: torch.device, im
         adapter_image_path=str(image_path),
         adapter_text_path=str(text_path),
         div_k=div_metric.k,
-        dds_k=dds_metric.k,
-        dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
-        dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
+        sv_k=sv_metric.k,
+        sv_eigval_lower_bound=sv_metric.eigval_lower_bound,
+        sv_eigval_upper_bound=sv_metric.eigval_upper_bound,
         prompt_template=sa_metric.prompt_template,
         num_samples=num_samples,
         compute_fn=_compute_scores,
@@ -920,7 +920,7 @@ def run_mask_stage(args: argparse.Namespace, seed: int, device: torch.device, im
 
     sa_scores_np = np.asarray(static_scores["sa"], dtype=np.float32)
     div_scores_np = np.asarray(static_scores["div"], dtype=np.float32)
-    dds_scores_np = np.asarray(static_scores["dds"], dtype=np.float32)
+    sv_scores_np = np.asarray(static_scores["sv"], dtype=np.float32)
     labels_np = np.asarray(static_scores["labels"], dtype=np.int64)
 
     if not np.array_equal(labels_np, noisy_targets.astype(np.int64)):
@@ -942,7 +942,7 @@ def run_mask_stage(args: argparse.Namespace, seed: int, device: torch.device, im
             keep_ratio=kr,
             device=device,
             seed=seed,
-            dds_static_scores=dds_scores_np,
+            sv_static_scores=sv_scores_np,
             group_candidate_pool_size=args.group_candidate_pool_size,
             group_init_count=args.group_init_count,
         )
@@ -1016,7 +1016,7 @@ def run_one_seed(args: argparse.Namespace, seed: int, device: torch.device) -> N
         run_weight_learning_stage(args, seed, device, image_path, text_path, proxy_log_dir)
     else:
         ensure_scoring_weights(WEIGHTS_ROOT / "scoring_weights.json", args.dataset)
-        print("[weights] skip proxy and weight learning for weight_group=naive; use equal DDS/Div/SA weights.")
+        print("[weights] skip proxy and weight learning for weight_group=naive; use equal SV/Div/SA weights.")
 
     run_mask_stage(args, seed, device, image_path, text_path)
 

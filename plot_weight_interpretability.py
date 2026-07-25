@@ -8,10 +8,10 @@ smartlixiang/2026-lx-graduation-project
 Expected input format (same as weights/scoring_weights.json):
 {
   "cifar10": {
-    "naive": {"sa": 0.3333, "div": 0.3333, "dds": 0.3333},
-    "22": {"sa": ..., "div": ..., "dds": ...},
-    "42": {"sa": ..., "div": ..., "dds": ...},
-    "96": {"sa": ..., "div": ..., "dds": ...}
+    "naive": {"sa": 0.3333, "div": 0.3333, "sv": 0.3333},
+    "22": {"sa": ..., "div": ..., "sv": ...},
+    "42": {"sa": ..., "div": ..., "sv": ...},
+    "96": {"sa": ..., "div": ..., "sv": ...}
   },
   ...
 }
@@ -23,8 +23,8 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-COMPONENTS = ["sa", "div", "dds"]
-LABEL_MAP = {"sa": "SA", "div": "Div", "dds": "DDS"}
+COMPONENTS = ["sa", "div", "sv"]
+LABEL_MAP = {"sa": "SA", "div": "Div", "sv": "SV"}
 
 
 def parse_args() -> argparse.Namespace:

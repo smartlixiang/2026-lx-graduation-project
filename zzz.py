@@ -10,15 +10,15 @@ Default behavior:
 - datasets: CIFAR-100 and Tiny-ImageNet;
 - seed: 22;
 - reads the existing corruption manifest, static-score caches and learned weights;
-- never recomputes SA/Div/DDS;
+- never recomputes SA/Div/SV;
 - applies the project's class-wise standard z-score over the complete training set;
 - calculates each corruption type separately;
-- reports population mean and variance for SA, Div, DDS and the learned-weight total;
+- reports population mean and variance for SA, Div, SV and the learned-weight total;
 - saves CSV and JSON summaries under ``corruption_exp/analysis``.
 
 The total score is
 
-    total = w_sa * z_sa + w_div * z_div + w_dds * z_dds
+    total = w_sa * z_sa + w_div * z_div + w_sv * z_sv
 
 where all z-scores are computed class-wise on the complete training set, matching
 ``utils.score_utils.standard_zscore_by_class``.
@@ -63,18 +63,18 @@ CORRUPTION_ID_TO_NAME = {
     3: "fog",
     4: "motion_blur",
 }
-METRIC_KEYS = ("sa", "div", "dds")
+METRIC_KEYS = ("sa", "div", "sv")
 CACHE_FILENAMES = {
     "sa": "SA_cache.npz",
     "div": "Div_cache.npz",
-    "dds": "DDS_cache.npz",
+    "sv": "SV_cache.npz",
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Summarize cached corruption SA/Div/DDS scores after class-wise "
+            "Summarize cached corruption SA/Div/SV scores after class-wise "
             "z-score standardization; no static score is recomputed."
         )
     )
@@ -363,7 +363,7 @@ def resolve_static_cache(
 
     if not candidates:
         raise FileNotFoundError(
-            f"no cached SA/Div/DDS triplet found for {dataset}, seed={seed} "
+            f"no cached SA/Div/SV triplet found for {dataset}, seed={seed} "
             f"under {search_root}. zzz.py will not recompute static scores."
         )
 
@@ -471,8 +471,8 @@ def summarize_dataset(
                 "sa_var": variances["sa"],
                 "div_mean": means["div"],
                 "div_var": variances["div"],
-                "dds_mean": means["dds"],
-                "dds_var": variances["dds"],
+                "sv_mean": means["sv"],
+                "sv_var": variances["sv"],
                 "total_mean": float(
                     np.mean(total_scores[mask], dtype=np.float64)
                 ),
@@ -481,7 +481,7 @@ def summarize_dataset(
                 ),
                 "sa_weighted_mean": contribution_means["sa"],
                 "div_weighted_mean": contribution_means["div"],
-                "dds_weighted_mean": contribution_means["dds"],
+                "sv_weighted_mean": contribution_means["sv"],
                 "dominant_metric_by_abs_z_mean": dominant_raw.upper(),
                 "dominant_metric_by_abs_weighted_mean": dominant_weighted.upper(),
             }
@@ -511,7 +511,7 @@ def print_dataset_summary(result: dict[str, Any]) -> None:
     print(
         "Weights: "
         f"SA={weights['sa']:.6f}, Div={weights['div']:.6f}, "
-        f"DDS={weights['dds']:.6f}"
+        f"SV={weights['sv']:.6f}"
     )
     print("Standardization: class-wise z-score over all training samples")
     print(f"Variance ddof: {result['variance_ddof']}")
@@ -520,7 +520,7 @@ def print_dataset_summary(result: dict[str, Any]) -> None:
         f"{'corruption':<24} {'n':>7} "
         f"{'SA mean':>10} {'SA var':>10} "
         f"{'Div mean':>10} {'Div var':>10} "
-        f"{'DDS mean':>10} {'DDS var':>10} "
+        f"{'SV mean':>10} {'SV var':>10} "
         f"{'Total mean':>11} {'Total var':>11} "
         f"{'raw shift':>10} {'weighted':>10}"
     )
@@ -531,7 +531,7 @@ def print_dataset_summary(result: dict[str, Any]) -> None:
             f"{row['corruption']:<24} {row['num_samples']:>7d} "
             f"{row['sa_mean']:>10.6f} {row['sa_var']:>10.6f} "
             f"{row['div_mean']:>10.6f} {row['div_var']:>10.6f} "
-            f"{row['dds_mean']:>10.6f} {row['dds_var']:>10.6f} "
+            f"{row['sv_mean']:>10.6f} {row['sv_var']:>10.6f} "
             f"{row['total_mean']:>11.6f} {row['total_var']:>11.6f} "
             f"{row['dominant_metric_by_abs_z_mean']:>10} "
             f"{row['dominant_metric_by_abs_weighted_mean']:>10}"
@@ -556,13 +556,13 @@ def save_results(
         "sa_var",
         "div_mean",
         "div_var",
-        "dds_mean",
-        "dds_var",
+        "sv_mean",
+        "sv_var",
         "total_mean",
         "total_var",
         "sa_weighted_mean",
         "div_weighted_mean",
-        "dds_weighted_mean",
+        "sv_weighted_mean",
         "dominant_metric_by_abs_z_mean",
         "dominant_metric_by_abs_weighted_mean",
     ]

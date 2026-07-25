@@ -24,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET  # noqa: E402
 from model.adapter import load_trained_adapters  # noqa: E402
-from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
+from scoring import StructuralVariation, Div, SemanticAlignment  # noqa: E402
 from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.score_utils import standard_zscore  # noqa: E402
@@ -230,7 +230,7 @@ def compute_candidate_table(
     div_metric: Div,
     device: torch.device,
     sa_scores: np.ndarray,
-    dds_scores: np.ndarray,
+    sv_scores: np.ndarray,
     weights: dict[str, float],
     class_budget: int,
     top_candidates: int,
@@ -276,16 +276,16 @@ def compute_candidate_table(
     dist_improve = (old_dist - new_dist).astype(np.float32)
     dist_z = standard_zscore(dist_improve)
     sa_z = standard_zscore(sa_scores[candidate_indices])
-    dds_z = standard_zscore(dds_scores[candidate_indices])
+    sv_z = standard_zscore(sv_scores[candidate_indices])
     progress = current_count / float(class_budget) if class_budget > 0 else 1.0
     progress = float(np.clip(progress, 0.0, 1.0))
     dist_weight_t = 0.6 * (1.0 - progress)
 
     sa_component = float(weights["sa"]) * sa_z
-    dds_component = float(weights["dds"]) * dds_z
+    sv_component = float(weights["sv"]) * sv_z
     div_component = float(weights["div"]) * div_z
     dist_component = float(dist_weight_t) * dist_z
-    total = sa_component + dds_component + div_component + dist_component
+    total = sa_component + sv_component + div_component + dist_component
 
     order = np.argsort(-total, kind="mergesort")
     top_n = min(top_candidates, candidate_indices.size)
@@ -305,11 +305,11 @@ def compute_candidate_table(
                 "dist_improve_raw": float(dist_improve[local_pos]),
                 "div_raw": float(div_raw[local_pos]),
                 "sa_z": float(sa_z[local_pos]),
-                "dds_z": float(dds_z[local_pos]),
+                "sv_z": float(sv_z[local_pos]),
                 "div_z": float(div_z[local_pos]),
                 "dist_z": float(dist_z[local_pos]),
                 "sa_component": float(sa_component[local_pos]),
-                "dds_component": float(dds_component[local_pos]),
+                "sv_component": float(sv_component[local_pos]),
                 "div_component": float(div_component[local_pos]),
                 "dist_weight_t": float(dist_weight_t),
                 "dist_component": float(dist_component[local_pos]),
@@ -332,7 +332,7 @@ def greedy_advance_one_class(
     div_metric: Div,
     device: torch.device,
     sa_scores: np.ndarray,
-    dds_scores: np.ndarray,
+    sv_scores: np.ndarray,
     weights: dict[str, float],
     class_budget: int,
 ) -> np.ndarray:
@@ -348,7 +348,7 @@ def greedy_advance_one_class(
             div_metric=div_metric,
             device=device,
             sa_scores=sa_scores,
-            dds_scores=dds_scores,
+            sv_scores=sv_scores,
             weights=weights,
             class_budget=class_budget,
             top_candidates=1,
@@ -388,8 +388,8 @@ def plot_candidate_contributions(path: Path, title: str, rows: list[dict[str, fl
         return
 
     labels = [f"#{int(row['rank'])}\nidx {int(row['sample_index'])}" for row in rows]
-    component_names = ["sa_component", "dds_component", "div_component", "dist_component", "total"]
-    display_names = ["SA", "DDS", "DynDiv", "Dist", "Total"]
+    component_names = ["sa_component", "sv_component", "div_component", "dist_component", "total"]
+    display_names = ["SA", "SV", "DynDiv", "Dist", "Total"]
 
     x = np.arange(len(rows), dtype=np.float32)
     width = 0.15
@@ -444,7 +444,7 @@ def main() -> None:
     all_weights = ensure_scoring_weights(weights_path, dataset_name)
     weights = load_scoring_weights(all_weights, args.weight_group, args.seed)
 
-    dds_metric = DifficultyDirection(class_names=class_names, clip_model=args.clip_model, device=device)
+    sv_metric = StructuralVariation(class_names=class_names, clip_model=args.clip_model, device=device)
     div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
     sa_metric = SemanticAlignment(
         class_names=class_names,
@@ -458,22 +458,22 @@ def main() -> None:
     image_adapter, text_adapter, adapter_paths = load_trained_adapters(
         dataset_name=dataset_name,
         clip_model=args.clip_model,
-        input_dim=dds_metric.extractor.embed_dim,
+        input_dim=sv_metric.extractor.embed_dim,
         seed=args.seed,
         map_location=device,
     )
     image_adapter.to(device).eval()
     text_adapter.to(device).eval()
 
-    dds_loader = build_score_loader(dds_metric.extractor.preprocess, dataset_name, device, args.batch_size, args.num_workers)
+    sv_loader = build_score_loader(sv_metric.extractor.preprocess, dataset_name, device, args.batch_size, args.num_workers)
     div_loader = build_score_loader(div_metric.extractor.preprocess, dataset_name, device, args.batch_size, args.num_workers)
     sa_loader = build_score_loader(sa_metric.extractor.preprocess, dataset_name, device, args.batch_size, args.num_workers)
 
     num_samples = len(dataset_for_names)
 
     def _compute_scores() -> dict[str, np.ndarray]:
-        dds_scores_local = dds_metric.score_dataset(
-            tqdm(dds_loader, desc="Scoring DDS", unit="batch"),
+        sv_scores_local = sv_metric.score_dataset(
+            tqdm(sv_loader, desc="Scoring SV", unit="batch"),
             adapter=image_adapter,
         ).scores
         div_scores_local = div_metric.score_dataset(
@@ -488,7 +488,7 @@ def main() -> None:
         return {
             "sa": np.asarray(sa_scores_local, dtype=np.float32),
             "div": np.asarray(div_scores_local, dtype=np.float32),
-            "dds": np.asarray(dds_scores_local, dtype=np.float32),
+            "sv": np.asarray(sv_scores_local, dtype=np.float32),
             "labels": labels,
         }
 
@@ -500,16 +500,16 @@ def main() -> None:
         adapter_image_path=str(adapter_paths["image_path"]),
         adapter_text_path=str(adapter_paths["text_path"]),
         div_k=div_metric.k,
-        dds_k=dds_metric.k,
-        dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
-        dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
+        sv_k=sv_metric.k,
+        sv_eigval_lower_bound=sv_metric.eigval_lower_bound,
+        sv_eigval_upper_bound=sv_metric.eigval_upper_bound,
         prompt_template=sa_metric.prompt_template,
         num_samples=num_samples,
         compute_fn=_compute_scores,
     )
 
     sa_scores = np.asarray(static_scores["sa"], dtype=np.float32)
-    dds_scores = np.asarray(static_scores["dds"], dtype=np.float32)
+    sv_scores = np.asarray(static_scores["sv"], dtype=np.float32)
     static_init_score = sa_scores
     rng = np.random.default_rng(args.seed)
 
@@ -569,7 +569,7 @@ def main() -> None:
                     div_metric=div_metric,
                     device=device,
                     sa_scores=sa_scores,
-                    dds_scores=dds_scores,
+                    sv_scores=sv_scores,
                     weights=weights,
                     class_budget=budget,
                 ),
@@ -587,7 +587,7 @@ def main() -> None:
                     div_metric=div_metric,
                     device=device,
                     sa_scores=sa_scores,
-                    dds_scores=dds_scores,
+                    sv_scores=sv_scores,
                     weights=weights,
                     class_budget=budget,
                     top_candidates=args.top_candidates,

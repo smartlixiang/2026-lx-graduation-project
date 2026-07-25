@@ -24,7 +24,7 @@ from calculate_my_mask import (  # noqa: E402
 )
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR100  # noqa: E402
 from model.adapter import load_trained_adapters  # noqa: E402
-from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
+from scoring import StructuralVariation, Div, SemanticAlignment  # noqa: E402
 from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.path_rules import resolve_mask_path  # noqa: E402
@@ -35,14 +35,14 @@ from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
 
 ABLATION_NAME = "ablation_sa"
 ABLATION_COMPONENT = "sa"
-ACTIVE_COMPONENTS = ("dds", "div")
-ALL_COMPONENTS = ("dds", "div", "sa")
+ACTIVE_COMPONENTS = ("sv", "div")
+ALL_COMPONENTS = ("sv", "div", "sa")
 
 
-class RatioBandDifficultyDirection(DifficultyDirection):
-    """DDS variant using eigenvalue-ratio band [lower, upper].
+class RatioBandStructuralVariation(StructuralVariation):
+    """SV variant using eigenvalue-ratio band [lower, upper].
 
-    The repository's current DifficultyDirection class keeps the historical
+    The repository's current StructuralVariation class keeps the historical
     2%-20% cache parameters, but its default direction selector is the dominant
     cumulative-ratio version. This subclass restores the ablation setting that
     selects PCA directions whose individual eigenvalue ratio lies in [2%, 20%].
@@ -145,7 +145,7 @@ def load_ablation_weights(dataset_name: str, weight_group: str, seed: int) -> di
     if isinstance(selected, dict):
         weights = _renormalize_without_ablation(selected)
     elif weight_group == "naive":
-        weights = {"dds": 0.5, "div": 0.5, "sa": 0.0}
+        weights = {"sv": 0.5, "div": 0.5, "sa": 0.0}
     else:
         original = _load_original_weights(dataset_name)
         fallback = original.get(str(seed)) or original.get("learned") or original.get("naive") or {}
@@ -181,7 +181,7 @@ def main() -> None:
     )
     print(f"[Init] {dataset_name} samples={len(dataset_for_names)} classes={len(class_names)}")
 
-    dds_metric = RatioBandDifficultyDirection(
+    sv_metric = RatioBandStructuralVariation(
         class_names=class_names,
         clip_model=args.clip_model,
         device=device,
@@ -200,7 +200,7 @@ def main() -> None:
 
     batch_size = 128
     num_workers = 4
-    dds_loader = build_score_loader(dds_metric.extractor.preprocess, dataset_name, device, batch_size, num_workers)
+    sv_loader = build_score_loader(sv_metric.extractor.preprocess, dataset_name, device, batch_size, num_workers)
     div_loader = build_score_loader(div_metric.extractor.preprocess, dataset_name, device, batch_size, num_workers)
     sa_loader = build_score_loader(sa_metric.extractor.preprocess, dataset_name, device, batch_size, num_workers)
 
@@ -216,7 +216,7 @@ def main() -> None:
         image_adapter, text_adapter, adapter_paths = load_trained_adapters(
             dataset_name=dataset_name,
             clip_model=args.clip_model,
-            input_dim=dds_metric.extractor.embed_dim,
+            input_dim=sv_metric.extractor.embed_dim,
             seed=seed,
             map_location=device,
         )
@@ -224,7 +224,7 @@ def main() -> None:
         text_adapter.to(device).eval()
 
         def _compute_scores() -> dict[str, np.ndarray]:
-            dds_scores = dds_metric.score_dataset(tqdm(dds_loader, desc="Scoring DDS(2%-20%)", unit="batch"), adapter=image_adapter).scores
+            sv_scores = sv_metric.score_dataset(tqdm(sv_loader, desc="Scoring SV(2%-20%)", unit="batch"), adapter=image_adapter).scores
             div_scores = div_metric.score_dataset(tqdm(div_loader, desc="Scoring Div", unit="batch"), adapter=image_adapter).scores
             sa_scores = sa_metric.score_dataset(
                 tqdm(sa_loader, desc="Scoring SA", unit="batch"),
@@ -232,7 +232,7 @@ def main() -> None:
                 adapter_text=text_adapter,
             ).scores
             return {
-                "dds": np.asarray(dds_scores),
+                "sv": np.asarray(sv_scores),
                 "div": np.asarray(div_scores),
                 "sa": np.asarray(sa_scores),
                 "labels": np.asarray(dataset_for_names.targets),
@@ -247,23 +247,23 @@ def main() -> None:
             adapter_image_path=str(adapter_paths["image_path"]),
             adapter_text_path=str(adapter_paths["text_path"]),
             div_k=div_metric.k,
-            dds_k=dds_metric.k,
-            dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
-            dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
+            sv_k=sv_metric.k,
+            sv_eigval_lower_bound=sv_metric.eigval_lower_bound,
+            sv_eigval_upper_bound=sv_metric.eigval_upper_bound,
             prompt_template=sa_metric.prompt_template,
             num_samples=len(dataset_for_names),
             compute_fn=_compute_scores,
         )
         static_seconds = time.perf_counter() - static_start
 
-        dds_scores_np = np.asarray(static_scores["dds"], dtype=np.float32)
+        sv_scores_np = np.asarray(static_scores["sv"], dtype=np.float32)
         div_scores_np = np.asarray(static_scores["div"], dtype=np.float32)
         sa_scores_np = np.asarray(static_scores["sa"], dtype=np.float32)
         labels = np.asarray(dataset_for_names.targets)
 
-        dds_global_z = standard_zscore_by_class(dds_scores_np, labels)
+        sv_global_z = standard_zscore_by_class(sv_scores_np, labels)
         div_global_z = standard_zscore_by_class(div_scores_np, labels)
-        total_scores_np = weights["dds"] * dds_global_z + weights["div"] * div_global_z
+        total_scores_np = weights["sv"] * sv_global_z + weights["div"] * div_global_z
 
         for keep_ratio in keep_ratios:
             task_idx += 1
@@ -306,7 +306,7 @@ def main() -> None:
                     clip_model=args.clip_model,
                     adapter_image_path=str(adapter_paths["image_path"]),
                     div_static_scores=div_scores_np,
-                    dds_static_scores=dds_scores_np,
+                    sv_static_scores=sv_scores_np,
                     group_candidate_pool_size=args.group_candidate_pool_size,
                 )
 

@@ -34,10 +34,10 @@ No new tunable hyperparameter is introduced.
 
 Behavior
 --------
-- normal: learn SA/Div/DDS weights in memory; do not save weights or masks;
+- normal: learn SA/Div/SV weights in memory; do not save weights or masks;
 - corruption: learn weights, calculate the current center-repair group mask in
   memory, and print retained counts for five corruption types;
-- A/C and static SA/Div/DDS must already exist in the corresponding formal
+- A/C and static SA/Div/SV must already exist in the corresponding formal
   experiment caches; this script never recomputes them;
 - only the new T cache is written, under ``yyy/test_T_cache``.
 """
@@ -68,7 +68,7 @@ import learn_scoring_weights as learn_mod  # noqa: E402
 from corruption_exp import cal_corruption_mask as corr_mod  # noqa: E402
 from dataset.dataset_config import CIFAR100, TINY_IMAGENET  # noqa: E402
 from model.adapter import load_trained_adapters  # noqa: E402
-from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
+from scoring import StructuralVariation, Div, SemanticAlignment  # noqa: E402
 from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.proxy_log_utils import (  # noqa: E402
@@ -629,7 +629,7 @@ def static_cache_expected_meta(
     adapter_image_path: Path,
     adapter_text_path: Path,
     div_metric: Div,
-    dds_metric: DifficultyDirection,
+    sv_metric: StructuralVariation,
     sa_metric: SemanticAlignment,
     num_samples: int,
 ) -> dict[str, object]:
@@ -642,9 +642,9 @@ def static_cache_expected_meta(
         "adapter_image_sha1": _hash_file(adapter_image_path),
         "adapter_text_sha1": _hash_file(adapter_text_path),
         "div_k": float(div_metric.k),
-        "dds_k": int(dds_metric.k),
-        "dds_eigval_lower_bound": float(dds_metric.eigval_lower_bound),
-        "dds_eigval_upper_bound": float(dds_metric.eigval_upper_bound),
+        "sv_k": int(sv_metric.k),
+        "sv_eigval_lower_bound": float(sv_metric.eigval_lower_bound),
+        "sv_eigval_upper_bound": float(sv_metric.eigval_upper_bound),
         "prompt_template": sa_metric.prompt_template,
         "num_samples": int(num_samples),
         "score_storage": NORMALIZATION_VERSION,
@@ -665,7 +665,7 @@ def load_static_cache_strict(
         loaded: dict[str, np.ndarray] = {}
         labels_ref: np.ndarray | None = None
         ok = True
-        for metric_name, key in (("SA", "sa"), ("Div", "div"), ("DDS", "dds")):
+        for metric_name, key in (("SA", "sa"), ("Div", "div"), ("SV", "sv")):
             validated = _validate_metric_cache(
                 cache_dir, metric_name, expected_meta, num_samples
             )
@@ -684,7 +684,7 @@ def load_static_cache_strict(
             matches.append(loaded)
     if not matches:
         raise FileNotFoundError(
-            f"No valid SA/Div/DDS cache matching current adapter under {cache_search_root}"
+            f"No valid SA/Div/SV cache matching current adapter under {cache_search_root}"
         )
     if len(matches) > 1:
         tqdm.write(
@@ -704,7 +704,7 @@ def build_static_bundle(
     corruption_info: corr_mod.CorruptionInfo | None,
 ) -> StaticBundle:
     class_names = build_class_names(dataset)
-    dds = DifficultyDirection(
+    sv = StructuralVariation(
         class_names=class_names,
         clip_model=args.clip_model,
         device=device,
@@ -727,7 +727,7 @@ def build_static_bundle(
         image_adapter, text_adapter, paths = load_trained_adapters(
             dataset_name=dataset,
             clip_model=args.clip_model,
-            input_dim=dds.extractor.embed_dim,
+            input_dim=sv.extractor.embed_dim,
             seed=seed,
             map_location=device,
         )
@@ -742,7 +742,7 @@ def build_static_bundle(
         image_adapter, text_adapter, _ = load_trained_adapters(
             dataset_name=dataset,
             clip_model=args.clip_model,
-            input_dim=dds.extractor.embed_dim,
+            input_dim=sv.extractor.embed_dim,
             seed=seed,
             map_location=device,
             adapter_image_path=image_path,
@@ -773,7 +773,7 @@ def build_static_bundle(
         adapter_image_path=image_path,
         adapter_text_path=text_path,
         div_metric=div,
-        dds_metric=dds,
+        sv_metric=sv,
         sa_metric=sa,
         num_samples=num_samples,
     )
@@ -839,7 +839,7 @@ def print_correlations(
     print(f"\n[{experiment}/{dataset}] new T vs class-standardized static metrics")
     print(f"{'metric':<10}{'Pearson':>14}{'Spearman':>14}")
     print("-" * 38)
-    for key, label in (("sa", "SA"), ("div", "Div"), ("dds", "DDS")):
+    for key, label in (("sa", "SA"), ("div", "Div"), ("sv", "SV")):
         feature = standard_zscore_by_class(static.scores[key], static.labels)
         print(
             f"{label:<10}{pearson(t_score, feature):>14.6f}"
@@ -868,7 +868,7 @@ def fit_weights(
         [
             standard_zscore_by_class(static.scores["sa"], static.labels),
             standard_zscore_by_class(static.scores["div"], static.labels),
-            standard_zscore_by_class(static.scores["dds"], static.labels),
+            standard_zscore_by_class(static.scores["sv"], static.labels),
         ]
     ).astype(np.float64)
     fit = learn_mod.fit_softplus_ratio_regression(
@@ -884,7 +884,7 @@ def fit_weights(
     weights = {
         "sa": float(normalized[0]),
         "div": float(normalized[1]),
-        "dds": float(normalized[2]),
+        "sv": float(normalized[2]),
     }
     return weights, fit
 
@@ -898,7 +898,7 @@ def print_weights(
     print(
         f"[weights] experiment={experiment} dataset={dataset} "
         f"SA={weights['sa']:.6f}, Div={weights['div']:.6f}, "
-        f"DDS={weights['dds']:.6f}, MSE={float(fit['mse']):.6f}, "
+        f"SV={weights['sv']:.6f}, MSE={float(fit['mse']):.6f}, "
         f"iterations={int(fit['iterations'])}"
     )
 
@@ -937,7 +937,7 @@ def run_corruption_mask(
         keep_ratio=int(args.kr),
         device=device,
         seed=seed,
-        dds_static_scores=np.asarray(static.scores["dds"], dtype=np.float32),
+        sv_static_scores=np.asarray(static.scores["sv"], dtype=np.float32),
         group_candidate_pool_size=int(args.group_candidate_pool_size),
         group_init_count=int(args.group_init_count),
     )
@@ -1067,7 +1067,7 @@ def main() -> None:
     print("=" * 112)
     print("test_T: validation-dominant inclusion-effect dynamic component")
     print(f"tasks={tasks} | seed={args.seed} | kr={args.kr} | device={device}")
-    print("A/C and SA/Div/DDS are cache-only; weights and masks are not saved.")
+    print("A/C and SA/Div/SV are cache-only; weights and masks are not saved.")
     print(f"new T cache root={YYY_ROOT / 'test_T_cache'}")
     print("=" * 112)
 

@@ -1,6 +1,6 @@
 """Visualize high-score vs low-score CIFAR100 samples under learned static weights.
 
-This script computes SA/Div/DDS static metrics over CIFAR100 train split,
+This script computes SA/Div/SV static metrics over CIFAR100 train split,
 optionally loads metric caches, then aggregates them with learned weights and
 plots paired high/low scoring samples for selected classes.
 """
@@ -18,7 +18,7 @@ from torchvision import datasets
 from tqdm import tqdm
 
 from model.adapter import load_trained_adapters
-from scoring import DifficultyDirection, Div, SemanticAlignment
+from scoring import StructuralVariation, Div, SemanticAlignment
 from utils.global_config import CONFIG
 from utils.seed import set_seed
 from utils.score_utils import standard_zscore_by_class
@@ -39,10 +39,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=CONFIG.default_batch_size)
     parser.add_argument("--num-workers", type=int, default=CONFIG.num_workers)
     parser.add_argument("--div-k", type=float, default=0.05)
-    parser.add_argument("--dds-k", type=int, default=5)
-    parser.add_argument("--dds-eigval-lower-bound", type=float, default=0.02)
-    parser.add_argument("--dds-eigval-upper-bound", type=float, default=0.2)
-    parser.add_argument("--dds-important-eigval-ratio", type=float, default=0.8)
+    parser.add_argument("--sv-k", type=int, default=5)
+    parser.add_argument("--sv-eigval-lower-bound", type=float, default=0.02)
+    parser.add_argument("--sv-eigval-upper-bound", type=float, default=0.2)
+    parser.add_argument("--sv-important-eigval-ratio", type=float, default=0.8)
     parser.add_argument("--prompt-template", type=str, default="a photo of a {}")
     parser.add_argument("--weights-json", type=str, default="weights/scoring_weights.json")
     parser.add_argument("--static-cache-root", type=str, default="static_scores")
@@ -78,7 +78,7 @@ def _load_learned_weights(weights_json_path: Path, dataset_name: str, seed: int)
             by_seed = dataset_node.get(str(seed))
             if isinstance(by_seed, dict):
                 entry = by_seed
-        if entry is None and all(k in payload for k in ("sa", "div", "dds")):
+        if entry is None and all(k in payload for k in ("sa", "div", "sv")):
             entry = payload
 
     if entry is None:
@@ -89,7 +89,7 @@ def _load_learned_weights(weights_json_path: Path, dataset_name: str, seed: int)
     return (
         float(entry["sa"]),
         float(entry["div"]),
-        float(entry["dds"]),
+        float(entry["sv"]),
         float(entry.get("bias", 0.0)),
     )
 
@@ -262,14 +262,14 @@ def main() -> None:
     raw_dataset = datasets.CIFAR100(root=args.data_root, train=True, download=True, transform=None)
     class_names = [str(c) for c in raw_dataset.classes]
 
-    dds_metric = DifficultyDirection(
+    sv_metric = StructuralVariation(
         class_names=class_names,
-        k=args.dds_k,
+        k=args.sv_k,
         clip_model=args.clip_model,
         device=device,
-        eigval_lower_bound=args.dds_eigval_lower_bound,
-        eigval_upper_bound=args.dds_eigval_upper_bound,
-        important_eigval_ratio=args.dds_important_eigval_ratio,
+        eigval_lower_bound=args.sv_eigval_lower_bound,
+        eigval_upper_bound=args.sv_eigval_upper_bound,
+        important_eigval_ratio=args.sv_important_eigval_ratio,
     )
     div_metric = Div(
         class_names=class_names,
@@ -289,15 +289,15 @@ def main() -> None:
     image_adapter, text_adapter, adapter_paths = load_trained_adapters(
         dataset_name=args.dataset,
         clip_model=args.clip_model,
-        input_dim=dds_metric.extractor.embed_dim,
+        input_dim=sv_metric.extractor.embed_dim,
         seed=args.seed,
         map_location=device,
     )
     image_adapter.to(device).eval()
     text_adapter.to(device).eval()
 
-    dds_loader = _make_loader(
-        dds_metric.extractor.preprocess,
+    sv_loader = _make_loader(
+        sv_metric.extractor.preprocess,
         args.data_root,
         args.batch_size,
         args.num_workers,
@@ -322,8 +322,8 @@ def main() -> None:
 
     def _compute_scores() -> dict[str, np.ndarray]:
         with tqdm(total=3, desc="Computing static metrics", unit="metric") as metric_bar:
-            dds_scores = dds_metric.score_dataset(
-                tqdm(dds_loader, desc="Scoring DDS", unit="batch"),
+            sv_scores = sv_metric.score_dataset(
+                tqdm(sv_loader, desc="Scoring SV", unit="batch"),
                 adapter=image_adapter,
             )
             metric_bar.update(1)
@@ -343,7 +343,7 @@ def main() -> None:
         return {
             "sa": sa_scores.scores.numpy(),
             "div": div_scores.scores.numpy(),
-            "dds": dds_scores.scores.numpy(),
+            "sv": sv_scores.scores.numpy(),
             "labels": np.asarray(raw_dataset.targets),
         }
 
@@ -355,9 +355,9 @@ def main() -> None:
         adapter_image_path=str(adapter_paths["image_path"]),
         adapter_text_path=str(adapter_paths["text_path"]),
         div_k=div_metric.k,
-        dds_k=dds_metric.k,
-        dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
-        dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
+        sv_k=sv_metric.k,
+        sv_eigval_lower_bound=sv_metric.eigval_lower_bound,
+        sv_eigval_upper_bound=sv_metric.eigval_upper_bound,
         prompt_template=sa_metric.prompt_template,
         num_samples=num_samples,
         compute_fn=_compute_scores,
@@ -367,11 +367,11 @@ def main() -> None:
     if not np.array_equal(labels, np.asarray(raw_dataset.targets, dtype=np.int64)):
         raise ValueError("Static score labels mismatch CIFAR100 raw dataset order.")
 
-    w_sa, w_div, w_dds, bias = _load_learned_weights(Path(args.weights_json), args.dataset, args.seed)
+    w_sa, w_div, w_sv, bias = _load_learned_weights(Path(args.weights_json), args.dataset, args.seed)
     sa_z = standard_zscore_by_class(static_scores["sa"], labels).astype(np.float64)
     div_z = standard_zscore_by_class(static_scores["div"], labels).astype(np.float64)
-    dds_z = standard_zscore_by_class(static_scores["dds"], labels).astype(np.float64)
-    final_scores = w_sa * sa_z + w_div * div_z + w_dds * dds_z + bias
+    sv_z = standard_zscore_by_class(static_scores["sv"], labels).astype(np.float64)
+    final_scores = w_sa * sa_z + w_div * div_z + w_sv * sv_z + bias
 
     high_pairs, low_pairs = _select_extreme_indices_per_class(final_scores, labels, TARGET_CLASS_IDS, rng)
     _plot_pairs(raw_dataset, class_names, final_scores, high_pairs, low_pairs, Path(args.output))
@@ -379,7 +379,7 @@ def main() -> None:
     print(f"Saved figure to: {args.output}")
     print(
         "Weights:",
-        f"sa={w_sa:.6f}, div={w_div:.6f}, dds={w_dds:.6f}, bias={bias:.6f}",
+        f"sa={w_sa:.6f}, div={w_div:.6f}, sv={w_sv:.6f}, bias={bias:.6f}",
     )
 
 

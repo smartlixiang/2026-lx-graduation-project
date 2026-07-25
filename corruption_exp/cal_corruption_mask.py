@@ -61,7 +61,7 @@ EXPECTED_TRAIN_SIZES = {"cifar100": 50_000, "tiny-imagenet": 100_000}
 from corruption_exp import corruption_opt  # noqa: E402
 from dataset.dataset_config import CIFAR100, TINY_IMAGENET  # noqa: E402
 from model.adapter import CLIPFeatureExtractor, load_trained_adapters  # noqa: E402
-from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
+from scoring import StructuralVariation, Div, SemanticAlignment  # noqa: E402
 from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
 from utils.global_config import CONFIG  # noqa: E402
 from utils.proxy_log_utils import resolve_seed_epoch_proxy_log_dir  # noqa: E402
@@ -387,7 +387,7 @@ def migrate_dynamic_caches(args: argparse.Namespace, info: CorruptionInfo) -> No
 
 
 def _static_bundle_valid(cache_dir: Path, expected: dict[str, object], labels: np.ndarray) -> bool:
-    required = ("SA_cache.npz", "Div_cache.npz", "DDS_cache.npz")
+    required = ("SA_cache.npz", "Div_cache.npz", "SV_cache.npz")
     if not all((cache_dir / name).is_file() for name in required):
         return False
     for filename in required:
@@ -413,9 +413,9 @@ def _static_bundle_valid(cache_dir: Path, expected: dict[str, object], labels: n
     return True
 
 
-def migrate_static_score_cache(args: argparse.Namespace, info: CorruptionInfo, div: Div, dds: DifficultyDirection, sa: SemanticAlignment, labels: np.ndarray, img_p: Path, txt_p: Path) -> Path:
-    canonical = resolve_static_score_cache_dir(STATIC_SCORE_ROOT, info.dataset, info.seed, div.k, dds.eigval_lower_bound, dds.eigval_upper_bound)
-    required = ("SA_cache.npz", "Div_cache.npz", "DDS_cache.npz")
+def migrate_static_score_cache(args: argparse.Namespace, info: CorruptionInfo, div: Div, sv: StructuralVariation, sa: SemanticAlignment, labels: np.ndarray, img_p: Path, txt_p: Path) -> Path:
+    canonical = resolve_static_score_cache_dir(STATIC_SCORE_ROOT, info.dataset, info.seed, div.k, sv.eigval_lower_bound, sv.eigval_upper_bound)
+    required = ("SA_cache.npz", "Div_cache.npz", "SV_cache.npz")
     if all((canonical / name).is_file() for name in required):
         return canonical
     expected = {
@@ -425,9 +425,9 @@ def migrate_static_score_cache(args: argparse.Namespace, info: CorruptionInfo, d
         "adapter_image_path": str(img_p),
         "adapter_text_path": str(txt_p),
         "div_k": float(div.k),
-        "dds_k": int(dds.k),
-        "dds_eigval_lower_bound": float(dds.eigval_lower_bound),
-        "dds_eigval_upper_bound": float(dds.eigval_upper_bound),
+        "sv_k": int(sv.k),
+        "sv_eigval_lower_bound": float(sv.eigval_lower_bound),
+        "sv_eigval_upper_bound": float(sv.eigval_upper_bound),
         "prompt_template": sa.prompt_template,
         "num_samples": int(info.num_samples),
         "score_storage": "raw_static_scores_v1",
@@ -457,11 +457,11 @@ def migrate_static_score_cache(args: argparse.Namespace, info: CorruptionInfo, d
 def stage_static_scores(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any]) -> dict[str, np.ndarray]:
     device = torch.device(args.device) if args.device else CONFIG.global_device
     class_names = build_class_names(info.dataset)
-    dds = DifficultyDirection(class_names=class_names, clip_model=args.clip_model, device=device)
+    sv = StructuralVariation(class_names=class_names, clip_model=args.clip_model, device=device)
     div = Div(class_names=class_names, clip_model=args.clip_model, device=device)
     sa = SemanticAlignment(class_names=class_names, clip_model=args.clip_model, device=device, dataset_name=info.dataset, data_root=str(DATA_ROOT), debug_prompts=args.debug_prompts)
     img_p, txt_p = adapter_paths(info.dataset, info.seed)
-    image_adapter, text_adapter, _ = load_trained_adapters(info.dataset, args.clip_model, dds.extractor.embed_dim, info.seed, map_location=device, adapter_image_path=img_p, adapter_text_path=txt_p)
+    image_adapter, text_adapter, _ = load_trained_adapters(info.dataset, args.clip_model, sv.extractor.embed_dim, info.seed, map_location=device, adapter_image_path=img_p, adapter_text_path=txt_p)
     image_adapter.to(device).eval(); text_adapter.to(device).eval()
     raw = build_raw_train_dataset(info.dataset); labels = extract_labels(raw)
 
@@ -470,14 +470,14 @@ def stage_static_scores(args: argparse.Namespace, info: CorruptionInfo, ctx: dic
         return DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=device.type == "cuda")
     def compute():
         return {
-            "dds": np.asarray(dds.score_dataset(tqdm(loader(dds.extractor.preprocess), desc="Scoring DDS", unit="batch"), adapter=image_adapter).scores),
+            "sv": np.asarray(sv.score_dataset(tqdm(loader(sv.extractor.preprocess), desc="Scoring SV", unit="batch"), adapter=image_adapter).scores),
             "div": np.asarray(div.score_dataset(tqdm(loader(div.extractor.preprocess), desc="Scoring Div", unit="batch"), adapter=image_adapter).scores),
             "sa": np.asarray(sa.score_dataset(tqdm(loader(sa.extractor.preprocess), desc="Scoring SA", unit="batch"), adapter_image=image_adapter, adapter_text=text_adapter).scores),
             "labels": labels,
         }
-    cache_dir = migrate_static_score_cache(args, info, div, dds, sa, labels, img_p, txt_p)
+    cache_dir = migrate_static_score_cache(args, info, div, sv, sa, labels, img_p, txt_p)
     before = sorted(cache_dir.rglob("*.npz")) if cache_dir.exists() else []
-    scores = get_or_compute_static_scores(cache_root=STATIC_SCORE_ROOT, dataset=info.dataset, seed=info.seed, clip_model=args.clip_model, adapter_image_path=str(img_p), adapter_text_path=str(txt_p), div_k=div.k, dds_k=dds.k, dds_eigval_lower_bound=dds.eigval_lower_bound, dds_eigval_upper_bound=dds.eigval_upper_bound, prompt_template=sa.prompt_template, num_samples=info.num_samples, compute_fn=compute, use_file_hashes=False)
+    scores = get_or_compute_static_scores(cache_root=STATIC_SCORE_ROOT, dataset=info.dataset, seed=info.seed, clip_model=args.clip_model, adapter_image_path=str(img_p), adapter_text_path=str(txt_p), div_k=div.k, sv_k=sv.k, sv_eigval_lower_bound=sv.eigval_lower_bound, sv_eigval_upper_bound=sv.eigval_upper_bound, prompt_template=sa.prompt_template, num_samples=info.num_samples, compute_fn=compute, use_file_hashes=False)
     if not np.array_equal(np.asarray(scores["labels"], dtype=np.int64), labels):
         raise ValueError("static score labels do not match original clean labels")
     after = sorted(cache_dir.rglob("*.npz")) if cache_dir.exists() else []
@@ -567,7 +567,7 @@ def load_valid_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict
     entry = ((data.get(info.dataset) or {}).get(str(info.seed)) if isinstance(data.get(info.dataset), dict) else None)
     if not isinstance(entry, dict):
         return None
-    vals = {k: float(entry.get(k, np.nan)) for k in ("sa", "div", "dds")}
+    vals = {k: float(entry.get(k, np.nan)) for k in ("sa", "div", "sv")}
     if not all(np.isfinite(v) and v > 0 for v in vals.values()) or abs(sum(vals.values()) - 1.0) > 1e-4:
         return None
     if entry.get("transferability_component") != "TransferabilityScore":
@@ -590,7 +590,7 @@ def load_valid_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict
 def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str, Any], proxy_log_dir: Path | None = None) -> dict[str, float]:
     if args.weight_group == "naive":
         tqdm.write("skip proxy/dynamic/weight-learning for naive weights")
-        return {"sa": 1/3, "div": 1/3, "dds": 1/3}
+        return {"sa": 1/3, "div": 1/3, "sv": 1/3}
     if proxy_log_dir is None:
         raise ValueError("proxy_log_dir is required for learned corruption weights.")
     if not proxy_log_dir.is_dir():
@@ -603,7 +603,7 @@ def stage_weights(args: argparse.Namespace, info: CorruptionInfo, ctx: dict[str,
     tqdm.write("Learned weights cache MISS→LEARN")
     migrate_dynamic_caches(args, info)
     img_p, txt_p = adapter_paths(info.dataset, info.seed)
-    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), proxy_log=str(proxy_log_dir), proxy_model=args.proxy_model, proxy_epochs=int(ctx["proxy_epochs"]), adapter_image_path=str(img_p), adapter_text_path=str(txt_p), clip_model=args.clip_model, batch_size=args.batch_size, num_workers=args.num_workers, div_k=0.05, dds_k=5, dds_important_eigval_ratio=0.8, coverage_tau_g=0.15, coverage_s_g=0.07, coverage_k_pct=0.05, coverage_q_low=0.002, coverage_q_high=0.998, ridge_lambda=0.01, learning_rate=1e-2, max_iter=10000, tol=1e-6, ratio_lambda=args.ratio_lambda, regression_learning_rate=2e-3, regression_max_iter=10000, regression_tol=1e-8, output=str(WEIGHTS_PATH), device=args.device, debug_prompts=args.debug_prompts, seed=str(info.seed), proxy_training_seed=None)
+    ns = argparse.Namespace(dataset=info.dataset, data_root=str(DATA_ROOT), proxy_log=str(proxy_log_dir), proxy_model=args.proxy_model, proxy_epochs=int(ctx["proxy_epochs"]), adapter_image_path=str(img_p), adapter_text_path=str(txt_p), clip_model=args.clip_model, batch_size=args.batch_size, num_workers=args.num_workers, div_k=0.05, sv_k=5, sv_important_eigval_ratio=0.8, coverage_tau_g=0.15, coverage_s_g=0.07, coverage_k_pct=0.05, coverage_q_low=0.002, coverage_q_high=0.998, ridge_lambda=0.01, learning_rate=1e-2, max_iter=10000, tol=1e-6, ratio_lambda=args.ratio_lambda, regression_learning_rate=2e-3, regression_max_iter=10000, regression_tol=1e-8, output=str(WEIGHTS_PATH), device=args.device, debug_prompts=args.debug_prompts, seed=str(info.seed), proxy_training_seed=None)
     tqdm.write(f"[weights] ratio_lambda={float(args.ratio_lambda):.12g}")
     with patched_project_paths(), patched_training_corruption(info.dataset, info):
         learn_weights_mod.run_once(ns, [info.seed])
@@ -643,7 +643,7 @@ def validate_mask_file(path: Path, info: CorruptionInfo, keep_ratio: int, weight
             if int(np.asarray(data["seed"]).item()) != info.seed or int(np.asarray(data["keep_ratio"]).item()) != int(keep_ratio): return False, "seed/keep_ratio mismatch"
             saved_weights = np.asarray(data["weights"], dtype=np.float64)
             if saved_weights.shape != (3,): return False, "weights shape mismatch"
-            expected_weights = np.array([weights["sa"], weights["div"], weights["dds"]], dtype=np.float64)
+            expected_weights = np.array([weights["sa"], weights["div"], weights["sv"]], dtype=np.float64)
             if not np.allclose(saved_weights, expected_weights): return False, "weights mismatch"
     except Exception as exc:
         return False, f"mask load failed: {exc}"
@@ -666,7 +666,7 @@ def save_mask(path: Path, mask: np.ndarray, selected_by_class: dict[int, int], s
     scalar = dict(dataset=info.dataset, method=args.mode_name, weight_group=args.weight_group, seed=int(info.seed), keep_ratio=int(keep_ratio), num_selected=int(selected.size), num_corrupted_total=int(info.is_corrupted.sum()), num_corrupted_selected=int(np.sum(csel >= 0)), corruption_ratio_total=float(info.is_corrupted.mean()), corruption_ratio_in_mask=float(np.mean(csel >= 0)) if selected.size else 0.0)
     path.parent.mkdir(parents=True, exist_ok=True)
     group_stats = slim_group_stats(stats); group_stats["group_init_count"] = int(args.group_init_count); group_stats["candidate_pool_size"] = int(args.group_candidate_pool_size)
-    np.savez_compressed(path, mask=m, selected_indices=selected, corruption_types=info.corruption_types, is_corrupted=info.is_corrupted, weights=np.array([weights["sa"], weights["div"], weights["dds"]], dtype=np.float64), selected_by_class=np.array(json.dumps(selected_by_class), dtype=np.str_), group_stats=np.array(json.dumps(group_stats), dtype=np.str_), **{k: np.array(v) for k, v in scalar.items()})
+    np.savez_compressed(path, mask=m, selected_indices=selected, corruption_types=info.corruption_types, is_corrupted=info.is_corrupted, weights=np.array([weights["sa"], weights["div"], weights["sv"]], dtype=np.float64), selected_by_class=np.array(json.dumps(selected_by_class), dtype=np.str_), group_stats=np.array(json.dumps(group_stats), dtype=np.str_), **{k: np.array(v) for k, v in scalar.items()})
     _print_corruption_type_counts(path, m, info.corruption_types)
 
 
@@ -697,7 +697,7 @@ def stage_masks(args: argparse.Namespace, info: CorruptionInfo, scores: dict[str
             _print_corruption_type_counts(out, cached_mask, info.corruption_types); continue
         if args.skip_saved and not valid:
             tqdm.write(f"Mask cache MISS→COMPUTE ({reason})")
-        mask, selected_by_class, stats = mask_mod.select_group_mask_by_center_repair(np.asarray(scores["sa"], dtype=np.float32), div_metric=div, div_loader=div_loader, image_adapter=image_adapter, labels=labels, weights=weights, num_classes=len(class_names), keep_ratio=kr, device=device, seed=info.seed, dds_static_scores=np.asarray(scores["dds"], dtype=np.float32), group_candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count)
+        mask, selected_by_class, stats = mask_mod.select_group_mask_by_center_repair(np.asarray(scores["sa"], dtype=np.float32), div_metric=div, div_loader=div_loader, image_adapter=image_adapter, labels=labels, weights=weights, num_classes=len(class_names), keep_ratio=kr, device=device, seed=info.seed, sv_static_scores=np.asarray(scores["sv"], dtype=np.float32), group_candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count)
         save_mask(out, mask, selected_by_class, stats, weights, args, info, kr)
 
 

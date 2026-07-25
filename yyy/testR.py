@@ -15,7 +15,7 @@ Definition:
     signed_effect = (U_in - U_out) / (|U_in| + |U_out| + eps)
     R = clip(signed_effect, 0, 1)  # used for T*R and cache storage
 
-Only R is cached, under yyy/R_cache/. Existing A/C/T and SA/Div/DDS caches are
+Only R is cached, under yyy/R_cache/. Existing A/C/T and SA/Div/SV caches are
 read-only. Learned weights and corruption masks are not saved.
 
 Default:
@@ -463,17 +463,17 @@ def load_static_scores_readonly(
     for sa_path in sorted(paths.static_root.rglob("SA_cache.npz")):
         directory = sa_path.parent
         div_path = directory / "Div_cache.npz"
-        dds_path = directory / "DDS_cache.npz"
-        if not div_path.is_file() or not dds_path.is_file():
+        sv_path = directory / "SV_cache.npz"
+        if not div_path.is_file() or not sv_path.is_file():
             continue
         try:
             sa, labels_sa, indices_sa, meta_sa = _load_static_metric(sa_path)
             div, labels_div, indices_div, meta_div = _load_static_metric(div_path)
-            dds, labels_dds, indices_dds, meta_dds = _load_static_metric(dds_path)
+            sv, labels_sv, indices_sv, meta_sv = _load_static_metric(sv_path)
         except Exception:
             continue
 
-        metas = (meta_sa, meta_div, meta_dds)
+        metas = (meta_sa, meta_div, meta_sv)
         if any(meta.get("dataset") != dataset for meta in metas):
             continue
         if any(int(meta.get("seed", -1)) != int(seed) for meta in metas):
@@ -484,7 +484,7 @@ def load_static_scores_readonly(
             continue
         if any(abs(float(meta.get("div_k", np.nan)) - 0.05) > 1e-12 for meta in metas):
             continue
-        if any(int(meta.get("dds_k", -1)) != 5 for meta in metas):
+        if any(int(meta.get("sv_k", -1)) != 5 for meta in metas):
             continue
         if any(
             not _same_path(meta.get("adapter_image_path", ""), expected_image_adapter)
@@ -498,22 +498,22 @@ def load_static_scores_readonly(
             continue
         if not (
             np.array_equal(labels_sa, labels_div)
-            and np.array_equal(labels_sa, labels_dds)
+            and np.array_equal(labels_sa, labels_sv)
             and np.array_equal(indices_sa, indices_div)
-            and np.array_equal(indices_sa, indices_dds)
+            and np.array_equal(indices_sa, indices_sv)
         ):
             continue
         if labels_sa.shape != (num_samples,):
             continue
         if not np.array_equal(indices_sa, np.arange(num_samples, dtype=indices_sa.dtype)):
             continue
-        if any(array.shape != (num_samples,) for array in (sa, div, dds)):
+        if any(array.shape != (num_samples,) for array in (sa, div, sv)):
             continue
 
         matches.append(
             (
                 directory,
-                {"sa": sa, "div": div, "dds": dds, "labels": labels_sa},
+                {"sa": sa, "div": div, "sv": sv, "labels": labels_sa},
             )
         )
 
@@ -521,7 +521,7 @@ def load_static_scores_readonly(
         raise FileNotFoundError(
             f"No matching static cache under {paths.static_root} for "
             f"experiment={paths.name}, dataset={dataset}, seed={seed}. "
-            "The test script never recomputes SA/Div/DDS."
+            "The test script never recomputes SA/Div/SV."
         )
 
     matches.sort(
@@ -540,7 +540,7 @@ def load_static_scores_readonly(
         raise RuntimeError(f"Multiple matching static cache bundles found:\n  {choices}")
 
     directory, scores = matches[0]
-    print(f"[static] SA/Div/DDS cache hit: {directory}")
+    print(f"[static] SA/Div/SV cache hit: {directory}")
     return scores, directory
 
 
@@ -879,10 +879,10 @@ def learn_weights_in_memory(
     div_z = standard_zscore_by_class(
         np.asarray(static_scores["div"], dtype=np.float32), labels
     )
-    dds_z = standard_zscore_by_class(
-        np.asarray(static_scores["dds"], dtype=np.float32), labels
+    sv_z = standard_zscore_by_class(
+        np.asarray(static_scores["sv"], dtype=np.float32), labels
     )
-    features = np.stack([sa_z, div_z, dds_z], axis=1).astype(np.float64)
+    features = np.stack([sa_z, div_z, sv_z], axis=1).astype(np.float64)
 
     fit = learn_weights_mod.fit_softplus_ratio_regression(
         features,
@@ -897,7 +897,7 @@ def learn_weights_in_memory(
     weights = {
         "sa": float(normalized[0]),
         "div": float(normalized[1]),
-        "dds": float(normalized[2]),
+        "sv": float(normalized[2]),
     }
     return weights, fit
 
@@ -1041,7 +1041,7 @@ def run_normal_dataset(
         print(
             f"[normal][{variant}] weights: "
             f"SA={weights['sa']:.6f}, Div={weights['div']:.6f}, "
-            f"DDS={weights['dds']:.6f}, "
+            f"SV={weights['sv']:.6f}, "
             f"bias={float(fit['bias']):.6f}, "
             f"mse={float(fit['mse']):.6e}"
         )
@@ -1168,7 +1168,7 @@ def run_corruption_dataset(
             print(
                 f"[corruption][{variant}] weights: "
                 f"SA={weights['sa']:.6f}, Div={weights['div']:.6f}, "
-                f"DDS={weights['dds']:.6f}, "
+                f"SV={weights['sv']:.6f}, "
                 f"bias={float(fit['bias']):.6f}, "
                 f"mse={float(fit['mse']):.6e}"
             )
@@ -1185,8 +1185,8 @@ def run_corruption_dataset(
                     keep_ratio=args.kr,
                     device=device,
                     seed=args.seed,
-                    dds_static_scores=np.asarray(
-                        static_scores["dds"], dtype=np.float32
+                    sv_static_scores=np.asarray(
+                        static_scores["sv"], dtype=np.float32
                     ),
                     group_candidate_pool_size=(
                         args.group_candidate_pool_size

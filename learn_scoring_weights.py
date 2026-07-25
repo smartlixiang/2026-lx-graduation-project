@@ -11,7 +11,7 @@ Cache-first behavior:
 4. Otherwise, load proxy logs from
    weights/proxy_logs/[dataset]/[proxy_model]/[seed]/[epochs], recompute/save
    missing components, and continue.
-5. Static SA/Div/DDS scores are computed with the adapter of the same output
+5. Static SA/Div/SV scores are computed with the adapter of the same output
    seed, then fitted against that seed's dynamic target.
 """
 
@@ -31,7 +31,7 @@ from tqdm import tqdm
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET
 from utils.training_defaults import get_proxy_training_config
 from model.adapter import AdapterMLP, load_trained_adapters
-from scoring import DifficultyDirection, Div, SemanticAlignment
+from scoring import StructuralVariation, Div, SemanticAlignment
 from utils.class_name_utils import resolve_class_names_for_prompts
 from utils.global_config import CONFIG
 from utils.proxy_log_utils import resolve_proxy_log_path
@@ -81,8 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--div-k", type=float, default=0.05)
-    parser.add_argument("--dds-k", type=int, default=5)
-    parser.add_argument("--dds-important-eigval-ratio", type=float, default=0.8)
+    parser.add_argument("--sv-k", type=int, default=5)
+    parser.add_argument("--sv-important-eigval-ratio", type=float, default=0.8)
     parser.add_argument("--coverage-tau-g", type=float, default=0.15)
     parser.add_argument("--coverage-s-g", type=float, default=0.07)
     parser.add_argument("--coverage-k-pct", type=float, default=0.05)
@@ -612,7 +612,7 @@ def validate_saved_weight_entry(entry: object) -> tuple[bool, dict[str, float] |
     if not isinstance(entry, dict):
         return False, None, "entry is not a dict"
     values: dict[str, float] = {}
-    for key in ("sa", "div", "dds"):
+    for key in ("sa", "div", "sv"):
         if key not in entry:
             return False, None, f"missing required field: {key}"
         try:
@@ -624,7 +624,7 @@ def validate_saved_weight_entry(entry: object) -> tuple[bool, dict[str, float] |
         if value <= 0.0:
             return False, None, f"field {key} is not > 0"
         values[key] = value
-    weight_sum = values["sa"] + values["div"] + values["dds"]
+    weight_sum = values["sa"] + values["div"] + values["sv"]
     if abs(weight_sum - 1.0) > 1e-4:
         return False, None, f"weights sum is not approximately 1: sum={weight_sum:.10f}"
     return True, values, "ok"
@@ -649,12 +649,12 @@ def report_existing_weight_entry(
         return
     valid, weights, reason = validate_saved_weight_entry(seed_entry)
     if valid and weights is not None:
-        weight_sum = weights["sa"] + weights["div"] + weights["dds"]
+        weight_sum = weights["sa"] + weights["div"] + weights["sv"]
         print(
             "[weights] existing weights are valid and will be overwritten: "
             f"dataset={dataset} seed={seed} "
             f"SA={weights['sa']:.6f}, Div={weights['div']:.6f}, "
-            f"DDS={weights['dds']:.6f}, sum={weight_sum:.6f}"
+            f"SV={weights['sv']:.6f}, sum={weight_sum:.6f}"
         )
     else:
         print(
@@ -816,12 +816,12 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     resolved_proxy_epochs = int(args.proxy_epochs) if args.proxy_epochs is not None else resolve_default_proxy_epochs(args.dataset)
 
     class_names = load_class_names(args.dataset, args.data_root)
-    dds_metric = DifficultyDirection(
+    sv_metric = StructuralVariation(
         class_names=class_names,
         clip_model=args.clip_model,
         device=device,
-        k=args.dds_k,
-        important_eigval_ratio=args.dds_important_eigval_ratio,
+        k=args.sv_k,
+        important_eigval_ratio=args.sv_important_eigval_ratio,
     )
     div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device, k=args.div_k)
     sa_metric = SemanticAlignment(
@@ -833,7 +833,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         debug_prompts=args.debug_prompts,
     )
 
-    dds_loader = build_score_loader(dds_metric.extractor.preprocess, args.data_root, args.dataset, device, args.batch_size, args.num_workers)
+    sv_loader = build_score_loader(sv_metric.extractor.preprocess, args.data_root, args.dataset, device, args.batch_size, args.num_workers)
     div_loader = build_score_loader(div_metric.extractor.preprocess, args.data_root, args.dataset, device, args.batch_size, args.num_workers)
     sa_loader = build_score_loader(sa_metric.extractor.preprocess, args.data_root, args.dataset, device, args.batch_size, args.num_workers)
 
@@ -871,12 +871,12 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         report_existing_weight_entry(data, args.dataset, seed, output_path)
 
         image_adapter, text_adapter, adapter_paths = load_adapters_for_seed(
-            args, args.dataset, dds_metric.extractor.embed_dim, seed, device
+            args, args.dataset, sv_metric.extractor.embed_dim, seed, device
         )
 
         def _compute_scores() -> dict[str, np.ndarray]:
-            dds_scores_local = dds_metric.score_dataset(
-                tqdm(dds_loader, desc=f"Scoring DDS (seed={seed})", unit="batch"),
+            sv_scores_local = sv_metric.score_dataset(
+                tqdm(sv_loader, desc=f"Scoring SV (seed={seed})", unit="batch"),
                 adapter=image_adapter,
             )
             div_scores_local = div_metric.score_dataset(
@@ -891,7 +891,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             return {
                 "sa": sa_scores_local.scores.numpy(),
                 "div": div_scores_local.scores.numpy(),
-                "dds": dds_scores_local.scores.numpy(),
+                "sv": sv_scores_local.scores.numpy(),
                 "labels": np.asarray(dataset_for_labels.targets),
             }
 
@@ -903,9 +903,9 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             adapter_image_path=str(adapter_paths["image_path"]),
             adapter_text_path=str(adapter_paths["text_path"]),
             div_k=div_metric.k,
-            dds_k=dds_metric.k,
-            dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
-            dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
+            sv_k=sv_metric.k,
+            sv_eigval_lower_bound=sv_metric.eigval_lower_bound,
+            sv_eigval_upper_bound=sv_metric.eigval_upper_bound,
             prompt_template=sa_metric.prompt_template,
             num_samples=num_samples_static,
             compute_fn=_compute_scores,
@@ -917,9 +917,9 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
 
         sa_z = standard_zscore_by_class(static_scores["sa"], static_scores["labels"])
         div_z = standard_zscore_by_class(static_scores["div"], static_scores["labels"])
-        dds_z = standard_zscore_by_class(static_scores["dds"], static_scores["labels"])
+        sv_z = standard_zscore_by_class(static_scores["sv"], static_scores["labels"])
 
-        static_features = np.stack([sa_z, div_z, dds_z], axis=1).astype(np.float64)
+        static_features = np.stack([sa_z, div_z, sv_z], axis=1).astype(np.float64)
         fit_result = fit_softplus_ratio_regression(
             static_features,
             dynamic_scores,
@@ -935,7 +935,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         static_component_values = {
             "SA": sa_z,
             "Div": div_z,
-            "DDS": dds_z,
+            "SV": sv_z,
         }
         correlation_matrix: dict[str, dict[str, float]] = {}
         print(f"Dynamic-vs-static Pearson correlations (seed={seed}):")
@@ -950,14 +950,14 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
 
         print(
             f"Learned weights for seed {seed}: "
-            f"SA={weights[0]:.6f}, Div={weights[1]:.6f}, DDS={weights[2]:.6f}, bias={bias:.6f}"
+            f"SA={weights[0]:.6f}, Div={weights[1]:.6f}, SV={weights[2]:.6f}, bias={bias:.6f}"
         )
         sa_warning = bool(weights[0] > (1.0 / 3.0))
         div_is_lowest = bool(weights[1] <= min(weights[0], weights[2]))
         if sa_warning:
             print(f"WARNING (seed={seed}): learned SA weight is above 1/3.")
         if div_is_lowest:
-            print(f"WARNING (seed={seed}): learned Div weight is the lowest among SA/Div/DDS.")
+            print(f"WARNING (seed={seed}): learned Div weight is the lowest among SA/Div/SV.")
 
         dynamic_cache_dir = resolve_dynamic_component_cache_dir(
             args.dataset,
@@ -968,7 +968,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
         dataset_entry[str(seed)] = {
             "sa": float(weights[0]),
             "div": float(weights[1]),
-            "dds": float(weights[2]),
+            "sv": float(weights[2]),
             "bias": float(bias),
             "method_version": METHOD_VERSION,
             "ratio_lambda": float(args.ratio_lambda),

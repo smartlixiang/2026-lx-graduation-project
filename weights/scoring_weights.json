@@ -1,14 +1,14 @@
 {
   "cifar100": {
     "22": {
-      "sa": 0.346546258677666,
-      "div": 0.4149670690622436,
-      "dds": 0.23848667226009046,
-      "bias": 2.4286297503915504e-11,
+      "sa": 0.3476261077871169,
+      "div": 0.41905666789640944,
+      "dds": 0.23331722431647364,
+      "bias": 1.2128927857128987e-10,
       "method_version": "softplus_ratio",
-      "ratio_lambda": 0.005,
+      "ratio_lambda": 0.001,
       "transferability_component": "TransferabilityScore",
-      "proxy_log": "weights/proxy_logs/cifar100/resnet18/22/200",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -46,28 +46,28 @@
         "weight_solver": "softplus_ratio_no_simplex",
         "method_version": "softplus_ratio",
         "raw_weights": [
-          0.15421126911016728,
-          0.18465817118671202,
-          0.10612531941744863
+          0.15449885412276798,
+          0.1862454331023638,
+          0.10369544460704028
         ],
-        "mse": 0.9846557309125967,
-        "ratio_regularizer": 0.04748343556522769,
-        "iterations": 3476,
+        "mse": 0.9845341480559929,
+        "ratio_regularizer": 0.05264523299651931,
+        "iterations": 3536,
         "weights_sum": 1.0,
-        "weights_min": 0.23848667226009046,
+        "weights_min": 0.23331722431647364,
         "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }
     },
     "42": {
-      "sa": 0.34271986710924734,
-      "div": 0.42325176580751334,
-      "dds": 0.23402836708323937,
-      "bias": 2.9646444465677352e-08,
+      "sa": 0.343606109121347,
+      "div": 0.42755103415102214,
+      "dds": 0.22884285672763094,
+      "bias": 1.3152671189875304e-08,
       "method_version": "softplus_ratio",
-      "ratio_lambda": 0.005,
+      "ratio_lambda": 0.001,
       "transferability_component": "TransferabilityScore",
-      "proxy_log": "weights/proxy_logs/cifar100/resnet18/42/200",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -105,28 +105,28 @@
         "weight_solver": "softplus_ratio_no_simplex",
         "method_version": "softplus_ratio",
         "raw_weights": [
-          0.15628912800635553,
-          0.19301375774670287,
-          0.1067229913710592
+          0.15639558500011622,
+          0.19460391514703593,
+          0.10416000036360273
         ],
-        "mse": 0.9833226333296168,
-        "ratio_regularizer": 0.054082794250306473,
-        "iterations": 3461,
+        "mse": 0.9831928930977558,
+        "ratio_regularizer": 0.05967777361872123,
+        "iterations": 3524,
         "weights_sum": 1.0,
-        "weights_min": 0.23402836708323937,
+        "weights_min": 0.22884285672763094,
         "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }
     },
     "96": {
-      "sa": 0.3496401386600994,
-      "div": 0.41900817637900006,
-      "dds": 0.2313516849609005,
-      "bias": 0.000442165301063885,
+      "sa": 0.35123057483230663,
+      "div": 0.4244128338670995,
+      "dds": 0.22435659130059388,
+      "bias": 5.454511938631715e-09,
       "method_version": "softplus_ratio",
-      "ratio_lambda": 0.005,
+      "ratio_lambda": 0.001,
       "transferability_component": "TransferabilityScore",
-      "proxy_log": "weights/proxy_logs/cifar100/resnet18/96/200",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -164,15 +164,15 @@
         "weight_solver": "softplus_ratio_no_simplex",
         "method_version": "softplus_ratio",
         "raw_weights": [
-          0.14969463944902509,
-          0.17939381367830878,
-          0.09905071883012218
+          0.14943740312359263,
+          0.18057411936789722,
+          0.09545657121003602
         ],
-        "mse": 0.9861082591266666,
-        "ratio_regularizer": 0.05399626390730568,
-        "iterations": 3598,
+        "mse": 0.9859137849698749,
+        "ratio_regularizer": 0.06144945131320278,
+        "iterations": 3713,
         "weights_sum": 1.0,
-        "weights_min": 0.2313516849609005,
+        "weights_min": 0.22435659130059388,
         "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }
@@ -186,13 +186,14 @@
   },
   "cifar10": {
     "22": {
-      "sa": 0.2749941429373078,
-      "div": 0.5532277484743622,
-      "dds": 0.17177810858833012,
-      "bias": -0.00047999423984718375,
+      "sa": 0.23210096912356284,
+      "div": 0.5574715110972699,
+      "dds": 0.21042751977916718,
+      "bias": -1.354881356355639e-10,
       "method_version": "softplus_ratio",
-      "ratio_lambda": 0.005,
-      "proxy_log": "weights/proxy_logs/cifar10/resnet18/22/200",
+      "ratio_lambda": 0.001,
+      "transferability_component": "TransferabilityScore",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -222,35 +223,36 @@
             "DDS": 0.04344930537894774
           },
           "T": {
-            "SA": 0.05207597966509906,
-            "Div": -0.041858024517387286,
-            "DDS": -0.02301256747933563
+            "SA": 0.0017576154716837204,
+            "Div": -0.005402520831976618,
+            "DDS": 0.004324586670287111
           }
         },
         "weight_solver": "softplus_ratio_no_simplex",
         "method_version": "softplus_ratio",
         "raw_weights": [
-          0.12892509201923547,
-          0.25936893643553716,
-          0.08053447328036208
+          0.11005091714173326,
+          0.26432569975173886,
+          0.09977442847827642
         ],
-        "mse": 0.9643689472927252,
-        "ratio_regularizer": 0.2335484506196816,
-        "iterations": 5275,
-        "weights_sum": 1.0,
-        "weights_min": 0.17177810858833012,
+        "mse": 0.9585258842814531,
+        "ratio_regularizer": 0.22670692247650667,
+        "iterations": 3666,
+        "weights_sum": 0.9999999999999999,
+        "weights_min": 0.21042751977916718,
         "sa_gt_one_third_warning": false,
         "div_is_lowest_warning": false
       }
     },
     "42": {
-      "sa": 0.27883805496472547,
-      "div": 0.5536288419071889,
-      "dds": 0.16753310312808573,
-      "bias": 0.00045569165518954626,
+      "sa": 0.2421597482431774,
+      "div": 0.5644872450991533,
+      "dds": 0.1933530066576692,
+      "bias": 5.711845048554413e-11,
       "method_version": "softplus_ratio",
-      "ratio_lambda": 0.005,
-      "proxy_log": "weights/proxy_logs/cifar10/resnet18/42/200",
+      "ratio_lambda": 0.001,
+      "transferability_component": "TransferabilityScore",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -280,35 +282,36 @@
             "DDS": 0.05058971709525499
           },
           "T": {
-            "SA": 0.058441421148427874,
-            "Div": -0.05333180306124056,
-            "DDS": -0.03006033106974092
+            "SA": -0.004539300972757675,
+            "Div": 0.0070337678466014806,
+            "DDS": -0.0013667807337460125
           }
         },
         "weight_solver": "softplus_ratio_no_simplex",
         "method_version": "softplus_ratio",
         "raw_weights": [
-          0.13586080759405303,
-          0.269749627892026,
-          0.0816286811805473
+          0.1289651961041329,
+          0.30062472723331746,
+          0.10297255675988488
         ],
-        "mse": 0.961292348289253,
-        "ratio_regularizer": 0.23694748585507117,
-        "iterations": 5303,
-        "weights_sum": 1.0,
-        "weights_min": 0.16753310312808573,
+        "mse": 0.9477413956889685,
+        "ratio_regularizer": 0.2439508320027033,
+        "iterations": 3598,
+        "weights_sum": 0.9999999999999999,
+        "weights_min": 0.1933530066576692,
         "sa_gt_one_third_warning": false,
         "div_is_lowest_warning": false
       }
     },
     "96": {
-      "sa": 0.2735521122277715,
-      "div": 0.5523066872335061,
-      "dds": 0.1741412005387226,
-      "bias": -0.00043903053976108216,
+      "sa": 0.23860143291684593,
+      "div": 0.5494313361384617,
+      "dds": 0.21196723094469225,
+      "bias": -9.726566917558683e-09,
       "method_version": "softplus_ratio",
-      "ratio_lambda": 0.005,
-      "proxy_log": "weights/proxy_logs/cifar10/resnet18/96/200",
+      "ratio_lambda": 0.001,
+      "transferability_component": "TransferabilityScore",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -338,23 +341,23 @@
             "DDS": 0.04492780675425149
           },
           "T": {
-            "SA": 0.06797054959826565,
-            "Div": -0.05933838989835399,
-            "DDS": -0.034377390298491566
+            "SA": 0.008898264788003232,
+            "Div": -0.0039062367224505902,
+            "DDS": 0.007122332958098508
           }
         },
         "weight_solver": "softplus_ratio_no_simplex",
         "method_version": "softplus_ratio",
         "raw_weights": [
-          0.12164590557379332,
-          0.24560529463958147,
-          0.07743886115418509
+          0.12022131921486645,
+          0.2768355547620395,
+          0.10680145472292339
         ],
-        "mse": 0.9675254677348036,
-        "ratio_regularizer": 0.23057347453829422,
-        "iterations": 5412,
-        "weights_sum": 1.0000000000000002,
-        "weights_min": 0.1741412005387226,
+        "mse": 0.9550363070452955,
+        "ratio_regularizer": 0.211143035467777,
+        "iterations": 3518,
+        "weights_sum": 1.0,
+        "weights_min": 0.21196723094469225,
         "sa_gt_one_third_warning": false,
         "div_is_lowest_warning": false
       }
@@ -368,14 +371,14 @@
   },
   "tiny-imagenet": {
     "22": {
-      "sa": 0.34809257718451814,
-      "div": 0.40817063094594935,
-      "dds": 0.24373679186953257,
-      "bias": 0.00022538117278091135,
+      "sa": 0.34995866210803084,
+      "div": 0.41378921177118194,
+      "dds": 0.2362521261207872,
+      "bias": -7.776915016136878e-07,
       "method_version": "softplus_ratio",
-      "ratio_lambda": 0.005,
+      "ratio_lambda": 0.001,
       "transferability_component": "TransferabilityScore",
-      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/22/90",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -413,28 +416,28 @@
         "weight_solver": "softplus_ratio_no_simplex",
         "method_version": "softplus_ratio",
         "raw_weights": [
-          0.12887127138569646,
-          0.1511134439515015,
-          0.09023654139871895
+          0.12960607248550782,
+          0.15324551263137962,
+          0.08749522014521217
         ],
-        "mse": 0.9911153117600316,
-        "ratio_regularizer": 0.041518554503953996,
-        "iterations": 3856,
-        "weights_sum": 1.0,
-        "weights_min": 0.24373679186953257,
+        "mse": 0.990961787565504,
+        "ratio_regularizer": 0.048499491539932695,
+        "iterations": 3939,
+        "weights_sum": 0.9999999999999999,
+        "weights_min": 0.2362521261207872,
         "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }
     },
     "42": {
-      "sa": 0.34204535011080156,
-      "div": 0.40426888935468225,
-      "dds": 0.2536857605345162,
-      "bias": -6.862867808212842e-11,
+      "sa": 0.34332688218252155,
+      "div": 0.4088425242256486,
+      "dds": 0.2478305935918298,
+      "bias": 0.00044567964144562333,
       "method_version": "softplus_ratio",
-      "ratio_lambda": 0.005,
+      "ratio_lambda": 0.001,
       "transferability_component": "TransferabilityScore",
-      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/42/90",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -472,28 +475,28 @@
         "weight_solver": "softplus_ratio_no_simplex",
         "method_version": "softplus_ratio",
         "raw_weights": [
-          0.12556148846379855,
-          0.14840313856199855,
-          0.09312555099628211
+          0.1266196958509871,
+          0.1507820061724164,
+          0.09140045831448912
         ],
-        "mse": 0.9910833115860448,
-        "ratio_regularizer": 0.03433777134089021,
-        "iterations": 3802,
-        "weights_sum": 1.0,
-        "weights_min": 0.2536857605345162,
+        "mse": 0.9909921021450051,
+        "ratio_regularizer": 0.03931638419518826,
+        "iterations": 3836,
+        "weights_sum": 0.9999999999999999,
+        "weights_min": 0.2478305935918298,
         "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }
     },
     "96": {
-      "sa": 0.35540387133667406,
-      "div": 0.4070672121111552,
-      "dds": 0.23752891655217068,
-      "bias": -2.1709767745060987e-06,
+      "sa": 0.3573747830599747,
+      "div": 0.411795137619969,
+      "dds": 0.23083007932005617,
+      "bias": -0.00043747727469356084,
       "method_version": "softplus_ratio",
-      "ratio_lambda": 0.005,
+      "ratio_lambda": 0.001,
       "transferability_component": "TransferabilityScore",
-      "proxy_log": "weights/proxy_logs/tiny-imagenet/resnet18/96/90",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -531,15 +534,15 @@
         "weight_solver": "softplus_ratio_no_simplex",
         "method_version": "softplus_ratio",
         "raw_weights": [
-          0.13350831529223336,
-          0.15291577296349643,
-          0.08922830627252491
+          0.13498189196561586,
+          0.1555366786157833,
+          0.08718544873930133
         ],
-        "mse": 0.9908857568379206,
-        "ratio_regularizer": 0.04528616051263634,
-        "iterations": 3880,
+        "mse": 0.9907689341341711,
+        "ratio_regularizer": 0.05169879038725994,
+        "iterations": 3924,
         "weights_sum": 0.9999999999999999,
-        "weights_min": 0.23752891655217068,
+        "weights_min": 0.23083007932005617,
         "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }

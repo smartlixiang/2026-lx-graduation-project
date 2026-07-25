@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=10000)
     parser.add_argument("--tol", type=float, default=1e-6)
-    parser.add_argument("--ratio-lambda", type=float, default=5e-3)
+    parser.add_argument("--ratio-lambda", type=float, default=1e-3)
     parser.add_argument("--regression-learning-rate", type=float, default=2e-3)
     parser.add_argument("--regression-max-iter", type=int, default=10000)
     parser.add_argument("--regression-tol", type=float, default=1e-6)

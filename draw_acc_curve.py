@@ -209,11 +209,11 @@ def main() -> None:
         for method, kr_to_stats in method_to_stats.items()
     }
 
-    # 再开始画图
+    # 绘图时只转换展示单位，内部统计和排名仍使用原始 0-1 准确率
     for method in valid_methods:
         mean_by_kr = method_to_mean.get(method, {})
         x_values = [kr for kr in keep_ratios if kr in mean_by_kr]
-        y_values = [mean_by_kr[kr] for kr in x_values]
+        y_values = [mean_by_kr[kr] * 100.0 for kr in x_values]
 
         if not x_values:
             print(f"[WARN] method={method} has no results for requested keep ratios: {keep_ratios}")
@@ -256,7 +256,7 @@ def main() -> None:
         if ranking_count[method] > 0:
             avg_rank_map[method] = ranking_sum[method] / ranking_count[method]
 
-    print("\nMean accuracy by keep ratio (4 decimal places):")
+    print("\nMean accuracy by keep ratio (2 decimal places):")
     header = ["method"] + [str(kr) for kr in keep_ratios] + ["avg_rank"]
 
     # kr=100 不参与“最优结果”加粗
@@ -281,7 +281,8 @@ def main() -> None:
                 row.append("-")
             else:
                 mean_val, std_val = stats
-                cell = f"{mean_val:.4f}±{std_val:.4f}"
+                # 终端表格不附加百分号；标准差补零到至少两位整数宽度。
+                cell = f"{mean_val * 100.0:.2f}±{std_val * 100.0:05.2f}"
                 if (
                     kr != 100
                     and kr in best_by_kr
@@ -323,17 +324,21 @@ def main() -> None:
         print(line)
 
     ax.set_xlabel("Keep Ratio (kr)")
-    ax.set_ylabel("Accuracy (mean of last 10 epochs)")
+    ax.set_ylabel("Accuracy (%)")
     ax.set_title(f"{args.dataset.upper()} {args.model} - Mean Accuracy")
 
     ax.grid(True, linestyle="--", alpha=0.18, linewidth=0.7)
     ax.set_xticks(keep_ratios)
 
-    all_y = [v for row in method_to_mean.values() for v in row.values()]
+    all_y = [
+        value * 100.0
+        for row in method_to_mean.values()
+        for value in row.values()
+    ]
     if all_y:
         ymin = min(all_y)
         ymax = max(all_y)
-        eps = max(0.0003, 0.015 * (ymax - ymin))
+        eps = max(0.03, 0.015 * (ymax - ymin))
         ax.set_ylim(ymin - eps, ymax + eps)
 
     if valid_methods:

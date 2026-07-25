@@ -6,7 +6,7 @@
     "result_root": "result_corruption",
     "model": "resnet50",
     "keep_ratio": 30,
-    "selection_method": "corruption_learned_group",
+    "selection_method": "corruption_naive_group",
     "seed": 22,
     "epochs": 90,
     "batch_size": 64,
@@ -40,30 +40,30 @@
       "fog": 4000,
       "motion_blur": 4000
     },
-    "num_corrupted_selected": 329,
-    "corruption_ratio_in_selection": 0.010966666666666666,
+    "num_corrupted_selected": 2356,
+    "corruption_ratio_in_selection": 0.07853333333333333,
     "selected_corruption_type_counts": {
-      "gaussian_noise": 62,
-      "partial_occlusion": 106,
-      "resolution_degradation": 46,
-      "fog": 63,
-      "motion_blur": 52
+      "gaussian_noise": 1034,
+      "partial_occlusion": 329,
+      "resolution_degradation": 313,
+      "fog": 285,
+      "motion_blur": 395
     }
   },
-  "accuracy": 0.474,
-  "accuracy_mean": 0.474,
+  "accuracy": 0.3847,
+  "accuracy_mean": 0.3847,
   "accuracy_std": 0.0011,
   "accuracy_samples": [
-    0.4741,
-    0.4717,
-    0.4744,
-    0.4727,
-    0.4741,
-    0.4744,
-    0.4762,
-    0.4736,
-    0.4748,
-    0.4742
+    0.3851,
+    0.3867,
+    0.3864,
+    0.3845,
+    0.3836,
+    0.3834,
+    0.3848,
+    0.3842,
+    0.3832,
+    0.3848
   ],
-  "time_seconds": 3792.7539529800415
+  "time_seconds": 3811.0836000442505
 }

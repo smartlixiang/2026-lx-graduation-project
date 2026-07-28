@@ -82,6 +82,16 @@ def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
     return apply_dataset_training_defaults(args, lr_attr="init_lr")
 
 
+def validate_model_dataset(model_name: str, dataset_name: str) -> None:
+    """Reject dataset/model combinations whose input contract is unsupported."""
+    if model_name == "vit_small" and dataset_name not in {"cifar10", "cifar100"}:
+        raise ValueError(
+            "vit_small currently supports only cifar10 and cifar100 because this "
+            "implementation is designed for 32x32 CIFAR images; "
+            f"received dataset={dataset_name}."
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -942,6 +952,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
 def main() -> None:
     args = parse_args()
+    validate_model_dataset(args.model, args.dataset)
     if args.exp == "corruption" and args.dataset not in CORRUPTION_SUPPORTED_DATASETS:
         supported = ", ".join(sorted(CORRUPTION_SUPPORTED_DATASETS))
         raise ValueError(f"--exp corruption 仅支持数据集: {supported}; 当前 dataset={args.dataset}")

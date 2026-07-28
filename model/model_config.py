@@ -8,12 +8,15 @@ from torch import nn
 from model.densenet import densenet121
 from model.resnet import resnet18, resnet50
 from model.swin import swin_t
+from model.vit import vit_small
 
 MODEL_REGISTRY: dict[str, Callable[..., nn.Module]] = {
     "densenet121": densenet121,
     "resnet18": resnet18,
     "resnet50": resnet50,
+    "swin_t": swin_t,
     "swin_tiny": swin_t,
+    "vit_small": vit_small,
 }
 
 

@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+"""Prepare scorers and masks for the three explicit unseen-sample protocols.
+
+Experiment 1 calibrates on 50% known data and selects from the clean full
+CIFAR-100/Tiny-ImageNet training set (60/70/80/90%).  Experiment 2 calibrates
+on 20% known CIFAR-10 data, recomputes every static reference on the disjoint
+80% unseen pool, and selects global 20/30/40/60% targets from that pool.
+Experiment 3 corrupts the full CIFAR-100 training set first, then makes the
+50/50 views, and uses center-repair selection (30/40/50/60%).
+
+This entry point never trains a final classifier; it ends after writing masks.
+"""
 from __future__ import annotations
 
 import argparse
@@ -5,7 +17,7 @@ import contextlib
 import json
 import os
 import sys
-import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator
@@ -14,843 +26,721 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets
-from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import calculate_my_mask as mask_solvers
 import train_adapter as train_adapter_module
 import train_proxy as train_proxy_module
 import weights.dynamic_utils as dynamic_utils
-
-from dataset.dataset_config import CIFAR10, CIFAR100
+from corruption_exp.cal_corruption_mask import (FixedCorruptionDataset, CorruptionInfo,
+                                                  load_corruption_info)
+from dataset.dataset_config import CIFAR10, CIFAR100, TINY_IMAGENET
 from model.adapter import load_trained_adapters
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.class_name_utils import resolve_class_names_for_prompts
 from utils.global_config import CONFIG
-from utils.seed import set_seed
-from calculate_my_mask import select_group_mask
-from utils.path_rules import resolve_mask_path, resolve_proxy_log_dir
 from utils.score_utils import standard_zscore_by_class
+from utils.seed import set_seed
+from weights import AbsorptionGainScore, ConfusionComplementarityScore, TransferabilityScore
 from weights.calibration import build_dynamic_target, fit_softplus_ratio_regression
-from weights import (
-    AbsorptionGainScore,
-    ConfusionComplementarityScore,
-    TransferabilityScore,
-)
 
 
-VALID_DATASETS = (CIFAR10, CIFAR100)
-KEEP_RATIOS = (60, 70, 80, 90)
-COMPONENT_NAMES = ("A", "C", "T")
-METHOD = "unseen_learned_group"
-KNOWN_RATIO = 0.5
+@dataclass(frozen=True)
+class UnseenExperimentConfig:
+    exp_id: int
+    allowed_datasets: tuple[str, ...]
+    known_ratio: float
+    unseen_ratio: int
+    default_keep_ratios: tuple[int, ...]
+    selection_scope: str
+    static_reference_scope: str
+    use_corruption: bool
+    group_solver: str
+    allowed_modes: tuple[str, ...]
+
+
+EXPERIMENT_CONFIGS = {
+    1: UnseenExperimentConfig(1, (CIFAR100, TINY_IMAGENET), .5, 50, (60, 70, 80, 90),
+                              "full", "full", False, "standard", ("learned_group", "random")),
+    2: UnseenExperimentConfig(2, (CIFAR10,), .2, 80, (20, 30, 40, 60),
+                              "unseen", "unseen", False, "standard", ("learned_group", "random")),
+    3: UnseenExperimentConfig(3, (CIFAR100,), .5, 50, (30, 40, 50, 60),
+                              "full", "full_corrupted", True, "center_repair",
+                              ("learned_group", "naive_group", "random")),
+}
+MODE_METHODS = {"learned_group": "unseen_learned_group",
+                "naive_group": "unseen_naive_group", "random": "unseen_random"}
+COMPONENTS = {"A": AbsorptionGainScore, "C": ConfusionComplementarityScore,
+              "T": TransferabilityScore}
 K_FOLDS = 5
-RATIO_LAMBDA = 1e-3
+
+
+def parse_keep_ratios(text: str | None, config: UnseenExperimentConfig) -> tuple[int, ...]:
+    if text is None:
+        return config.default_keep_ratios
+    try:
+        ratios = tuple(dict.fromkeys(int(x.strip()) for x in text.split(",") if x.strip()))
+    except ValueError as exc:
+        raise ValueError("--kr must be comma-separated integers") from exc
+    if not ratios or not set(ratios).issubset(config.default_keep_ratios):
+        raise ValueError(f"Experiment {config.exp_id} --kr must be a nonempty subset of {config.default_keep_ratios}")
+    return ratios
+
+
+def validate_experiment(exp: int, dataset: str, mode: str, kr: str | None = None):
+    config = EXPERIMENT_CONFIGS[exp]
+    if dataset not in config.allowed_datasets:
+        raise ValueError(f"Experiment {exp} supports datasets {config.allowed_datasets}, not {dataset!r}")
+    if mode not in config.allowed_modes:
+        raise ValueError(f"Experiment {exp} does not support mode {mode!r}; allowed: {config.allowed_modes}")
+    return config, parse_keep_ratios(kr, config)
+
+
+def parse_args() -> argparse.Namespace:
+    details = """Experiment 1: 50/50, CIFAR-100 or Tiny-ImageNet, full clean references and selection.
+Experiment 2: 20/80 CIFAR-10, known-only calibration and unseen-only references/selection; kr is global.
+Experiment 3: corrupt full CIFAR-100 first, 50/50 views, full corrupted references and center-repair."""
+    parser = argparse.ArgumentParser(description=__doc__, epilog=details,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--exp", required=True, type=int, choices=(1, 2, 3), help="Protocol number; see details below.")
+    parser.add_argument("--dataset", default=CIFAR100, choices=(CIFAR10, CIFAR100, TINY_IMAGENET))
+    parser.add_argument("--mode", choices=tuple(MODE_METHODS), default="learned_group")
+    parser.add_argument("--kr", help="Comma-separated subset of the protocol keep ratios.")
+    parser.add_argument("--seed", type=int, default=int(CONFIG.global_seed))
+    parser.add_argument("--data-root", default=str(PROJECT_ROOT / "data"))
+    parser.add_argument("--clip-model", default="ViT-B/32")
+    parser.add_argument("--proxy-model", default="resnet18")
+    parser.add_argument("--device")
+    parser.add_argument("--skip-saved", action="store_true")
+    parser.add_argument("--group-candidate-pool-size", type=int, default=1)
+    parser.add_argument("--group-init-count", type=int, default=2)
+    parser.add_argument("--dist-weight-factor", type=float, default=1.0)
+    parser.add_argument("--debug-prompts", action="store_true")
+    args = parser.parse_args()
+    try:
+        args.config, args.keep_ratios = validate_experiment(args.exp, args.dataset, args.mode, args.kr)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def _atomic_savez(path: Path, **values: Any) -> None:
-    """Write an npz only after it has been completely assembled."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp.npz")
-    try:
-        np.savez_compressed(tmp, **values)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+    temporary = path.with_name(path.name + ".tmp.npz")
+    np.savez_compressed(temporary, **values)
+    os.replace(temporary, path)
 
 
 def _atomic_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    temporary = path.with_name(path.name + ".tmp")
     try:
-        tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
     finally:
-        tmp.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+
+
+def corruption_context(info: CorruptionInfo | None) -> dict[str, np.ndarray]:
+    if info is None:
+        return {"corruption_indices": np.empty(0, dtype=np.int64),
+                "corruption_type_ids": np.empty(0, dtype=np.int16)}
+    indices = np.flatnonzero(info.is_corrupted).astype(np.int64)
+    return {"corruption_indices": indices,
+            "corruption_type_ids": info.corruption_types[indices].astype(np.int16)}
+
+
+def _json_corruption_context(info: CorruptionInfo | None) -> dict[str, list[int]]:
+    return {key: value.tolist() for key, value in corruption_context(info).items()}
 
 
 def _integer_vector(value: np.ndarray) -> bool:
     return value.ndim == 1 and np.issubdtype(value.dtype, np.integer)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Unseen-sample generalization experiment for the proposed selection framework."
-    )
-    parser.add_argument("--dataset", type=str, default=CIFAR100, choices=VALID_DATASETS)
-    parser.add_argument("--seed", type=int, default=int(CONFIG.global_seed))
-    parser.add_argument("--data-root", type=str, default=str(CONFIG.data_root))
-    parser.add_argument("--clip-model", type=str, default="ViT-B/32")
-    parser.add_argument("--proxy-model", type=str, default="resnet18")
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--skip-saved", action="store_true")
-    parser.add_argument("--group-candidate-pool-size", type=int, default=1)
-    parser.add_argument("--group-init-count", type=int, default=2)
-    parser.add_argument("--dist-weight-factor", type=float, default=1.0)
-    parser.add_argument("--debug-prompts", action="store_true")
-    return parser.parse_args()
+def _corruption_json_matches(entry: dict[str, Any], info: CorruptionInfo | None) -> bool:
+    expected = _json_corruption_context(info)
+    return (entry.get("corruption_indices", []) == expected["corruption_indices"]
+            and entry.get("corruption_type_ids", []) == expected["corruption_type_ids"])
 
 
-def build_raw_dataset(dataset_name: str, data_root: str | Path, transform=None):
-    data_root = str(data_root)
+def build_raw_dataset(dataset_name: str, data_root: str | Path, transform=None) -> Dataset:
+    root = Path(data_root)
+    if not root.is_absolute(): root = PROJECT_ROOT / root
     if dataset_name == CIFAR10:
-        return datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform)
+        return datasets.CIFAR10(str(root), train=True, download=True, transform=transform)
     if dataset_name == CIFAR100:
-        return datasets.CIFAR100(root=data_root, train=True, download=True, transform=transform)
-    raise ValueError(f"unseen_exp only supports cifar10/cifar100, got {dataset_name}")
+        return datasets.CIFAR100(str(root), train=True, download=True, transform=transform)
+    if dataset_name == TINY_IMAGENET:
+        train = root / "tiny-imagenet-200" / "train"
+        if not train.is_dir(): raise FileNotFoundError(f"Tiny-ImageNet train directory not found: {train}")
+        return datasets.ImageFolder(str(train), transform=transform)
+    raise ValueError(f"unsupported dataset: {dataset_name}")
 
 
 def get_targets(dataset: Dataset) -> np.ndarray:
-    if hasattr(dataset, "targets"):
-        return np.asarray(getattr(dataset, "targets"), dtype=np.int64)
-    if hasattr(dataset, "labels"):
-        return np.asarray(getattr(dataset, "labels"), dtype=np.int64)
-
-    labels = np.empty(len(dataset), dtype=np.int64)
-    for i in range(len(dataset)):
-        _, y = dataset[i]
-        labels[i] = int(y.item() if hasattr(y, "item") else y)
-    return labels
+    if hasattr(dataset, "targets"): return np.asarray(dataset.targets, dtype=np.int64)
+    if hasattr(dataset, "samples"): return np.asarray([row[1] for row in dataset.samples], dtype=np.int64)
+    return np.asarray([int(dataset[i][1]) for i in range(len(dataset))], dtype=np.int64)
 
 
-class KnownSubsetDataset(Dataset):
-    """
-    A local-index dataset view over the known subset.
-
-    In this experiment:
-    - known/unseen split is saved using original full-dataset indices;
-    - adapter and proxy CV are trained only on known samples;
-    - proxy logs use local known-subset indices 0..len(known)-1;
-    - final selection mask is still defined over the full training set.
-    """
-
+class IndexedSubsetDataset(Dataset):
+    """Local-index view; the base may already be a FixedCorruptionDataset."""
     def __init__(self, base_dataset: Dataset, indices: np.ndarray):
         self.base_dataset = base_dataset
         self.indices = np.asarray(indices, dtype=np.int64)
         self.classes = getattr(base_dataset, "classes", None)
+        self.targets = get_targets(base_dataset)[self.indices].tolist()
+    def __len__(self): return len(self.indices)
+    def __getitem__(self, index): return self.base_dataset[int(self.indices[index])]
 
-        base_targets = get_targets(base_dataset)
-        self.targets = base_targets[self.indices].astype(np.int64).tolist()
 
-    def __len__(self) -> int:
-        return int(self.indices.shape[0])
+KnownSubsetDataset = IndexedSubsetDataset
+UnseenSubsetDataset = IndexedSubsetDataset
 
-    def __getitem__(self, idx: int):
-        return self.base_dataset[int(self.indices[idx])]
+
+def load_unseen_split(dataset: str, unseen_ratio: int, seed: int, num_samples: int):
+    path = PROJECT_ROOT / "unseen_data" / dataset / str(unseen_ratio) / f"unseen_list_{seed}.txt"
+    if not path.is_file():
+        raise FileNotFoundError(f"unseen list not found: {path}; run unseen_exp/generate_unseen_list.py first")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if any(not x.strip() or not x.strip().lstrip("+-").isdigit() for x in lines):
+        raise ValueError(f"unseen list must contain exactly one integer per line: {path}")
+    unseen = np.asarray([int(x) for x in lines], dtype=np.int64)
+    expected = round(num_samples * unseen_ratio / 100)
+    if unseen.ndim != 1 or len(unseen) != expected: raise ValueError(f"unseen count {len(unseen)}, expected {expected}")
+    if np.unique(unseen).size != len(unseen): raise ValueError("unseen indices contain duplicates")
+    if np.any(unseen < 0) or np.any(unseen >= num_samples): raise ValueError("unseen index out of range")
+    known = np.setdiff1d(np.arange(num_samples, dtype=np.int64), unseen, assume_unique=False)
+    if np.intersect1d(known, unseen).size or not np.array_equal(np.sort(np.r_[known, unseen]), np.arange(num_samples)):
+        raise ValueError("known/unseen split is not a disjoint complete partition")
+    return known, np.sort(unseen), path
+
+
+def build_protocol_datasets(args, raw_dataset: Dataset):
+    info = None
+    full = raw_dataset
+    if args.config.use_corruption:
+        info = load_corruption_info(args.dataset, args.seed, num_samples=len(raw_dataset), strict_expected_size=True)
+        full = FixedCorruptionDataset(raw_dataset, corruption_info=info)
+    known, unseen, _ = load_unseen_split(args.dataset, args.config.unseen_ratio, args.seed, len(full))
+    return full, IndexedSubsetDataset(full, known), IndexedSubsetDataset(full, unseen), known, unseen, info
+
+
+def mask_path_for(exp: int, mode: str, dataset: str, seed: int, keep_ratio: int) -> Path:
+    return SCRIPT_DIR / "mask" / str(exp) / MODE_METHODS[mode] / dataset / str(seed) / f"mask_{keep_ratio}.npz"
+
+
+def cache_paths(exp: int, dataset: str, seed: int, proxy_model: str, epochs: int | None = None):
+    base = SCRIPT_DIR
+    epoch = str(epochs) if epochs is not None else "epochs"
+    return {"adapter": base / "adapter" / str(exp) / dataset / str(seed),
+            "proxy": base / "proxy_logs" / str(exp) / dataset / proxy_model / str(seed) / epoch,
+            "dynamic": base / "dynamic_cache" / str(exp) / dataset / proxy_model / str(seed) / epoch,
+            "calibration_static": base / "static_scores" / str(exp) / "calibration" / dataset / str(seed) / "static_scores.npz",
+            "selection_static": base / "static_scores" / str(exp) / "selection" / dataset / str(seed) / "static_scores.npz",
+            "weights": base / "weights" / str(exp) / "scoring_weights.json"}
+
+
+def stable_random_seed(seed: int, exp_id: int, keep_ratio: int) -> np.random.SeedSequence:
+    return np.random.SeedSequence([int(seed), int(exp_id), int(keep_ratio), 0x554E5345])
+
+
+def generate_random_mask(target_indices, full_num_samples, target_size, seed, exp_id, keep_ratio):
+    candidates = np.asarray(target_indices, dtype=np.int64)
+    if candidates.ndim != 1 or np.unique(candidates).size != len(candidates): raise ValueError("target indices must be unique")
+    if np.any(candidates < 0) or np.any(candidates >= full_num_samples): raise ValueError("target index out of range")
+    if not 0 <= target_size <= len(candidates): raise ValueError("target size exceeds candidate pool")
+    selected = np.random.default_rng(stable_random_seed(seed, exp_id, keep_ratio)).choice(candidates, target_size, replace=False)
+    mask = np.zeros(full_num_samples, dtype=np.uint8); mask[selected] = 1
+    return mask
+
+
+def mask_metadata(args, mask, known, unseen, info: CorruptionInfo | None, keep_ratio):
+    selected = np.flatnonzero(mask).astype(np.int64)
+    target_pool = unseen if args.config.selection_scope == "unseen" else np.arange(len(mask))
+    values = dict(mask=mask.astype(np.uint8), selected_indices=selected, dataset=np.asarray(args.dataset),
+        seed=np.asarray(args.seed), exp=np.asarray(args.exp), keep_ratio=np.asarray(keep_ratio),
+        method=np.asarray(MODE_METHODS[args.mode]), mode=np.asarray(args.mode),
+        selection_scope=np.asarray(args.config.selection_scope), known_ratio=np.asarray(args.config.known_ratio),
+        unseen_ratio=np.asarray(args.config.unseen_ratio), known_indices=known, unseen_indices=unseen,
+        known_selected=np.asarray(mask[known].sum()), unseen_selected=np.asarray(mask[unseen].sum()),
+        target_pool_size=np.asarray(len(target_pool)), target_selected=np.asarray(mask[target_pool].sum()))
+    if info is not None:
+        total = int(info.is_corrupted.sum()); corrupt_selected = int(mask[info.is_corrupted].sum())
+        values.update(corruption_types=info.corruption_types, is_corrupted=info.is_corrupted,
+            **corruption_context(info),
+            num_corrupted_total=np.asarray(total), num_corrupted_selected=np.asarray(corrupt_selected),
+            corruption_ratio_total=np.asarray(total / len(mask)),
+            corruption_ratio_in_mask=np.asarray(corrupt_selected / max(1, int(mask.sum()))))
+    return values
+
+
+def mask_cache_valid(path, args, num_samples, known, unseen, info, keep_ratio):
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            required = set(mask_metadata(args, np.zeros(num_samples, np.uint8), known, unseen, info, keep_ratio))
+            if not required.issubset(data.files): return False
+            mask = np.asarray(data["mask"]); target = round(num_samples * keep_ratio / 100)
+            scalar_checks = (int(data["exp"]) == args.exp and str(data["dataset"]) == args.dataset
+                and int(data["seed"]) == args.seed and str(data["mode"]) == args.mode
+                and int(data["keep_ratio"]) == keep_ratio
+                and str(data["method"]) == MODE_METHODS[args.mode]
+                and str(data["selection_scope"]) == args.config.selection_scope
+                and float(data["known_ratio"]) == args.config.known_ratio
+                and int(data["unseen_ratio"]) == args.config.unseen_ratio)
+            valid = (scalar_checks and mask.shape == (num_samples,) and set(np.unique(mask)).issubset({0, 1})
+                and int(mask.sum()) == target and np.array_equal(data["selected_indices"], np.flatnonzero(mask))
+                and np.array_equal(data["known_indices"], known) and np.array_equal(data["unseen_indices"], unseen)
+                and int(data["known_selected"]) == int(mask[known].sum())
+                and int(data["unseen_selected"]) == int(mask[unseen].sum())
+                and int(data["target_pool_size"]) == (len(unseen) if args.exp == 2 else num_samples)
+                and int(data["target_selected"]) == target)
+            if args.exp == 2:
+                valid = (valid and not mask[known].any() and int(data["known_selected"]) == 0
+                         and np.isin(np.flatnonzero(mask), unseen).all())
+            if info is not None:
+                corrupt_selected = int(mask[info.is_corrupted].sum())
+                valid = (valid and np.array_equal(data["corruption_types"], info.corruption_types)
+                    and np.array_equal(data["is_corrupted"], info.is_corrupted)
+                    and int(data["num_corrupted_total"]) == int(info.is_corrupted.sum())
+                    and int(data["num_corrupted_selected"]) == corrupt_selected
+                    and np.isclose(float(data["corruption_ratio_total"]), .2)
+                    and np.isclose(float(data["corruption_ratio_in_mask"]), corrupt_selected / max(1, target)))
+            return bool(valid)
+    except Exception:
+        return False
+
+
+def save_mask(args, mask, known, unseen, info, keep_ratio):
+    path = mask_path_for(args.exp, args.mode, args.dataset, args.seed, keep_ratio)
+    _atomic_savez(path, **mask_metadata(args, mask, known, unseen, info, keep_ratio))
+    return path
 
 
 @contextlib.contextmanager
 def patch_attr(obj: Any, name: str, value: Any) -> Iterator[None]:
-    old = getattr(obj, name)
-    setattr(obj, name, value)
-    try:
-        yield
-    finally:
-        setattr(obj, name, old)
+    old = getattr(obj, name); setattr(obj, name, value)
+    try: yield
+    finally: setattr(obj, name, old)
 
 
-def save_known_split(
-    dataset_name: str,
-    seed: int,
-    known_root: Path,
-    num_samples: int,
-    skip_saved: bool,
-) -> tuple[np.ndarray, np.ndarray, Path]:
-    out_dir = known_root / dataset_name / str(seed)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    split_path = out_dir / "split.npz"
-
-    if skip_saved:
-        try:
-            with np.load(split_path, allow_pickle=False) as data:
-                required = {"dataset", "seed", "num_samples", "known_ratio", "known_indices", "unseen_indices"}
-                known_raw, unseen_raw = data["known_indices"], data["unseen_indices"]
-                valid = required.issubset(data.files) and (
-                    str(data["dataset"].item()) == dataset_name
-                    and int(data["seed"].item()) == seed
-                    and int(data["num_samples"].item()) == num_samples
-                    and float(data["known_ratio"].item()) == KNOWN_RATIO
-                    and _integer_vector(known_raw) and _integer_vector(unseen_raw)
-                )
-                known = np.asarray(known_raw, dtype=np.int64); unseen = np.asarray(unseen_raw, dtype=np.int64)
-                valid = valid and len(known) == num_samples // 2 and len(unseen) == num_samples - num_samples // 2
-                valid = valid and np.unique(known).size == len(known) and np.unique(unseen).size == len(unseen)
-                valid = valid and np.array_equal(np.sort(np.concatenate((known, unseen))), np.arange(num_samples))
-            if valid:
-                print(f"[Skip] known/unseen split loaded: {split_path}")
-                return known, unseen, split_path
-        except Exception:
-            pass
-        print(f"[Recompute] known/unseen split: {split_path}")
-
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(num_samples)
-    half = num_samples // 2
-    known = np.sort(perm[:half]).astype(np.int64)
-    unseen = np.sort(perm[half:]).astype(np.int64)
-
-    _atomic_savez(
-        split_path,
-        dataset=np.asarray(dataset_name),
-        seed=np.asarray(seed, dtype=np.int64),
-        num_samples=np.asarray(num_samples, dtype=np.int64),
-        known_indices=known,
-        unseen_indices=unseen,
-        known_ratio=np.asarray(0.5, dtype=np.float32),
-    )
-
-    print(f"[Save] known/unseen split: {split_path}")
-    return known, unseen, split_path
-
-
-def adapter_cache_valid(adapter_dir: Path, dataset_name: str, seed: int, known_count: int, clip_model: str) -> bool:
-    meta_path = adapter_dir / "meta.json"
-    image_path = adapter_dir / "adapter_image.pt"
-    text_path = adapter_dir / "adapter_context.pt"
-
-    if not (meta_path.exists() and image_path.exists() and text_path.exists()):
-        return False
-
+def adapter_cache_valid(adapter_dir, args, known_indices, unseen_indices, info) -> bool:
+    image_path, context_path, meta_path = (adapter_dir / "adapter_image.pt",
+        adapter_dir / "adapter_context.pt", adapter_dir / "meta.json")
+    if not (image_path.is_file() and context_path.is_file() and meta_path.is_file()): return False
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        valid = (int(meta["exp"]) == args.exp and meta["dataset"] == args.dataset
+            and int(meta["seed"]) == args.seed and float(meta["known_ratio"]) == args.config.known_ratio
+            and int(meta["unseen_ratio"]) == args.config.unseen_ratio
+            and meta["known_indices"] == known_indices.tolist() and meta["unseen_indices"] == unseen_indices.tolist()
+            and meta["clip_model"] == args.clip_model and meta["static_reference_scope"] == args.config.static_reference_scope
+            and meta["selection_scope"] == args.config.selection_scope
+            and int(meta["num_samples"]) == len(known_indices) and meta["adapter_type"] == "linear"
+            and meta["training_objective"] == "InfoNCE" and _corruption_json_matches(meta, info))
+        if not valid: return False
+        torch.load(image_path, map_location="cpu")
+        torch.load(context_path, map_location="cpu")
+        return True
     except Exception:
         return False
 
-    try:
-        return (
-        meta.get("dataset") == dataset_name and int(meta.get("seed")) == int(seed)
-        and meta.get("clip_model") == clip_model and int(meta.get("num_samples")) == int(known_count)
-        and meta.get("adapter_type") == "linear"
-        and meta.get("training_objective") == "InfoNCE"
-        and meta.get("unseen_known_subset") is True
-        and float(meta.get("known_ratio")) == KNOWN_RATIO)
-    except (TypeError, ValueError):
-        return False
 
-
-def train_adapter_on_known(
-    args: argparse.Namespace,
-    known_indices: np.ndarray,
-    result_root: Path,
-) -> Path:
-    adapter_dir = result_root / "adapter" / args.dataset / str(args.seed)
-
-    if args.skip_saved and adapter_cache_valid(adapter_dir, args.dataset, args.seed, len(known_indices), args.clip_model):
-        print(f"[Skip] known-subset adapter exists: {adapter_dir}")
-        return adapter_dir
-    if args.skip_saved:
-        print(f"[Recompute] known-subset adapter: {adapter_dir}")
-    # Metadata is the completion marker; never leave an old valid marker while retraining.
-    (adapter_dir / "meta.json").unlink(missing_ok=True)
-
-    def patched_build_dataset(dataset_name: str, data_root: str, transform):
-        base = build_raw_dataset(dataset_name, data_root, transform=transform)
-        return KnownSubsetDataset(base, known_indices)
-
-    def patched_resolve_adapter_dir(dataset_name: str, seed: int) -> Path:
-        out = result_root / "adapter" / dataset_name / str(seed)
-        out.mkdir(parents=True, exist_ok=True)
-        return out
-
-    adapter_args = SimpleNamespace(
-        dataset=args.dataset,
-        data_root=str(args.data_root),
-        clip_model=args.clip_model,
-        prompt_template="a photo of a {}",
-        batch_size=None,
-        num_workers=4,
-        epochs=30,
-        lr=1e-4,
-        weight_decay=0.0,
-        hidden_dim=256,
-        temperature=0.07,
-        step_size=30,
-        gamma=0.1,
-        device=args.device,
-        seed=str(args.seed),
-        debug_prompts=args.debug_prompts,
-    )
-
-    print("[Adapter] train adapter on known subset with train_adapter.py defaults")
-    with patch_attr(train_adapter_module, "_build_dataset", patched_build_dataset):
-        with patch_attr(train_adapter_module, "resolve_adapter_dir", patched_resolve_adapter_dir):
-            train_adapter_module.train_for_seed(adapter_args, args.seed, multi_seed=False)
-
-    meta_path = adapter_dir / "meta.json"
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    meta["unseen_known_subset"] = True
-    meta["known_ratio"] = 0.5
-    meta["known_num_samples"] = int(len(known_indices))
+def train_adapter_on_known(args, known_indices, unseen_indices, full_factory, info=None) -> Path:
+    out = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model)["adapter"]
+    meta_path = out / "meta.json"
+    if args.skip_saved and adapter_cache_valid(out, args, known_indices, unseen_indices, info): return out
+    meta_path.unlink(missing_ok=True)
+    def patched_build(_name, _root, transform): return IndexedSubsetDataset(full_factory(transform), known_indices)
+    def patched_dir(_name, _seed): out.mkdir(parents=True, exist_ok=True); return out
+    ns = SimpleNamespace(dataset=args.dataset, data_root=str(args.data_root), clip_model=args.clip_model,
+        prompt_template="a photo of a {}", batch_size=None, num_workers=4, epochs=30, lr=1e-4,
+        weight_decay=0., hidden_dim=256, temperature=.07, step_size=30, gamma=.1,
+        device=args.device, seed=str(args.seed), debug_prompts=args.debug_prompts)
+    with patch_attr(train_adapter_module, "_build_dataset", patched_build), patch_attr(train_adapter_module, "resolve_adapter_dir", patched_dir):
+        train_adapter_module.train_for_seed(ns, args.seed, multi_seed=False)
+    meta = json.loads(meta_path.read_text()); meta.update(exp=args.exp, known_ratio=args.config.known_ratio,
+        unseen_ratio=args.config.unseen_ratio, known_indices=known_indices.tolist(),
+        unseen_indices=unseen_indices.tolist(), clip_model=args.clip_model,
+        static_reference_scope=args.config.static_reference_scope, selection_scope=args.config.selection_scope,
+        **_json_corruption_context(info))
+    if not ((out / "adapter_image.pt").is_file() and (out / "adapter_context.pt").is_file()):
+        raise RuntimeError("adapter training did not produce both adapter files")
     _atomic_json(meta_path, meta)
-
-    return adapter_dir
-
-
-def proxy_log_dir_for(
-    result_root: Path,
-    dataset_name: str,
-    proxy_model: str,
-    seed: int,
-    epochs: int,
-) -> Path:
-    return resolve_proxy_log_dir(dataset_name, seed=seed, proxy_model=proxy_model,
-        epochs=epochs, root=SCRIPT_DIR / "proxy_logs")
+    return out
 
 
-def proxy_cache_valid(proxy_dir: Path, dataset: str, model: str, known_count: int, seed: int, epochs: int) -> bool:
-    meta_path = proxy_dir / "meta.json"
+def make_proxy_args(args):
+    proxy_args = SimpleNamespace(dataset=args.dataset, data_root=str(args.data_root), model=args.proxy_model,
+        epochs=None, batch_size=None, num_workers=4, lr=None, momentum=None, weight_decay=None,
+        lr_milestones=None, lr_gamma=None, device=args.device or "", k_folds=K_FOLDS, seed=str(args.seed))
+    return train_proxy_module.apply_dataset_defaults(proxy_args)
+
+
+def resolve_proxy_epochs(args) -> int:
+    return int(make_proxy_args(args).epochs)
+
+
+def dataset_transform(dataset):
+    seen: set[int] = set()
+    current = dataset
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        transform = getattr(current, "transform", None)
+        if transform is not None: return transform
+        current = next((getattr(current, name) for name in ("dataset", "base_dataset", "raw_dataset")
+                        if hasattr(current, name)), None)
+    return None
+
+
+def build_proxy_known_dataset(original_train_dataset, full_factory, known_indices):
+    protocol_full_dataset = full_factory(dataset_transform(original_train_dataset))
+    return IndexedSubsetDataset(protocol_full_dataset, known_indices)
+
+
+def proxy_cache_valid(proxy_dir, args, known_indices, unseen_indices, proxy_epochs, info) -> bool:
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if not (meta.get("dataset") == dataset and meta.get("model") == model
-                and int(meta.get("num_samples")) == known_count and int(meta.get("seed")) == seed
-                and int(meta.get("epochs")) == epochs and int(meta.get("k_folds")) == K_FOLDS
-                and meta.get("unseen_known_subset") is True
-                and meta.get("unseen_proxy_log_seed_specific") is True):
+        meta = json.loads((proxy_dir / "meta.json").read_text(encoding="utf-8"))
+        model = meta.get("proxy_model", meta.get("model"))
+        if not (int(meta["exp"]) == args.exp and meta["dataset"] == args.dataset
+                and int(meta["seed"]) == args.seed and int(meta["num_samples"]) == len(known_indices)
+                and int(meta["epochs"]) == proxy_epochs and int(meta["k_folds"]) == K_FOLDS
+                and float(meta["known_ratio"]) == args.config.known_ratio
+                and int(meta["unseen_ratio"]) == args.config.unseen_ratio
+                and meta["known_indices"] == known_indices.tolist() and meta["unseen_indices"] == unseen_indices.tolist()
+                and model == args.proxy_model and meta["proxy_model"] == args.proxy_model
+                and meta["static_reference_scope"] == args.config.static_reference_scope
+                and meta["selection_scope"] == args.config.selection_scope and _corruption_json_matches(meta, info)):
             return False
-        num_classes = int(meta["num_classes"])
-        validation = []
+        num_classes = int(meta["num_classes"]); validations = []
+        expected_local = np.arange(len(known_indices), dtype=np.int64)
         for fold_no in range(1, K_FOLDS + 1):
             with np.load(proxy_dir / f"fold_{fold_no}.npz", allow_pickle=False) as fold:
                 required = {"train_indices", "val_indices", "train_logits", "val_logits"}
                 if not required.issubset(fold.files): return False
-                train, val = fold["train_indices"], fold["val_indices"]
-                train_logits, val_logits = fold["train_logits"], fold["val_logits"]
+                train, val = np.asarray(fold["train_indices"]), np.asarray(fold["val_indices"])
                 if not (_integer_vector(train) and _integer_vector(val)): return False
-                if (np.any(train < 0) or np.any(train >= known_count) or np.any(val < 0)
-                        or np.any(val >= known_count) or np.intersect1d(train, val).size): return False
-                if (np.unique(train).size != len(train) or np.unique(val).size != len(val)
-                        or not np.array_equal(np.sort(np.concatenate((train, val))), np.arange(known_count))):
-                    return False
-                if train_logits.shape != (epochs, len(train), num_classes): return False
-                if val_logits.shape != (epochs, len(val), num_classes): return False
-                if not (np.isfinite(train_logits).all() and np.isfinite(val_logits).all()): return False
-                validation.append(np.asarray(val, dtype=np.int64))
-        return np.array_equal(np.sort(np.concatenate(validation)), np.arange(known_count))
+                if (np.any(train < 0) or np.any(train >= len(known_indices)) or np.any(val < 0)
+                        or np.any(val >= len(known_indices)) or np.intersect1d(train, val).size
+                        or not np.array_equal(np.sort(np.r_[train, val]), expected_local)): return False
+                train_logits, val_logits = np.asarray(fold["train_logits"]), np.asarray(fold["val_logits"])
+                if (train_logits.shape != (proxy_epochs, len(train), num_classes)
+                        or val_logits.shape != (proxy_epochs, len(val), num_classes)
+                        or not np.isfinite(train_logits).all() or not np.isfinite(val_logits).all()): return False
+                validations.append(val.astype(np.int64))
+        return np.array_equal(np.sort(np.concatenate(validations)), expected_local)
     except Exception:
         return False
 
 
-def train_proxy_on_known(
-    args: argparse.Namespace,
-    known_indices: np.ndarray,
-    result_root: Path,
-) -> tuple[Path, int]:
-    proxy_args = SimpleNamespace(
-        dataset=args.dataset,
-        data_root=str(args.data_root),
-        model=args.proxy_model,
-        epochs=None,
-        batch_size=None,
-        num_workers=4,
-        lr=None,
-        momentum=None,
-        weight_decay=None,
-        lr_milestones=None,
-        lr_gamma=None,
-        device=args.device or "",
-        k_folds=5,
-        seed=str(args.seed),
-    )
-    proxy_args = train_proxy_module.apply_dataset_defaults(proxy_args)
-    resolved_epochs = int(proxy_args.epochs)
-
-    proxy_dir = proxy_log_dir_for(
-        result_root=result_root,
-        dataset_name=args.dataset,
-        proxy_model=args.proxy_model,
-        seed=args.seed,
-        epochs=resolved_epochs,
-    )
-
-    if args.skip_saved and proxy_cache_valid(proxy_dir, args.dataset, args.proxy_model,
-                                              len(known_indices), args.seed, resolved_epochs):
-        print(f"[Skip] seed-specific known-subset proxy logs exist: {proxy_dir}")
-        return proxy_dir, resolved_epochs
-    if args.skip_saved:
-        print(f"[Recompute] known-subset proxy logs: {proxy_dir}")
-    # A proxy cache is all-or-nothing.  Remove the old set so an interrupted run
-    # cannot be mistaken for five mutually consistent folds.
-    (proxy_dir / "meta.json").unlink(missing_ok=True)
-    for fold_no in range(1, K_FOLDS + 1):
-        (proxy_dir / f"fold_{fold_no}.npz").unlink(missing_ok=True)
-
-    OriginalBaseDataLoader = train_proxy_module.BaseDataLoader
-
-    class KnownBaseDataLoader:
-        def __init__(
-            self,
-            dataset_name: str,
-            data_path: Path,
-            batch_size: int,
-            num_workers: int,
-            val_split: float,
-            seed: int,
-        ) -> None:
-            self.inner = OriginalBaseDataLoader(
-                dataset_name,
-                data_path=data_path,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                val_split=val_split,
-                seed=seed,
-            )
-            self.batch_size = batch_size
-            self.num_workers = num_workers
-            self.num_classes = None
-
+def train_proxy_on_known(args, known_indices, unseen_indices, full_factory, info=None):
+    """Run the unchanged five-fold proxy implementation on local known indices."""
+    proxy_args = make_proxy_args(args)
+    epochs = int(proxy_args.epochs)
+    out = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model, epochs)["proxy"]
+    meta_path = out / "meta.json"
+    if args.skip_saved and proxy_cache_valid(out, args, known_indices, unseen_indices, epochs, info): return out, epochs
+    meta_path.unlink(missing_ok=True)
+    for fold_no in range(1, K_FOLDS + 1): (out / f"fold_{fold_no}.npz").unlink(missing_ok=True)
+    original_loader = train_proxy_module.BaseDataLoader
+    class KnownLoader:
+        def __init__(self, dataset_name, data_path, batch_size, num_workers, val_split, seed):
+            self.batch_size, self.num_workers = batch_size, num_workers
+            self.inner = original_loader(dataset_name, data_path=data_path, batch_size=batch_size,
+                num_workers=num_workers, val_split=val_split, seed=seed)
         def load(self):
-            train_loader, val_loader, test_loader = self.inner.load()
-            self.num_classes = self.inner.num_classes
-
-            known_dataset = KnownSubsetDataset(train_loader.dataset, known_indices)
-            known_loader = DataLoader(
-                known_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=self.num_workers,
-                drop_last=False,
-            )
-            return known_loader, val_loader, test_loader
-
-    def patched_resolve_proxy_log_dir(dataset: str, seed: int | None = None, *, proxy_model: str = "resnet18", epochs: int, root=None) -> Path:
-        out = resolve_proxy_log_dir(dataset, seed=args.seed, proxy_model=proxy_model,
-            epochs=int(epochs), root=SCRIPT_DIR / "proxy_logs")
-        out.mkdir(parents=True, exist_ok=True)
-        return out
-
-    print(
-        "[Proxy] train seed-specific proxy CV on known subset "
-        f"-> {args.dataset}/{args.proxy_model}/{args.seed}/{resolved_epochs}"
-    )
-    with patch_attr(train_proxy_module, "BaseDataLoader", KnownBaseDataLoader):
-        with patch_attr(train_proxy_module, "resolve_proxy_log_dir", patched_resolve_proxy_log_dir):
-            train_proxy_module.run_for_seed(proxy_args, args.seed)
-
-    meta_path = proxy_dir / "meta.json"
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    meta["unseen_known_subset"] = True
-    meta["known_ratio"] = 0.5
-    meta["known_num_samples"] = int(len(known_indices))
-    meta["unseen_proxy_log_seed_specific"] = True
-    meta["unseen_proxy_log_seed"] = int(args.seed)
+            train, val, test = self.inner.load(); self.num_classes = self.inner.num_classes
+            known = build_proxy_known_dataset(train.dataset, full_factory, known_indices)
+            return DataLoader(known, batch_size=self.batch_size, shuffle=False,
+                              num_workers=self.num_workers), val, test
+    def patched_dir(_dataset, seed=None, *, proxy_model="resnet18", epochs, root=None):
+        result = cache_paths(args.exp, args.dataset, args.seed, proxy_model, int(epochs))["proxy"]
+        result.mkdir(parents=True, exist_ok=True); return result
+    with patch_attr(train_proxy_module, "BaseDataLoader", KnownLoader), patch_attr(train_proxy_module, "resolve_proxy_log_dir", patched_dir):
+        train_proxy_module.run_for_seed(proxy_args, args.seed)
+    meta = json.loads(meta_path.read_text()); meta.update(exp=args.exp, known_ratio=args.config.known_ratio,
+        unseen_ratio=args.config.unseen_ratio, known_indices=known_indices.tolist(), unseen_indices=unseen_indices.tolist(),
+        proxy_model=args.proxy_model, static_reference_scope=args.config.static_reference_scope,
+        selection_scope=args.config.selection_scope, **_json_corruption_context(info))
     _atomic_json(meta_path, meta)
-
-    return proxy_dir, resolved_epochs
-
-
-def build_score_loader(dataset_name: str, data_root: str | Path, preprocess, batch_size: int = 128) -> DataLoader:
-    dataset = build_raw_dataset(dataset_name, data_root, transform=preprocess)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=CONFIG.global_device.type == "cuda",
-    )
+    if not proxy_cache_valid(out, args, known_indices, unseen_indices, epochs, info):
+        meta_path.unlink(missing_ok=True)
+        raise RuntimeError("proxy training did not produce a complete valid five-fold cache")
+    return out, epochs
 
 
-def build_known_score_loader(
-    dataset_name: str,
-    data_root: str | Path,
-    preprocess,
-    known_indices: np.ndarray,
-    batch_size: int = 128,
-) -> DataLoader:
-    base = build_raw_dataset(dataset_name, data_root, transform=preprocess)
-    known_dataset = KnownSubsetDataset(base, known_indices)
-    return DataLoader(
-        known_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=CONFIG.global_device.type == "cuda",
-    )
-
-
-@torch.no_grad()
-def encode_all_images(metric, loader: DataLoader, image_adapter, device: torch.device):
-    image_adapter.eval()
-    features, labels = metric._encode_images(tqdm(loader, desc="[Static] encode all images"), image_adapter)
-    return features.to(device), labels.to(device)
-
-
-def compute_static_scores_for_known_weight_learning(
-    args: argparse.Namespace,
-    known_indices: np.ndarray,
-    adapter_paths: dict[str, Path],
-    class_names: list[str],
-    device: torch.device,
-    result_root: Path,
-) -> dict[str, np.ndarray]:
-    cache_path = (
-        result_root
-        / "static_scores"
-        / "known_only"
-        / args.dataset
-        / str(args.seed)
-        / "static_scores.npz"
-    )
-
-    known_labels = get_targets(build_raw_dataset(args.dataset, args.data_root))[known_indices]
-    if args.skip_saved:
-        cached = load_known_static_cache(cache_path, args.dataset, args.seed, known_labels)
-        if cached is not None:
-            print(f"[Skip] known static scores loaded: {cache_path}")
-            return cached
-        print(f"[Recompute] known static scores: {cache_path}")
-
-    dds_metric = DifficultyDirection(class_names=class_names, clip_model=args.clip_model, device=device)
-    div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
-    sa_metric = SemanticAlignment(
-        class_names=class_names,
-        clip_model=args.clip_model,
-        device=device,
-        dataset_name=args.dataset,
-        data_root=str(args.data_root),
-        debug_prompts=args.debug_prompts,
-    )
-
-    image_adapter, text_adapter, _ = load_trained_adapters(
-        dataset_name=args.dataset,
-        clip_model=args.clip_model,
-        input_dim=dds_metric.extractor.embed_dim,
-        seed=args.seed,
-        map_location=device,
-        adapter_image_path=adapter_paths["image_path"],
-        adapter_text_path=adapter_paths["text_path"],
-    )
-    image_adapter.to(device).eval()
-    text_adapter.to(device).eval()
-
-    dds_loader = build_known_score_loader(
-        args.dataset, args.data_root, dds_metric.extractor.preprocess, known_indices
-    )
-    div_loader = build_known_score_loader(
-        args.dataset, args.data_root, div_metric.extractor.preprocess, known_indices
-    )
-    sa_loader = build_known_score_loader(
-        args.dataset, args.data_root, sa_metric.extractor.preprocess, known_indices
-    )
-
-    dds = dds_metric.score_dataset(
-        tqdm(dds_loader, desc="[Known static] DDS"),
-        adapter=image_adapter,
-    ).scores.numpy()
-    div = div_metric.score_dataset(
-        tqdm(div_loader, desc="[Known static] Div"),
-        adapter=image_adapter,
-    ).scores.numpy()
-    sa = sa_metric.score_dataset(
-        tqdm(sa_loader, desc="[Known static] SA"),
-        adapter_image=image_adapter,
-        adapter_text=text_adapter,
-    ).scores.numpy()
-
-    labels = np.asarray(
-        KnownSubsetDataset(build_raw_dataset(args.dataset, args.data_root, None), known_indices).targets,
-        dtype=np.int64,
-    )
-
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_savez(
-        cache_path,
-        sa=sa.astype(np.float32),
-        div=div.astype(np.float32),
-        dds=dds.astype(np.float32),
-        labels=labels.astype(np.int64),
-        dataset=np.asarray(args.dataset),
-        seed=np.asarray(args.seed, dtype=np.int64),
-        known_num_samples=np.asarray(len(known_indices), dtype=np.int64),
-    )
-
-    print(f"[Known static] saved: {cache_path}")
-    return {"sa": sa, "div": div, "dds": dds, "labels": labels}
-
-
-def load_known_static_cache(path: Path, dataset: str, seed: int,
-                            known_labels: np.ndarray) -> dict[str, np.ndarray] | None:
-    try:
-        with np.load(path, allow_pickle=False) as data:
-            required = {"sa", "div", "dds", "labels", "dataset", "seed", "known_num_samples"}
-            if not required.issubset(data.files): return None
-            result = {key: np.asarray(data[key]) for key in ("sa", "div", "dds", "labels")}
-            n = len(known_labels)
-            if (str(data["dataset"].item()) != dataset or int(data["seed"].item()) != seed
-                    or int(data["known_num_samples"].item()) != n): return None
-            if any(result[key].shape != (n,) for key in result): return None
-            if not all(np.isfinite(result[key]).all() for key in ("sa", "div", "dds")): return None
-            if not np.array_equal(result["labels"].astype(np.int64), known_labels): return None
-            return {key: result[key].astype(np.int64 if key == "labels" else np.float32) for key in result}
-    except Exception:
-        return None
-
-
-def load_dynamic_component(path: Path, known_labels: np.ndarray) -> SimpleNamespace | None:
-    try:
-        with np.load(path, allow_pickle=False) as data:
-            required = {"labels", "raw_foldwise", "fold_normalized", "aggregated", "final_normalized"}
-            if not required.issubset(data.files): return None
-            labels = np.asarray(data["labels"]); raw = np.asarray(data["raw_foldwise"])
-            normalized = np.asarray(data["fold_normalized"]); aggregated = np.asarray(data["aggregated"])
-            final = np.asarray(data["final_normalized"]); n = len(known_labels)
-            if not np.array_equal(labels.astype(np.int64), known_labels): return None
-            if aggregated.shape != (n,) or final.shape != (n,): return None
-            if raw.ndim < 2 or normalized.ndim < 2 or raw.shape[0] != K_FOLDS or normalized.shape[0] != K_FOLDS: return None
-            if raw.shape[1] != n or normalized.shape[1] != n: return None
-            if not (np.isfinite(aggregated).all() and np.isfinite(final).all()): return None
-            if np.isinf(raw).any() or np.isinf(normalized).any(): return None
-            return SimpleNamespace(raw_foldwise=raw, fold_normalized=normalized,
-                                   aggregated=aggregated, final_normalized=final)
-    except Exception:
-        return None
-
-
-def get_dynamic_components(args: argparse.Namespace, proxy_dir: Path, proxy_epochs: int,
-                           known_labels: np.ndarray, result_root: Path) -> dict[str, Any]:
-    cache_dir = result_root / "dynamic_cache" / args.dataset / args.proxy_model / str(args.seed) / str(proxy_epochs)
-    results: dict[str, Any] = {}
-    if args.skip_saved:
-        for name in COMPONENT_NAMES:
-            cached = load_dynamic_component(cache_dir / f"{name}.npz", known_labels)
-            if cached is not None:
-                results[name] = cached
-                print(f"[Skip] dynamic {name}: {cache_dir / f'{name}.npz'}")
-    missing = [name for name in COMPONENT_NAMES if name not in results]
-    if not missing: return results
-    for name in missing: print(f"[Recompute] dynamic {name}: {cache_dir / f'{name}.npz'}")
-    old_loader = dynamic_utils.load_dataset_labels
-    dynamic_utils.load_dataset_labels = lambda dataset_name, data_root: known_labels.copy()
-    try:
-        folds, labels_all = dynamic_utils.load_cv_fold_logs(proxy_dir, args.dataset, str(args.data_root))
-    finally:
-        dynamic_utils.load_dataset_labels = old_loader
-    calculators = {"A": AbsorptionGainScore, "C": ConfusionComplementarityScore, "T": TransferabilityScore}
-    for name in missing:
-        value = calculators[name]().compute(folds=folds, labels_all=labels_all)
-        results[name] = value
-        _atomic_savez(cache_dir / f"{name}.npz", labels=labels_all, raw_foldwise=value.raw_foldwise,
-                      fold_normalized=value.fold_normalized, aggregated=value.aggregated,
-                      final_normalized=value.final_normalized)
-        print(f"[Save] dynamic {name}: {cache_dir / f'{name}.npz'}")
-    return results
-
-
-def learn_weights_on_known(
-    args: argparse.Namespace,
-    known_indices: np.ndarray,
-    proxy_dir: Path,
-    proxy_epochs: int,
-    adapter_paths: dict[str, Path],
-    class_names: list[str],
-    device: torch.device,
-    result_root: Path,
-) -> dict[str, float]:
-    weight_path = result_root / "weights" / "scoring_weights.json"
-    known_labels = np.asarray(KnownSubsetDataset(build_raw_dataset(args.dataset, args.data_root), known_indices).targets, dtype=np.int64)
-    if args.skip_saved:
-        cached = load_scoring_weights(weight_path, args, len(known_indices), proxy_epochs)
-        if cached is not None:
-            print(f"[Skip] scoring weights loaded: {weight_path}")
-            return cached
-        print(f"[Recompute] scoring weights: {weight_path}")
-    results = get_dynamic_components(args, proxy_dir, proxy_epochs, known_labels, result_root)
-    labels_all = known_labels
-    dynamic_target, _ = build_dynamic_target(results)
-    static = compute_static_scores_for_known_weight_learning(
-        args, known_indices, adapter_paths, class_names, device, result_root
-    )
-    if not np.array_equal(labels_all.astype(np.int64), static["labels"]):
-        raise ValueError("Known-subset dynamic and static labels are inconsistent.")
-    features = np.stack([
-        standard_zscore_by_class(static["sa"], known_labels),
-        standard_zscore_by_class(static["div"], known_labels),
-        standard_zscore_by_class(static["dds"], known_labels),
-    ], axis=1)
-    fit = fit_softplus_ratio_regression(features, dynamic_target, ratio_lambda=RATIO_LAMBDA,
-        learning_rate=2e-3, max_iter=10000, tol=1e-6, device=device)
-    normalized = np.asarray(fit["normalized_weights"], dtype=np.float64)
-    entry = {"sa": float(normalized[0]), "div": float(normalized[1]), "dds": float(normalized[2]),
-             "bias": float(fit["bias"]), "ratio_lambda": RATIO_LAMBDA, "dataset": args.dataset,
-             "seed": args.seed, "known_ratio": 0.5, "known_num_samples": len(known_indices),
-             "proxy_model": args.proxy_model, "proxy_epochs": proxy_epochs}
-    try:
-        payload = json.loads(weight_path.read_text(encoding="utf-8")) if weight_path.exists() else {}
-        if not isinstance(payload, dict): payload = {}
-    except Exception:
-        payload = {}
-    payload.setdefault(args.dataset, {})[str(args.seed)] = entry
-    _atomic_json(weight_path, payload)
-    print(f"[Save] scoring weights: {weight_path}")
-    return {key: entry[key] for key in ("sa", "div", "dds")}
-
-
-def load_scoring_weights(path: Path, args: argparse.Namespace, known_count: int,
-                         proxy_epochs: int) -> dict[str, float] | None:
+def load_scoring_weights(path, args, known, unseen, proxy_epochs, info):
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         entry = payload[args.dataset][str(args.seed)]
-        required = {"sa", "div", "dds", "bias", "ratio_lambda", "dataset", "seed", "known_ratio",
-                    "known_num_samples", "proxy_model", "proxy_epochs"}
+        required = {"sa", "div", "dds", "bias", "ratio_lambda", "exp", "dataset", "seed",
+            "known_ratio", "unseen_ratio", "known_indices", "unseen_indices", "proxy_model",
+            "proxy_epochs", "clip_model", "static_reference_scope", "selection_scope"}
         if not required.issubset(entry): return None
-        if not (entry["dataset"] == args.dataset and int(entry["seed"]) == args.seed
-                and float(entry["known_ratio"]) == KNOWN_RATIO
-                and int(entry["known_num_samples"]) == known_count
-                and entry["proxy_model"] == args.proxy_model and int(entry["proxy_epochs"]) == proxy_epochs
-                and float(entry["ratio_lambda"]) == RATIO_LAMBDA): return None
-        values = np.asarray([entry[k] for k in ("sa", "div", "dds", "bias")], dtype=np.float64)
+        values = np.asarray([entry[key] for key in ("sa", "div", "dds", "bias")], dtype=np.float64)
         weights = values[:3]
-        if (not np.isfinite(values).all() or np.any(weights <= 0)
-                or not np.isclose(weights.sum(), 1.0, atol=1e-4, rtol=0.0)):
-            return None
-        return {key: float(entry[key]) for key in ("sa", "div", "dds")}
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        valid = (np.isfinite(values).all() and np.all(weights > 0)
+            and np.isclose(weights.sum(), 1.0, atol=1e-4, rtol=0.0)
+            and float(entry["ratio_lambda"]) == 1e-3 and int(entry["exp"]) == args.exp
+            and entry["dataset"] == args.dataset and int(entry["seed"]) == args.seed
+            and float(entry["known_ratio"]) == args.config.known_ratio
+            and int(entry["unseen_ratio"]) == args.config.unseen_ratio
+            and entry["known_indices"] == known.tolist() and entry["unseen_indices"] == unseen.tolist()
+            and entry["proxy_model"] == args.proxy_model and int(entry["proxy_epochs"]) == proxy_epochs
+            and entry["clip_model"] == args.clip_model
+            and entry["static_reference_scope"] == args.config.static_reference_scope
+            and entry["selection_scope"] == args.config.selection_scope
+            and _corruption_json_matches(entry, info))
+        return {key: float(entry[key]) for key in ("sa", "div", "dds")} if valid else None
+    except Exception:
         return None
 
 
-def compute_all_static_scores_with_known_base(args, known_indices, adapter_paths, class_names, device, result_root):
-    cache_path = result_root / "static_scores" / "all_with_known_base" / args.dataset / str(args.seed) / "static_scores.npz"
-    labels_expected = get_targets(build_raw_dataset(args.dataset, args.data_root))
-    if args.skip_saved:
-        cached = load_all_static_cache(cache_path, args.dataset, args.seed, labels_expected, known_indices)
-        if cached is not None:
-            print(f"[Skip] all-sample static scores loaded: {cache_path}")
-            return cached
-        print(f"[Recompute] all-sample static scores: {cache_path}")
-    dds_metric = DifficultyDirection(class_names=class_names, clip_model=args.clip_model, device=device)
-    sa_metric = SemanticAlignment(class_names=class_names, clip_model=args.clip_model, device=device,
-        dataset_name=args.dataset, data_root=str(args.data_root), debug_prompts=args.debug_prompts)
-    image_adapter, text_adapter, _ = load_trained_adapters(dataset_name=args.dataset, clip_model=args.clip_model,
-        input_dim=dds_metric.extractor.embed_dim, seed=args.seed, map_location=device,
-        adapter_image_path=adapter_paths["image_path"], adapter_text_path=adapter_paths["text_path"])
-    image_adapter.to(device).eval(); text_adapter.to(device).eval()
-    all_dataset = build_raw_dataset(args.dataset, args.data_root)
-    labels = get_targets(all_dataset)
-    sa_loader = build_score_loader(args.dataset, args.data_root, sa_metric.extractor.preprocess)
-    sa = sa_metric.score_dataset(sa_loader, adapter_image=image_adapter, adapter_text=text_adapter).scores.numpy()
-    dds_loader = build_score_loader(args.dataset, args.data_root, dds_metric.extractor.preprocess)
-    features, encoded_labels = encode_all_images(dds_metric, dds_loader, image_adapter, device)
-    if not np.array_equal(labels, encoded_labels.cpu().numpy()):
-        raise ValueError("Full-dataset labels are inconsistent.")
-    dds = np.zeros(len(labels), dtype=np.float32)
-    known_mask = np.zeros(len(labels), dtype=bool); known_mask[known_indices] = True
-    for class_id in tqdm(range(len(class_names)), desc="[Static] DDS with known base", unit="class"):
-        query = np.flatnonzero(labels == class_id); reference = np.flatnonzero((labels == class_id) & known_mask)
-        dds[query] = dds_metric._dds_from_reference_pca(features[query], features[reference]).cpu().numpy()
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_savez(cache_path, sa=sa.astype(np.float32), dds=dds, labels=labels,
-                  known_indices=known_indices, dataset=np.asarray(args.dataset), seed=np.asarray(args.seed))
-    print(f"[Static] saved: {cache_path}")
-    return {"sa": sa, "dds": dds, "labels": labels}
-
-
-def load_all_static_cache(path: Path, dataset: str, seed: int, labels: np.ndarray,
-                          known_indices: np.ndarray) -> dict[str, np.ndarray] | None:
+def load_dynamic_component_cache(path, component_name, args, known, unseen, known_labels,
+                                 proxy_epochs, info):
     try:
         with np.load(path, allow_pickle=False) as data:
-            required = {"sa", "dds", "labels", "known_indices", "dataset", "seed"}
+            required = {"labels", "raw_foldwise", "fold_normalized", "aggregated", "final_normalized",
+                "component", "exp", "dataset", "seed", "known_ratio", "unseen_ratio", "known_indices",
+                "unseen_indices", "proxy_model", "proxy_epochs", "clip_model", "static_reference_scope",
+                "selection_scope", "corruption_types", "is_corrupted"}
             if not required.issubset(data.files): return None
-            sa, dds, saved_labels = (np.asarray(data[key]) for key in ("sa", "dds", "labels"))
-            if (str(data["dataset"].item()) != dataset or int(data["seed"].item()) != seed
-                    or sa.shape != labels.shape or dds.shape != labels.shape or saved_labels.shape != labels.shape
-                    or not np.isfinite(sa).all() or not np.isfinite(dds).all()
-                    or not np.array_equal(saved_labels.astype(np.int64), labels)
-                    or not np.array_equal(np.asarray(data["known_indices"], dtype=np.int64), known_indices)):
-                return None
-            return {"sa": sa.astype(np.float32), "dds": dds.astype(np.float32),
-                    "labels": saved_labels.astype(np.int64)}
+            raw, normalized = np.asarray(data["raw_foldwise"]), np.asarray(data["fold_normalized"])
+            aggregated, final = np.asarray(data["aggregated"]), np.asarray(data["final_normalized"])
+            n = len(known_labels)
+            valid = (str(data["component"]) == component_name and int(data["exp"]) == args.exp
+                and str(data["dataset"]) == args.dataset and int(data["seed"]) == args.seed
+                and float(data["known_ratio"]) == args.config.known_ratio
+                and int(data["unseen_ratio"]) == args.config.unseen_ratio
+                and np.array_equal(data["known_indices"], known) and np.array_equal(data["unseen_indices"], unseen)
+                and str(data["proxy_model"]) == args.proxy_model and int(data["proxy_epochs"]) == proxy_epochs
+                and str(data["clip_model"]) == args.clip_model
+                and str(data["static_reference_scope"]) == args.config.static_reference_scope
+                and str(data["selection_scope"]) == args.config.selection_scope
+                and np.array_equal(data["labels"], known_labels) and aggregated.shape == (n,) and final.shape == (n,)
+                and raw.ndim >= 2 and normalized.ndim >= 2 and raw.shape[:2] == (K_FOLDS, n)
+                and normalized.shape[:2] == (K_FOLDS, n) and np.isfinite(aggregated).all()
+                and np.isfinite(final).all() and not np.isinf(raw).any() and not np.isinf(normalized).any())
+            expected_types = info.corruption_types if info else np.empty(0, np.int16)
+            expected_corrupted = info.is_corrupted if info else np.empty(0, bool)
+            valid = valid and np.array_equal(data["corruption_types"], expected_types) and np.array_equal(data["is_corrupted"], expected_corrupted)
+            return SimpleNamespace(raw_foldwise=raw, fold_normalized=normalized,
+                aggregated=aggregated, final_normalized=final) if valid else None
     except Exception:
         return None
 
 
-def mask_path_for(dataset: str, seed: int, keep_ratio: int) -> Path:
-    return resolve_mask_path(METHOD, dataset, "", seed, keep_ratio, root=SCRIPT_DIR / "mask")
+def get_dynamic_components(args, proxy_dir, proxy_epochs, known, unseen, labels, info):
+    cache_dir = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model, proxy_epochs)["dynamic"]
+    components = {}
+    if args.skip_saved:
+        for name in COMPONENTS:
+            cached = load_dynamic_component_cache(cache_dir / f"{name}.npz", name, args, known,
+                                                   unseen, labels, proxy_epochs, info)
+            if cached is not None: components[name] = cached
+    missing = [name for name in COMPONENTS if name not in components]
+    if not missing: return components
+    old_labels = dynamic_utils.load_dataset_labels
+    dynamic_utils.load_dataset_labels = lambda *_: labels.copy()
+    try:
+        folds, labels_all = dynamic_utils.load_cv_fold_logs(proxy_dir, args.dataset, str(args.data_root))
+    finally:
+        dynamic_utils.load_dataset_labels = old_labels
+    for name in missing:
+        value = COMPONENTS[name]().compute(folds=folds, labels_all=labels_all)
+        components[name] = value
+        _atomic_savez(cache_dir / f"{name}.npz", labels=labels_all, raw_foldwise=value.raw_foldwise,
+            fold_normalized=value.fold_normalized, aggregated=value.aggregated,
+            final_normalized=value.final_normalized, component=name, exp=args.exp, dataset=args.dataset,
+            seed=args.seed, known_ratio=args.config.known_ratio, unseen_ratio=args.config.unseen_ratio,
+            known_indices=known, unseen_indices=unseen, proxy_model=args.proxy_model,
+            proxy_epochs=proxy_epochs, clip_model=args.clip_model,
+            static_reference_scope=args.config.static_reference_scope, selection_scope=args.config.selection_scope,
+            corruption_types=info.corruption_types if info else np.empty(0, np.int16),
+            is_corrupted=info.is_corrupted if info else np.empty(0, bool))
+    return components
 
 
-def save_mask(dataset, seed, keep_ratio, mask, known_indices, unseen_indices) -> Path:
-    out_path = mask_path_for(dataset, seed, keep_ratio)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    known_selected = int(mask[known_indices].sum())
-    unseen_selected = int(mask[unseen_indices].sum())
-    _atomic_savez(out_path, mask=mask.astype(np.uint8), dataset=np.asarray(dataset),
-        seed=np.asarray(seed), keep_ratio=np.asarray(keep_ratio), method=np.asarray(METHOD),
-        known_indices=known_indices, unseen_indices=unseen_indices,
-        known_selected=np.asarray(known_selected), unseen_selected=np.asarray(unseen_selected))
-    return out_path
+def prepare_proxy_and_weights(args, known, unseen, static, full_factory, info=None):
+    """Check weights first; only then prepare proxy and missing A/C/T components."""
+    epochs = resolve_proxy_epochs(args)
+    weight_path = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model, epochs)["weights"]
+    if args.skip_saved:
+        cached = load_scoring_weights(weight_path, args, known, unseen, epochs, info)
+        if cached is not None: return cached
+    proxy_dir, actual_epochs = train_proxy_on_known(args, known, unseen, full_factory, info)
+    if actual_epochs != epochs: raise RuntimeError("proxy epoch configuration changed during preparation")
+    labels = np.asarray(static["labels"], dtype=np.int64)
+    components = get_dynamic_components(args, proxy_dir, epochs, known, unseen, labels, info)
+    dynamic_target, _ = build_dynamic_target(components)
+    features = np.stack([standard_zscore_by_class(static[key], labels) for key in ("sa", "div", "dds")], axis=1)
+    device = torch.device(args.device) if args.device else CONFIG.global_device
+    fit = fit_softplus_ratio_regression(features, dynamic_target, ratio_lambda=1e-3,
+        learning_rate=2e-3, max_iter=10000, tol=1e-6, device=device)
+    weights = np.asarray(fit["normalized_weights"], dtype=np.float64)
+    entry = dict(sa=float(weights[0]), div=float(weights[1]), dds=float(weights[2]), bias=float(fit["bias"]),
+        ratio_lambda=1e-3, exp=args.exp, dataset=args.dataset, seed=args.seed,
+        known_ratio=args.config.known_ratio, unseen_ratio=args.config.unseen_ratio,
+        known_indices=known.tolist(), unseen_indices=unseen.tolist(), proxy_model=args.proxy_model,
+        proxy_epochs=epochs, clip_model=args.clip_model, static_reference_scope=args.config.static_reference_scope,
+        selection_scope=args.config.selection_scope, **_json_corruption_context(info))
+    try: payload = json.loads(weight_path.read_text()) if weight_path.exists() else {}
+    except (OSError, json.JSONDecodeError): payload = {}
+    payload.setdefault(args.dataset, {})[str(args.seed)] = entry
+    _atomic_json(weight_path, payload)
+    return {key: entry[key] for key in ("sa", "div", "dds")}
 
 
-def mask_cache_valid(path: Path, num_samples: int, dataset: str, seed: int, keep_ratio: int,
-                     known_indices: np.ndarray, unseen_indices: np.ndarray) -> bool:
+def static_reference_scope(args, cache_kind):
+    if args.exp == 2: return "known" if cache_kind == "calibration" else "unseen"
+    return "full_corrupted" if args.exp == 3 else "full"
+
+
+def static_sample_indices(dataset):
+    if isinstance(dataset, IndexedSubsetDataset): return dataset.indices.copy()
+    return np.arange(len(dataset), dtype=np.int64)
+
+
+def load_static_cache(path, args, cache_kind, labels, sample_indices, known, unseen, info):
     try:
         with np.load(path, allow_pickle=False) as data:
-            required = {"mask", "dataset", "seed", "keep_ratio", "method", "known_indices",
-                        "unseen_indices", "known_selected", "unseen_selected"}
-            if not required.issubset(data.files): return False
-            mask = np.asarray(data["mask"])
-            known_selected, unseen_selected = int(data["known_selected"].item()), int(data["unseen_selected"].item())
-            expected = round(num_samples * keep_ratio / 100)
-            return (mask.shape == (num_samples,) and set(np.unique(mask).tolist()).issubset({0, 1})
-                    and int(mask.sum()) == expected and str(data["dataset"].item()) == dataset
-                    and int(data["seed"].item()) == seed and int(data["keep_ratio"].item()) == keep_ratio
-                    and str(data["method"].item()) == METHOD
-                    and np.array_equal(np.asarray(data["known_indices"], dtype=np.int64), known_indices)
-                    and np.array_equal(np.asarray(data["unseen_indices"], dtype=np.int64), unseen_indices)
-                    and known_selected == int(mask[known_indices].sum())
-                    and unseen_selected == int(mask[unseen_indices].sum())
-                    and known_selected + unseen_selected == int(mask.sum()))
+            required = {"sa", "div", "dds", "labels", "exp", "dataset", "seed", "known_ratio",
+                "unseen_ratio", "known_indices", "unseen_indices", "clip_model", "proxy_model",
+                "num_samples", "static_reference_scope", "reference_scope", "selection_scope",
+                "cache_kind", "sample_indices", "corruption_types", "is_corrupted"}
+            if not required.issubset(data.files): return None
+            scores = {key: np.asarray(data[key]) for key in ("sa", "div", "dds")}
+            n = len(labels)
+            valid = (all(value.shape == (n,) and np.isfinite(value).all() for value in scores.values())
+                and np.asarray(data["labels"]).shape == (n,) and np.array_equal(data["labels"], labels)
+                and int(data["exp"]) == args.exp and str(data["dataset"]) == args.dataset
+                and int(data["seed"]) == args.seed and float(data["known_ratio"]) == args.config.known_ratio
+                and int(data["unseen_ratio"]) == args.config.unseen_ratio
+                and np.array_equal(data["known_indices"], known) and np.array_equal(data["unseen_indices"], unseen)
+                and str(data["clip_model"]) == args.clip_model and str(data["proxy_model"]) == args.proxy_model
+                and int(data["num_samples"]) == n and str(data["static_reference_scope"]) == args.config.static_reference_scope
+                and str(data["reference_scope"]) == static_reference_scope(args, cache_kind)
+                and str(data["selection_scope"]) == args.config.selection_scope
+                and str(data["cache_kind"]) == cache_kind and np.array_equal(data["sample_indices"], sample_indices))
+            expected_types = info.corruption_types if info else np.empty(0, np.int16)
+            expected_corrupted = info.is_corrupted if info else np.empty(0, bool)
+            valid = valid and np.array_equal(data["corruption_types"], expected_types) and np.array_equal(data["is_corrupted"], expected_corrupted)
+            return {**scores, "labels": labels.copy()} if valid else None
     except Exception:
-        return False
+        return None
+
+
+def compute_static_scores(args, dataset, adapter_dir, cache_kind, known, unseen, info):
+    path = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model)[f"{cache_kind}_static"]
+    labels = get_targets(dataset)
+    sample_indices = static_sample_indices(dataset)
+    if args.skip_saved:
+        cached = load_static_cache(path, args, cache_kind, labels, sample_indices, known, unseen, info)
+        if cached is not None: return cached
+    device = torch.device(args.device) if args.device else CONFIG.global_device
+    classes = resolve_class_names_for_prompts(args.dataset, args.data_root, dataset.classes)
+    dds = DifficultyDirection(class_names=classes, clip_model=args.clip_model, device=device)
+    div = Div(class_names=classes, clip_model=args.clip_model, device=device)
+    sa = SemanticAlignment(class_names=classes, clip_model=args.clip_model, device=device,
+                           dataset_name=args.dataset, data_root=str(args.data_root), debug_prompts=args.debug_prompts)
+    image, text, _ = load_trained_adapters(args.dataset, args.clip_model, dds.extractor.embed_dim, args.seed,
+        map_location=device, adapter_image_path=adapter_dir/"adapter_image.pt", adapter_text_path=adapter_dir/"adapter_context.pt")
+    def loader(preprocess):
+        # Corruption stays in the base and therefore precedes both transform and index view.
+        base = dataset.base_dataset if isinstance(dataset, IndexedSubsetDataset) else dataset
+        if isinstance(base, FixedCorruptionDataset): base.transform = preprocess
+        elif hasattr(base, "transform"): base.transform = preprocess
+        view = IndexedSubsetDataset(base, dataset.indices) if isinstance(dataset, IndexedSubsetDataset) else base
+        return DataLoader(view, batch_size=128, shuffle=False, num_workers=4)
+    sa_scores = sa.score_dataset(loader(sa.extractor.preprocess), adapter_image=image, adapter_text=text).scores.numpy()
+    div_scores = div.score_dataset(loader(div.extractor.preprocess), adapter=image).scores.numpy()
+    dds_scores = dds.score_dataset(loader(dds.extractor.preprocess), adapter=image).scores.numpy()
+    _atomic_savez(path, sa=sa_scores, div=div_scores, dds=dds_scores, labels=labels, exp=args.exp,
+        dataset=args.dataset, seed=args.seed, known_ratio=args.config.known_ratio, unseen_ratio=args.config.unseen_ratio,
+        known_indices=known, unseen_indices=unseen, clip_model=args.clip_model, proxy_model=args.proxy_model,
+        num_samples=len(dataset), static_reference_scope=args.config.static_reference_scope,
+        reference_scope=static_reference_scope(args, cache_kind), selection_scope=args.config.selection_scope,
+        cache_kind=cache_kind, sample_indices=sample_indices,
+        corruption_types=info.corruption_types if info else np.empty(0, np.int16),
+        is_corrupted=info.is_corrupted if info else np.empty(0, bool))
+    return {"sa": sa_scores, "div": div_scores, "dds": dds_scores, "labels": labels}
+
+
+def run_group_solver(args, static, dataset, adapter_dir, weights, target_size):
+    device = torch.device(args.device) if args.device else CONFIG.global_device
+    classes = resolve_class_names_for_prompts(args.dataset, args.data_root, dataset.classes)
+    div = Div(class_names=classes, clip_model=args.clip_model, device=device)
+    image, _, _ = load_trained_adapters(args.dataset, args.clip_model, div.extractor.embed_dim, args.seed,
+        map_location=device, adapter_image_path=adapter_dir/"adapter_image.pt", adapter_text_path=adapter_dir/"adapter_context.pt")
+    base = dataset.base_dataset if isinstance(dataset, IndexedSubsetDataset) else dataset
+    if isinstance(base, FixedCorruptionDataset): base.transform = div.extractor.preprocess
+    elif hasattr(base, "transform"): base.transform = div.extractor.preprocess
+    scored_dataset = IndexedSubsetDataset(base, dataset.indices) if isinstance(dataset, IndexedSubsetDataset) else base
+    loader = DataLoader(scored_dataset, batch_size=128, shuffle=False, num_workers=4)
+    pool_ratio = 100.0 * target_size / len(dataset)
+    solver = (mask_solvers.select_group_mask_by_center_repair if args.config.group_solver == "center_repair"
+              else mask_solvers.select_group_mask)
+    kwargs = dict(sa_raw_scores=static["sa"], div_metric=div, div_loader=loader, image_adapter=image,
+        labels=static["labels"], weights=weights, num_classes=len(classes), keep_ratio=pool_ratio,
+        device=device, seed=args.seed, dds_static_scores=static["dds"],
+        group_candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count)
+    if solver is mask_solvers.select_group_mask:
+        kwargs["weight_group"] = "learned"
+        kwargs["dist_weight_factor"] = args.dist_weight_factor
+    local, _, _ = solver(**kwargs)
+    if int(local.sum()) != target_size: raise RuntimeError(f"group solver selected {local.sum()}, expected {target_size}")
+    return local
 
 
 def main() -> None:
-    args = parse_args(); args.dataset = args.dataset.strip().lower()
-    set_seed(args.seed)
-    device = torch.device(args.device) if args.device else CONFIG.global_device
-    full_dataset = build_raw_dataset(args.dataset, args.data_root)
-    labels_full = get_targets(full_dataset)
-    known_indices, unseen_indices, _ = save_known_split(args.dataset, args.seed,
-        SCRIPT_DIR / "known_dataset", len(full_dataset), args.skip_saved)
-    valid_masks = {
-        keep_ratio: args.skip_saved and mask_cache_valid(
-            mask_path_for(args.dataset, args.seed, keep_ratio), len(full_dataset), args.dataset,
-            args.seed, keep_ratio, known_indices, unseen_indices)
-        for keep_ratio in KEEP_RATIOS
-    }
-    for keep_ratio, valid in valid_masks.items():
-        if valid: print(f"[Skip] mask: {mask_path_for(args.dataset, args.seed, keep_ratio)}")
-        elif args.skip_saved: print(f"[Recompute] mask: {mask_path_for(args.dataset, args.seed, keep_ratio)}")
-    if all(valid_masks.values()):
+    args = parse_args(); set_seed(args.seed)
+    raw = build_raw_dataset(args.dataset, args.data_root)
+    full, known_ds, unseen_ds, known, unseen, info = build_protocol_datasets(args, raw)
+    valid = {kr: args.skip_saved and mask_cache_valid(mask_path_for(args.exp, args.mode, args.dataset, args.seed, kr),
+             args, len(full), known, unseen, info, kr) for kr in args.keep_ratios}
+    if all(valid.values()): return
+    pending = [kr for kr in args.keep_ratios if not valid[kr]]
+    pool_indices = unseen if args.config.selection_scope == "unseen" else np.arange(len(full), dtype=np.int64)
+    if args.mode == "random":
+        for kr in pending:
+            target = round(len(full) * kr / 100)
+            save_mask(args, generate_random_mask(pool_indices, len(full), target, args.seed, args.exp, kr), known, unseen, info, kr)
         return
-    class_names = list(resolve_class_names_for_prompts(args.dataset, args.data_root, full_dataset.classes))
-    adapter_dir = train_adapter_on_known(args, known_indices, SCRIPT_DIR)
-    adapter_paths = {"image_path": adapter_dir / "adapter_image.pt", "text_path": adapter_dir / "adapter_context.pt",
-                     "meta_path": adapter_dir / "meta.json"}
-    proxy_dir, proxy_epochs = train_proxy_on_known(args, known_indices, SCRIPT_DIR)
-    weights = learn_weights_on_known(args, known_indices, proxy_dir, proxy_epochs,
-        adapter_paths, class_names, device, SCRIPT_DIR)
-    static = compute_all_static_scores_with_known_base(args, known_indices, adapter_paths,
-        class_names, device, SCRIPT_DIR)
-    if static["labels"].shape != labels_full.shape: raise RuntimeError("Static scores must cover the full training set.")
-    div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
-    image_adapter, _, _ = load_trained_adapters(dataset_name=args.dataset, clip_model=args.clip_model,
-        input_dim=div_metric.extractor.embed_dim, seed=args.seed, map_location=device,
-        adapter_image_path=adapter_paths["image_path"], adapter_text_path=adapter_paths["text_path"])
-    image_adapter.to(device).eval()
-    div_loader = build_score_loader(args.dataset, args.data_root, div_metric.extractor.preprocess)
-    for keep_ratio in KEEP_RATIOS:
-        if valid_masks[keep_ratio]: continue
-        mask, _, _ = select_group_mask(sa_raw_scores=static["sa"], div_metric=div_metric,
-            div_loader=div_loader, image_adapter=image_adapter, labels=static["labels"], weights=weights,
-            num_classes=len(class_names), keep_ratio=keep_ratio, device=device, seed=args.seed,
-            weight_group="learned", dds_static_scores=static["dds"],
-            group_candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count,
-            dist_weight_factor=args.dist_weight_factor)
-        expected = round(len(full_dataset) * keep_ratio / 100)
-        if int(mask.sum()) != expected: raise RuntimeError(f"mask selected {mask.sum()}, expected {expected}")
-        out = save_mask(args.dataset, args.seed, keep_ratio, mask, known_indices, unseen_indices)
-        print(f"[Save] mask: {out}")
+    # Corruption is applied to the full dataset before this factory creates either view.
+    def full_factory(transform):
+        base = build_raw_dataset(args.dataset, args.data_root, transform=None)
+        if info is not None: return FixedCorruptionDataset(base, transform=transform, corruption_info=info)
+        base.transform = transform; return base
+    adapter = train_adapter_on_known(args, known, unseen, full_factory, info)
+    selection_ds = unseen_ds if args.config.selection_scope == "unseen" else full
+    static_selection = compute_static_scores(args, selection_ds, adapter, "selection", known, unseen, info)
+    if args.mode == "naive_group":
+        weights = {"sa": 1/3, "div": 1/3, "dds": 1/3}
+    else:
+        epochs = resolve_proxy_epochs(args)
+        weight_path = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model, epochs)["weights"]
+        weights = (load_scoring_weights(weight_path, args, known, unseen, epochs, info)
+                   if args.skip_saved else None)
+        if weights is None:
+            calibration_ds = known_ds if args.exp == 2 else selection_ds
+            static_calibration = (compute_static_scores(args, calibration_ds, adapter, "calibration", known, unseen, info)
+                                  if args.exp == 2 else {k: v[known] for k, v in static_selection.items()})
+            weights = prepare_proxy_and_weights(args, known, unseen, static_calibration, full_factory, info)
+    for kr in pending:
+        target = round(len(full) * kr / 100)
+        if target > len(selection_ds): raise ValueError(f"global target {target} exceeds selection pool {len(selection_ds)}")
+        local = run_group_solver(args, static_selection, selection_ds, adapter, weights, target)
+        mask = local if args.config.selection_scope == "full" else np.zeros(len(full), np.uint8)
+        if args.config.selection_scope == "unseen": mask[unseen] = local
+        save_mask(args, mask, known, unseen, info, kr)
 
 
 if __name__ == "__main__":

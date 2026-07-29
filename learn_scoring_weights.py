@@ -44,10 +44,10 @@ from weights import (
     TransferabilityScore,
 )
 from weights.dynamic_utils import DynamicComponentResult, FoldLogData, load_cv_fold_logs, resolve_epoch_windows
+from weights.calibration import build_dynamic_target, fit_softplus_ratio_regression
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 COMPONENT_NAMES = ("A", "C", "T")
-METHOD_VERSION = "softplus_ratio"
 
 
 def resolve_default_proxy_epochs(dataset_name: str) -> int:
@@ -88,7 +88,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coverage-k-pct", type=float, default=0.05)
     parser.add_argument("--coverage-q-low", type=float, default=0.002)
     parser.add_argument("--coverage-q-high", type=float, default=0.998)
-    parser.add_argument("--ridge-lambda", type=float, default=0.01)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--max-iter", type=int, default=10000)
     parser.add_argument("--tol", type=float, default=1e-6)
@@ -166,159 +165,6 @@ def load_adapters_for_seed(args: argparse.Namespace, dataset_name: str, input_di
     image_adapter.to(device).eval()
     text_adapter.to(device).eval()
     return image_adapter, text_adapter, adapter_paths
-
-def _softmax_simplex(theta: np.ndarray) -> np.ndarray:
-    """Map unconstrained parameters to strictly positive simplex weights."""
-    theta = np.asarray(theta, dtype=np.float64)
-    if theta.ndim != 1 or theta.size == 0:
-        raise ValueError("theta must be a non-empty 1D array.")
-
-    shifted = theta - float(np.max(theta))
-    shifted = np.clip(shifted, -50.0, 50.0)
-    exp_theta = np.exp(shifted)
-    denom = float(np.sum(exp_theta))
-
-    if (not np.isfinite(denom)) or denom <= 0.0:
-        return np.full(theta.shape, 1.0 / theta.size, dtype=np.float64)
-
-    weights = exp_theta / denom
-    return weights.astype(np.float64)
-
-def project_to_simplex(vector: np.ndarray) -> np.ndarray:
-    if vector.ndim != 1 or vector.size == 0:
-        raise ValueError("vector must be a non-empty 1D array.")
-    sorted_vec = np.sort(vector)[::-1]
-    cumulative_sum = np.cumsum(sorted_vec)
-    rho_candidates = sorted_vec - (cumulative_sum - 1) / np.arange(1, vector.size + 1)
-    rho_indices = np.where(rho_candidates > 0)[0]
-    if rho_indices.size == 0:
-        return np.full_like(vector, 1.0 / vector.size, dtype=np.float64)
-    rho = rho_indices[-1]
-    theta = (cumulative_sum[rho] - 1) / (rho + 1)
-    projected = np.maximum(vector - theta, 0.0)
-    denom = projected.sum()
-    if denom <= 0:
-        return np.full_like(vector, 1.0 / vector.size, dtype=np.float64)
-    return (projected / denom).astype(np.float64)
-
-
-def fit_ridge_regression_nonnegative(
-    features: np.ndarray,
-    targets: np.ndarray,
-    l2_lambda: float,
-    learning_rate: float,
-    max_iter: int,
-    tol: float,
-) -> tuple[np.ndarray, float]:
-    """Fit positive simplex weights with ridge regularization.
-
-    The returned weights satisfy:
-      - weights_i > 0
-      - sum_i weights_i = 1
-
-    We optimize unconstrained theta and set weights = softmax(theta).
-    The L2 term is applied to weights. Under the simplex constraint, this
-    discourages overly concentrated weights and favors a more balanced mixture.
-    """
-    if features.ndim != 2 or targets.ndim != 1 or features.shape[0] != targets.shape[0]:
-        raise ValueError("features/targets shape mismatch.")
-    if l2_lambda < 0:
-        raise ValueError("l2_lambda must be non-negative.")
-    if learning_rate <= 0:
-        raise ValueError("learning_rate must be positive.")
-    if max_iter <= 0:
-        raise ValueError("max_iter must be positive.")
-    if tol <= 0:
-        raise ValueError("tol must be positive.")
-
-    num_samples, num_features = features.shape
-    features = features.astype(np.float64, copy=False)
-    targets = targets.astype(np.float64, copy=False)
-
-    theta = np.zeros(num_features, dtype=np.float64)
-    weights = _softmax_simplex(theta)
-    bias = float(np.mean(targets))
-
-    for _ in tqdm(range(max_iter), desc="Fitting positive simplex weights", unit="iter", leave=False):
-        preds = features @ weights + bias
-        errors = preds - targets
-
-        grad_w = (features.T @ errors) / num_samples + l2_lambda * weights
-        grad_b = float(np.mean(errors))
-
-        # Chain rule through softmax:
-        # dL/dtheta_i = w_i * (dL/dw_i - sum_j w_j * dL/dw_j)
-        grad_theta = weights * (grad_w - float(np.dot(weights, grad_w)))
-
-        next_theta = theta - learning_rate * grad_theta
-        next_bias = bias - learning_rate * grad_b
-        next_weights = _softmax_simplex(next_theta)
-
-        if np.linalg.norm(next_weights - weights) < tol and abs(next_bias - bias) < tol:
-            theta = next_theta
-            weights = next_weights
-            bias = next_bias
-            break
-
-        theta = next_theta
-        weights = next_weights
-        bias = next_bias
-
-    return weights.astype(np.float64), float(bias)
-
-
-def fit_softplus_ratio_regression(
-    features: np.ndarray,
-    targets: np.ndarray,
-    ratio_lambda: float,
-    learning_rate: float,
-    max_iter: int,
-    tol: float,
-    device: torch.device,
-) -> dict[str, object]:
-    if features.ndim != 2 or targets.ndim != 1 or features.shape[0] != targets.shape[0]:
-        raise ValueError("features/targets shape mismatch.")
-    features_t = torch.as_tensor(features, dtype=torch.float64, device=device)
-    targets_t = torch.as_tensor(targets, dtype=torch.float64, device=device)
-    theta = torch.zeros(features.shape[1], dtype=torch.float64, device=device, requires_grad=True)
-    bias = torch.tensor(float(np.mean(targets)), dtype=torch.float64, device=device, requires_grad=True)
-    optimizer = torch.optim.Adam([theta, bias], lr=float(learning_rate))
-    prev_loss: float | None = None
-    iterations = 0
-    final_mse = 0.0
-    final_ratio = 0.0
-    for iteration in tqdm(range(int(max_iter)), desc="fit softplus-ratio", unit="iter", leave=False):
-        optimizer.zero_grad()
-        raw_weights = torch.nn.functional.softplus(theta) + 1e-8
-        pred = features_t @ raw_weights + bias
-        mse = torch.mean((pred - targets_t) ** 2)
-        ratio_reg = torch.var(raw_weights, unbiased=False) / (torch.mean(raw_weights) ** 2 + 1e-8)
-        loss = mse + float(ratio_lambda) * ratio_reg
-        loss.backward()
-        optimizer.step()
-        loss_value = float(loss.detach().cpu())
-        final_mse = float(mse.detach().cpu())
-        final_ratio = float(ratio_reg.detach().cpu())
-        iterations = iteration + 1
-        if prev_loss is not None and abs(prev_loss - loss_value) < float(tol):
-            break
-        prev_loss = loss_value
-
-    with torch.no_grad():
-        raw_weights_t = torch.nn.functional.softplus(theta) + 1e-8
-        pred_t = features_t @ raw_weights_t + bias
-        raw_weights_np = raw_weights_t.detach().cpu().numpy().astype(np.float64)
-        normalized_weights = raw_weights_np / float(np.sum(raw_weights_np))
-        pred_np = pred_t.detach().cpu().numpy().astype(np.float64)
-    return {
-        "raw_weights": raw_weights_np,
-        "normalized_weights": normalized_weights.astype(np.float64),
-        "bias": float(bias.detach().cpu()),
-        "mse": final_mse,
-        "ratio_regularizer": final_ratio,
-        "iterations": iterations,
-        "pred": pred_np,
-    }
 
 def build_output_path(base_path: str) -> Path:
     return Path(base_path)
@@ -773,38 +619,6 @@ def load_or_compute_dynamic_supervision_for_seed(
 
     return component_results, labels_all, proxy_log, component_cache_paths, reasons
 
-def build_dynamic_target(
-    component_results: dict[str, DynamicComponentResult],
-) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    a_result = component_results["A"]
-    c_result = component_results["C"]
-    t_result = component_results["T"]
-
-    num_samples = a_result.final_normalized.shape[0]
-    for name, arr in {
-        "A_final_normalized": a_result.final_normalized,
-        "C_final_normalized": c_result.final_normalized,
-        "T_final_normalized": t_result.final_normalized,
-    }.items():
-        if arr.shape != (num_samples,):
-            raise ValueError(f"{name} shape mismatch: {arr.shape}")
-        if not np.all(np.isfinite(arr)):
-            raise ValueError(f"{name} contains NaN/inf values.")
-
-    utility_raw = (
-        a_result.final_normalized
-        + c_result.final_normalized
-        + t_result.final_normalized
-    ).astype(np.float64) / 3.0
-    u_scores = standard_zscore(utility_raw)
-    dynamic_component_values = {
-        "A": a_result.final_normalized,
-        "C": c_result.final_normalized,
-        "T": t_result.final_normalized,
-    }
-    return u_scores.astype(np.float64), dynamic_component_values
-
-
 def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
     if args.proxy_training_seed is not None and len(output_seeds) > 1:
         raise ValueError(
@@ -970,7 +784,6 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "div": float(weights[1]),
             "dds": float(weights[2]),
             "bias": float(bias),
-            "method_version": METHOD_VERSION,
             "ratio_lambda": float(args.ratio_lambda),
             "transferability_component": "TransferabilityScore",
             "proxy_log": str(proxy_log) if proxy_log is not None else "",
@@ -985,8 +798,7 @@ def run_once(args: argparse.Namespace, output_seeds: list[int]) -> None:
             "diagnostics": {
                 "dynamic_static_pearson": correlation_matrix,
                 "weight_solver": "softplus_ratio_no_simplex",
-                "method_version": METHOD_VERSION,
-                "raw_weights": [float(x) for x in np.asarray(fit_result["raw_weights"], dtype=np.float64)],
+                    "raw_weights": [float(x) for x in np.asarray(fit_result["raw_weights"], dtype=np.float64)],
                 "mse": float(fit_result["mse"]),
                 "ratio_regularizer": float(fit_result["ratio_regularizer"]),
                 "iterations": int(fit_result["iterations"]),

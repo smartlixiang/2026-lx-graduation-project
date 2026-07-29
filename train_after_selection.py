@@ -167,6 +167,7 @@ def parse_args() -> argparse.Namespace:
         help="图像破坏实验中是否严格检查 corruption list 的数量和类型分布。",
     )
     parser.add_argument("--result_root", type=str, default="result")
+    parser.add_argument("--mask_root", type=str, default="mask")
     parser.add_argument(
         "--checkpoint_root",
         type=str,
@@ -481,6 +482,7 @@ def load_selection_mask(
     keep_ratio: int,
     seed: int,
     model_name: str,
+    mask_root: str | Path = "mask",
 ) -> np.ndarray:
     """Load a 0/1 mask for a selection method.
 
@@ -494,6 +496,7 @@ def load_selection_mask(
         model=model_name,
         seed=mask_seed,
         keep_ratio=keep_ratio,
+        root=mask_root,
     )
     if not mask_path.exists():
         raise FileNotFoundError(f"未找到 mask 文件: {mask_path}")
@@ -580,6 +583,7 @@ def prepare_selection_indices(
     dataset: torch.utils.data.Dataset,
     num_classes: int,
     model_name: str,
+    mask_root: str | Path = "mask",
 ) -> np.ndarray:
     if mode == "random":
         labels = _extract_labels(dataset)
@@ -591,6 +595,7 @@ def prepare_selection_indices(
         keep_ratio,
         seed,
         model_name,
+        mask_root,
     )
     if mask.shape[0] != len(dataset):
         raise ValueError(
@@ -731,6 +736,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             train_dataset,
             data_loader.num_classes,
             model_name,
+            args.mask_root,
         )
         noise_selection_stats = _selected_noise_stats(selected_indices, noise_info)
         corruption_selection_stats = _selected_corruption_stats(selected_indices, corruption_info)

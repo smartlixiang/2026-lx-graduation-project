@@ -332,32 +332,67 @@ def patch_attr(obj: Any, name: str, value: Any) -> Iterator[None]:
     finally: setattr(obj, name, old)
 
 
-def adapter_cache_valid(adapter_dir, args, known_indices, unseen_indices, info) -> bool:
-    image_path, context_path, meta_path = (adapter_dir / "adapter_image.pt",
-        adapter_dir / "adapter_context.pt", adapter_dir / "meta.json")
-    if not (image_path.is_file() and context_path.is_file() and meta_path.is_file()): return False
+def adapter_batch_size(dataset: str) -> int:
+    """Resolve the effective batch size using train_adapter's defaults."""
+    return int(train_adapter_module._default_batch_size(dataset))
+
+
+def expected_adapter_metadata(args, known_indices, unseen_indices, info, *, batch_size) -> dict[str, Any]:
+    """Return precisely the protocol inputs that determine adapter training."""
+    return dict(exp=args.exp, dataset=args.dataset, seed=args.seed,
+        known_ratio=args.config.known_ratio, unseen_ratio=args.config.unseen_ratio,
+        known_indices=np.asarray(known_indices).tolist(), unseen_indices=np.asarray(unseen_indices).tolist(),
+        clip_model=args.clip_model, adapter_type="linear", training_objective="InfoNCE",
+        prompt_template="a photo of a {}", epochs=30, batch_size=batch_size,
+        learning_rate=1e-4, weight_decay=0.0, temperature=0.07, step_size=30, gamma=0.1,
+        **_json_corruption_context(info))
+
+
+def validate_adapter_cache(adapter_dir, args, known_indices, unseen_indices, info) -> tuple[bool, str]:
+    adapter_dir = Path(adapter_dir)
+    paths = {name: adapter_dir / name for name in ("adapter_image.pt", "adapter_context.pt", "meta.json")}
+    for name, path in paths.items():
+        if not path.is_file():
+            return False, f"missing {name}"
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        valid = (int(meta["exp"]) == args.exp and meta["dataset"] == args.dataset
-            and int(meta["seed"]) == args.seed and float(meta["known_ratio"]) == args.config.known_ratio
-            and int(meta["unseen_ratio"]) == args.config.unseen_ratio
-            and meta["known_indices"] == known_indices.tolist() and meta["unseen_indices"] == unseen_indices.tolist()
-            and meta["clip_model"] == args.clip_model and meta["static_reference_scope"] == args.config.static_reference_scope
-            and meta["selection_scope"] == args.config.selection_scope
-            and int(meta["num_samples"]) == len(known_indices) and meta["adapter_type"] == "linear"
-            and meta["training_objective"] == "InfoNCE" and _corruption_json_matches(meta, info))
-        if not valid: return False
-        torch.load(image_path, map_location="cpu")
-        torch.load(context_path, map_location="cpu")
-        return True
-    except Exception:
-        return False
+        meta = json.loads(paths["meta.json"].read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"invalid meta.json: {exc}"
+    if not isinstance(meta, dict):
+        return False, "invalid meta.json: expected an object"
+    expected = expected_adapter_metadata(args, known_indices, unseen_indices, info,
+                                         batch_size=adapter_batch_size(args.dataset))
+    for field, value in expected.items():
+        if field not in meta:
+            return False, f"metadata mismatch: {field} (missing field)"
+        if meta[field] != value:
+            return False, f"metadata mismatch: {field}"
+    for name in ("adapter_image.pt", "adapter_context.pt"):
+        try:
+            state = torch.load(paths[name], map_location="cpu", weights_only=True)
+            if not isinstance(state, dict):
+                return False, f"failed to load {name}: expected a state_dict"
+        except Exception as exc:
+            return False, f"failed to load {name}: {exc}"
+    return True, "valid"
 
 
-def train_adapter_on_known(args, known_indices, unseen_indices, full_factory, info=None) -> Path:
+def adapter_cache_valid(adapter_dir, args, known_indices, unseen_indices, info) -> bool:
+    valid, _ = validate_adapter_cache(adapter_dir, args, known_indices, unseen_indices, info)
+    return valid
+
+
+def train_adapter_on_known(args, known_indices, unseen_indices, full_factory, info=None) -> tuple[Path, bool]:
     out = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model)["adapter"]
     meta_path = out / "meta.json"
-    if args.skip_saved and adapter_cache_valid(out, args, known_indices, unseen_indices, info): return out
+    valid, reason = validate_adapter_cache(out, args, known_indices, unseen_indices, info)
+    if args.skip_saved and valid:
+        print(f"[Skip] valid adapter cache: {out}")
+        return out, False
+    if args.skip_saved:
+        print(f"[Recompute] adapter cache invalid: {reason}")
+    else:
+        print("[Recompute] --skip-saved not specified")
     meta_path.unlink(missing_ok=True)
     def patched_build(_name, _root, transform): return IndexedSubsetDataset(full_factory(transform), known_indices)
     def patched_dir(_name, _seed): out.mkdir(parents=True, exist_ok=True); return out
@@ -367,15 +402,19 @@ def train_adapter_on_known(args, known_indices, unseen_indices, full_factory, in
         device=args.device, seed=str(args.seed), debug_prompts=args.debug_prompts)
     with patch_attr(train_adapter_module, "_build_dataset", patched_build), patch_attr(train_adapter_module, "resolve_adapter_dir", patched_dir):
         train_adapter_module.train_for_seed(ns, args.seed, multi_seed=False)
-    meta = json.loads(meta_path.read_text()); meta.update(exp=args.exp, known_ratio=args.config.known_ratio,
-        unseen_ratio=args.config.unseen_ratio, known_indices=known_indices.tolist(),
-        unseen_indices=unseen_indices.tolist(), clip_model=args.clip_model,
-        static_reference_scope=args.config.static_reference_scope, selection_scope=args.config.selection_scope,
-        **_json_corruption_context(info))
     if not ((out / "adapter_image.pt").is_file() and (out / "adapter_context.pt").is_file()):
         raise RuntimeError("adapter training did not produce both adapter files")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"adapter training did not produce valid base metadata: {exc}") from exc
+    meta.update(expected_adapter_metadata(args, known_indices, unseen_indices, info,
+                                          batch_size=adapter_batch_size(args.dataset)))
     _atomic_json(meta_path, meta)
-    return out
+    valid, reason = validate_adapter_cache(out, args, known_indices, unseen_indices, info)
+    if not valid:
+        raise RuntimeError(f"newly trained adapter cache failed validation: {reason}")
+    return out, True
 
 
 def make_proxy_args(args):
@@ -613,7 +652,7 @@ def load_static_cache(path, args, cache_kind, labels, sample_indices, known, uns
     try:
         with np.load(path, allow_pickle=False) as data:
             required = {"sa", "div", "dds", "labels", "exp", "dataset", "seed", "known_ratio",
-                "unseen_ratio", "known_indices", "unseen_indices", "clip_model", "proxy_model",
+                "unseen_ratio", "known_indices", "unseen_indices", "clip_model",
                 "num_samples", "static_reference_scope", "reference_scope", "selection_scope",
                 "cache_kind", "sample_indices", "corruption_types", "is_corrupted"}
             if not required.issubset(data.files): return None
@@ -625,7 +664,7 @@ def load_static_cache(path, args, cache_kind, labels, sample_indices, known, uns
                 and int(data["seed"]) == args.seed and float(data["known_ratio"]) == args.config.known_ratio
                 and int(data["unseen_ratio"]) == args.config.unseen_ratio
                 and np.array_equal(data["known_indices"], known) and np.array_equal(data["unseen_indices"], unseen)
-                and str(data["clip_model"]) == args.clip_model and str(data["proxy_model"]) == args.proxy_model
+                and str(data["clip_model"]) == args.clip_model
                 and int(data["num_samples"]) == n and str(data["static_reference_scope"]) == args.config.static_reference_scope
                 and str(data["reference_scope"]) == static_reference_scope(args, cache_kind)
                 and str(data["selection_scope"]) == args.config.selection_scope
@@ -665,13 +704,48 @@ def compute_static_scores(args, dataset, adapter_dir, cache_kind, known, unseen,
     dds_scores = dds.score_dataset(loader(dds.extractor.preprocess), adapter=image).scores.numpy()
     _atomic_savez(path, sa=sa_scores, div=div_scores, dds=dds_scores, labels=labels, exp=args.exp,
         dataset=args.dataset, seed=args.seed, known_ratio=args.config.known_ratio, unseen_ratio=args.config.unseen_ratio,
-        known_indices=known, unseen_indices=unseen, clip_model=args.clip_model, proxy_model=args.proxy_model,
+        known_indices=known, unseen_indices=unseen, clip_model=args.clip_model,
         num_samples=len(dataset), static_reference_scope=args.config.static_reference_scope,
         reference_scope=static_reference_scope(args, cache_kind), selection_scope=args.config.selection_scope,
         cache_kind=cache_kind, sample_indices=sample_indices,
         corruption_types=info.corruption_types if info else np.empty(0, np.int16),
         is_corrupted=info.is_corrupted if info else np.empty(0, bool))
     return {"sa": sa_scores, "div": div_scores, "dds": dds_scores, "labels": labels}
+
+
+def invalidate_adapter_dependents(args) -> None:
+    """Invalidate caches derived from a newly trained adapter, without involving mode."""
+    paths = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model)
+    paths["selection_static"].unlink(missing_ok=True)
+    paths["calibration_static"].unlink(missing_ok=True)
+    weight_path = paths["weights"]
+    if not weight_path.is_file():
+        return
+    try:
+        values = json.loads(weight_path.read_text(encoding="utf-8"))
+        dataset_values = values.get(args.dataset, {})
+        dataset_values.pop(str(args.seed), None)
+        if not dataset_values:
+            values.pop(args.dataset, None)
+        _atomic_json(weight_path, values)
+    except Exception:
+        weight_path.unlink(missing_ok=True)
+
+
+def resolve_group_weights(args, known, unseen, static_selection, known_ds, selection_ds,
+                          adapter, full_factory, info):
+    """Choose naive constants or run the learned-only calibration pipeline."""
+    if args.mode == "naive_group":
+        return {"sa": 1/3, "div": 1/3, "dds": 1/3}
+    epochs = resolve_proxy_epochs(args)
+    weight_path = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model, epochs)["weights"]
+    weights = load_scoring_weights(weight_path, args, known, unseen, epochs, info) if args.skip_saved else None
+    if weights is None:
+        calibration_ds = known_ds if args.exp == 2 else selection_ds
+        static_calibration = (compute_static_scores(args, calibration_ds, adapter, "calibration", known, unseen, info)
+                              if args.exp == 2 else {k: v[known] for k, v in static_selection.items()})
+        weights = prepare_proxy_and_weights(args, known, unseen, static_calibration, full_factory, info)
+    return weights
 
 
 def run_group_solver(args, static, dataset, adapter_dir, weights, target_size):
@@ -719,21 +793,13 @@ def main() -> None:
         base = build_raw_dataset(args.dataset, args.data_root, transform=None)
         if info is not None: return FixedCorruptionDataset(base, transform=transform, corruption_info=info)
         base.transform = transform; return base
-    adapter = train_adapter_on_known(args, known, unseen, full_factory, info)
+    adapter, adapter_recomputed = train_adapter_on_known(args, known, unseen, full_factory, info)
+    if adapter_recomputed:
+        invalidate_adapter_dependents(args)
     selection_ds = unseen_ds if args.config.selection_scope == "unseen" else full
     static_selection = compute_static_scores(args, selection_ds, adapter, "selection", known, unseen, info)
-    if args.mode == "naive_group":
-        weights = {"sa": 1/3, "div": 1/3, "dds": 1/3}
-    else:
-        epochs = resolve_proxy_epochs(args)
-        weight_path = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model, epochs)["weights"]
-        weights = (load_scoring_weights(weight_path, args, known, unseen, epochs, info)
-                   if args.skip_saved else None)
-        if weights is None:
-            calibration_ds = known_ds if args.exp == 2 else selection_ds
-            static_calibration = (compute_static_scores(args, calibration_ds, adapter, "calibration", known, unseen, info)
-                                  if args.exp == 2 else {k: v[known] for k, v in static_selection.items()})
-            weights = prepare_proxy_and_weights(args, known, unseen, static_calibration, full_factory, info)
+    weights = resolve_group_weights(args, known, unseen, static_selection, known_ds, selection_ds,
+                                    adapter, full_factory, info)
     for kr in pending:
         target = round(len(full) * kr / 100)
         if target > len(selection_ds): raise ValueError(f"global target {target} exceeds selection pool {len(selection_ds)}")

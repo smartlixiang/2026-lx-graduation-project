@@ -197,6 +197,86 @@ def test_adapter_cache_requires_all_files(tmp_path, monkeypatch):
     assert not ue.adapter_cache_valid(tmp_path,args,known,unseen,None)
 
 
+def adapter_meta(args, known, unseen, info=None):
+    return ue.expected_adapter_metadata(args, known, unseen, info,
+                                        batch_size=ue.adapter_batch_size(args.dataset))
+
+
+def write_adapter_cache(path, args, known, unseen, info=None):
+    path.mkdir(parents=True, exist_ok=True)
+    torch.save({}, path / "adapter_image.pt")
+    torch.save({}, path / "adapter_context.pt")
+    ue._atomic_json(path / "meta.json", adapter_meta(args, known, unseen, info))
+
+
+def test_exp3_naive_reuses_learned_adapter(tmp_path, monkeypatch):
+    args = make_args(3, mode="learned_group"); known=np.arange(2); unseen=np.arange(2,4)
+    write_adapter_cache(tmp_path, args, known, unseen)
+    args.mode = "naive_group"
+    monkeypatch.setattr(ue, "cache_paths", lambda *a, **k: {"adapter": tmp_path})
+    monkeypatch.setattr(ue.train_adapter_module, "train_for_seed",
+                        lambda *a, **k: pytest.fail("adapter retrained"))
+    path, recomputed = ue.train_adapter_on_known(args, known, unseen, lambda _: None)
+    assert path == tmp_path and recomputed is False
+
+
+def test_adapter_cache_is_mode_independent(tmp_path):
+    args = make_args(3, mode="learned_group"); known=np.arange(2); unseen=np.arange(2,4)
+    write_adapter_cache(tmp_path, args, known, unseen)
+    assert ue.validate_adapter_cache(tmp_path, args, known, unseen, None) == (True, "valid")
+    args.mode = "naive_group"
+    assert ue.validate_adapter_cache(tmp_path, args, known, unseen, None) == (True, "valid")
+
+
+@pytest.mark.parametrize("field", ["known_indices", "corruption_type_ids", "clip_model", "epochs"])
+def test_adapter_cache_reports_mismatch_reason(tmp_path, field):
+    args = make_args(3); known=np.arange(2); unseen=np.arange(2,4)
+    info = SimpleNamespace(is_corrupted=np.array([True, False, False, False]),
+                           corruption_types=np.array([2, -1, -1, -1], dtype=np.int16))
+    write_adapter_cache(tmp_path, args, known, unseen, info)
+    meta = json.loads((tmp_path / "meta.json").read_text())
+    meta[field] = [9] if field.endswith("indices") or field.endswith("ids") else "changed"
+    ue._atomic_json(tmp_path / "meta.json", meta)
+    valid, reason = ue.validate_adapter_cache(tmp_path, args, known, unseen, info)
+    assert not valid and field in reason
+
+
+def test_new_adapter_passes_its_own_validator(tmp_path, monkeypatch):
+    args=make_args(1, skip_saved=False); known=np.arange(2); unseen=np.arange(2,4)
+    monkeypatch.setattr(ue, "cache_paths", lambda *a, **k: {"adapter": tmp_path})
+    def fake_train(ns, seed, multi_seed):
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        torch.save({}, tmp_path / "adapter_image.pt"); torch.save({}, tmp_path / "adapter_context.pt")
+        ue._atomic_json(tmp_path / "meta.json", {"dataset": args.dataset, "seed": seed,
+                                                  "num_samples": len(known)})
+    monkeypatch.setattr(ue.train_adapter_module, "train_for_seed", fake_train)
+    path, recomputed = ue.train_adapter_on_known(args, known, unseen, lambda _: FakeDataset(range(4)))
+    assert path == tmp_path and recomputed
+    assert ue.validate_adapter_cache(path, args, known, unseen, None) == (True, "valid")
+
+
+def test_adapter_recompute_invalidates_static(tmp_path, monkeypatch):
+    selection=tmp_path/"selection.npz"; calibration=tmp_path/"calibration.npz"; weights=tmp_path/"weights.json"
+    selection.write_bytes(b"old"); calibration.write_bytes(b"old")
+    ue._atomic_json(weights, {"cifar100": {"22": {"sa": 1}}, "other": {"1": {}}})
+    args=make_args(3)
+    monkeypatch.setattr(ue, "cache_paths", lambda *a, **k: {
+        "selection_static": selection, "calibration_static": calibration, "weights": weights})
+    ue.invalidate_adapter_dependents(args)
+    assert not selection.exists() and not calibration.exists()
+    assert "cifar100" not in json.loads(weights.read_text())
+
+
+def test_naive_group_skips_proxy_and_weights(monkeypatch):
+    args=make_args(3, mode="naive_group"); known=np.arange(2); unseen=np.arange(2,4)
+    monkeypatch.setattr(ue, "train_proxy_on_known", lambda *a, **k: pytest.fail("proxy called"))
+    monkeypatch.setattr(ue, "get_dynamic_components", lambda *a, **k: pytest.fail("A/C/T called"))
+    monkeypatch.setattr(ue, "fit_softplus_ratio_regression", lambda *a, **k: pytest.fail("weights fitted"))
+    weights = ue.resolve_group_weights(args, known, unseen, {}, FakeDataset(range(2)),
+                                       FakeDataset(range(4)), Path("adapter"), None, None)
+    assert weights == {"sa": 1/3, "div": 1/3, "dds": 1/3}
+
+
 def proxy_meta(args, known, unseen, epochs):
     return dict(exp=args.exp,dataset=args.dataset,seed=args.seed,num_samples=len(known),epochs=epochs,k_folds=5,
         known_ratio=args.config.known_ratio,unseen_ratio=args.config.unseen_ratio,known_indices=known.tolist(),

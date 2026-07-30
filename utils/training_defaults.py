@@ -47,6 +47,19 @@ DATASET_DEFAULT_TRAINING_CONFIGS = {
     },
 }
 
+VIT_SMALL_CIFAR10_TRAINING_CONFIG = {
+    "epochs": 200,
+    "batch_size": 512,
+    "init_lr": 1e-4,
+    "weight_decay": 0.0,
+    "optimizer": "adam",
+    "scheduler": "cosine",
+    "use_amp": True,
+    "reference_effective_batch_size": 512,
+}
+
+VIT_SMALL_CIFAR10_TRAINING_RECIPE = "vit_small_cifar10_adam_cosine_randaugment"
+
 
 def _config_payload(config: dict) -> dict[str, int | float | list[int]]:
     return {
@@ -139,3 +152,32 @@ def apply_dataset_training_defaults(
         args.effective_batch_size = args.batch_size
     return args
 
+
+def apply_target_model_training_defaults(
+    args: argparse.Namespace,
+    *,
+    lr_attr: str = "init_lr",
+) -> argparse.Namespace:
+    """Apply target-model defaults, isolating the CIFAR-10 ViT recipe."""
+    if args.dataset != "cifar10" or args.model != "vit_small":
+        return apply_dataset_training_defaults(args, lr_attr=lr_attr)
+
+    config = VIT_SMALL_CIFAR10_TRAINING_CONFIG
+    for attr, key in (
+        ("epochs", "epochs"),
+        ("batch_size", "batch_size"),
+        (lr_attr, "init_lr"),
+        ("weight_decay", "weight_decay"),
+    ):
+        if getattr(args, attr) is None:
+            setattr(args, attr, config[key])
+
+    args.optimizer_name = config["optimizer"]
+    args.scheduler_name = config["scheduler"]
+    args.use_amp = bool(config["use_amp"])
+    args.physical_batch_size = int(args.batch_size)
+    args.grad_accum_steps = 1
+    args.effective_batch_size = int(args.batch_size)
+    args.reference_effective_batch_size = int(config["reference_effective_batch_size"])
+    args.training_recipe = VIT_SMALL_CIFAR10_TRAINING_RECIPE
+    return args

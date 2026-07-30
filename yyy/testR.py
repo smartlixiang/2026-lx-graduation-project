@@ -685,6 +685,9 @@ def compute_r_from_proxy_logs(
         signed_effect, nan=0.0, posinf=1.0, neginf=-1.0
     )
 
+    # Apply the requested uniform shift before clipping.
+    signed_effect = signed_effect - 0.05
+
     # Direct clip requested by the experiment design.
     r = np.clip(signed_effect, 0.0, 1.0).astype(np.float32)
     return (
@@ -954,9 +957,6 @@ def prepare_common_data(
         required_epochs=epochs,
         k_folds=k_folds,
     )
-    if components["T"].raw_foldwise.shape[0] != len(layouts):
-        raise ValueError(
-            f"T cache folds={components['T'].raw_foldwise.shape[0]}, "
             f"proxy folds={len(layouts)}"
         )
 

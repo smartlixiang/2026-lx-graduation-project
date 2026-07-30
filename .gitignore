@@ -30,3 +30,7 @@ yyy/change_Ag_2_results/
 yyy/dynamic_cache/
 yyy/dynamic_cache/
 yyy/outputs/
+unseen_exp/adapter/
+unseen_exp/dynamic_cache/
+unseen_exp/proxy_logs/
+unseen_exp/static_scores/

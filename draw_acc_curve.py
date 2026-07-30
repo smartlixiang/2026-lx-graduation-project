@@ -6,6 +6,27 @@ from pathlib import Path
 from statistics import mean, stdev
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.ticker import AutoMinorLocator, FormatStrFormatter, MultipleLocator
+
+
+# 固定颜色顺序，保证不同运行之间的方法配色一致。
+# 最后一个方法仍作为重点方法单独使用深红色。
+COLOR_POOL = [
+    "#1f77b4",  # blue
+    "#ff7f0e",  # orange
+    "#2ca02c",  # green
+    "#d62728",  # red
+    "#9467bd",  # purple
+    "#8c564b",  # brown
+    "#e377c2",  # pink
+    "#7f7f7f",  # gray
+    "#bcbd22",  # olive
+    "#17becf",  # cyan
+    "#4c78a8",  # muted blue
+    "#f58518",  # muted orange
+    "#54a24b",  # muted green
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,12 +46,9 @@ def parse_args() -> argparse.Namespace:
         "--methods",
         nargs="+",
         default=[
-            "random", "herding", "EL2N", "GraNd", "Forgetting","MDS", 
-            "MoSo", "yangclip", "RLSelector", "naive_group", "learned_group"
+            "random", "herding", "EL2N", "GraNd", "Forgetting", "MDS",
+            "MoSo", "yangclip", "RLSelector", "learned_group"
         ],
-        # default=[
-        #     "random", "naive_group", "ablation_dds", "ablation_sa", "ablation_div", "unseen_exp", "learned_group"
-        # ],
         help="Selection methods to compare",
     )
     parser.add_argument(
@@ -39,7 +57,31 @@ def parse_args() -> argparse.Namespace:
         help="Keep ratio list, e.g. '20,30,40,50,60,70,80,90,100'",
     )
     parser.add_argument("--output", default=None, help="Output image path")
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=320,
+        help="Output image resolution (default: 320)",
+    )
     return parser.parse_args()
+
+
+def configure_plot_style() -> None:
+    """配置更接近论文实验图的清晰、紧凑绘图风格。"""
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Sans",
+            "font.size": 13.0,
+            "axes.labelsize": 16.2,
+            "axes.linewidth": 1.18,
+            "xtick.labelsize": 13.8,
+            "ytick.labelsize": 13.8,
+            "legend.fontsize": 14.0,
+            "lines.solid_capstyle": "round",
+            "lines.solid_joinstyle": "round",
+            "axes.unicode_minus": False,
+        }
+    )
 
 
 def parse_kr_list(raw: str) -> list[int]:
@@ -93,31 +135,35 @@ def build_marker_map(methods: list[str]) -> dict[str, str]:
 
 def build_style_map(methods: list[str]) -> dict[str, dict]:
     """
-    最后一个方法默认突出显示：
-    - 更鲜艳的颜色
-    - 略粗的线
-    - 略大的五角星节点
+    放大折线和数据点，并通过固定颜色、白色描边和更高层级减少重叠。
+    最后一个方法默认作为重点方法突出显示。
     """
-    style_map: dict[str, dict] = {}
+    if len(methods) - 1 > len(COLOR_POOL):
+        raise ValueError(
+            f"当前方法数为 {len(methods)}，普通颜色数量不足，请扩充 COLOR_POOL。"
+        )
 
-    for method in methods[:-1]:
+    style_map: dict[str, dict] = {}
+    for i, method in enumerate(methods[:-1]):
         style_map[method] = {
-            "linewidth": 0.9,
-            "markersize": 2.6,
-            "markeredgewidth": 0.5,
-            "alpha": 0.9,
-            "color": None,
-            "zorder": 2,
+            "linewidth": 1.70,
+            "markersize": 5.9,
+            "markeredgewidth": 0.80,
+            "markeredgecolor": "white",
+            "alpha": 0.97,
+            "color": COLOR_POOL[i],
+            "zorder": 3,
         }
 
     if methods:
         style_map[methods[-1]] = {
-            "linewidth": 1.3,
-            "markersize": 4.8,
-            "markeredgewidth": 0.7,
+            "linewidth": 2.65,
+            "markersize": 10.4,
+            "markeredgewidth": 0.90,
+            "markeredgecolor": "#8b0000",
             "alpha": 1.0,
-            "color": "red",
-            "zorder": 5,
+            "color": "#e31a1c",
+            "zorder": 8,
         }
 
     return style_map
@@ -171,8 +217,115 @@ def inject_kr100_from_random(
         method_to_stats[method][100] = random_kr100_stats
 
 
+def choose_y_tick_step(ymin: float, ymax: float) -> float:
+    """根据百分数纵轴跨度选择较密但不拥挤的主刻度间隔。"""
+    span = ymax - ymin
+    if span >= 32.0:
+        return 5.0
+    if span >= 18.0:
+        return 2.5
+    if span >= 10.0:
+        return 2.0
+    if span >= 5.0:
+        return 1.0
+    if span >= 2.5:
+        return 0.5
+    return 0.25
+
+
+def compute_y_limits(
+    method_to_mean: dict[str, dict[int, float]],
+    keep_ratios: list[int],
+) -> tuple[float, float] | None:
+    """
+    纵轴下界采用“最小 kr 的所有方法均值中的最小值 × 0.8”。
+    这样可避免个别极低离群点把整张图拉得过扁。
+    若有点低于该下界，它会被裁到图外，只保留折线连接效果。
+    """
+    all_y = [
+        value * 100.0
+        for row in method_to_mean.values()
+        for value in row.values()
+    ]
+    if not all_y or not keep_ratios:
+        return None
+
+    left_kr = min(keep_ratios)
+    right_kr = max(keep_ratios)
+
+    left_values = [
+        row[left_kr] * 100.0
+        for row in method_to_mean.values()
+        if left_kr in row
+    ]
+    right_values = [
+        row[right_kr] * 100.0
+        for row in method_to_mean.values()
+        if right_kr in row
+    ]
+
+    if left_values:
+        ymin = mean(left_values) * 0.98
+    else:
+        ymin = min(all_y)
+
+    if right_values:
+        ymax_ref = max(right_values)
+    else:
+        ymax_ref = max(all_y)
+
+    ymax = max(max(all_y), ymax_ref)
+    upper_pad = max(0.18, 0.018 * (ymax - ymin))
+    return ymin, ymax + upper_pad
+
+
+def build_legend_handles(
+    valid_methods: list[str],
+    focus_method: str | None,
+    marker_map: dict[str, str],
+    style_map: dict[str, dict],
+) -> tuple[list[Line2D], list[str]]:
+    """
+    构造独立图例句柄：
+    - 除最后一个重点方法外，其余所有图例符号大小完全一致；
+    - 重点方法允许更大一些。
+    """
+    handles: list[Line2D] = []
+    labels: list[str] = []
+
+    regular_ms = 7.4
+    regular_lw = 2.2
+    regular_mew = 0.95
+
+    focus_ms = 10.2
+    focus_lw = 2.9
+    focus_mew = 1.00
+
+    for method in valid_methods:
+        is_focus = method == focus_method
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=style_map[method]["color"],
+                marker=marker_map[method],
+                linestyle="-",
+                linewidth=focus_lw if is_focus else regular_lw,
+                markersize=focus_ms if is_focus else regular_ms,
+                markeredgewidth=focus_mew if is_focus else regular_mew,
+                markeredgecolor=style_map[method]["markeredgecolor"],
+                alpha=1.0,
+            )
+        )
+        labels.append(method)
+
+    return handles, labels
+
+
 def main() -> None:
     args = parse_args()
+    configure_plot_style()
+
     keep_ratios = parse_kr_list(args.kr)
     result_root = Path(args.result_dir)
     methods = args.methods
@@ -183,7 +336,8 @@ def main() -> None:
     output_name = args.output or f"{args.dataset}_{args.model}.png"
     output_path = Path("picture") / Path(output_name).name
 
-    fig, ax = plt.subplots(figsize=(8.6, 6.8))
+    # 取消标题后，可将更多空间分配给坐标轴和右下角图例。
+    fig, ax = plt.subplots(figsize=(9.0, 7.45))
     missing_methods: list[str] = []
     valid_methods: list[str] = []
     method_to_stats: dict[str, dict[int, tuple[float, float]]] = {}
@@ -209,7 +363,7 @@ def main() -> None:
         for method, kr_to_stats in method_to_stats.items()
     }
 
-    # 绘图时只转换展示单位，内部统计和排名仍使用原始 0-1 准确率
+    # 绘图时只转换展示单位，内部统计和排名仍使用原始 0-1 准确率。
     for method in valid_methods:
         mean_by_kr = method_to_mean.get(method, {})
         x_values = [kr for kr in keep_ratios if kr in mean_by_kr]
@@ -219,23 +373,18 @@ def main() -> None:
             print(f"[WARN] method={method} has no results for requested keep ratios: {keep_ratios}")
             continue
 
-        plot_kwargs = {
-            "marker": marker_map[method],
-            "linewidth": style_map[method]["linewidth"],
-            "markersize": style_map[method]["markersize"],
-            "markeredgewidth": style_map[method]["markeredgewidth"],
-            "alpha": style_map[method]["alpha"],
-            "label": method,
-            "zorder": style_map[method]["zorder"],
-        }
-
-        if style_map[method]["color"] is not None:
-            plot_kwargs["color"] = style_map[method]["color"]
-
         ax.plot(
             x_values,
             y_values,
-            **plot_kwargs,
+            marker=marker_map[method],
+            linewidth=style_map[method]["linewidth"],
+            markersize=style_map[method]["markersize"],
+            markeredgewidth=style_map[method]["markeredgewidth"],
+            markeredgecolor=style_map[method]["markeredgecolor"],
+            color=style_map[method]["color"],
+            alpha=style_map[method]["alpha"],
+            zorder=style_map[method]["zorder"],
+            clip_on=True,
         )
 
     # kr=100 不参与排名
@@ -323,42 +472,91 @@ def main() -> None:
         )
         print(line)
 
-    ax.set_xlabel("Keep Ratio (kr)")
-    ax.set_ylabel("Accuracy (%)")
-    ax.set_title(f"{args.dataset.upper()} {args.model} - Mean Accuracy")
+    ax.set_xlabel("Keep Ratio (kr)", labelpad=8, fontweight="medium")
+    ax.set_ylabel("Accuracy (%)", labelpad=8, fontweight="medium")
+    # 按要求：单张图不显示标题。
 
-    ax.grid(True, linestyle="--", alpha=0.18, linewidth=0.7)
+    ax.set_axisbelow(True)
+    ax.grid(
+        True,
+        which="major",
+        linestyle="-",
+        color="#d9d9d9",
+        alpha=0.78,
+        linewidth=0.84,
+    )
+    ax.grid(
+        True,
+        which="minor",
+        linestyle=":",
+        color="#ececec",
+        alpha=0.52,
+        linewidth=0.58,
+    )
+
     ax.set_xticks(keep_ratios)
+    ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+    ax.tick_params(axis="both", which="major", width=1.1, length=5.2, pad=5)
+    ax.tick_params(axis="both", which="minor", width=0.8, length=3.0)
 
-    all_y = [
-        value * 100.0
-        for row in method_to_mean.values()
-        for value in row.values()
-    ]
-    if all_y:
-        ymin = min(all_y)
-        ymax = max(all_y)
-        eps = max(0.03, 0.015 * (ymax - ymin))
-        ax.set_ylim(ymin - eps, ymax + eps)
+    if keep_ratios:
+        x_span = max(keep_ratios) - min(keep_ratios)
+        x_margin = max(1.5, 0.018 * x_span)
+        ax.set_xlim(min(keep_ratios) - x_margin, max(keep_ratios) + x_margin)
+
+    y_limits = compute_y_limits(method_to_mean, keep_ratios)
+    if y_limits is not None:
+        ymin, ymax = y_limits
+        ax.set_ylim(ymin, ymax)
+
+        major_step = choose_y_tick_step(ymin, ymax)
+        ax.yaxis.set_major_locator(MultipleLocator(major_step))
+        ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+        if major_step < 1.0 or not float(major_step).is_integer():
+            ax.yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
+        else:
+            ax.yaxis.set_major_formatter(FormatStrFormatter("%.0f"))
+
+    for spine in ax.spines.values():
+        spine.set_color("#303030")
+        spine.set_linewidth(1.15)
 
     if valid_methods:
-        # 将图例放入坐标轴内部右下区域，利用折线图右下角天然空白
-        ax.legend(
-            loc="lower right",
-            frameon=True,
-            fancybox=True,
-            framealpha=0.90,
-            fontsize=10.0,
-            ncol=1,
-            handlelength=1.8,
-            markerscale=1.0,
-            borderpad=0.5,
-            labelspacing=0.45,
+        focus_method = methods[-1] if methods and methods[-1] in valid_methods else None
+        legend_handles, legend_labels = build_legend_handles(
+            valid_methods=valid_methods,
+            focus_method=focus_method,
+            marker_map=marker_map,
+            style_map=style_map,
         )
 
+        # 右下角视作安全区域，尽量放大图例和文字。
+        legend = ax.legend(
+            legend_handles,
+            legend_labels,
+            loc="lower right",
+            bbox_to_anchor=(0.996, 0.012),
+            frameon=True,
+            fancybox=False,
+            framealpha=0.985,
+            facecolor="white",
+            edgecolor="#888888",
+            fontsize=14.8,
+            ncol=1,
+            handlelength=2.70,
+            handletextpad=0.82,
+            borderpad=0.94,
+            labelspacing=0.56,
+            columnspacing=1.0,
+        )
+        legend.get_frame().set_linewidth(1.08)
+
+    # 手动留白比 tight_layout 更稳定，避免大图例和大字号挤压坐标轴。
+    fig.subplots_adjust(left=0.105, right=0.985, bottom=0.108, top=0.985)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=240, bbox_inches="tight")
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
     print(f"Saved figure to {output_path}")
 
     if 100 in keep_ratios and ("random" not in method_to_stats or 100 not in method_to_stats["random"]):

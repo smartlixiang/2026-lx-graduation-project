@@ -56,9 +56,10 @@ import numpy as np
 import torch
 from torch import nn
 from torch.cuda.amp import GradScaler, autocast
-from torch.optim import SGD
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim import Adam, SGD
+from torch.optim.lr_scheduler import CosineAnnealingLR, MultiStepLR
 from torch.utils.data import DataLoader, Dataset, Subset
+from torchvision import transforms
 from tqdm import tqdm
 
 from corruption_exp import corruption_opt
@@ -69,7 +70,10 @@ from utils.global_config import CONFIG
 from utils.path_rules import resolve_checkpoint_path, resolve_mask_path, resolve_result_path
 from utils.progress import PersistentStatusLine, create_persistent_bar, create_transient_batch_bar
 from utils.seed import parse_seed_list, set_seed
-from utils.training_defaults import apply_dataset_training_defaults
+from utils.training_defaults import (
+    VIT_SMALL_CIFAR10_TRAINING_RECIPE,
+    apply_target_model_training_defaults,
+)
 
 
 SUPPORTED_EXPERIMENTS = {"label_noise", "corruption"}
@@ -79,7 +83,121 @@ DATASET_NUMERIC_ID = {"cifar100": 100, "tiny-imagenet": 200}
 
 
 def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
-    return apply_dataset_training_defaults(args, lr_attr="init_lr")
+    return apply_target_model_training_defaults(args, lr_attr="init_lr")
+
+
+def is_vit_small_cifar10(args: argparse.Namespace) -> bool:
+    return args.dataset == "cifar10" and args.model == "vit_small"
+
+
+def build_vit_small_cifar10_transforms() -> tuple[transforms.Compose, transforms.Compose]:
+    normalization = transforms.Normalize(
+        mean=(0.4914, 0.4822, 0.4465),
+        std=(0.2023, 0.1994, 0.2010),
+    )
+    train_transform = transforms.Compose(
+        [
+            transforms.RandAugment(num_ops=2, magnitude=14),
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalization,
+        ]
+    )
+    test_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.4914, 0.4822, 0.4465),
+                std=(0.2023, 0.1994, 0.2010),
+            ),
+        ]
+    )
+    return train_transform, test_transform
+
+
+def apply_model_specific_transforms(args: argparse.Namespace, train_dataset, test_dataset) -> bool:
+    """Install the ViT transforms without changing any other dataset/model pair."""
+    if not is_vit_small_cifar10(args):
+        return False
+    train_dataset.transform, test_dataset.transform = build_vit_small_cifar10_transforms()
+    return True
+
+
+def build_optimizer_and_scheduler(
+    args: argparse.Namespace,
+    model: nn.Module,
+) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
+    if is_vit_small_cifar10(args):
+        optimizer = Adam(
+            model.parameters(), lr=args.init_lr, betas=(0.9, 0.999), eps=1e-8,
+            weight_decay=args.weight_decay,
+        )
+        return optimizer, CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0.0)
+    optimizer = SGD(
+        model.parameters(), lr=args.init_lr, momentum=args.momentum,
+        weight_decay=args.weight_decay,
+    )
+    return optimizer, MultiStepLR(
+        optimizer, milestones=args.lr_milestones, gamma=args.lr_gamma,
+    )
+
+
+def validate_vit_checkpoint(checkpoint: dict, checkpoint_path: Path, args: argparse.Namespace) -> None:
+    """Reject legacy/incompatible ViT checkpoints before loading any state."""
+    if not is_vit_small_cifar10(args):
+        return
+    expected = {
+        "training_recipe": VIT_SMALL_CIFAR10_TRAINING_RECIPE,
+        "optimizer_name": "adam",
+        "scheduler_name": "cosine",
+        "model": "vit_small",
+        "dataset": "cifar10",
+        "epochs": args.epochs,
+    }
+    mismatches = [
+        f"{field}: expected {value!r}, found {checkpoint.get(field, '<missing>')!r}"
+        for field, value in expected.items()
+        if checkpoint.get(field) != value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            f"Incompatible CIFAR-10 vit_small checkpoint {checkpoint_path}: "
+            + "; ".join(mismatches)
+        )
+
+
+def build_training_metadata(args: argparse.Namespace, runtime_use_amp: bool) -> dict[str, object]:
+    if is_vit_small_cifar10(args):
+        return {
+            "training_recipe": args.training_recipe,
+            "optimizer": "Adam",
+            "optimizer_config": {
+                "lr": args.init_lr, "betas": [0.9, 0.999], "eps": 1e-8,
+                "weight_decay": args.weight_decay,
+            },
+            "lr_schedule": {
+                "type": "CosineAnnealingLR", "T_max": args.epochs, "eta_min": 0.0,
+            },
+            "augmentation": {
+                "randaugment_num_ops": 2, "randaugment_magnitude": 14,
+                "random_crop_size": 32, "random_crop_padding": 4,
+                "random_horizontal_flip": True,
+            },
+            "normalization": {
+                "mean": [0.4914, 0.4822, 0.4465],
+                "std": [0.2023, 0.1994, 0.2010],
+            },
+            "use_amp": runtime_use_amp,
+        }
+    return {
+        "optimizer": "SGD", "momentum": args.momentum,
+        "lr_schedule": {
+            "type": "MultiStepLR", "milestones": args.lr_milestones,
+            "gamma": args.lr_gamma,
+        },
+        "use_amp": runtime_use_amp,
+    }
 
 
 def validate_model_dataset(model_name: str, dataset_name: str) -> None:
@@ -658,6 +776,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         seed=seed,
     )
     train_loader, _, test_loader = data_loader.load()
+    apply_model_specific_transforms(args, train_loader.dataset, test_loader.dataset)
     train_dataset = train_loader.dataset
 
     noise_info: dict[str, object] | None = None
@@ -771,18 +890,12 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
         model = model_factory(num_classes=data_loader.num_classes).to(device)
         criterion = nn.CrossEntropyLoss()
-        optimizer = SGD(
-            model.parameters(),
-            lr=args.init_lr,
-            momentum=args.momentum,
-            weight_decay=args.weight_decay,
+        optimizer, scheduler = build_optimizer_and_scheduler(args, model)
+        runtime_use_amp = (
+            device.type == "cuda"
+            if is_vit_small_cifar10(args)
+            else bool(args.use_amp and device.type == "cuda")
         )
-        scheduler = MultiStepLR(
-            optimizer,
-            milestones=args.lr_milestones,
-            gamma=args.lr_gamma,
-        )
-        runtime_use_amp = bool(args.use_amp and device.type == "cuda")
         scaler = GradScaler(enabled=runtime_use_amp)
 
         accuracy_samples: list[float] = []
@@ -790,6 +903,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         start_epoch = 1
         if args.load_checkpoint and checkpoint_path.exists():
             checkpoint = torch.load(checkpoint_path, map_location=device)
+            validate_vit_checkpoint(checkpoint, checkpoint_path, args)
             model.load_state_dict(checkpoint["model_state"])
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -858,6 +972,19 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                     "effective_batch_size": args.effective_batch_size,
                     "exp": args.exp,
                 }
+                if is_vit_small_cifar10(args):
+                    checkpoint_payload.update(
+                        {
+                            "training_recipe": args.training_recipe,
+                            "optimizer_name": args.optimizer_name,
+                            "scheduler_name": args.scheduler_name,
+                            "model": args.model,
+                            "dataset": args.dataset,
+                            "epochs": args.epochs,
+                            "init_lr": args.init_lr,
+                            "weight_decay": args.weight_decay,
+                        }
+                    )
                 if noise_info is not None:
                     checkpoint_payload["noise_path"] = noise_info["noise_path"]
                 if corruption_info is not None:
@@ -889,19 +1016,12 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             "grad_accum_steps": args.grad_accum_steps,
             "effective_batch_size": args.effective_batch_size,
             "reference_effective_batch_size": args.reference_effective_batch_size,
-            "optimizer": "SGD",
-            "momentum": args.momentum,
             "weight_decay": args.weight_decay,
             "init_lr": args.init_lr,
-            "use_amp": runtime_use_amp,
-            "lr_schedule": {
-                "type": "MultiStepLR",
-                "milestones": args.lr_milestones,
-                "gamma": args.lr_gamma,
-            },
             "num_selected": len(selected_indices),
             "num_total": len(train_dataset),
         }
+        metadata.update(build_training_metadata(args, runtime_use_amp))
         if noise_info is not None:
             metadata.update(
                 {

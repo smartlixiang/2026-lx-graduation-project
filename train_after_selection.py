@@ -90,39 +90,6 @@ def is_vit_small_cifar10(args: argparse.Namespace) -> bool:
     return args.dataset == "cifar10" and args.model == "vit_small"
 
 
-def build_vit_small_cifar10_transforms() -> tuple[transforms.Compose, transforms.Compose]:
-    normalization = transforms.Normalize(
-        mean=(0.4914, 0.4822, 0.4465),
-        std=(0.2023, 0.1994, 0.2010),
-    )
-    train_transform = transforms.Compose(
-        [
-            transforms.RandAugment(num_ops=2, magnitude=14),
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalization,
-        ]
-    )
-    test_transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.4914, 0.4822, 0.4465),
-                std=(0.2023, 0.1994, 0.2010),
-            ),
-        ]
-    )
-    return train_transform, test_transform
-
-
-def apply_model_specific_transforms(args: argparse.Namespace, train_dataset, test_dataset) -> bool:
-    """Install the ViT transforms without changing any other dataset/model pair."""
-    if not is_vit_small_cifar10(args):
-        return False
-    train_dataset.transform, test_dataset.transform = build_vit_small_cifar10_transforms()
-    return True
-
 
 def build_optimizer_and_scheduler(
     args: argparse.Namespace,
@@ -293,7 +260,7 @@ def parse_args() -> argparse.Namespace:
         help="checkpoint 根目录；指定 --exp 时会自动追加实验名。",
     )
     parser.add_argument(
-        "--skip_saved",
+        "--skip-saved",
         action="store_true",
         help="跳过已经保存的结果文件",
     )
@@ -776,7 +743,6 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         seed=seed,
     )
     train_loader, _, test_loader = data_loader.load()
-    apply_model_specific_transforms(args, train_loader.dataset, test_loader.dataset)
     train_dataset = train_loader.dataset
 
     noise_info: dict[str, object] | None = None

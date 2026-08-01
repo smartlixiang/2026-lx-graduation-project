@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kr",
         default="20,30,40,50,60,70,80,90,100",
-        help="Keep ratio list, e.g. '20,30,40,50,60,70,80,90,100'",
+        help="retention ratio list, e.g. '20,30,40,50,60,70,80,90,100'",
     )
     parser.add_argument("--output", default=None, help="Output image path")
     parser.add_argument(
@@ -175,7 +175,7 @@ def load_method_seed_stats(
 ) -> dict[int, tuple[float, float]]:
     """
     读取某一方法在指定数据集和模型下、跨 seed 的聚合结果。
-    返回每个 keep ratio 的 (mean, std)。
+    返回每个 retention ratio 的 (mean, std)。
     """
     if not method_root.exists():
         return {}
@@ -370,7 +370,7 @@ def main() -> None:
         y_values = [mean_by_kr[kr] * 100.0 for kr in x_values]
 
         if not x_values:
-            print(f"[WARN] method={method} has no results for requested keep ratios: {keep_ratios}")
+            print(f"[WARN] method={method} has no results for requested retention ratios: {keep_ratios}")
             continue
 
         ax.plot(
@@ -405,7 +405,7 @@ def main() -> None:
         if ranking_count[method] > 0:
             avg_rank_map[method] = ranking_sum[method] / ranking_count[method]
 
-    print("\nMean accuracy by keep ratio (2 decimal places):")
+    print("\nMean accuracy by retention ratio (2 decimal places):")
     header = ["method"] + [str(kr) for kr in keep_ratios] + ["avg_rank"]
 
     # kr=100 不参与“最优结果”加粗
@@ -472,7 +472,7 @@ def main() -> None:
         )
         print(line)
 
-    ax.set_xlabel("Keep Ratio (kr)", labelpad=8, fontweight="medium")
+    ax.set_xlabel("Retention Ratio (kr)", labelpad=8, fontweight="medium")
     ax.set_ylabel("Accuracy (%)", labelpad=8, fontweight="medium")
     # 按要求：单张图不显示标题。
 

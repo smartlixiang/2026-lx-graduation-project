@@ -119,12 +119,11 @@
       }
     },
     "96": {
-      "sa": 0.35123057483230663,
-      "div": 0.4244128338670995,
-      "dds": 0.22435659130059388,
-      "bias": 5.454511938631715e-09,
-      "method_version": "softplus_ratio",
-      "ratio_lambda": 0.001,
+      "sa": 0.3483887371468933,
+      "div": 0.41451045234616135,
+      "dds": 0.23710081050694543,
+      "bias": 1.290195174197541e-10,
+      "ratio_lambda": 0.01,
       "transferability_component": "TransferabilityScore",
       "proxy_log": "",
       "dynamic_components": [
@@ -162,17 +161,16 @@
           }
         },
         "weight_solver": "softplus_ratio_no_simplex",
-        "method_version": "softplus_ratio",
         "raw_weights": [
-          0.14943740312359263,
-          0.18057411936789722,
-          0.09545657121003602
+          0.14861190576935257,
+          0.17681739309071337,
+          0.10113990365319567
         ],
-        "mse": 0.9859137849698749,
-        "ratio_regularizer": 0.06144945131320278,
-        "iterations": 3713,
+        "mse": 0.9862430114457289,
+        "ratio_regularizer": 0.048211920590923656,
+        "iterations": 3565,
         "weights_sum": 1.0,
-        "weights_min": 0.22435659130059388,
+        "weights_min": 0.23710081050694543,
         "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }
@@ -186,12 +184,11 @@
   },
   "cifar10": {
     "22": {
-      "sa": 0.23210096912356284,
-      "div": 0.5574715110972699,
-      "dds": 0.21042751977916718,
-      "bias": -1.354881356355639e-10,
-      "method_version": "softplus_ratio",
-      "ratio_lambda": 0.001,
+      "sa": 0.24592766414059586,
+      "div": 0.5285992960411583,
+      "dds": 0.2254730398182459,
+      "bias": -0.0005050326910258335,
+      "ratio_lambda": 0.01,
       "transferability_component": "TransferabilityScore",
       "proxy_log": "",
       "dynamic_components": [
@@ -229,28 +226,26 @@
           }
         },
         "weight_solver": "softplus_ratio_no_simplex",
-        "method_version": "softplus_ratio",
         "raw_weights": [
-          0.11005091714173326,
-          0.26432569975173886,
-          0.09977442847827642
+          0.12347113413379635,
+          0.2653900479744948,
+          0.11320162796747325
         ],
-        "mse": 0.9585258842814531,
-        "ratio_regularizer": 0.22670692247650667,
-        "iterations": 3666,
-        "weights_sum": 0.9999999999999999,
-        "weights_min": 0.21042751977916718,
+        "mse": 0.9594588406266988,
+        "ratio_regularizer": 0.17215518337052346,
+        "iterations": 3308,
+        "weights_sum": 1.0,
+        "weights_min": 0.2254730398182459,
         "sa_gt_one_third_warning": false,
         "div_is_lowest_warning": false
       }
     },
     "42": {
-      "sa": 0.2421597482431774,
-      "div": 0.5644872450991533,
-      "dds": 0.1933530066576692,
-      "bias": 5.711845048554413e-11,
-      "method_version": "softplus_ratio",
-      "ratio_lambda": 0.001,
+      "sa": 0.2529324759553574,
+      "div": 0.538919170717527,
+      "dds": 0.20814835332711568,
+      "bias": -0.0004322899177404111,
+      "ratio_lambda": 0.01,
       "transferability_component": "TransferabilityScore",
       "proxy_log": "",
       "dynamic_components": [
@@ -288,28 +283,26 @@
           }
         },
         "weight_solver": "softplus_ratio_no_simplex",
-        "method_version": "softplus_ratio",
         "raw_weights": [
-          0.1289651961041329,
-          0.30062472723331746,
-          0.10297255675988488
+          0.141427738163664,
+          0.30133781389571285,
+          0.1163865996343662
         ],
-        "mse": 0.9477413956889685,
-        "ratio_regularizer": 0.2439508320027033,
-        "iterations": 3598,
-        "weights_sum": 0.9999999999999999,
-        "weights_min": 0.1933530066576692,
+        "mse": 0.9486463513735706,
+        "ratio_regularizer": 0.19314949951877564,
+        "iterations": 3257,
+        "weights_sum": 1.0,
+        "weights_min": 0.20814835332711568,
         "sa_gt_one_third_warning": false,
         "div_is_lowest_warning": false
       }
     },
     "96": {
-      "sa": 0.23860143291684593,
-      "div": 0.5494313361384617,
-      "dds": 0.21196723094469225,
-      "bias": -9.726566917558683e-09,
-      "method_version": "softplus_ratio",
-      "ratio_lambda": 0.001,
+      "sa": 0.2498192919711204,
+      "div": 0.5251870159861589,
+      "dds": 0.22499369204272074,
+      "bias": -2.0443877463008682e-11,
+      "ratio_lambda": 0.01,
       "transferability_component": "TransferabilityScore",
       "proxy_log": "",
       "dynamic_components": [
@@ -347,17 +340,16 @@
           }
         },
         "weight_solver": "softplus_ratio_no_simplex",
-        "method_version": "softplus_ratio",
         "raw_weights": [
-          0.12022131921486645,
-          0.2768355547620395,
-          0.10680145472292339
+          0.13182735525433564,
+          0.27713638440451355,
+          0.11872711325404416
         ],
-        "mse": 0.9550363070452955,
-        "ratio_regularizer": 0.211143035467777,
-        "iterations": 3518,
+        "mse": 0.9558199387960424,
+        "ratio_regularizer": 0.16651040341400594,
+        "iterations": 3230,
         "weights_sum": 1.0,
-        "weights_min": 0.21196723094469225,
+        "weights_min": 0.22499369204272074,
         "sa_gt_one_third_warning": false,
         "div_is_lowest_warning": false
       }
@@ -489,12 +481,11 @@
       }
     },
     "96": {
-      "sa": 0.3573747830599747,
-      "div": 0.411795137619969,
-      "dds": 0.23083007932005617,
-      "bias": -0.00043747727469356084,
-      "method_version": "softplus_ratio",
-      "ratio_lambda": 0.001,
+      "sa": 0.3530175299974782,
+      "div": 0.4013792072724704,
+      "dds": 0.24560326273005134,
+      "bias": 2.7167537910119623e-09,
+      "ratio_lambda": 0.01,
       "transferability_component": "TransferabilityScore",
       "proxy_log": "",
       "dynamic_components": [
@@ -532,17 +523,16 @@
           }
         },
         "weight_solver": "softplus_ratio_no_simplex",
-        "method_version": "softplus_ratio",
         "raw_weights": [
-          0.13498189196561586,
-          0.1555366786157833,
-          0.08718544873930133
+          0.13218155120762654,
+          0.15028977807459473,
+          0.09196206276086161
         ],
-        "mse": 0.9907689341341711,
-        "ratio_regularizer": 0.05169879038725994,
-        "iterations": 3924,
-        "weights_sum": 0.9999999999999999,
-        "weights_min": 0.23083007932005617,
+        "mse": 0.9910669527911371,
+        "ratio_regularizer": 0.03812635170008322,
+        "iterations": 3805,
+        "weights_sum": 1.0,
+        "weights_min": 0.24560326273005134,
         "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }

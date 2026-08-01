@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-candidate-pool-size",
         type=int,
-        default=10,
+        default=5,
         help="group 模式下类内贪心候选池大小，1 表示纯贪心。",
     )
     parser.add_argument(

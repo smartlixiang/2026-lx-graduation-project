@@ -363,13 +363,24 @@ def main() -> None:
         for method, kr_to_stats in method_to_stats.items()
     }
 
+    # 横轴使用 retention ratio 的顺序位置，而不是数值本身。
+    # 因此 20、30、50、70、90、100 等节点在图中保持等间距，
+    # 但刻度标签仍显示真实 retention ratio。
+    x_position_by_kr = {
+        keep_ratio: position
+        for position, keep_ratio in enumerate(keep_ratios)
+    }
+
     # 绘图时只转换展示单位，内部统计和排名仍使用原始 0-1 准确率。
     for method in valid_methods:
         mean_by_kr = method_to_mean.get(method, {})
-        x_values = [kr for kr in keep_ratios if kr in mean_by_kr]
-        y_values = [mean_by_kr[kr] * 100.0 for kr in x_values]
+        available_keep_ratios = [
+            kr for kr in keep_ratios if kr in mean_by_kr
+        ]
+        x_values = [x_position_by_kr[kr] for kr in available_keep_ratios]
+        y_values = [mean_by_kr[kr] * 100.0 for kr in available_keep_ratios]
 
-        if not x_values:
+        if not available_keep_ratios:
             print(f"[WARN] method={method} has no results for requested retention ratios: {keep_ratios}")
             continue
 
@@ -494,15 +505,20 @@ def main() -> None:
         linewidth=0.58,
     )
 
-    ax.set_xticks(keep_ratios)
+    x_tick_positions = list(range(len(keep_ratios)))
+    ax.set_xticks(x_tick_positions)
+    ax.set_xticklabels([str(kr) for kr in keep_ratios])
     ax.xaxis.set_minor_locator(AutoMinorLocator(2))
     ax.tick_params(axis="both", which="major", width=1.1, length=5.2, pad=5)
     ax.tick_params(axis="both", which="minor", width=0.8, length=3.0)
 
-    if keep_ratios:
-        x_span = max(keep_ratios) - min(keep_ratios)
-        x_margin = max(1.5, 0.018 * x_span)
-        ax.set_xlim(min(keep_ratios) - x_margin, max(keep_ratios) + x_margin)
+    if x_tick_positions:
+        # 使用序号坐标后，各 retention ratio 节点在视觉上严格等间距。
+        x_margin = 0.15
+        ax.set_xlim(
+            x_tick_positions[0] - x_margin,
+            x_tick_positions[-1] + x_margin,
+        )
 
     y_limits = compute_y_limits(method_to_mean, keep_ratios)
     if y_limits is not None:

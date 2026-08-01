@@ -3,21 +3,25 @@
 Supported modes:
   1. Default clean-data experiment: train on the selected clean training subset
      and evaluate on the clean test split.
-  2. ``--exp label_noise``: read ``noise/<dataset>/noise_list_<seed>.txt``,
+  2. ``--exp noise`` (alias ``label_noise``): read ``noise/<dataset>/noise_list_<seed>.txt``,
      modify training labels only, keep the test split clean, and write outputs
-     under ``result_label_noise/`` and ``checkpoint_label_noise/``.
+     under ``noise_result/noise_<mode>/`` and ``noise_checkpoint/noise_<mode>/``.
   3. ``--exp corruption``: read
      ``corruption_data/<dataset>/corruption_list_<seed>.txt``, apply fixed image
      corruptions to listed training samples before the training transform, keep
      labels correct and the test split clean, and write outputs under
-     ``result_corruption/`` and ``checkpoint_corruption/``.
+     ``corruption_result/corruption_<mode>/`` and
+     ``corruption_checkpoint/corruption_<mode>/``.
 
-All non-random experiments read selection masks from the project-level
-``mask/`` directory via ``utils.path_rules.resolve_mask_path``. The common
-layout is ``mask/<mode>/<dataset>/<seed>/mask_<keep_ratio>.npz``. ``random``
-mode samples by class and does not read a mask file.
+All non-random experiments use ``utils.path_rules.resolve_mask_path``. Clean,
+label-noise, and corruption experiments default respectively to ``mask/``,
+``noise_mask/``, and ``corruption_mask/``. ``random`` samples by class and does
+not read a mask file.
 
 Examples:
+  python train_after_selection.py --exp noise --mode MoSo --dataset cifar100 \
+      --seed 22 --kr 30
+
   CUDA_VISIBLE_DEVICES=0 python train_after_selection.py \
       --dataset tiny-imagenet \
       --exp corruption \
@@ -25,8 +29,8 @@ Examples:
       --seed 22 \
       --kr 30
 
-  The command above reads:
-      mask/corruption_yangclip/tiny-imagenet/22/mask_30.npz
+  The command above first tries:
+      corruption_mask/corruption_yangclip/tiny-imagenet/22/mask_30.npz
 
   python train_after_selection.py \
       --exp corruption \
@@ -76,7 +80,7 @@ from utils.training_defaults import (
 )
 
 
-SUPPORTED_EXPERIMENTS = {"label_noise", "corruption"}
+SUPPORTED_EXPERIMENTS = {"noise", "label_noise", "corruption"}
 CORRUPTION_SUPPORTED_DATASETS = {"cifar100", "tiny-imagenet"}
 EXPECTED_TRAIN_SIZES = {"cifar100": 50000, "tiny-imagenet": 100000}
 DATASET_NUMERIC_ID = {"cifar100": 100, "tiny-imagenet": 200}
@@ -225,7 +229,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         choices=sorted(SUPPORTED_EXPERIMENTS),
-        help="实验设置。None 为正常数据实验；label_noise 为标签噪声实验；corruption 为图像破坏实验。",
+        help="实验设置。None 为正常实验；noise/label_noise 为等价的标签噪声实验；corruption 为图像破坏实验。",
     )
     parser.add_argument(
         "--noise_root",
@@ -251,13 +255,13 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="图像破坏实验中是否严格检查 corruption list 的数量和类型分布。",
     )
-    parser.add_argument("--result_root", type=str, default="result")
-    parser.add_argument("--mask_root", type=str, default="mask")
+    parser.add_argument("--result_root", type=str, default=None)
+    parser.add_argument("--mask_root", type=str, default=None)
     parser.add_argument(
         "--checkpoint_root",
         type=str,
-        default="checkpoint",
-        help="checkpoint 根目录；指定 --exp 时会自动追加实验名。",
+        default=None,
+        help="checkpoint 根目录；未指定时根据实验类型选择规范根目录。",
     )
     parser.add_argument(
         "--skip-saved",
@@ -284,14 +288,46 @@ def parse_ratio_list(ratio_text: str) -> list[int]:
     return [int(item) for item in items]
 
 
-def _root_for_exp(base_root: str | Path, exp: str | None) -> Path:
-    base = Path(base_root)
-    if exp is None:
-        return base
+def normalize_experiment(exp: str | None) -> str | None:
+    return "label_noise" if exp == "noise" else exp
 
-    # Default result/checkpoint roots become result_label_noise/checkpoint_label_noise.
-    # Custom roots are handled consistently by appending the experiment name.
-    return base.with_name(f"{base.name}_{exp}")
+
+def strip_repeated_prefix(mode: str, prefix: str) -> str:
+    while mode.startswith(prefix):
+        mode = mode[len(prefix):]
+    return mode
+
+
+def normalize_mode_for_experiment(mode: str, exp: str | None) -> tuple[str, str]:
+    prefix = "noise_" if exp == "label_noise" else "corruption_" if exp == "corruption" else ""
+    base_mode = strip_repeated_prefix(mode, prefix) if prefix else mode
+    return base_mode, f"{prefix}{base_mode}"
+
+
+def resolve_default_roots(args: argparse.Namespace) -> argparse.Namespace:
+    defaults = {
+        None: ("mask", "result", "checkpoint"),
+        "label_noise": ("noise_mask", "noise_result", "noise_checkpoint"),
+        "corruption": ("corruption_mask", "corruption_result", "corruption_checkpoint"),
+    }[args.exp]
+    args.mask_root = args.mask_root or defaults[0]
+    args.result_root = args.result_root or defaults[1]
+    args.checkpoint_root = args.checkpoint_root or defaults[2]
+    return args
+
+
+def candidate_mode_names_for_read(base_mode: str, storage_mode: str) -> list[str]:
+    return list(dict.fromkeys([storage_mode, base_mode]))
+
+
+def resolve_existing_mask_path(dataset_name: str, mode_candidates: list[str], keep_ratio: int,
+                               seed: int, model_name: str, mask_root: str | Path) -> Path:
+    paths = [resolve_mask_path(mode=mode, dataset=dataset_name, model=model_name, seed=seed,
+                               keep_ratio=keep_ratio, root=mask_root) for mode in mode_candidates]
+    for path in paths:
+        if path.exists():
+            return path
+    raise FileNotFoundError("未找到 mask 文件；尝试过: " + ", ".join(str(path) for path in paths))
 
 
 def _extract_labels(dataset: torch.utils.data.Dataset) -> np.ndarray:
@@ -575,16 +611,8 @@ def load_selection_mask(
     the sample is selected.
     """
     mask_seed = CONFIG.global_seed if mode == "my_naive" else seed
-    mask_path = resolve_mask_path(
-        mode=mode,
-        dataset=dataset_name,
-        model=model_name,
-        seed=mask_seed,
-        keep_ratio=keep_ratio,
-        root=mask_root,
-    )
-    if not mask_path.exists():
-        raise FileNotFoundError(f"未找到 mask 文件: {mask_path}")
+    mask_path = resolve_existing_mask_path(dataset_name, [mode], keep_ratio, mask_seed,
+                                           model_name, mask_root)
     with np.load(mask_path) as data:
         if "mask" in data:
             mask = data["mask"]
@@ -669,19 +697,18 @@ def prepare_selection_indices(
     num_classes: int,
     model_name: str,
     mask_root: str | Path = "mask",
+    storage_mode: str | None = None,
 ) -> np.ndarray:
-    if mode == "random":
+    if mode.lower() == "random":
         labels = _extract_labels(dataset)
         return select_random_indices_by_class(labels, num_classes, keep_ratio, seed)
 
-    mask = load_selection_mask(
-        dataset_name,
-        mode,
-        keep_ratio,
-        seed,
-        model_name,
-        mask_root,
-    )
+    candidates = candidate_mode_names_for_read(mode, storage_mode or mode)
+    mask_seed = CONFIG.global_seed if mode == "my_naive" else seed
+    mask_path = resolve_existing_mask_path(dataset_name, candidates, keep_ratio, mask_seed,
+                                           model_name, mask_root)
+    with np.load(mask_path) as data:
+        mask = data["mask"] if "mask" in data else data[data.files[0]]
     if mask.shape[0] != len(dataset):
         raise ValueError(
             f"mask 长度与训练集长度不一致: mask={mask.shape[0]}, train={len(dataset)}, "
@@ -787,12 +814,12 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     keep_ratios = parse_ratio_list(args.kr)
     model_factory = get_model(model_name)
 
-    result_root = _root_for_exp(args.result_root, args.exp)
-    checkpoint_root = _root_for_exp(args.checkpoint_root, args.exp)
+    result_root = Path(args.result_root)
+    checkpoint_root = Path(args.checkpoint_root)
     for keep_ratio in keep_ratios:
         # Result files are model-sensitive and therefore include the model name.
         result_path = resolve_result_path(
-            mode=args.mode,
+            mode=args.storage_mode,
             dataset=args.dataset,
             model=model_name,
             seed=seed,
@@ -801,7 +828,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         )
         result_dir = result_path.parent
         checkpoint_path = resolve_checkpoint_path(
-            mode=args.mode,
+            mode=args.storage_mode,
             dataset=args.dataset,
             model=model_name,
             seed=seed,
@@ -809,19 +836,23 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             root=checkpoint_root,
         )
         checkpoint_dir = checkpoint_path.parent
-        if args.skip_saved and result_path.exists():
+        compatible_results = [resolve_result_path(mode=mode, dataset=args.dataset, model=model_name,
+                              seed=seed, keep_ratio=keep_ratio, root=result_root)
+                              for mode in candidate_mode_names_for_read(args.base_mode, args.storage_mode)]
+        if args.skip_saved and any(path.exists() for path in compatible_results):
             continue
 
         start_time = time.time()
         selected_indices = prepare_selection_indices(
             args.dataset,
-            args.mode,
+            args.base_mode,
             keep_ratio,
             seed,
             train_dataset,
             data_loader.num_classes,
             model_name,
             args.mask_root,
+            args.storage_mode,
         )
         noise_selection_stats = _selected_noise_stats(selected_indices, noise_info)
         corruption_selection_stats = _selected_corruption_stats(selected_indices, corruption_info)
@@ -974,7 +1005,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             "result_root": str(result_root),
             "model": model_name,
             "keep_ratio": keep_ratio,
-            "selection_method": args.mode,
+            "selection_method": args.storage_mode,
             "seed": seed,
             "epochs": args.epochs,
             "batch_size": args.physical_batch_size,
@@ -1044,6 +1075,10 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
 
 def main() -> None:
     args = parse_args()
+    args.exp = normalize_experiment(args.exp)
+    args.raw_mode = args.mode
+    args.base_mode, args.storage_mode = normalize_mode_for_experiment(args.raw_mode, args.exp)
+    args = resolve_default_roots(args)
     validate_model_dataset(args.model, args.dataset)
     if args.exp == "corruption" and args.dataset not in CORRUPTION_SUPPORTED_DATASETS:
         supported = ", ".join(sorted(CORRUPTION_SUPPORTED_DATASETS))

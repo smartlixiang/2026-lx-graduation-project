@@ -64,6 +64,17 @@ def parse_args() -> argparse.Namespace:
         help="数据选择方式，可选 {topk, group}",
     )
     parser.add_argument(
+        "--type",
+        type=int,
+        default=1,
+        choices=(1, 2),
+        help=(
+            "group 算法类型："
+            "1 表示现有的 classwise greedy group；"
+            "2 表示 center-repair group 变体。"
+        ),
+    )
+    parser.add_argument(
         "--model-name",
         type=str,
         default="resnet50",
@@ -83,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-init-count",
         type=int,
-        default=5,
+        default=10,
         help="group 模式下每个类别随机初始化的样本数。",
     )
     parser.add_argument(
@@ -316,7 +327,7 @@ def select_group_mask(
     div_static_scores: np.ndarray | None = None,
     dds_static_scores: np.ndarray | None = None,
     group_candidate_pool_size: int = 1,
-    group_init_count: int = 2,
+    group_init_count: int = 10,
     dist_weight_factor: float = 1.0,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
@@ -528,6 +539,7 @@ def select_group_mask(
 
     stats: dict[str, object] = {
         "solver": "group_classwise_greedy_add",
+        "type": 1,
         "sr": float(sr),
         "dist_weight": float(dist_weight_max),
         "dist_weight_schedule": "linear_increase_by_class_progress",
@@ -560,7 +572,7 @@ def select_group_mask_by_center_repair(
     seed: int,
     dds_static_scores: np.ndarray | None = None,
     group_candidate_pool_size: int = 1,
-    group_init_count: int = 2,
+    group_init_count: int = 10,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
         raise ValueError("kr 必须在 1-100 之间。")
@@ -758,6 +770,7 @@ def select_group_mask_by_center_repair(
 
     stats: dict[str, object] = {
         "solver": "group_center_repair",
+        "type": 2,
         "sr": float(sr),
         "final_rate": float(final_mask.mean()),
         "selected_by_class": selected_by_class,
@@ -780,6 +793,11 @@ def main() -> None:
     method = args.method.strip().lower()
     if method not in {"topk", "group"}:
         raise ValueError(f"未知 method={method}，应为 {{'topk','group'}}")
+    print(
+        f"[Config] method={method} | type={args.type} | "
+        f"group_init_count={args.group_init_count} | "
+        f"group_candidate_pool_size={args.group_candidate_pool_size}"
+    )
 
     weight_group = args.weight_group.strip().lower()
     if weight_group not in {"naive", "learned"}:
@@ -849,7 +867,11 @@ def main() -> None:
         f"[Init] DataLoaders ready (DDS/Div/SA) | elapsed={time.perf_counter() - loader_build_start:.2f}s"
     )
 
-    method_name = f"{weight_group}_{method}"
+    method_name = (
+        f"{weight_group}_group_type2"
+        if method == "group" and args.type == 2
+        else f"{weight_group}_{method}"
+    )
     keep_ratios = parse_ratio_list(args.kr)
     if not keep_ratios:
         raise ValueError("kr 参数不能为空。")
@@ -936,7 +958,8 @@ def main() -> None:
         for keep_ratio in keep_ratios:
             task_idx += 1
             print(
-                f"[Mask {task_idx}/{total_tasks}] seed={seed} | kr={keep_ratio} | method={method} | weight_group={weight_group}"
+                f"[Mask {task_idx}/{total_tasks}] seed={seed} | kr={keep_ratio} | "
+                f"method={method} | type={args.type} | weight_group={weight_group}"
             )
             mask_path = resolve_mask_path(
                 mode=method_name,
@@ -957,7 +980,7 @@ def main() -> None:
                     num_classes=len(class_names),
                     keep_ratio=keep_ratio,
                 )
-            else:
+            elif args.type == 1:
                 mask, selected_by_class, group_stats = select_group_mask(
                     sa_raw_np,
                     div_metric=div_metric,
@@ -975,6 +998,24 @@ def main() -> None:
                     group_candidate_pool_size=args.group_candidate_pool_size,
                     group_init_count=args.group_init_count,
                 )
+            elif args.type == 2:
+                mask, selected_by_class, group_stats = select_group_mask_by_center_repair(
+                    sa_raw_np,
+                    div_metric=div_metric,
+                    div_loader=div_loader,
+                    image_adapter=image_adapter,
+                    labels=labels,
+                    weights=weights,
+                    num_classes=len(class_names),
+                    keep_ratio=keep_ratio,
+                    device=device,
+                    seed=seed,
+                    dds_static_scores=dds_raw_np,
+                    group_candidate_pool_size=args.group_candidate_pool_size,
+                    group_init_count=args.group_init_count,
+                )
+            else:
+                raise ValueError(f"未知 group type={args.type}，应为 1 或 2")
 
             total_time = time.perf_counter() - total_start
             mask_dir = mask_path.parent
@@ -986,8 +1027,15 @@ def main() -> None:
                 f"| static_score_seconds={static_score_seconds:.2f} | total_seconds={total_time:.2f}"
             )
             if group_stats is not None:
+                dist_weight = group_stats.get("dist_weight")
+                dist_weight_text = (
+                    f" | dist_weight={float(dist_weight):.6f}"
+                    if dist_weight is not None
+                    else ""
+                )
                 print(
-                    f"group_summary: dist_weight={group_stats['dist_weight']:.6f} | "
+                    f"group_summary: solver={group_stats['solver']} | type={group_stats['type']}"
+                    f"{dist_weight_text} | "
                     f"subset_score={group_stats['subset_comprehensive_score']:.6f} | "
                     f"distribution_shift={group_stats['distribution_shift']:.6f}"
                 )

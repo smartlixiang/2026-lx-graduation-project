@@ -1,0 +1,54 @@
+{
+  "metadata": {
+    "dataset": "cifar100",
+    "data_root": "data",
+    "noise_root": "noise",
+    "noise_path": "noise/cifar100/noise_list_22.txt",
+    "noise_rate": 0.2,
+    "model": "resnet50",
+    "keep_ratio": 50,
+    "selection_method": "noise_herding",
+    "seed": 22,
+    "epochs": 200,
+    "batch_size": 128,
+    "physical_batch_size": 128,
+    "grad_accum_steps": 1,
+    "effective_batch_size": 128,
+    "reference_effective_batch_size": 128,
+    "optimizer": "SGD",
+    "momentum": 0.9,
+    "weight_decay": 0.0005,
+    "init_lr": 0.1,
+    "use_amp": false,
+    "lr_schedule": {
+      "type": "MultiStepLR",
+      "milestones": [
+        60,
+        120,
+        160
+      ],
+      "gamma": 0.2
+    },
+    "num_selected": 25000,
+    "num_total": 50000,
+    "num_noisy_total": 10000,
+    "num_noisy_selected": 4995,
+    "noise_ratio_in_selection": 0.1998
+  },
+  "accuracy": 0.5499,
+  "accuracy_mean": 0.5499,
+  "accuracy_std": 0.0013,
+  "accuracy_samples": [
+    0.549,
+    0.5491,
+    0.5505,
+    0.5498,
+    0.5484,
+    0.5499,
+    0.5497,
+    0.5516,
+    0.5486,
+    0.5527
+  ],
+  "time_seconds": 3381.696633338928
+}

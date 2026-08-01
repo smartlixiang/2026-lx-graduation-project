@@ -39,7 +39,7 @@ import numpy as np
 
 
 
-DEFAULT_DATASETS = ["cifar100", "tiny-imagenet"]
+DEFAULT_DATASET = ["cifar100", "tiny-imagenet"]
 DEFAULT_SEEDS = [22, 42, 96]
 DEFAULT_KR = [30, 50, 70]
 DEFAULT_MODEL = "resnet50"
@@ -90,9 +90,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-root", default="data", help="Dataset root. Default: data")
     parser.add_argument(
-        "--datasets",
-        default=",".join(DEFAULT_DATASETS),
-        help="Comma-separated datasets. Default: cifar100,tiny-imagenet",
+        "--dataset",
+        # default=",".join(DEFAULT_DATASET),
+        default="tiny-imagenet",
+        help="Comma-separated dataset. Default: cifar100,tiny-imagenet",
     )
     parser.add_argument(
         "--seeds",
@@ -419,14 +420,14 @@ def aggregate_corruption_ratio(
     mask_roots: Sequence[Path],
     corruption_root: Path,
     method: str,
-    datasets: Sequence[str],
+    dataset: Sequence[str],
     seeds: Sequence[int],
     kr: int,
     strict: bool,
     data_root: Path,
 ) -> Optional[tuple[float, float, int]]:
     values: list[float] = []
-    for dataset in datasets:
+    for dataset in dataset:
         for seed in seeds:
             value = (compute_random_corruption_ratio(data_root, corruption_root, dataset,
                                                        seed, kr, strict)
@@ -465,7 +466,7 @@ def build_rows(
     mask_roots: Sequence[Path],
     corruption_root: Path,
     methods: Sequence[str],
-    datasets: Sequence[str],
+    dataset: Sequence[str],
     seeds: Sequence[int],
     keep_ratios: Sequence[int],
     model: str,
@@ -475,7 +476,7 @@ def build_rows(
 ) -> tuple[list[list[str]], list[str], list[str]]:
     header1 = ["method"]
     header2 = [""]
-    for dataset in datasets:
+    for dataset in dataset:
         for kr in keep_ratios:
             header1.append(dataset)
             header2.append(f"kr={kr}")
@@ -484,13 +485,13 @@ def build_rows(
         header2.append(f"kr={kr}")
 
     rows: list[list[str]] = []
-    expected_ratio_count = len(datasets) * len(seeds)
+    expected_ratio_count = len(dataset) * len(seeds)
     for method in methods:
         row = [display_method_name(method, keep_prefix)]
-        for dataset in datasets:
+        for dataset in dataset:
             for kr in keep_ratios:
                 stats = aggregate_accuracy(
-                    result_roots, method, dataset, model, seeds, kr, strict
+                    result_roots, method, dataset, model, seeds, kr, strict, data_root
                 )
                 row.append(format_cell(stats, len(seeds), 4))
         for kr in keep_ratios:
@@ -498,7 +499,7 @@ def build_rows(
                 mask_roots,
                 corruption_root,
                 method,
-                datasets,
+                dataset,
                 seeds,
                 kr,
                 strict,
@@ -535,7 +536,7 @@ def main() -> None:
     result_roots = [Path(item) for item in parse_csv_str(args.result_roots)]
     mask_roots = [Path(item) for item in parse_csv_str(args.mask_roots)]
     corruption_root = Path(args.corruption_root)
-    datasets = parse_csv_str(args.datasets)
+    dataset = parse_csv_str(args.dataset)
     seeds = parse_csv_int(args.seeds)
     keep_ratios = parse_csv_int(args.kr)
 
@@ -554,7 +555,7 @@ def main() -> None:
     print(f"       result_roots={[str(path) for path in result_roots]}")
     print(f"       mask_roots={[str(path) for path in mask_roots]}")
     print(f"       corruption_root={corruption_root}")
-    print(f"       datasets={datasets}")
+    print(f"       dataset={dataset}")
     print(f"       seeds={seeds}")
     print(f"       keep_ratios={keep_ratios}")
     print(f"       model={args.model}")
@@ -566,7 +567,7 @@ def main() -> None:
         mask_roots,
         corruption_root,
         methods,
-        datasets,
+        dataset,
         seeds,
         keep_ratios,
         args.model,

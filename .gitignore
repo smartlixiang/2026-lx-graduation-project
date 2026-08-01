@@ -10,6 +10,7 @@ mask/
 noise_exp/mask/
 noise_exp/adapters/
 noise_exp/static_scores/
+noise_checkpoint/
 picture/
 picture_old/
 result/
@@ -24,7 +25,7 @@ corruption_exp/weights/
 corruption_exp/static_scores/
 corruption_exp/adapters/
 corruption_exp/contexts/
-checkpoint_corruption/
+corruption_checkpoint/
 yyy/a_balanced_gain_loss_stability_cache_v2/
 yyy/change_Ag_2_results/
 yyy/dynamic_cache/

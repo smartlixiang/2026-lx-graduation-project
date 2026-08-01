@@ -1,0 +1,18 @@
+{
+  "dataset": "tiny-imagenet",
+  "method": "noise_learned_group",
+  "weight_group": "learned",
+  "seed": 96,
+  "keep_ratio": 50,
+  "num_selected": 50000,
+  "num_noisy_total": 20000,
+  "num_noisy_selected": 113,
+  "noise_ratio_total": 0.2,
+  "noise_ratio_in_mask": 0.00226,
+  "weights": {
+    "dds": 0.15024936581672324,
+    "div": 0.006413501148079331,
+    "sa": 0.8433371330351974
+  },
+  "mask_path": "/nvme/home/lixiang/code/noise_exp/mask/noise_learned_group/tiny-imagenet/96/mask_50.npz"
+}

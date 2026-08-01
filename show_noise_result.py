@@ -17,15 +17,14 @@ Accuracy is aggregated across seeds as mean±std, following draw_acc_curve.py:
     - otherwise use the scalar field "accuracy".
 
 Noise ratio is computed from:
-    - mask/[noise_method]/[dataset]/[seed]/mask_[kr].npz
+    - noise_mask/[noise_method]/[dataset]/[seed]/mask_[kr].npz
     - noise/[dataset]/noise_list_[seed].txt
 
 For the noise-ratio block, each keep ratio aggregates 6 values:
     2 datasets × 3 seeds.
 
-The random baseline is treated specially in the noise-ratio block:
-    20.00±0.00 (%)
-because it samples globally from a dataset with fixed 20% injected labels.
+The random baseline is re-sampled once per requested dataset/seed/keep ratio
+with the same class-stratified selection function used by training.
 """
 
 from __future__ import annotations
@@ -66,16 +65,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--result-root",
         type=str,
-        default="result",
-        help="Root directory for training result JSON files. Default: result",
+        default="noise_result",
+        help="Comma-separated result roots. Default: noise_result",
     )
     parser.add_argument(
         "--mask-roots",
         type=str,
-        default="mask,noise_exp/mask",
+        default="noise_mask",
         help=(
             "Comma-separated mask roots. The first existing matching mask is used. "
-            "Default: mask,noise_exp/mask"
+            "Default: noise_mask"
         ),
     )
     parser.add_argument(
@@ -84,6 +83,7 @@ def parse_args() -> argparse.Namespace:
         default="noise",
         help="Root directory for noise_list files. Default: noise",
     )
+    parser.add_argument("--data-root", default="data", help="Dataset root. Default: data")
     parser.add_argument(
         "--datasets",
         type=str,
@@ -133,47 +133,43 @@ def parse_csv_int(raw: str) -> list[int]:
     return [int(item.strip()) for item in raw.split(",") if item.strip()]
 
 
+def normalize_noise_method(method: str) -> str:
+    return strip_repeated_prefix(method, "noise_")
+
+
+def strip_repeated_prefix(method: str, prefix: str) -> str:
+    while method.startswith(prefix):
+        method = method[len(prefix):]
+    return method
+
+
+def noise_method_candidates(base_method: str) -> list[str]:
+    return [f"noise_{base_method}", base_method]
+
+
 def display_method_name(method: str, keep_prefix: bool = False) -> str:
-    if keep_prefix:
-        return method
-    return method[len("noise_"):] if method.startswith("noise_") else method
+    base = normalize_noise_method(method)
+    return f"noise_{base}" if keep_prefix else base
 
 
 def is_random_method(method: str) -> bool:
-    return method.lower() == "noise_random"
+    return normalize_noise_method(method).lower() == "random"
 
 
 def sort_methods(methods: Sequence[str]) -> list[str]:
-    order = {m: i for i, m in enumerate(PREFERRED_METHOD_ORDER)}
-
-    def key_fn(m: str) -> tuple[int, str]:
-        return (order.get(m, 10000), m.lower())
-
-    return sorted(dict.fromkeys(methods), key=key_fn)
+    order = {normalize_noise_method(m): i for i, m in enumerate(PREFERRED_METHOD_ORDER)}
+    bases = dict.fromkeys(normalize_noise_method(m) for m in methods)
+    return sorted(bases, key=lambda m: (order.get(m, 10000), m.lower()))
 
 
-def discover_noise_methods(
-    result_root: Path,
-    mask_roots: Sequence[Path],
-    explicit_methods: Sequence[str],
-) -> list[str]:
+def discover_noise_methods(result_roots: Sequence[Path], mask_roots: Sequence[Path],
+                           explicit_methods: Sequence[str]) -> list[str]:
     if explicit_methods:
-        return sort_methods([m for m in explicit_methods if m.startswith("noise_")])
-
-    methods: set[str] = set()
-
-    if result_root.exists():
-        for path in result_root.iterdir():
-            if path.is_dir() and path.name.startswith("noise_"):
-                methods.add(path.name)
-
-    for mask_root in mask_roots:
-        if not mask_root.exists():
-            continue
-        for path in mask_root.iterdir():
-            if path.is_dir() and path.name.startswith("noise_"):
-                methods.add(path.name)
-
+        return sort_methods(explicit_methods)
+    methods = set()
+    for root in [*result_roots, *mask_roots]:
+        if root.is_dir():
+            methods.update(normalize_noise_method(p.name) for p in root.iterdir() if p.is_dir())
     return sort_methods(methods)
 
 
@@ -216,7 +212,7 @@ def accuracy_result_path(
 
 
 def aggregate_accuracy(
-    result_root: Path,
+    result_root: Sequence[Path],
     method: str,
     dataset: str,
     model: str,
@@ -225,7 +221,9 @@ def aggregate_accuracy(
 ) -> Optional[tuple[float, float, int]]:
     values: list[float] = []
     for seed in seeds:
-        path = accuracy_result_path(result_root, method, dataset, model, seed, kr)
+        paths = [root / candidate / dataset / model / str(seed) / f"result_{int(kr)}.json"
+                 for candidate in noise_method_candidates(method) for root in result_root]
+        path = next((item for item in paths if item.is_file()), paths[0])
         value = load_accuracy_from_json(path)
         if value is not None:
             values.append(value)
@@ -267,10 +265,11 @@ def find_mask_path(
     seed: int,
     kr: int,
 ) -> Optional[Path]:
-    for root in mask_roots:
-        path = root / method / dataset / str(seed) / f"mask_{int(kr)}.npz"
-        if path.is_file():
-            return path
+    for candidate in noise_method_candidates(method):
+        for root in mask_roots:
+            path = root / candidate / dataset / str(seed) / f"mask_{int(kr)}.npz"
+            if path.is_file():
+                return path
     return None
 
 
@@ -334,6 +333,33 @@ def compute_noise_ratio_for_mask(
     return float(is_noisy[mask].mean() * 100.0)
 
 
+_LABEL_CACHE: dict[tuple[str, int, str], tuple[np.ndarray, int]] = {}
+
+
+def compute_random_noise_ratio(data_root: Path, noise_root: Path, dataset: str,
+                               seed: int, kr: int) -> Optional[float]:
+    try:
+        from dataset.dataset import BaseDataLoader
+        from train_after_selection import _extract_labels, select_random_indices_by_class
+        from train_after_selection import read_noise_list
+        key = (dataset, seed, str(data_root))
+        if key not in _LABEL_CACHE:
+            loader = BaseDataLoader(dataset, data_path=data_root, batch_size=1,
+                                    num_workers=0, val_split=0.0, seed=seed)
+            train_loader, _, _ = loader.load()
+            labels = _extract_labels(train_loader.dataset).astype(np.int64)
+            _LABEL_CACHE[key] = (labels, loader.num_classes)
+        clean_labels, num_classes = _LABEL_CACHE[key]
+        mapping = read_noise_list(noise_root / dataset / f"noise_list_{seed}.txt")
+        noisy_labels = clean_labels.copy()
+        noisy_labels[mapping[:, 0].astype(np.int64)] = mapping[:, 1].astype(np.int64)
+        selected = select_random_indices_by_class(noisy_labels, num_classes, kr, seed)
+        return float(np.isin(selected, mapping[:, 0]).mean() * 100.0)
+    except Exception as exc:
+        print(f"[WARN] failed random noise ratio: dataset={dataset}, seed={seed}, kr={kr} ({exc})")
+        return None
+
+
 def aggregate_noise_ratio(
     mask_roots: Sequence[Path],
     noise_root: Path,
@@ -341,21 +367,20 @@ def aggregate_noise_ratio(
     datasets: Sequence[str],
     seeds: Sequence[int],
     kr: int,
+    data_root: Path,
 ) -> Optional[tuple[float, float, int]]:
-    if is_random_method(method):
-        return 20.0, 0.0, len(datasets) * len(seeds)
-
     values: list[float] = []
     for dataset in datasets:
         for seed in seeds:
-            value = compute_noise_ratio_for_mask(
+            value = (compute_random_noise_ratio(data_root, noise_root, dataset, seed, kr)
+                     if is_random_method(method) else compute_noise_ratio_for_mask(
                 mask_roots=mask_roots,
                 noise_root=noise_root,
                 method=method,
                 dataset=dataset,
                 seed=seed,
                 kr=kr,
-            )
+            ))
             if value is not None:
                 values.append(value)
 
@@ -396,6 +421,7 @@ def build_table_rows(
     keep_ratios: Sequence[int],
     model: str,
     keep_prefix: bool,
+    data_root: Path,
 ) -> tuple[list[list[str]], list[str], list[str]]:
     header1 = ["method"]
     header2 = [""]
@@ -435,6 +461,7 @@ def build_table_rows(
                 datasets=datasets,
                 seeds=seeds,
                 kr=kr,
+                data_root=data_root,
             )
             row.append(format_noise_cell(noise_stats, expected_count=expected_noise_count))
 
@@ -472,7 +499,7 @@ def print_table(header1: list[str], header2: list[str], rows: list[list[str]]) -
 def main() -> None:
     args = parse_args()
 
-    result_root = Path(args.result_root)
+    result_root = [Path(item) for item in parse_csv_str(args.result_root)]
     mask_roots = [Path(item) for item in parse_csv_str(args.mask_roots)]
     noise_root = Path(args.noise_root)
 
@@ -482,7 +509,7 @@ def main() -> None:
 
     explicit_methods = parse_csv_str(args.methods)
     methods = discover_noise_methods(
-        result_root=result_root,
+        result_roots=result_root,
         mask_roots=mask_roots,
         explicit_methods=explicit_methods,
     )
@@ -514,6 +541,7 @@ def main() -> None:
         keep_ratios=keep_ratios,
         model=args.model,
         keep_prefix=args.keep_prefix,
+        data_root=Path(args.data_root),
     )
 
     print_table(header1, header2, rows)

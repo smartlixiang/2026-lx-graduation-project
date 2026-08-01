@@ -38,12 +38,13 @@ from typing import Optional, Sequence
 import numpy as np
 
 
+
 DEFAULT_DATASETS = ["cifar100", "tiny-imagenet"]
 DEFAULT_SEEDS = [22, 42, 96]
 DEFAULT_KR = [30, 50, 70]
 DEFAULT_MODEL = "resnet50"
-DEFAULT_RESULT_ROOTS = ["result", "corruption_exp/result", "result_corruption"]
-DEFAULT_MASK_ROOTS = ["mask", "corruption_exp/mask"]
+DEFAULT_RESULT_ROOTS = ["corruption_result"]
+DEFAULT_MASK_ROOTS = ["corruption_mask"]
 
 PREFERRED_METHOD_ORDER = [
     "corruption_random",
@@ -71,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         default=",".join(DEFAULT_RESULT_ROOTS),
         help=(
             "Comma-separated result roots searched in order. "
-            "Default: result,corruption_exp/result,result_corruption"
+            "Default: corruption_result"
         ),
     )
     parser.add_argument(
@@ -79,7 +80,7 @@ def parse_args() -> argparse.Namespace:
         default=",".join(DEFAULT_MASK_ROOTS),
         help=(
             "Comma-separated mask roots searched in order. "
-            "Default: mask,corruption_exp/mask"
+            "Default: corruption_mask"
         ),
     )
     parser.add_argument(
@@ -87,6 +88,7 @@ def parse_args() -> argparse.Namespace:
         default="corruption_data",
         help="Root containing corruption_list files. Default: corruption_data",
     )
+    parser.add_argument("--data-root", default="data", help="Dataset root. Default: data")
     parser.add_argument(
         "--datasets",
         default=",".join(DEFAULT_DATASETS),
@@ -139,38 +141,44 @@ def parse_csv_int(raw: str) -> list[int]:
     return values
 
 
+def strip_repeated_prefix(method: str, prefix: str) -> str:
+    while method.startswith(prefix):
+        method = method[len(prefix):]
+    return method
+
+
+def normalize_corruption_method(method: str) -> str:
+    return strip_repeated_prefix(method, "corruption_")
+
+
+def corruption_method_candidates(base_method: str) -> list[str]:
+    return [f"corruption_{base_method}", base_method]
+
+
 def display_method_name(method: str, keep_prefix: bool = False) -> str:
-    if keep_prefix:
-        return method
-    prefix = "corruption_"
-    return method[len(prefix) :] if method.startswith(prefix) else method
+    base = normalize_corruption_method(method)
+    return f"corruption_{base}" if keep_prefix else base
+
+
+def is_random_method(method: str) -> bool:
+    return normalize_corruption_method(method).lower() == "random"
 
 
 def sort_methods(methods: Sequence[str]) -> list[str]:
-    order = {method: index for index, method in enumerate(PREFERRED_METHOD_ORDER)}
-    return sorted(
-        dict.fromkeys(methods),
-        key=lambda method: (order.get(method, 10_000), method.lower()),
-    )
+    order = {normalize_corruption_method(m): i for i, m in enumerate(PREFERRED_METHOD_ORDER)}
+    bases = dict.fromkeys(normalize_corruption_method(m) for m in methods)
+    return sorted(bases, key=lambda m: (order.get(m, 10_000), m.lower()))
 
 
-def discover_methods(
-    result_roots: Sequence[Path],
-    mask_roots: Sequence[Path],
-    explicit_methods: Sequence[str],
-) -> list[str]:
+def discover_methods(result_roots: Sequence[Path], mask_roots: Sequence[Path],
+                     explicit_methods: Sequence[str]) -> list[str]:
     if explicit_methods:
         return sort_methods(explicit_methods)
-
-    methods: set[str] = set()
+    methods = set()
     for root in [*result_roots, *mask_roots]:
-        if not root.is_dir():
-            continue
-        for path in root.iterdir():
-            if path.is_dir() and path.name.startswith("corruption_"):
-                methods.add(path.name)
+        if root.is_dir():
+            methods.update(normalize_corruption_method(p.name) for p in root.iterdir() if p.is_dir())
     return sort_methods(methods)
-
 
 def first_existing(paths: Sequence[Path]) -> Optional[Path]:
     return next((path for path in paths if path.is_file()), None)
@@ -185,8 +193,8 @@ def result_candidates(
     kr: int,
 ) -> list[Path]:
     return [
-        root / method / dataset / model / str(seed) / f"result_{int(kr)}.json"
-        for root in roots
+        root / candidate / dataset / model / str(seed) / f"result_{int(kr)}.json"
+        for candidate in corruption_method_candidates(method) for root in roots
     ]
 
 
@@ -198,8 +206,8 @@ def mask_candidates(
     kr: int,
 ) -> list[Path]:
     return [
-        root / method / dataset / str(seed) / f"mask_{int(kr)}.npz"
-        for root in roots
+        root / candidate / dataset / str(seed) / f"mask_{int(kr)}.npz"
+        for candidate in corruption_method_candidates(method) for root in roots
     ]
 
 
@@ -249,6 +257,7 @@ def aggregate_accuracy(
     seeds: Sequence[int],
     kr: int,
     strict: bool,
+    data_root: Path,
 ) -> Optional[tuple[float, float, int]]:
     values: list[float] = []
     for seed in seeds:
@@ -378,6 +387,34 @@ def corruption_ratio_for_mask(
     return float(is_corrupted[mask].mean() * 100.0)
 
 
+_LABEL_CACHE: dict[tuple[str, int, str], tuple[np.ndarray, int]] = {}
+
+
+def compute_random_corruption_ratio(data_root: Path, corruption_root: Path, dataset: str,
+                                    seed: int, kr: int, strict: bool) -> Optional[float]:
+    try:
+        from dataset.dataset import BaseDataLoader
+        from train_after_selection import _extract_labels, select_random_indices_by_class
+        key = (dataset, seed, str(data_root))
+        if key not in _LABEL_CACHE:
+            loader = BaseDataLoader(dataset, data_path=data_root, batch_size=1,
+                                    num_workers=0, val_split=0.0, seed=seed)
+            train_loader, _, _ = loader.load()
+            _LABEL_CACHE[key] = (_extract_labels(train_loader.dataset).astype(np.int64),
+                                 loader.num_classes)
+        labels, num_classes = _LABEL_CACHE[key]
+        ids = read_corrupted_ids(corruption_root, dataset, seed)
+        if ids is None:
+            raise FileNotFoundError(f"invalid corruption list: dataset={dataset}, seed={seed}")
+        selected = select_random_indices_by_class(labels, num_classes, kr, seed)
+        return float(np.isin(selected, ids).mean() * 100.0)
+    except Exception as exc:
+        if strict:
+            raise
+        print(f"[WARN] failed random corruption ratio: dataset={dataset}, seed={seed}, kr={kr} ({exc})")
+        return None
+
+
 def aggregate_corruption_ratio(
     mask_roots: Sequence[Path],
     corruption_root: Path,
@@ -386,11 +423,14 @@ def aggregate_corruption_ratio(
     seeds: Sequence[int],
     kr: int,
     strict: bool,
+    data_root: Path,
 ) -> Optional[tuple[float, float, int]]:
     values: list[float] = []
     for dataset in datasets:
         for seed in seeds:
-            value = corruption_ratio_for_mask(
+            value = (compute_random_corruption_ratio(data_root, corruption_root, dataset,
+                                                       seed, kr, strict)
+                     if is_random_method(method) else corruption_ratio_for_mask(
                 mask_roots,
                 corruption_root,
                 method,
@@ -398,7 +438,7 @@ def aggregate_corruption_ratio(
                 seed,
                 kr,
                 strict,
-            )
+            ))
             if value is not None:
                 values.append(value)
     if not values:
@@ -431,6 +471,7 @@ def build_rows(
     model: str,
     keep_prefix: bool,
     strict: bool,
+    data_root: Path,
 ) -> tuple[list[list[str]], list[str], list[str]]:
     header1 = ["method"]
     header2 = [""]
@@ -461,6 +502,7 @@ def build_rows(
                 seeds,
                 kr,
                 strict,
+                data_root,
             )
             row.append(format_cell(stats, expected_ratio_count, 2))
         rows.append(row)
@@ -530,6 +572,7 @@ def main() -> None:
         args.model,
         args.keep_prefix,
         args.strict,
+        Path(args.data_root),
     )
     print_table(header1, header2, rows)
 

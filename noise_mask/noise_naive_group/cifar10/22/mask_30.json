@@ -1,0 +1,18 @@
+{
+  "dataset": "cifar10",
+  "method": "noise_naive_group",
+  "weight_group": "naive",
+  "seed": 22,
+  "keep_ratio": 30,
+  "num_selected": 15000,
+  "num_noisy_total": 10000,
+  "num_noisy_selected": 4810,
+  "noise_ratio_total": 0.2,
+  "noise_ratio_in_mask": 0.32066666666666666,
+  "weights": {
+    "dds": 0.3333333333333333,
+    "div": 0.3333333333333333,
+    "sa": 0.3333333333333333
+  },
+  "mask_path": "/nvme/home/lixiang/code/noise_exp/mask/noise_naive_group/cifar10/22/mask_30.npz"
+}

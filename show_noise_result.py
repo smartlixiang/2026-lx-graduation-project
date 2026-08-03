@@ -16,6 +16,9 @@ Accuracy is aggregated across seeds as mean±std, following draw_acc_curve.py:
     - use mean of the last 10 entries in "accuracy_samples" if available;
     - otherwise use the scalar field "accuracy".
 
+Accuracy is displayed as a percentage with two decimal places. Noise ratios are
+already computed in percentage units and are displayed with two decimal places.
+
 Noise ratio is computed from:
     - noise_mask/[noise_method]/[dataset]/[seed]/mask_[kr].npz
     - noise/[dataset]/noise_list_[seed].txt
@@ -162,14 +165,21 @@ def sort_methods(methods: Sequence[str]) -> list[str]:
     return sorted(bases, key=lambda m: (order.get(m, 10000), m.lower()))
 
 
-def discover_noise_methods(result_roots: Sequence[Path], mask_roots: Sequence[Path],
-                           explicit_methods: Sequence[str]) -> list[str]:
+def discover_noise_methods(
+    result_roots: Sequence[Path],
+    mask_roots: Sequence[Path],
+    explicit_methods: Sequence[str],
+) -> list[str]:
     if explicit_methods:
         return sort_methods(explicit_methods)
     methods = set()
     for root in [*result_roots, *mask_roots]:
         if root.is_dir():
-            methods.update(normalize_noise_method(p.name) for p in root.iterdir() if p.is_dir())
+            methods.update(
+                normalize_noise_method(path.name)
+                for path in root.iterdir()
+                if path.is_dir()
+            )
     return sort_methods(methods)
 
 
@@ -178,15 +188,15 @@ def load_accuracy_from_json(path: Path) -> Optional[float]:
         return None
 
     try:
-        with path.open("r", encoding="utf-8") as f:
-            payload = json.load(f)
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
     except Exception as exc:
         print(f"[WARN] failed to read JSON: {path} ({exc})")
         return None
 
     acc_samples = payload.get("accuracy_samples")
     if isinstance(acc_samples, list) and acc_samples:
-        values = [float(v) for v in acc_samples[-10:]]
+        values = [float(value) for value in acc_samples[-10:]]
         return mean(values)
 
     for key in ("accuracy", "test_acc", "test_accuracy", "last10_mean_acc"):
@@ -221,8 +231,11 @@ def aggregate_accuracy(
 ) -> Optional[tuple[float, float, int]]:
     values: list[float] = []
     for seed in seeds:
-        paths = [root / candidate / dataset / model / str(seed) / f"result_{int(kr)}.json"
-                 for candidate in noise_method_candidates(method) for root in result_root]
+        paths = [
+            root / candidate / dataset / model / str(seed) / f"result_{int(kr)}.json"
+            for candidate in noise_method_candidates(method)
+            for root in result_root
+        ]
         path = next((item for item in paths if item.is_file()), paths[0])
         value = load_accuracy_from_json(path)
         if value is not None:
@@ -273,7 +286,11 @@ def find_mask_path(
     return None
 
 
-def read_noisy_sample_ids(noise_root: Path, dataset: str, seed: int) -> Optional[np.ndarray]:
+def read_noisy_sample_ids(
+    noise_root: Path,
+    dataset: str,
+    seed: int,
+) -> Optional[np.ndarray]:
     path = noise_root / dataset / f"noise_list_{int(seed)}.txt"
     if not path.is_file():
         print(f"[WARN] noise list not found: {path}")
@@ -336,27 +353,50 @@ def compute_noise_ratio_for_mask(
 _LABEL_CACHE: dict[tuple[str, int, str], tuple[np.ndarray, int]] = {}
 
 
-def compute_random_noise_ratio(data_root: Path, noise_root: Path, dataset: str,
-                               seed: int, kr: int) -> Optional[float]:
+def compute_random_noise_ratio(
+    data_root: Path,
+    noise_root: Path,
+    dataset: str,
+    seed: int,
+    kr: int,
+) -> Optional[float]:
     try:
         from dataset.dataset import BaseDataLoader
-        from train_after_selection import _extract_labels, select_random_indices_by_class
-        from train_after_selection import read_noise_list
+        from train_after_selection import _extract_labels, read_noise_list
+        from train_after_selection import select_random_indices_by_class
+
         key = (dataset, seed, str(data_root))
         if key not in _LABEL_CACHE:
-            loader = BaseDataLoader(dataset, data_path=data_root, batch_size=1,
-                                    num_workers=0, val_split=0.0, seed=seed)
+            loader = BaseDataLoader(
+                dataset,
+                data_path=data_root,
+                batch_size=1,
+                num_workers=0,
+                val_split=0.0,
+                seed=seed,
+            )
             train_loader, _, _ = loader.load()
             labels = _extract_labels(train_loader.dataset).astype(np.int64)
             _LABEL_CACHE[key] = (labels, loader.num_classes)
         clean_labels, num_classes = _LABEL_CACHE[key]
-        mapping = read_noise_list(noise_root / dataset / f"noise_list_{seed}.txt")
+
+        mapping = read_noise_list(
+            noise_root / dataset / f"noise_list_{seed}.txt"
+        )
         noisy_labels = clean_labels.copy()
         noisy_labels[mapping[:, 0].astype(np.int64)] = mapping[:, 1].astype(np.int64)
-        selected = select_random_indices_by_class(noisy_labels, num_classes, kr, seed)
+        selected = select_random_indices_by_class(
+            noisy_labels,
+            num_classes,
+            kr,
+            seed,
+        )
         return float(np.isin(selected, mapping[:, 0]).mean() * 100.0)
     except Exception as exc:
-        print(f"[WARN] failed random noise ratio: dataset={dataset}, seed={seed}, kr={kr} ({exc})")
+        print(
+            f"[WARN] failed random noise ratio: dataset={dataset}, "
+            f"seed={seed}, kr={kr} ({exc})"
+        )
         return None
 
 
@@ -372,15 +412,24 @@ def aggregate_noise_ratio(
     values: list[float] = []
     for dataset in datasets:
         for seed in seeds:
-            value = (compute_random_noise_ratio(data_root, noise_root, dataset, seed, kr)
-                     if is_random_method(method) else compute_noise_ratio_for_mask(
-                mask_roots=mask_roots,
-                noise_root=noise_root,
-                method=method,
-                dataset=dataset,
-                seed=seed,
-                kr=kr,
-            ))
+            value = (
+                compute_random_noise_ratio(
+                    data_root,
+                    noise_root,
+                    dataset,
+                    seed,
+                    kr,
+                )
+                if is_random_method(method)
+                else compute_noise_ratio_for_mask(
+                    mask_roots=mask_roots,
+                    noise_root=noise_root,
+                    method=method,
+                    dataset=dataset,
+                    seed=seed,
+                    kr=kr,
+                )
+            )
             if value is not None:
                 values.append(value)
 
@@ -391,28 +440,36 @@ def aggregate_noise_ratio(
     return mean(values), std_val, len(values)
 
 
-def format_acc_cell(stats: Optional[tuple[float, float, int]], expected_count: int) -> str:
+def format_acc_cell(
+    stats: Optional[tuple[float, float, int]],
+    expected_count: int,
+) -> str:
+    """Format raw 0-1 accuracy as percentage values without a percent sign."""
     if stats is None:
         return "-"
     mean_val, std_val, count = stats
-    cell = f"{mean_val:.4f}±{std_val:.4f}"
+    cell = f"{mean_val * 100.0:.2f}±{std_val * 100.0:05.2f}"
     if count < expected_count:
         cell += f"({count})"
     return cell
 
 
-def format_noise_cell(stats: Optional[tuple[float, float, int]], expected_count: int) -> str:
+def format_noise_cell(
+    stats: Optional[tuple[float, float, int]],
+    expected_count: int,
+) -> str:
+    """Format values that are already expressed on a 0-100 percentage scale."""
     if stats is None:
         return "-"
     mean_val, std_val, count = stats
-    cell = f"{mean_val:.2f}±{std_val:.2f}"
+    cell = f"{mean_val:.2f}±{std_val:05.2f}"
     if count < expected_count:
         cell += f"({count})"
     return cell
 
 
 def build_table_rows(
-    result_root: Path,
+    result_root: Sequence[Path],
     mask_roots: Sequence[Path],
     noise_root: Path,
     methods: Sequence[str],
@@ -451,7 +508,12 @@ def build_table_rows(
                     seeds=seeds,
                     kr=kr,
                 )
-                row.append(format_acc_cell(acc_stats, expected_count=len(seeds)))
+                row.append(
+                    format_acc_cell(
+                        acc_stats,
+                        expected_count=len(seeds),
+                    )
+                )
 
         for kr in keep_ratios:
             noise_stats = aggregate_noise_ratio(
@@ -463,30 +525,39 @@ def build_table_rows(
                 kr=kr,
                 data_root=data_root,
             )
-            row.append(format_noise_cell(noise_stats, expected_count=expected_noise_count))
+            row.append(
+                format_noise_cell(
+                    noise_stats,
+                    expected_count=expected_noise_count,
+                )
+            )
 
         rows.append(row)
 
     return rows, header1, header2
 
 
-def print_table(header1: list[str], header2: list[str], rows: list[list[str]]) -> None:
+def print_table(
+    header1: list[str],
+    header2: list[str],
+    rows: list[list[str]],
+) -> None:
     table = [header1, header2] + rows
     ncols = len(header1)
 
     widths = [0] * ncols
     for row in table:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(str(cell)))
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(str(cell)))
 
     def fmt_row(row: list[str]) -> str:
         parts = []
-        for i, cell in enumerate(row):
+        for index, cell in enumerate(row):
             text = str(cell)
-            if i == 0:
-                parts.append(text.ljust(widths[i]))
+            if index == 0:
+                parts.append(text.ljust(widths[index]))
             else:
-                parts.append(text.rjust(widths[i]))
+                parts.append(text.rjust(widths[index]))
         return "  ".join(parts)
 
     print(fmt_row(header1))
@@ -499,8 +570,14 @@ def print_table(header1: list[str], header2: list[str], rows: list[list[str]]) -
 def main() -> None:
     args = parse_args()
 
-    result_root = [Path(item) for item in parse_csv_str(args.result_root)]
-    mask_roots = [Path(item) for item in parse_csv_str(args.mask_roots)]
+    result_root = [
+        Path(item)
+        for item in parse_csv_str(args.result_root)
+    ]
+    mask_roots = [
+        Path(item)
+        for item in parse_csv_str(args.mask_roots)
+    ]
     noise_root = Path(args.noise_root)
 
     datasets = parse_csv_str(args.datasets)
@@ -517,12 +594,12 @@ def main() -> None:
     if not methods:
         print("[INFO] No noise_* methods found.")
         print(f"       result_root={result_root}")
-        print(f"       mask_roots={[str(p) for p in mask_roots]}")
+        print(f"       mask_roots={[str(path) for path in mask_roots]}")
         return
 
     print("[INFO] show label-noise experiment table")
     print(f"       result_root={result_root}")
-    print(f"       mask_roots={[str(p) for p in mask_roots]}")
+    print(f"       mask_roots={[str(path) for path in mask_roots]}")
     print(f"       noise_root={noise_root}")
     print(f"       datasets={datasets}")
     print(f"       seeds={seeds}")

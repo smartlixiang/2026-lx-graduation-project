@@ -363,12 +363,11 @@
   },
   "tiny-imagenet": {
     "22": {
-      "sa": 0.34995866210803084,
-      "div": 0.41378921177118194,
-      "dds": 0.2362521261207872,
-      "bias": -7.776915016136878e-07,
-      "method_version": "softplus_ratio",
-      "ratio_lambda": 0.001,
+      "sa": 0.3461714530005095,
+      "div": 0.4025097287908045,
+      "dds": 0.25131881820868596,
+      "bias": 2.6567138335217833e-11,
+      "ratio_lambda": 0.01,
       "transferability_component": "TransferabilityScore",
       "proxy_log": "",
       "dynamic_components": [
@@ -406,28 +405,26 @@
           }
         },
         "weight_solver": "softplus_ratio_no_simplex",
-        "method_version": "softplus_ratio",
         "raw_weights": [
-          0.12960607248550782,
-          0.15324551263137962,
-          0.08749522014521217
+          0.1276623145656728,
+          0.14843894020504259,
+          0.09268222942226026
         ],
-        "mse": 0.990961787565504,
-        "ratio_regularizer": 0.048499491539932695,
-        "iterations": 3939,
+        "mse": 0.9912751322715233,
+        "ratio_regularizer": 0.03501439347078373,
+        "iterations": 3794,
         "weights_sum": 0.9999999999999999,
-        "weights_min": 0.2362521261207872,
+        "weights_min": 0.25131881820868596,
         "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }
     },
     "42": {
-      "sa": 0.34332688218252155,
-      "div": 0.4088425242256486,
-      "dds": 0.2478305935918298,
-      "bias": 0.00044567964144562333,
-      "method_version": "softplus_ratio",
-      "ratio_lambda": 0.001,
+      "sa": 0.3405537304574325,
+      "div": 0.3988732303270825,
+      "dds": 0.2605730392154849,
+      "bias": 1.0466934155490505e-11,
+      "ratio_lambda": 0.01,
       "transferability_component": "TransferabilityScore",
       "proxy_log": "",
       "dynamic_components": [
@@ -465,17 +462,16 @@
           }
         },
         "weight_solver": "softplus_ratio_no_simplex",
-        "method_version": "softplus_ratio",
         "raw_weights": [
-          0.1266196958509871,
-          0.1507820061724164,
-          0.09140045831448912
+          0.12468535394071549,
+          0.14603760127368587,
+          0.09540239532349425
         ],
-        "mse": 0.9909921021450051,
-        "ratio_regularizer": 0.03931638419518826,
-        "iterations": 3836,
+        "mse": 0.9912230248605237,
+        "ratio_regularizer": 0.02891197842490256,
+        "iterations": 3744,
         "weights_sum": 0.9999999999999999,
-        "weights_min": 0.2478305935918298,
+        "weights_min": 0.2605730392154849,
         "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       }

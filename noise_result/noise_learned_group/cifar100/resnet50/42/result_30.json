@@ -2,9 +2,8 @@
   "metadata": {
     "dataset": "cifar100",
     "data_root": "data",
-    "noise_root": "noise",
-    "noise_path": "noise/cifar100/noise_list_42.txt",
-    "noise_rate": 0.2,
+    "exp": "label_noise",
+    "result_root": "noise_result",
     "model": "resnet50",
     "keep_ratio": 30,
     "selection_method": "noise_learned_group",
@@ -15,11 +14,12 @@
     "grad_accum_steps": 1,
     "effective_batch_size": 128,
     "reference_effective_batch_size": 128,
-    "optimizer": "SGD",
-    "momentum": 0.9,
     "weight_decay": 0.0005,
     "init_lr": 0.1,
-    "use_amp": false,
+    "num_selected": 15000,
+    "num_total": 50000,
+    "optimizer": "SGD",
+    "momentum": 0.9,
     "lr_schedule": {
       "type": "MultiStepLR",
       "milestones": [
@@ -29,26 +29,28 @@
       ],
       "gamma": 0.2
     },
-    "num_selected": 15000,
-    "num_total": 50000,
+    "use_amp": false,
+    "noise_root": "noise",
+    "noise_path": "noise/cifar100/noise_list_42.txt",
+    "noise_rate": 0.2,
     "num_noisy_total": 10000,
-    "num_noisy_selected": 2639,
-    "noise_ratio_in_selection": 0.17593333333333333
+    "num_noisy_selected": 41,
+    "noise_ratio_in_selection": 0.0027333333333333333
   },
-  "accuracy": 0.4148,
-  "accuracy_mean": 0.4148,
-  "accuracy_std": 0.0008,
+  "accuracy": 0.5893,
+  "accuracy_mean": 0.5893,
+  "accuracy_std": 0.0009,
   "accuracy_samples": [
-    0.4143,
-    0.4143,
-    0.4151,
-    0.4143,
-    0.4145,
-    0.4138,
-    0.4147,
-    0.4167,
-    0.4157,
-    0.4147
+    0.5896,
+    0.5898,
+    0.5894,
+    0.5879,
+    0.5911,
+    0.5881,
+    0.5886,
+    0.5894,
+    0.5899,
+    0.5887
   ],
-  "time_seconds": 2927.196207046509
+  "time_seconds": 3487.9179649353027
 }

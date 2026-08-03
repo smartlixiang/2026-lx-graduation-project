@@ -2,8 +2,8 @@
 """Prepare scorers and masks for the three explicit unseen-sample protocols.
 
 Experiment 1 calibrates on 50% known data and selects from the clean full
-CIFAR-100/Tiny-ImageNet training set (60/70/80/90%).  Experiment 2 calibrates
-on 20% known CIFAR-10 data, recomputes every static reference on the disjoint
+CIFAR-100/Tiny-ImageNet training set (60/70/80/90%).  
+Experiment 2 calibrates on 20% known CIFAR-10 data, recomputes every static reference on the disjoint
 80% unseen pool, and selects global 20/30/40/60% targets from that pool.
 Experiment 3 corrupts the full CIFAR-100 training set first, then makes the
 50/50 views, and uses center-repair selection (30/40/50/60%).
@@ -116,7 +116,7 @@ Experiment 3: corrupt full CIFAR-100 first, 50/50 views, full corrupted referenc
     parser.add_argument("--proxy-model", default="resnet18")
     parser.add_argument("--device")
     parser.add_argument("--skip-saved", action="store_true")
-    parser.add_argument("--group-candidate-pool-size", type=int, default=1)
+    parser.add_argument("--group-candidate-pool-size", type=int, default=10)
     parser.add_argument("--group-init-count", type=int, default=2)
     parser.add_argument("--dist-weight-factor", type=float, default=1.0)
     parser.add_argument("--debug-prompts", action="store_true")

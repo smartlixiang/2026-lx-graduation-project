@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Prepare scorers and masks for the three explicit unseen-sample protocols.
+"""Prepare scorers and masks for the two explicit unseen-sample protocols.
 
 Experiment 1 calibrates on 50% known data and selects from the clean full
 CIFAR-100/Tiny-ImageNet training set (60/70/80/90%).  
-Experiment 2 calibrates on 20% known CIFAR-10 data, recomputes every static reference on the disjoint
-80% unseen pool, and selects global 20/30/40/60% targets from that pool.
 Experiment 3 corrupts the full CIFAR-100 training set first, then makes the
 50/50 views, and uses center-repair selection (30/40/50/60%).
 
@@ -14,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -38,7 +37,7 @@ import train_proxy as train_proxy_module
 import weights.dynamic_utils as dynamic_utils
 from corruption_exp.cal_corruption_mask import (FixedCorruptionDataset, CorruptionInfo,
                                                   load_corruption_info)
-from dataset.dataset_config import CIFAR10, CIFAR100, TINY_IMAGENET
+from dataset.dataset_config import CIFAR100, TINY_IMAGENET
 from model.adapter import load_trained_adapters
 from scoring import DifficultyDirection, Div, SemanticAlignment
 from utils.class_name_utils import resolve_class_names_for_prompts
@@ -66,8 +65,6 @@ class UnseenExperimentConfig:
 EXPERIMENT_CONFIGS = {
     1: UnseenExperimentConfig(1, (CIFAR100, TINY_IMAGENET), .5, 50, (60, 70, 80, 90),
                               "full", "full", False, "standard", ("learned_group", "random")),
-    2: UnseenExperimentConfig(2, (CIFAR10,), .2, 80, (20, 30, 40, 60),
-                              "unseen", "unseen", False, "standard", ("learned_group", "random")),
     3: UnseenExperimentConfig(3, (CIFAR100,), .5, 50, (30, 40, 50, 60),
                               "full", "full_corrupted", True, "center_repair",
                               ("learned_group", "naive_group", "random")),
@@ -77,6 +74,27 @@ MODE_METHODS = {"learned_group": "unseen_learned_group",
 COMPONENTS = {"A": AbsorptionGainScore, "C": ConfusionComplementarityScore,
               "T": TransferabilityScore}
 K_FOLDS = 5
+ALL_STAGES = frozenset(range(1, 7))
+
+
+def parse_skip_saved_stages(text: str | None) -> frozenset[int]:
+    """Parse the stages whose valid artifacts may be reused."""
+    if text is None:
+        return frozenset()
+    parts = text.split(",")
+    if not parts or any(not part.strip() for part in parts):
+        raise ValueError("--skip-saved must be comma-separated stage numbers 1 through 6")
+    try:
+        stages = frozenset(int(part.strip()) for part in parts)
+    except ValueError as exc:
+        raise ValueError("--skip-saved must be comma-separated stage numbers 1 through 6") from exc
+    if not stages.issubset(ALL_STAGES):
+        raise ValueError("--skip-saved stages must be between 1 and 6")
+    return stages
+
+
+def stage_reuse_requested(args, stage: int, *, upstream_dirty: bool = False) -> bool:
+    return not upstream_dirty and stage in args.skip_saved_stages
 
 
 def parse_keep_ratios(text: str | None, config: UnseenExperimentConfig) -> tuple[int, ...]:
@@ -92,6 +110,8 @@ def parse_keep_ratios(text: str | None, config: UnseenExperimentConfig) -> tuple
 
 
 def validate_experiment(exp: int, dataset: str, mode: str, kr: str | None = None):
+    if exp not in EXPERIMENT_CONFIGS:
+        raise ValueError(f"unsupported experiment {exp}; choose 1 or 3")
     config = EXPERIMENT_CONFIGS[exp]
     if dataset not in config.allowed_datasets:
         raise ValueError(f"Experiment {exp} supports datasets {config.allowed_datasets}, not {dataset!r}")
@@ -102,12 +122,11 @@ def validate_experiment(exp: int, dataset: str, mode: str, kr: str | None = None
 
 def parse_args() -> argparse.Namespace:
     details = """Experiment 1: 50/50, CIFAR-100 or Tiny-ImageNet, full clean references and selection.
-Experiment 2: 20/80 CIFAR-10, known-only calibration and unseen-only references/selection; kr is global.
 Experiment 3: corrupt full CIFAR-100 first, 50/50 views, full corrupted references and center-repair."""
     parser = argparse.ArgumentParser(description=__doc__, epilog=details,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--exp", required=True, type=int, choices=(1, 2, 3), help="Protocol number; see details below.")
-    parser.add_argument("--dataset", default=CIFAR100, choices=(CIFAR10, CIFAR100, TINY_IMAGENET))
+    parser.add_argument("--exp", required=True, type=int, choices=(1, 3), help="Protocol number; see details below.")
+    parser.add_argument("--dataset", default=CIFAR100, choices=(CIFAR100, TINY_IMAGENET))
     parser.add_argument("--mode", choices=tuple(MODE_METHODS), default="learned_group")
     parser.add_argument("--kr", help="Comma-separated subset of the protocol keep ratios.")
     parser.add_argument("--seed", type=int, default=int(CONFIG.global_seed))
@@ -115,13 +134,16 @@ Experiment 3: corrupt full CIFAR-100 first, 50/50 views, full corrupted referenc
     parser.add_argument("--clip-model", default="ViT-B/32")
     parser.add_argument("--proxy-model", default="resnet18")
     parser.add_argument("--device")
-    parser.add_argument("--skip-saved", action="store_true")
+    parser.add_argument("--skip-saved", nargs="?", const="1,2,3,4,5,6", metavar="STAGES",
+                        help="Comma-separated stages whose valid caches may be reused (bare flag: all stages).")
     parser.add_argument("--group-candidate-pool-size", type=int, default=10)
     parser.add_argument("--group-init-count", type=int, default=2)
     parser.add_argument("--dist-weight-factor", type=float, default=1.0)
     parser.add_argument("--debug-prompts", action="store_true")
     args = parser.parse_args()
     try:
+        args.skip_saved_stages = parse_skip_saved_stages(args.skip_saved)
+        del args.skip_saved
         args.config, args.keep_ratios = validate_experiment(args.exp, args.dataset, args.mode, args.kr)
     except ValueError as exc:
         parser.error(str(exc))
@@ -174,8 +196,6 @@ def _corruption_json_matches(entry: dict[str, Any], info: CorruptionInfo | None)
 def build_raw_dataset(dataset_name: str, data_root: str | Path, transform=None) -> Dataset:
     root = Path(data_root)
     if not root.is_absolute(): root = PROJECT_ROOT / root
-    if dataset_name == CIFAR10:
-        return datasets.CIFAR10(str(root), train=True, download=True, transform=transform)
     if dataset_name == CIFAR100:
         return datasets.CIFAR100(str(root), train=True, download=True, transform=transform)
     if dataset_name == TINY_IMAGENET:
@@ -244,7 +264,6 @@ def cache_paths(exp: int, dataset: str, seed: int, proxy_model: str, epochs: int
     return {"adapter": base / "adapter" / str(exp) / dataset / str(seed),
             "proxy": base / "proxy_logs" / str(exp) / dataset / proxy_model / str(seed) / epoch,
             "dynamic": base / "dynamic_cache" / str(exp) / dataset / proxy_model / str(seed) / epoch,
-            "calibration_static": base / "static_scores" / str(exp) / "calibration" / dataset / str(seed) / "static_scores.npz",
             "selection_static": base / "static_scores" / str(exp) / "selection" / dataset / str(seed) / "static_scores.npz",
             "weights": base / "weights" / str(exp) / "scoring_weights.json"}
 
@@ -265,7 +284,7 @@ def generate_random_mask(target_indices, full_num_samples, target_size, seed, ex
 
 def mask_metadata(args, mask, known, unseen, info: CorruptionInfo | None, keep_ratio):
     selected = np.flatnonzero(mask).astype(np.int64)
-    target_pool = unseen if args.config.selection_scope == "unseen" else np.arange(len(mask))
+    target_pool = np.arange(len(mask))
     values = dict(mask=mask.astype(np.uint8), selected_indices=selected, dataset=np.asarray(args.dataset),
         seed=np.asarray(args.seed), exp=np.asarray(args.exp), keep_ratio=np.asarray(keep_ratio),
         method=np.asarray(MODE_METHODS[args.mode]), mode=np.asarray(args.mode),
@@ -301,11 +320,8 @@ def mask_cache_valid(path, args, num_samples, known, unseen, info, keep_ratio):
                 and np.array_equal(data["known_indices"], known) and np.array_equal(data["unseen_indices"], unseen)
                 and int(data["known_selected"]) == int(mask[known].sum())
                 and int(data["unseen_selected"]) == int(mask[unseen].sum())
-                and int(data["target_pool_size"]) == (len(unseen) if args.exp == 2 else num_samples)
+                and int(data["target_pool_size"]) == num_samples
                 and int(data["target_selected"]) == target)
-            if args.exp == 2:
-                valid = (valid and not mask[known].any() and int(data["known_selected"]) == 0
-                         and np.isin(np.flatnonzero(mask), unseen).all())
             if info is not None:
                 corrupt_selected = int(mask[info.is_corrupted].sum())
                 valid = (valid and np.array_equal(data["corruption_types"], info.corruption_types)
@@ -382,17 +398,21 @@ def adapter_cache_valid(adapter_dir, args, known_indices, unseen_indices, info) 
     return valid
 
 
-def train_adapter_on_known(args, known_indices, unseen_indices, full_factory, info=None) -> tuple[Path, bool]:
+def train_adapter_on_known(args, known_indices, unseen_indices, full_factory, info=None,
+                           *, upstream_dirty=False) -> tuple[Path, bool]:
     out = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model)["adapter"]
     meta_path = out / "meta.json"
     valid, reason = validate_adapter_cache(out, args, known_indices, unseen_indices, info)
-    if args.skip_saved and valid:
-        print(f"[Skip] valid adapter cache: {out}")
+    reuse = stage_reuse_requested(args, 1, upstream_dirty=upstream_dirty)
+    if reuse and valid:
+        print(f"[Stage 1][Reuse] valid adapter cache: {out}")
         return out, False
-    if args.skip_saved:
-        print(f"[Recompute] adapter cache invalid: {reason}")
+    if reuse:
+        print(f"[Stage 1][Recompute] requested reuse but adapter cache is invalid: {reason}")
+    elif upstream_dirty:
+        print("[Stage 1][Dependency] recomputing because an upstream artifact changed")
     else:
-        print("[Recompute] --skip-saved not specified")
+        print("[Stage 1][Force] recomputing adapter")
     meta_path.unlink(missing_ok=True)
     def patched_build(_name, _root, transform): return IndexedSubsetDataset(full_factory(transform), known_indices)
     def patched_dir(_name, _seed): out.mkdir(parents=True, exist_ok=True); return out
@@ -480,13 +500,19 @@ def proxy_cache_valid(proxy_dir, args, known_indices, unseen_indices, proxy_epoc
         return False
 
 
-def train_proxy_on_known(args, known_indices, unseen_indices, full_factory, info=None):
+def train_proxy_on_known(args, known_indices, unseen_indices, full_factory, info=None,
+                         *, upstream_dirty=False):
     """Run the unchanged five-fold proxy implementation on local known indices."""
     proxy_args = make_proxy_args(args)
     epochs = int(proxy_args.epochs)
     out = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model, epochs)["proxy"]
     meta_path = out / "meta.json"
-    if args.skip_saved and proxy_cache_valid(out, args, known_indices, unseen_indices, epochs, info): return out, epochs
+    reuse = stage_reuse_requested(args, 3, upstream_dirty=upstream_dirty)
+    if reuse and proxy_cache_valid(out, args, known_indices, unseen_indices, epochs, info):
+        print(f"[Stage 3][Reuse] valid proxy cache: {out}")
+        return out, epochs, False
+    print("[Stage 3][Recompute] requested cache is invalid" if reuse else
+          "[Stage 3][Force] retraining proxy")
     meta_path.unlink(missing_ok=True)
     for fold_no in range(1, K_FOLDS + 1): (out / f"fold_{fold_no}.npz").unlink(missing_ok=True)
     original_loader = train_proxy_module.BaseDataLoader
@@ -513,7 +539,35 @@ def train_proxy_on_known(args, known_indices, unseen_indices, full_factory, info
     if not proxy_cache_valid(out, args, known_indices, unseen_indices, epochs, info):
         meta_path.unlink(missing_ok=True)
         raise RuntimeError("proxy training did not produce a complete valid five-fold cache")
-    return out, epochs
+    return out, epochs, True
+
+
+def split_fingerprint(known, unseen, num_samples: int | None = None) -> str:
+    known_array = np.ascontiguousarray(known, dtype=np.int64)
+    unseen_array = np.ascontiguousarray(unseen, dtype=np.int64)
+    total = len(known_array) + len(unseen_array) if num_samples is None else int(num_samples)
+    digest = hashlib.sha256()
+    digest.update(known_array.tobytes())
+    digest.update(b"\0KNOWN/UNSEEN\0")
+    digest.update(unseen_array.tobytes())
+    digest.update(np.asarray([total], dtype=np.int64).tobytes())
+    return digest.hexdigest()
+
+
+def _strip_known_indices(payload: Any) -> Any:
+    """Remove the deprecated verbose field from every weight entry."""
+    if isinstance(payload, dict):
+        payload.pop("known_indices", None)
+        for value in payload.values():
+            _strip_known_indices(value)
+    elif isinstance(payload, list):
+        for value in payload:
+            _strip_known_indices(value)
+    return payload
+
+
+def write_weight_payload(path: Path, payload: dict[str, Any]) -> None:
+    _atomic_json(path, _strip_known_indices(payload))
 
 
 def load_scoring_weights(path, args, known, unseen, proxy_epochs, info):
@@ -521,24 +575,36 @@ def load_scoring_weights(path, args, known, unseen, proxy_epochs, info):
         payload = json.loads(path.read_text(encoding="utf-8"))
         entry = payload[args.dataset][str(args.seed)]
         required = {"sa", "div", "dds", "bias", "ratio_lambda", "exp", "dataset", "seed",
-            "known_ratio", "unseen_ratio", "known_indices", "unseen_indices", "proxy_model",
+            "known_ratio", "unseen_ratio", "unseen_indices", "proxy_model",
             "proxy_epochs", "clip_model", "static_reference_scope", "selection_scope"}
         if not required.issubset(entry): return None
         values = np.asarray([entry[key] for key in ("sa", "div", "dds", "bias")], dtype=np.float64)
         weights = values[:3]
+        legacy = "known_indices" in entry
+        split_valid = ((legacy and entry["known_indices"] == known.tolist()
+                        and entry["unseen_indices"] == unseen.tolist()) or
+                       (not legacy and int(entry.get("known_count", -1)) == len(known)
+                        and int(entry.get("unseen_count", -1)) == len(unseen)
+                        and entry.get("split_fingerprint") == split_fingerprint(known, unseen)))
         valid = (np.isfinite(values).all() and np.all(weights > 0)
             and np.isclose(weights.sum(), 1.0, atol=1e-4, rtol=0.0)
             and float(entry["ratio_lambda"]) == 1e-3 and int(entry["exp"]) == args.exp
             and entry["dataset"] == args.dataset and int(entry["seed"]) == args.seed
             and float(entry["known_ratio"]) == args.config.known_ratio
             and int(entry["unseen_ratio"]) == args.config.unseen_ratio
-            and entry["known_indices"] == known.tolist() and entry["unseen_indices"] == unseen.tolist()
+            and split_valid and entry["unseen_indices"] == unseen.tolist()
             and entry["proxy_model"] == args.proxy_model and int(entry["proxy_epochs"]) == proxy_epochs
             and entry["clip_model"] == args.clip_model
             and entry["static_reference_scope"] == args.config.static_reference_scope
             and entry["selection_scope"] == args.config.selection_scope
             and _corruption_json_matches(entry, info))
-        return {key: float(entry[key]) for key in ("sa", "div", "dds")} if valid else None
+        if not valid:
+            return None
+        if legacy:
+            entry.update(known_count=len(known), unseen_count=len(unseen),
+                         split_fingerprint=split_fingerprint(known, unseen))
+            write_weight_payload(path, payload)
+        return {key: float(entry[key]) for key in ("sa", "div", "dds")}
     except Exception:
         return None
 
@@ -577,49 +643,97 @@ def load_dynamic_component_cache(path, component_name, args, known, unseen, know
         return None
 
 
-def get_dynamic_components(args, proxy_dir, proxy_epochs, known, unseen, labels, info):
+def _dynamic_metadata(args, known, unseen, labels, proxy_epochs, info):
+    return dict(labels=labels, exp=args.exp, dataset=args.dataset, seed=args.seed,
+        known_ratio=args.config.known_ratio, unseen_ratio=args.config.unseen_ratio,
+        known_indices=known, unseen_indices=unseen, proxy_model=args.proxy_model,
+        proxy_epochs=proxy_epochs, clip_model=args.clip_model,
+        static_reference_scope=args.config.static_reference_scope,
+        selection_scope=args.config.selection_scope,
+        corruption_types=info.corruption_types if info else np.empty(0, np.int16),
+        is_corrupted=info.is_corrupted if info else np.empty(0, bool))
+
+
+def load_pseudo_labels_cache(path, args, known, unseen, labels, proxy_epochs, info):
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            required = set(_dynamic_metadata(args, known, unseen, labels, proxy_epochs, info)) | {"dynamic_target"}
+            if not required.issubset(data.files): return None
+            target = np.asarray(data["dynamic_target"])
+            expected = _dynamic_metadata(args, known, unseen, labels, proxy_epochs, info)
+            valid = target.shape == (len(labels),) and np.isfinite(target).all()
+            for key, value in expected.items():
+                actual = data[key]
+                valid = valid and (np.array_equal(actual, value) if isinstance(value, np.ndarray)
+                                   else actual.item() == value)
+            return target if valid else None
+    except Exception:
+        return None
+
+
+def run_dynamic_stage(args, proxy_dir, proxy_epochs, known, unseen, labels, info,
+                      *, upstream_dirty=False):
     cache_dir = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model, proxy_epochs)["dynamic"]
     components = {}
-    if args.skip_saved:
+    reuse = stage_reuse_requested(args, 4, upstream_dirty=upstream_dirty)
+    if reuse:
         for name in COMPONENTS:
             cached = load_dynamic_component_cache(cache_dir / f"{name}.npz", name, args, known,
                                                    unseen, labels, proxy_epochs, info)
             if cached is not None: components[name] = cached
     missing = [name for name in COMPONENTS if name not in components]
-    if not missing: return components
-    old_labels = dynamic_utils.load_dataset_labels
-    dynamic_utils.load_dataset_labels = lambda *_: labels.copy()
-    try:
-        folds, labels_all = dynamic_utils.load_cv_fold_logs(proxy_dir, args.dataset, str(args.data_root))
-    finally:
-        dynamic_utils.load_dataset_labels = old_labels
+    pseudo = (load_pseudo_labels_cache(cache_dir / "pseudo_labels.npz", args, known, unseen,
+                                       labels, proxy_epochs, info) if reuse and not missing else None)
+    if not missing and pseudo is not None:
+        print(f"[Stage 4][Reuse] valid A,C,T and pseudo labels: {cache_dir}")
+        return components, pseudo, False
+    folds = labels_all = None
+    if missing:
+        old_labels = dynamic_utils.load_dataset_labels
+        dynamic_utils.load_dataset_labels = lambda *_: labels.copy()
+        try:
+            folds, labels_all = dynamic_utils.load_cv_fold_logs(proxy_dir, args.dataset, str(args.data_root))
+        finally:
+            dynamic_utils.load_dataset_labels = old_labels
     for name in missing:
         value = COMPONENTS[name]().compute(folds=folds, labels_all=labels_all)
         components[name] = value
         _atomic_savez(cache_dir / f"{name}.npz", labels=labels_all, raw_foldwise=value.raw_foldwise,
             fold_normalized=value.fold_normalized, aggregated=value.aggregated,
             final_normalized=value.final_normalized, component=name, exp=args.exp, dataset=args.dataset,
-            seed=args.seed, known_ratio=args.config.known_ratio, unseen_ratio=args.config.unseen_ratio,
-            known_indices=known, unseen_indices=unseen, proxy_model=args.proxy_model,
-            proxy_epochs=proxy_epochs, clip_model=args.clip_model,
-            static_reference_scope=args.config.static_reference_scope, selection_scope=args.config.selection_scope,
-            corruption_types=info.corruption_types if info else np.empty(0, np.int16),
-            is_corrupted=info.is_corrupted if info else np.empty(0, bool))
-    return components
+            **_dynamic_metadata(args, known, unseen, labels_all, proxy_epochs, info))
+    pseudo, _ = build_dynamic_target(components)
+    _atomic_savez(cache_dir / "pseudo_labels.npz", dynamic_target=pseudo,
+                  **_dynamic_metadata(args, known, unseen, labels, proxy_epochs, info))
+    reused = ",".join(name for name in COMPONENTS if name not in missing) or "none"
+    print(f"[Stage 4][Partial reuse] reused {reused}; recomputed {','.join(missing) or 'pseudo labels'} and pseudo labels")
+    return components, pseudo, True
 
 
-def prepare_proxy_and_weights(args, known, unseen, static, full_factory, info=None):
-    """Check weights first; only then prepare proxy and missing A/C/T components."""
+def get_dynamic_components(args, proxy_dir, proxy_epochs, known, unseen, labels, info):
+    """Compatibility wrapper returning the three mathematical components."""
+    return run_dynamic_stage(args, proxy_dir, proxy_epochs, known, unseen, labels, info)[0]
+
+
+def prepare_proxy_and_weights(args, known, unseen, static, full_factory, info=None,
+                              *, proxy_upstream_dirty=False, weights_upstream_dirty=False):
+    """Execute stages 3--5 independently and propagate explicit dirty state."""
     epochs = resolve_proxy_epochs(args)
     weight_path = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model, epochs)["weights"]
-    if args.skip_saved:
-        cached = load_scoring_weights(weight_path, args, known, unseen, epochs, info)
-        if cached is not None: return cached
-    proxy_dir, actual_epochs = train_proxy_on_known(args, known, unseen, full_factory, info)
+    proxy_dir, actual_epochs, proxy_recomputed = train_proxy_on_known(
+        args, known, unseen, full_factory, info, upstream_dirty=proxy_upstream_dirty)
     if actual_epochs != epochs: raise RuntimeError("proxy epoch configuration changed during preparation")
     labels = np.asarray(static["labels"], dtype=np.int64)
-    components = get_dynamic_components(args, proxy_dir, epochs, known, unseen, labels, info)
-    dynamic_target, _ = build_dynamic_target(components)
+    _, dynamic_target, dynamic_recomputed = run_dynamic_stage(
+        args, proxy_dir, epochs, known, unseen, labels, info, upstream_dirty=proxy_recomputed)
+    dirty = weights_upstream_dirty or proxy_recomputed or dynamic_recomputed
+    if stage_reuse_requested(args, 5, upstream_dirty=dirty):
+        cached = load_scoring_weights(weight_path, args, known, unseen, epochs, info)
+        if cached is not None:
+            print(f"[Stage 5][Reuse] valid scoring weights: {weight_path}")
+            return cached, (proxy_recomputed, dynamic_recomputed, False)
+    print("[Stage 5][Dependency] refitting weights because an upstream stage changed" if dirty else
+          "[Stage 5][Force] refitting scoring weights")
     features = np.stack([standard_zscore_by_class(static[key], labels) for key in ("sa", "div", "dds")], axis=1)
     device = torch.device(args.device) if args.device else CONFIG.global_device
     fit = fit_softplus_ratio_regression(features, dynamic_target, ratio_lambda=1e-3,
@@ -628,18 +742,18 @@ def prepare_proxy_and_weights(args, known, unseen, static, full_factory, info=No
     entry = dict(sa=float(weights[0]), div=float(weights[1]), dds=float(weights[2]), bias=float(fit["bias"]),
         ratio_lambda=1e-3, exp=args.exp, dataset=args.dataset, seed=args.seed,
         known_ratio=args.config.known_ratio, unseen_ratio=args.config.unseen_ratio,
-        known_indices=known.tolist(), unseen_indices=unseen.tolist(), proxy_model=args.proxy_model,
+        known_count=len(known), unseen_count=len(unseen), split_fingerprint=split_fingerprint(known, unseen),
+        unseen_indices=unseen.tolist(), proxy_model=args.proxy_model,
         proxy_epochs=epochs, clip_model=args.clip_model, static_reference_scope=args.config.static_reference_scope,
         selection_scope=args.config.selection_scope, **_json_corruption_context(info))
     try: payload = json.loads(weight_path.read_text()) if weight_path.exists() else {}
     except (OSError, json.JSONDecodeError): payload = {}
     payload.setdefault(args.dataset, {})[str(args.seed)] = entry
-    _atomic_json(weight_path, payload)
-    return {key: entry[key] for key in ("sa", "div", "dds")}
+    write_weight_payload(weight_path, payload)
+    return {key: entry[key] for key in ("sa", "div", "dds")}, (proxy_recomputed, dynamic_recomputed, True)
 
 
 def static_reference_scope(args, cache_kind):
-    if args.exp == 2: return "known" if cache_kind == "calibration" else "unseen"
     return "full_corrupted" if args.exp == 3 else "full"
 
 
@@ -677,13 +791,19 @@ def load_static_cache(path, args, cache_kind, labels, sample_indices, known, uns
         return None
 
 
-def compute_static_scores(args, dataset, adapter_dir, cache_kind, known, unseen, info):
+def compute_static_scores(args, dataset, adapter_dir, cache_kind, known, unseen, info,
+                          *, upstream_dirty=False, return_status=False):
     path = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model)[f"{cache_kind}_static"]
     labels = get_targets(dataset)
     sample_indices = static_sample_indices(dataset)
-    if args.skip_saved:
+    reuse = stage_reuse_requested(args, 2, upstream_dirty=upstream_dirty)
+    if reuse:
         cached = load_static_cache(path, args, cache_kind, labels, sample_indices, known, unseen, info)
-        if cached is not None: return cached
+        if cached is not None:
+            print(f"[Stage 2][Reuse] valid static scores: {path}")
+            return (cached, False) if return_status else cached
+    print("[Stage 2][Dependency] recomputing static scores" if upstream_dirty else
+          "[Stage 2][Force] recomputing static scores")
     device = torch.device(args.device) if args.device else CONFIG.global_device
     classes = resolve_class_names_for_prompts(args.dataset, args.data_root, dataset.classes)
     dds = DifficultyDirection(class_names=classes, clip_model=args.clip_model, device=device)
@@ -710,14 +830,14 @@ def compute_static_scores(args, dataset, adapter_dir, cache_kind, known, unseen,
         cache_kind=cache_kind, sample_indices=sample_indices,
         corruption_types=info.corruption_types if info else np.empty(0, np.int16),
         is_corrupted=info.is_corrupted if info else np.empty(0, bool))
-    return {"sa": sa_scores, "div": div_scores, "dds": dds_scores, "labels": labels}
+    result = {"sa": sa_scores, "div": div_scores, "dds": dds_scores, "labels": labels}
+    return (result, True) if return_status else result
 
 
 def invalidate_adapter_dependents(args) -> None:
     """Invalidate caches derived from a newly trained adapter, without involving mode."""
     paths = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model)
     paths["selection_static"].unlink(missing_ok=True)
-    paths["calibration_static"].unlink(missing_ok=True)
     weight_path = paths["weights"]
     if not weight_path.is_file():
         return
@@ -733,19 +853,17 @@ def invalidate_adapter_dependents(args) -> None:
 
 
 def resolve_group_weights(args, known, unseen, static_selection, known_ds, selection_ds,
-                          adapter, full_factory, info):
+                          adapter, full_factory, info, *, upstream_dirty=False,
+                          return_status=False):
     """Choose naive constants or run the learned-only calibration pipeline."""
     if args.mode == "naive_group":
-        return {"sa": 1/3, "div": 1/3, "dds": 1/3}
-    epochs = resolve_proxy_epochs(args)
-    weight_path = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model, epochs)["weights"]
-    weights = load_scoring_weights(weight_path, args, known, unseen, epochs, info) if args.skip_saved else None
-    if weights is None:
-        calibration_ds = known_ds if args.exp == 2 else selection_ds
-        static_calibration = (compute_static_scores(args, calibration_ds, adapter, "calibration", known, unseen, info)
-                              if args.exp == 2 else {k: v[known] for k, v in static_selection.items()})
-        weights = prepare_proxy_and_weights(args, known, unseen, static_calibration, full_factory, info)
-    return weights
+        result = {"sa": 1/3, "div": 1/3, "dds": 1/3}
+        return (result, False) if return_status else result
+    static_calibration = {key: value[known] for key, value in static_selection.items()}
+    weights, statuses = prepare_proxy_and_weights(
+        args, known, unseen, static_calibration, full_factory, info,
+        weights_upstream_dirty=upstream_dirty)
+    return (weights, any(statuses)) if return_status else weights
 
 
 def run_group_solver(args, static, dataset, adapter_dir, weights, target_size):
@@ -776,15 +894,18 @@ def run_group_solver(args, static, dataset, adapter_dir, weights, target_size):
 
 def main() -> None:
     args = parse_args(); set_seed(args.seed)
+    print(f"Requested reusable stages: {sorted(args.skip_saved_stages)}")
+    print(f"Forced stages: {sorted(ALL_STAGES - args.skip_saved_stages)}")
     raw = build_raw_dataset(args.dataset, args.data_root)
     full, known_ds, unseen_ds, known, unseen, info = build_protocol_datasets(args, raw)
-    valid = {kr: args.skip_saved and mask_cache_valid(mask_path_for(args.exp, args.mode, args.dataset, args.seed, kr),
-             args, len(full), known, unseen, info, kr) for kr in args.keep_ratios}
-    if all(valid.values()): return
-    pending = [kr for kr in args.keep_ratios if not valid[kr]]
-    pool_indices = unseen if args.config.selection_scope == "unseen" else np.arange(len(full), dtype=np.int64)
+    pool_indices = np.arange(len(full), dtype=np.int64)
     if args.mode == "random":
-        for kr in pending:
+        for stage in range(1, 6): print(f"[Stage {stage}][Not applicable] mode=random")
+        for kr in args.keep_ratios:
+            path = mask_path_for(args.exp, args.mode, args.dataset, args.seed, kr)
+            if stage_reuse_requested(args, 6) and mask_cache_valid(path, args, len(full), known, unseen, info, kr):
+                print(f"[Stage 6][Reuse] valid mask, kr={kr}: {path}"); continue
+            print(f"[Stage 6][Force] regenerating mask, kr={kr}")
             target = round(len(full) * kr / 100)
             save_mask(args, generate_random_mask(pool_indices, len(full), target, args.seed, args.exp, kr), known, unseen, info, kr)
         return
@@ -794,18 +915,25 @@ def main() -> None:
         if info is not None: return FixedCorruptionDataset(base, transform=transform, corruption_info=info)
         base.transform = transform; return base
     adapter, adapter_recomputed = train_adapter_on_known(args, known, unseen, full_factory, info)
-    if adapter_recomputed:
-        invalidate_adapter_dependents(args)
-    selection_ds = unseen_ds if args.config.selection_scope == "unseen" else full
-    static_selection = compute_static_scores(args, selection_ds, adapter, "selection", known, unseen, info)
-    weights = resolve_group_weights(args, known, unseen, static_selection, known_ds, selection_ds,
-                                    adapter, full_factory, info)
-    for kr in pending:
+    static_selection, static_recomputed = compute_static_scores(
+        args, full, adapter, "selection", known, unseen, info,
+        upstream_dirty=adapter_recomputed, return_status=True)
+    if args.mode == "naive_group":
+        for stage in (3, 4, 5): print(f"[Stage {stage}][Not applicable] mode=naive_group")
+        weights, weights_dirty = {"sa": 1/3, "div": 1/3, "dds": 1/3}, False
+    else:
+        weights, weights_dirty = resolve_group_weights(
+            args, known, unseen, static_selection, known_ds, full, adapter, full_factory, info,
+            upstream_dirty=static_recomputed, return_status=True)
+    stage6_dirty = adapter_recomputed or static_recomputed or weights_dirty
+    for kr in args.keep_ratios:
+        path = mask_path_for(args.exp, args.mode, args.dataset, args.seed, kr)
+        if stage_reuse_requested(args, 6, upstream_dirty=stage6_dirty) and mask_cache_valid(
+                path, args, len(full), known, unseen, info, kr):
+            print(f"[Stage 6][Reuse] valid mask, kr={kr}: {path}"); continue
+        print(f"[Stage 6][{'Dependency' if stage6_dirty else 'Force'}] regenerating mask, kr={kr}")
         target = round(len(full) * kr / 100)
-        if target > len(selection_ds): raise ValueError(f"global target {target} exceeds selection pool {len(selection_ds)}")
-        local = run_group_solver(args, static_selection, selection_ds, adapter, weights, target)
-        mask = local if args.config.selection_scope == "full" else np.zeros(len(full), np.uint8)
-        if args.config.selection_scope == "unseen": mask[unseen] = local
+        mask = run_group_solver(args, static_selection, full, adapter, weights, target)
         save_mask(args, mask, known, unseen, info, kr)
 
 

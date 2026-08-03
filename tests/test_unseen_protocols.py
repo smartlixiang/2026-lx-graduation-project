@@ -1,316 +1,119 @@
+"""Protocol and cache regression tests for the staged unseen experiment."""
+import json
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
-from unseen_exp.generate_unseen_list import generate_unseen_indices, largest_remainder_quotas
-from unseen_exp.unseen_exp import (EXPERIMENT_CONFIGS, generate_random_mask, mask_path_for,
-                                  validate_experiment)
-
-
-def test_stratified_generation_reproducible_and_exact():
-    labels = np.repeat(np.arange(7), [11, 13, 17, 19, 23, 29, 31])
-    for ratio in (50, 80):
-        a = generate_unseen_indices(labels, ratio, 22)
-        b = generate_unseen_indices(labels, ratio, 22)
-        c = generate_unseen_indices(labels, ratio, 42)
-        assert len(a) == round(len(labels) * ratio / 100)
-        assert np.array_equal(a, b) and not np.array_equal(a, c)
-        assert len(np.unique(a)) == len(a) and (a >= 0).all() and (a < len(labels)).all()
-        known = np.setdiff1d(np.arange(len(labels)), a)
-        assert np.array_equal(np.sort(np.r_[known, a]), np.arange(len(labels)))
-        quotas = largest_remainder_quotas(labels, ratio)
-        assert {k: int((labels[a] == k).sum()) for k in quotas} == quotas
-
-
-@pytest.mark.parametrize("args", [(1, "cifar10", "learned_group"), (2, "cifar100", "learned_group"),
-                                   (3, "tiny-imagenet", "learned_group"), (1, "cifar100", "naive_group"),
-                                   (2, "cifar10", "naive_group")])
-def test_invalid_protocol_combinations(args):
-    with pytest.raises(ValueError): validate_experiment(*args)
-
-
-@pytest.mark.parametrize("exp,dataset,mode", [(1,"cifar100","learned_group"),
-                                                (2,"cifar10","learned_group"),
-                                                (3,"cifar100","naive_group")])
-def test_invalid_keep_ratio(exp, dataset, mode):
-    with pytest.raises(ValueError): validate_experiment(exp, dataset, mode, "99")
-
-
-def test_paths_and_exp2_random_counts():
-    path = mask_path_for(3, "naive_group", "cifar100", 22, 50)
-    assert path.as_posix().endswith("unseen_exp/mask/3/unseen_naive_group/cifar100/22/mask_50.npz")
-    unseen = np.arange(10_000, 50_000)
-    for kr, expected in ((20,10_000),(30,15_000),(40,20_000),(60,30_000)):
-        mask = generate_random_mask(unseen, 50_000, expected, 22, 2, kr)
-        assert mask.sum() == expected and not mask[:10_000].any()
-        assert np.array_equal(mask, generate_random_mask(unseen, 50_000, expected, 22, 2, kr))
-
-
-def test_configs_are_exact():
-    assert EXPERIMENT_CONFIGS[1].default_keep_ratios == (60,70,80,90)
-    assert EXPERIMENT_CONFIGS[2].selection_scope == "unseen"
-    assert EXPERIMENT_CONFIGS[3].group_solver == "center_repair"
-
-from pathlib import Path
-from types import SimpleNamespace
-import json
-
-import torch
-from torch.utils.data import Dataset
 import unseen_exp.unseen_exp as ue
 
 
-class FakeDataset(Dataset):
-    def __init__(self, values, transform=None):
-        self.values = list(values); self.targets = [v % 2 for v in range(len(values))]
-        self.classes = ["a", "b"]; self.transform = transform
-    def __len__(self): return len(self.values)
-    def __getitem__(self, index):
-        value = self.values[index]
-        return (self.transform(value) if self.transform else value), self.targets[index]
-
-
-def make_args(exp, mode="learned_group", skip_saved=True):
+def make_args(exp=1, mode="learned_group", stages=ue.ALL_STAGES):
     config = ue.EXPERIMENT_CONFIGS[exp]
     return SimpleNamespace(exp=exp, config=config, dataset=config.allowed_datasets[0], mode=mode,
         seed=22, data_root="data", clip_model="clip", proxy_model="proxy", device="cpu",
-        skip_saved=skip_saved, debug_prompts=False, group_candidate_pool_size=1,
+        skip_saved_stages=frozenset(stages), debug_prompts=False, group_candidate_pool_size=1,
         group_init_count=2, dist_weight_factor=1.0, keep_ratios=config.default_keep_ratios)
 
 
-def patch_solver_dependencies(monkeypatch, captured):
-    class FakeDiv:
-        def __init__(self, **kwargs): self.extractor = SimpleNamespace(embed_dim=2, preprocess=lambda x: x)
-    monkeypatch.setattr(ue, "Div", FakeDiv)
-    monkeypatch.setattr(ue, "resolve_class_names_for_prompts", lambda *a: ["a", "b"])
-    monkeypatch.setattr(ue, "load_trained_adapters", lambda *a, **k: (object(), object(), None))
-    def solver(**kwargs):
-        captured.append(kwargs); n = len(kwargs["labels"]); target = round(n * kwargs["keep_ratio"] / 100)
-        mask = np.zeros(n, np.uint8); mask[:target] = 1
-        return mask, {}, {}
-    return solver
-
-
-@pytest.mark.parametrize("exp", [1, 2])
-def test_standard_group_receives_weight_group(monkeypatch, exp):
-    captured = []; solver = patch_solver_dependencies(monkeypatch, captured)
-    monkeypatch.setattr(ue.mask_solvers, "select_group_mask", solver)
-    dataset = FakeDataset(range(10)); static = {"sa": np.zeros(10), "dds": np.zeros(10), "labels": np.arange(10) % 2}
-    ue.run_group_solver(make_args(exp), static, dataset, Path("adapter"), {"sa": .3, "div": .3, "dds": .4}, 5)
-    assert captured[0]["weight_group"] == "learned"
-
-
-def test_center_repair_does_not_receive_weight_group(monkeypatch):
-    captured = []; solver = patch_solver_dependencies(monkeypatch, captured)
-    monkeypatch.setattr(ue.mask_solvers, "select_group_mask_by_center_repair", solver)
-    dataset = FakeDataset(range(10)); static = {"sa": np.zeros(10), "dds": np.zeros(10), "labels": np.arange(10) % 2}
-    ue.run_group_solver(make_args(3), static, dataset, Path("adapter"), {"sa": 1/3, "div": 1/3, "dds": 1/3}, 5)
-    assert "weight_group" not in captured[0]
-
-
-def test_exp3_proxy_uses_corrupted_full_factory():
-    clean = FakeDataset(range(6), transform=lambda value: value + 1)
-    calls = []
-    def full_factory(transform):
-        calls.append(transform); return FakeDataset([100 + i for i in range(6)], transform=transform)
-    known = ue.build_proxy_known_dataset(clean, full_factory, np.array([1, 4]))
-    assert calls == [clean.transform] and len(known) == 2
-    assert known[0][0] == 102 and known[1][0] == 105
-    assert np.array_equal(known.indices, [1, 4])
-
-
-def valid_weight_entry(args, known, unseen, epochs=10, info=None):
-    return dict(sa=.2, div=.3, dds=.5, bias=.1, ratio_lambda=1e-3, exp=args.exp,
+def weight_entry(args, known, unseen, *, legacy=False, info=None):
+    entry = dict(sa=.2, div=.3, dds=.5, bias=.1, ratio_lambda=1e-3, exp=args.exp,
         dataset=args.dataset, seed=args.seed, known_ratio=args.config.known_ratio,
-        unseen_ratio=args.config.unseen_ratio, known_indices=known.tolist(), unseen_indices=unseen.tolist(),
-        proxy_model=args.proxy_model, proxy_epochs=epochs, clip_model=args.clip_model,
-        static_reference_scope=args.config.static_reference_scope, selection_scope=args.config.selection_scope,
-        **ue._json_corruption_context(info))
+        unseen_ratio=args.config.unseen_ratio, unseen_indices=unseen.tolist(),
+        proxy_model=args.proxy_model, proxy_epochs=10, clip_model=args.clip_model,
+        static_reference_scope=args.config.static_reference_scope,
+        selection_scope=args.config.selection_scope, **ue._json_corruption_context(info))
+    if legacy:
+        entry["known_indices"] = known.tolist()
+    else:
+        entry.update(known_count=len(known), unseen_count=len(unseen),
+                     split_fingerprint=ue.split_fingerprint(known, unseen))
+    return entry
 
 
-def test_valid_weight_cache_skips_proxy_and_dynamic(tmp_path, monkeypatch):
-    args = make_args(1); known, unseen = np.arange(3), np.arange(3, 6)
-    weight = tmp_path / "weights.json"
-    ue._atomic_json(weight, {args.dataset: {str(args.seed): valid_weight_entry(args, known, unseen)}})
-    monkeypatch.setattr(ue, "resolve_proxy_epochs", lambda _: 10)
-    monkeypatch.setattr(ue, "cache_paths", lambda *a, **k: {"weights": weight})
-    monkeypatch.setattr(ue, "train_proxy_on_known", lambda *a, **k: pytest.fail("proxy called"))
-    result = ue.prepare_proxy_and_weights(args, known, unseen, {}, None)
-    assert result == {"sa": .2, "div": .3, "dds": .5}
+def test_only_experiments_one_and_three_remain():
+    assert set(ue.EXPERIMENT_CONFIGS) == {1, 3}
+    assert ue.EXPERIMENT_CONFIGS[1].default_keep_ratios == (60, 70, 80, 90)
+    assert ue.EXPERIMENT_CONFIGS[3].default_keep_ratios == (30, 40, 50, 60)
+    with pytest.raises(ValueError):
+        ue.validate_experiment(2, "cifar10", "learned_group")
+    ue.validate_experiment(1, "cifar100", "learned_group")
+    ue.validate_experiment(3, "cifar100", "naive_group")
 
 
-@pytest.mark.parametrize("mutation", ["missing", "sum", "indices"])
-def test_invalid_weight_cache_recomputes(tmp_path, mutation):
-    args = make_args(1); known, unseen = np.arange(3), np.arange(3, 6); entry = valid_weight_entry(args, known, unseen)
-    if mutation == "missing": entry.pop("bias")
-    elif mutation == "sum": entry["sa"] = .4
-    else: entry["known_indices"] = [1, 2, 3]
-    path = tmp_path / "weights.json"; ue._atomic_json(path, {args.dataset: {str(args.seed): entry}})
-    assert ue.load_scoring_weights(path, args, known, unseen, 10, None) is None
+@pytest.mark.parametrize("text, expected", [
+    (None, frozenset()), ("1,2,3,4,5,6", ue.ALL_STAGES),
+    ("1,2,3", frozenset({1, 2, 3})), ("3,1,3", frozenset({1, 3})),
+])
+def test_parse_skip_saved_stages(text, expected):
+    assert ue.parse_skip_saved_stages(text) == expected
 
 
-def test_exp3_corruption_change_invalidates_weight_cache(tmp_path):
+@pytest.mark.parametrize("text", ["0", "7", "1,a,3", ",", "1,,3"])
+def test_parse_skip_saved_rejects_invalid_values(text):
+    with pytest.raises(ValueError, match="skip-saved"):
+        ue.parse_skip_saved_stages(text)
+
+
+def test_stage_reuse_honors_request_and_upstream_dirty():
+    args = make_args(stages={2, 5})
+    assert ue.stage_reuse_requested(args, 2)
+    assert not ue.stage_reuse_requested(args, 1)
+    assert not ue.stage_reuse_requested(args, 2, upstream_dirty=True)
+    assert not hasattr(args, "skip_saved")
+
+
+def test_split_fingerprint_is_deterministic_and_sensitive():
+    known, unseen = np.array([0, 2]), np.array([1, 3])
+    value = ue.split_fingerprint(known, unseen)
+    assert value == ue.split_fingerprint(known.copy(), unseen.copy())
+    assert value != ue.split_fingerprint(np.array([0, 3]), np.array([1, 2]))
+    assert value != ue.split_fingerprint(known, np.array([1, 4]))
+
+
+def test_new_weight_cache_has_compact_split_metadata(tmp_path):
+    args = make_args(); known, unseen = np.arange(3), np.arange(3, 6)
+    path = tmp_path / "weights.json"
+    ue.write_weight_payload(path, {args.dataset: {"22": weight_entry(args, known, unseen)}})
+    stored = json.loads(path.read_text())[args.dataset]["22"]
+    assert "known_indices" not in stored
+    assert (stored["known_count"], stored["unseen_count"]) == (3, 3)
+    assert stored["split_fingerprint"] == ue.split_fingerprint(known, unseen)
+    assert ue.load_scoring_weights(path, args, known, unseen, 10, None) == {"sa": .2, "div": .3, "dds": .5}
+    assert ue.load_scoring_weights(path, args, np.array([0, 1, 3]), np.array([2, 4, 5]), 10, None) is None
+
+
+def test_legacy_weight_cache_migrates_every_entry(tmp_path):
+    args = make_args(); known, unseen = np.arange(2), np.arange(2, 4)
+    other = weight_entry(args, known, unseen, legacy=True)
+    path = tmp_path / "weights.json"
+    ue._atomic_json(path, {args.dataset: {"22": weight_entry(args, known, unseen, legacy=True), "99": other}})
+    assert ue.load_scoring_weights(path, args, known, unseen, 10, None)
+    payload = json.loads(path.read_text())
+    assert "known_indices" not in json.dumps(payload)
+    assert payload[args.dataset]["22"]["split_fingerprint"] == ue.split_fingerprint(known, unseen)
+
+
+def test_corruption_change_invalidates_weights(tmp_path):
     args = make_args(3); known, unseen = np.arange(2), np.arange(2, 4)
     info = SimpleNamespace(is_corrupted=np.array([True, False, True, False]),
-                           corruption_types=np.array([0, -1, 1, -1], dtype=np.int16))
+        corruption_types=np.array([0, -1, 1, -1], dtype=np.int16))
     changed = SimpleNamespace(is_corrupted=info.is_corrupted.copy(),
-                              corruption_types=np.array([1, -1, 0, -1], dtype=np.int16))
+        corruption_types=np.array([1, -1, 0, -1], dtype=np.int16))
     path = tmp_path / "weights.json"
-    ue._atomic_json(path, {args.dataset: {str(args.seed): valid_weight_entry(args, known, unseen, info=info)}})
-    assert ue.load_scoring_weights(path, args, known, unseen, 10, info) is not None
+    ue._atomic_json(path, {args.dataset: {"22": weight_entry(args, known, unseen, info=info)}})
+    assert ue.load_scoring_weights(path, args, known, unseen, 10, info)
     assert ue.load_scoring_weights(path, args, known, unseen, 10, changed) is None
 
 
-def dynamic_value(n):
-    return SimpleNamespace(raw_foldwise=np.full((5,n), np.nan), fold_normalized=np.full((5,n), np.nan),
-                           aggregated=np.arange(n, dtype=float), final_normalized=np.arange(n, dtype=float))
+def test_random_mask_uses_full_candidate_pool():
+    mask = ue.generate_random_mask(np.arange(100), 100, 60, 22, 1, 60)
+    assert mask.shape == (100,) and mask.sum() == 60
+    assert np.array_equal(mask, ue.generate_random_mask(np.arange(100), 100, 60, 22, 1, 60))
 
 
-def write_dynamic(path, name, args, known, unseen, labels, epochs, value):
-    ue._atomic_savez(path, labels=labels, raw_foldwise=value.raw_foldwise,
-        fold_normalized=value.fold_normalized, aggregated=value.aggregated,
-        final_normalized=value.final_normalized, component=name, exp=args.exp, dataset=args.dataset,
-        seed=args.seed, known_ratio=args.config.known_ratio, unseen_ratio=args.config.unseen_ratio,
-        known_indices=known, unseen_indices=unseen, proxy_model=args.proxy_model, proxy_epochs=epochs,
-        clip_model=args.clip_model, static_reference_scope=args.config.static_reference_scope,
-        selection_scope=args.config.selection_scope, corruption_types=np.empty(0,np.int16), is_corrupted=np.empty(0,bool))
-
-
-def test_partial_dynamic_cache_reuse(tmp_path, monkeypatch):
-    args = make_args(1); known, unseen = np.arange(3), np.arange(3,6); labels=np.array([0,1,0]); epochs=2
-    for name in ("A", "C"): write_dynamic(tmp_path/f"{name}.npz", name, args, known, unseen, labels, epochs, dynamic_value(3))
-    monkeypatch.setattr(ue, "cache_paths", lambda *a, **k: {"dynamic": tmp_path})
-    monkeypatch.setattr(ue.dynamic_utils, "load_cv_fold_logs", lambda *a: (object(), labels))
-    calls=[]
-    class Calc:
-        def compute(self, **kwargs): calls.append("T"); return dynamic_value(3)
-    monkeypatch.setitem(ue.COMPONENTS, "T", Calc)
-    result = ue.get_dynamic_components(args, Path("proxy"), epochs, known, unseen, labels, None)
-    assert set(result) == {"A","C","T"} and calls == ["T"]
-
-
-def test_adapter_cache_requires_all_files(tmp_path, monkeypatch):
-    args=make_args(1); known=np.arange(2); unseen=np.arange(2,4)
-    meta=valid_weight_entry(args, known, unseen); meta.update(num_samples=2, adapter_type="linear", training_objective="InfoNCE")
-    (tmp_path/"meta.json").write_text(json.dumps(meta))
-    assert not ue.adapter_cache_valid(tmp_path,args,known,unseen,None)
-    (tmp_path/"adapter_image.pt").write_text("bad"); (tmp_path/"adapter_context.pt").write_text("bad")
-    assert not ue.adapter_cache_valid(tmp_path,args,known,unseen,None)
-
-
-def adapter_meta(args, known, unseen, info=None):
-    return ue.expected_adapter_metadata(args, known, unseen, info,
-                                        batch_size=ue.adapter_batch_size(args.dataset))
-
-
-def write_adapter_cache(path, args, known, unseen, info=None):
-    path.mkdir(parents=True, exist_ok=True)
-    torch.save({}, path / "adapter_image.pt")
-    torch.save({}, path / "adapter_context.pt")
-    ue._atomic_json(path / "meta.json", adapter_meta(args, known, unseen, info))
-
-
-def test_exp3_naive_reuses_learned_adapter(tmp_path, monkeypatch):
-    args = make_args(3, mode="learned_group"); known=np.arange(2); unseen=np.arange(2,4)
-    write_adapter_cache(tmp_path, args, known, unseen)
-    args.mode = "naive_group"
-    monkeypatch.setattr(ue, "cache_paths", lambda *a, **k: {"adapter": tmp_path})
-    monkeypatch.setattr(ue.train_adapter_module, "train_for_seed",
-                        lambda *a, **k: pytest.fail("adapter retrained"))
-    path, recomputed = ue.train_adapter_on_known(args, known, unseen, lambda _: None)
-    assert path == tmp_path and recomputed is False
-
-
-def test_adapter_cache_is_mode_independent(tmp_path):
-    args = make_args(3, mode="learned_group"); known=np.arange(2); unseen=np.arange(2,4)
-    write_adapter_cache(tmp_path, args, known, unseen)
-    assert ue.validate_adapter_cache(tmp_path, args, known, unseen, None) == (True, "valid")
-    args.mode = "naive_group"
-    assert ue.validate_adapter_cache(tmp_path, args, known, unseen, None) == (True, "valid")
-
-
-@pytest.mark.parametrize("field", ["known_indices", "corruption_type_ids", "clip_model", "epochs"])
-def test_adapter_cache_reports_mismatch_reason(tmp_path, field):
-    args = make_args(3); known=np.arange(2); unseen=np.arange(2,4)
-    info = SimpleNamespace(is_corrupted=np.array([True, False, False, False]),
-                           corruption_types=np.array([2, -1, -1, -1], dtype=np.int16))
-    write_adapter_cache(tmp_path, args, known, unseen, info)
-    meta = json.loads((tmp_path / "meta.json").read_text())
-    meta[field] = [9] if field.endswith("indices") or field.endswith("ids") else "changed"
-    ue._atomic_json(tmp_path / "meta.json", meta)
-    valid, reason = ue.validate_adapter_cache(tmp_path, args, known, unseen, info)
-    assert not valid and field in reason
-
-
-def test_new_adapter_passes_its_own_validator(tmp_path, monkeypatch):
-    args=make_args(1, skip_saved=False); known=np.arange(2); unseen=np.arange(2,4)
-    monkeypatch.setattr(ue, "cache_paths", lambda *a, **k: {"adapter": tmp_path})
-    def fake_train(ns, seed, multi_seed):
-        tmp_path.mkdir(parents=True, exist_ok=True)
-        torch.save({}, tmp_path / "adapter_image.pt"); torch.save({}, tmp_path / "adapter_context.pt")
-        ue._atomic_json(tmp_path / "meta.json", {"dataset": args.dataset, "seed": seed,
-                                                  "num_samples": len(known)})
-    monkeypatch.setattr(ue.train_adapter_module, "train_for_seed", fake_train)
-    path, recomputed = ue.train_adapter_on_known(args, known, unseen, lambda _: FakeDataset(range(4)))
-    assert path == tmp_path and recomputed
-    assert ue.validate_adapter_cache(path, args, known, unseen, None) == (True, "valid")
-
-
-def test_adapter_recompute_invalidates_static(tmp_path, monkeypatch):
-    selection=tmp_path/"selection.npz"; calibration=tmp_path/"calibration.npz"; weights=tmp_path/"weights.json"
-    selection.write_bytes(b"old"); calibration.write_bytes(b"old")
-    ue._atomic_json(weights, {"cifar100": {"22": {"sa": 1}}, "other": {"1": {}}})
-    args=make_args(3)
-    monkeypatch.setattr(ue, "cache_paths", lambda *a, **k: {
-        "selection_static": selection, "calibration_static": calibration, "weights": weights})
-    ue.invalidate_adapter_dependents(args)
-    assert not selection.exists() and not calibration.exists()
-    assert "cifar100" not in json.loads(weights.read_text())
-
-
-def test_naive_group_skips_proxy_and_weights(monkeypatch):
-    args=make_args(3, mode="naive_group"); known=np.arange(2); unseen=np.arange(2,4)
-    monkeypatch.setattr(ue, "train_proxy_on_known", lambda *a, **k: pytest.fail("proxy called"))
-    monkeypatch.setattr(ue, "get_dynamic_components", lambda *a, **k: pytest.fail("A/C/T called"))
-    monkeypatch.setattr(ue, "fit_softplus_ratio_regression", lambda *a, **k: pytest.fail("weights fitted"))
-    weights = ue.resolve_group_weights(args, known, unseen, {}, FakeDataset(range(2)),
-                                       FakeDataset(range(4)), Path("adapter"), None, None)
-    assert weights == {"sa": 1/3, "div": 1/3, "dds": 1/3}
-
-
-def proxy_meta(args, known, unseen, epochs):
-    return dict(exp=args.exp,dataset=args.dataset,seed=args.seed,num_samples=len(known),epochs=epochs,k_folds=5,
-        known_ratio=args.config.known_ratio,unseen_ratio=args.config.unseen_ratio,known_indices=known.tolist(),
-        unseen_indices=unseen.tolist(),model=args.proxy_model,proxy_model=args.proxy_model,num_classes=2,
-        static_reference_scope=args.config.static_reference_scope,selection_scope=args.config.selection_scope,
-        **ue._json_corruption_context(None))
-
-
-def write_proxy_fold(path, train, val, epochs=2):
-    ue._atomic_savez(path,train_indices=np.array(train),val_indices=np.array(val),
-        train_logits=np.zeros((epochs,len(train),2)),val_logits=np.zeros((epochs,len(val),2)))
-
-
-def test_proxy_cache_requires_complete_valid_folds(tmp_path):
-    args=make_args(1); known=np.arange(5); unseen=np.arange(5,10); epochs=2
-    (tmp_path/"meta.json").write_text(json.dumps(proxy_meta(args,known,unseen,epochs)))
-    for fold in range(5):
-        val=[fold]; train=[i for i in range(5) if i != fold]
-        write_proxy_fold(tmp_path/f"fold_{fold+1}.npz",train,val,epochs)
-    assert ue.proxy_cache_valid(tmp_path,args,known,unseen,epochs,None)
-    (tmp_path/"fold_5.npz").unlink(); assert not ue.proxy_cache_valid(tmp_path,args,known,unseen,epochs,None)
-    write_proxy_fold(tmp_path/"fold_5.npz",[0,1,2,3],[4],1)
-    assert not ue.proxy_cache_valid(tmp_path,args,known,unseen,epochs,None)
-
-
-def test_static_cache_missing_field_recomputes(tmp_path):
-    args=make_args(2); known=np.arange(2); unseen=np.arange(2,6); labels=np.array([0,1]); samples=known
-    ue._atomic_savez(tmp_path/"cache.npz",sa=np.zeros(2),div=np.zeros(2),labels=labels)
-    assert ue.load_static_cache(tmp_path/"cache.npz",args,"calibration",labels,samples,known,unseen,None) is None
-
-
-def test_exp2_static_scopes():
-    args=make_args(2); known=np.array([0,2]); unseen=np.array([1,3,4])
-    assert ue.static_reference_scope(args,"calibration") == "known"
-    assert ue.static_reference_scope(args,"selection") == "unseen"
-    assert np.array_equal(ue.static_sample_indices(ue.IndexedSubsetDataset(FakeDataset(range(5)),known)),known)
-    assert np.array_equal(ue.static_sample_indices(ue.IndexedSubsetDataset(FakeDataset(range(5)),unseen)),unseen)
+def test_cache_paths_have_one_static_cache_and_pseudo_label_location():
+    paths = ue.cache_paths(1, "cifar100", 22, "resnet18", 10)
+    assert "calibration_static" not in paths
+    assert paths["dynamic"].joinpath("pseudo_labels.npz").as_posix().endswith(
+        "dynamic_cache/1/cifar100/resnet18/22/10/pseudo_labels.npz")

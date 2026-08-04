@@ -35,6 +35,7 @@ import calculate_my_mask as mask_solvers
 import train_adapter as train_adapter_module
 import train_proxy as train_proxy_module
 import weights.dynamic_utils as dynamic_utils
+from corruption_exp import corruption_opt
 from corruption_exp.cal_corruption_mask import (FixedCorruptionDataset, CorruptionInfo,
                                                   load_corruption_info)
 from dataset.dataset_config import CIFAR100, TINY_IMAGENET
@@ -75,6 +76,31 @@ COMPONENTS = {"A": AbsorptionGainScore, "C": ConfusionComplementarityScore,
               "T": TransferabilityScore}
 K_FOLDS = 5
 ALL_STAGES = frozenset(range(1, 7))
+# Keep this synchronized with learn_scoring_weights.py --ratio-lambda.
+RATIO_LAMBDA_DEFAULT = 1e-3
+CORRUPTION_TYPE_NAMES = tuple(
+    corruption_opt.CORRUPTION_ID_TO_NAME[type_id]
+    for type_id in range(corruption_opt.NUM_CORRUPTION_TYPES)
+)
+
+# Proxy schedules used only by the unseen-sample protocols. Tiny-ImageNet
+# keeps a longer high-LR phase (25 epochs) before the first decay because the
+# 20-epoch decay caused an abrupt early saturation in the observed curves.
+# The last value in
+# ``phase_boundaries`` is max_epochs, not a MultiStepLR milestone: a decay at
+# the final epoch would have no subsequent optimization step on which to act.
+UNSEEN_PROXY_SCHEDULES = {
+    CIFAR100: {
+        "epochs": 100,
+        "lr_milestones": (40, 75),
+        "phase_boundaries": (40, 75, 100),
+    },
+    TINY_IMAGENET: {
+        "epochs": 45,
+        "lr_milestones": (15, 30),
+        "phase_boundaries": (15, 30, 45),
+    },
+}
 
 
 def parse_skip_saved_stages(text: str | None) -> frozenset[int]:
@@ -134,6 +160,12 @@ Experiment 3: corrupt full CIFAR-100 first, 50/50 views, full corrupted referenc
     parser.add_argument("--clip-model", default="ViT-B/32")
     parser.add_argument("--proxy-model", default="resnet18")
     parser.add_argument("--device")
+    # Stage 1: Train and cache the CLIP image and text Adapters on the known subset.
+    # Stage 2: Compute and cache the SA, Div, and DDS static scores.
+    # Stage 3: Train the proxy model with five-fold cross-validation and cache its logits.
+    # Stage 4: Extract A, C, and T, synthesize dynamic pseudo-labels, and cache them.
+    # Stage 5: Learn and save the weights combining the SA, Div, and DDS scores.
+    # Stage 6: Generate and save the group-based or random data-selection masks.
     parser.add_argument("--skip-saved", nargs="?", const="1,2,3,4,5,6", metavar="STAGES",
                         help="Comma-separated stages whose valid caches may be reused (bare flag: all stages).")
     parser.add_argument("--group-candidate-pool-size", type=int, default=10)
@@ -180,7 +212,54 @@ def corruption_context(info: CorruptionInfo | None) -> dict[str, np.ndarray]:
 
 
 def _json_corruption_context(info: CorruptionInfo | None) -> dict[str, list[int]]:
+    """Verbose corruption context retained for non-weight cache compatibility."""
     return {key: value.tolist() for key, value in corruption_context(info).items()}
+
+
+def corruption_fingerprint_from_arrays(indices: np.ndarray, type_ids: np.ndarray) -> str:
+    indices_array = np.ascontiguousarray(indices, dtype=np.int64)
+    type_array = np.ascontiguousarray(type_ids, dtype=np.int16)
+    if indices_array.ndim != 1 or type_array.ndim != 1:
+        raise ValueError("corruption indices and type ids must be one-dimensional")
+    if indices_array.shape[0] != type_array.shape[0]:
+        raise ValueError("corruption indices and type ids must have equal length")
+    digest = hashlib.sha256()
+    digest.update(indices_array.tobytes())
+    digest.update(b"\0CORRUPTION-TYPES\0")
+    digest.update(type_array.tobytes())
+    digest.update(np.asarray([indices_array.size], dtype=np.int64).tobytes())
+    return digest.hexdigest()
+
+
+def compact_corruption_context(info: CorruptionInfo | None) -> dict[str, Any]:
+    context = corruption_context(info)
+    indices = context["corruption_indices"]
+    type_ids = context["corruption_type_ids"]
+    return {
+        "corruption_count": int(indices.size),
+        "corruption_fingerprint": corruption_fingerprint_from_arrays(indices, type_ids),
+    }
+
+
+def _weight_corruption_matches(entry: dict[str, Any], info: CorruptionInfo | None) -> bool:
+    """Validate compact weight metadata while accepting the previous list format."""
+    expected_verbose = _json_corruption_context(info)
+    has_legacy = "corruption_indices" in entry or "corruption_type_ids" in entry
+    if has_legacy:
+        return (
+            entry.get("corruption_indices") == expected_verbose["corruption_indices"]
+            and entry.get("corruption_type_ids") == expected_verbose["corruption_type_ids"]
+        )
+
+    expected_compact = compact_corruption_context(info)
+    if info is None and "corruption_count" not in entry and "corruption_fingerprint" not in entry:
+        # Preserve compatibility with clean historical weight entries that did
+        # not record any corruption fields.
+        return True
+    return (
+        int(entry.get("corruption_count", -1)) == expected_compact["corruption_count"]
+        and entry.get("corruption_fingerprint") == expected_compact["corruption_fingerprint"]
+    )
 
 
 def _integer_vector(value: np.ndarray) -> bool:
@@ -282,6 +361,86 @@ def generate_random_mask(target_indices, full_num_samples, target_size, seed, ex
     return mask
 
 
+def print_scoring_weights(weights: dict[str, float]) -> None:
+    """Print the stage-5 static-score weights on one line."""
+    print(
+        "[Stage 5][Weights] "
+        f"SA={float(weights['sa']):.5f}, "
+        f"Div={float(weights['div']):.5f}, "
+        f"DDS={float(weights['dds']):.5f}"
+    )
+
+
+def corruption_type_mask_statistics(
+    mask: np.ndarray,
+    info: CorruptionInfo,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return per-type counts and two useful proportions for a selected mask.
+
+    ``ratios_in_mask`` uses all selected samples as the denominator.  The
+    additional ``ratios_among_corrupted`` uses only selected corrupted samples
+    as the denominator, making it possible to inspect whether the five fixed
+    corruption types are represented evenly among the corrupted selections.
+    """
+    mask_array = np.asarray(mask, dtype=np.uint8)
+    if mask_array.shape != (info.num_samples,):
+        raise ValueError(
+            f"mask shape {mask_array.shape} does not match corruption manifest "
+            f"size {(info.num_samples,)}"
+        )
+    if not set(np.unique(mask_array)).issubset({0, 1}):
+        raise ValueError("mask must contain only 0/1 values")
+
+    selected_types = np.asarray(info.corruption_types, dtype=np.int16)[
+        mask_array.astype(bool)
+    ]
+    counts = np.asarray(
+        [np.sum(selected_types == type_id) for type_id in range(len(CORRUPTION_TYPE_NAMES))],
+        dtype=np.int64,
+    )
+    selected_total = int(mask_array.sum())
+    corrupted_selected = int(counts.sum())
+    ratios_in_mask = counts.astype(np.float64) / max(1, selected_total)
+    ratios_among_corrupted = counts.astype(np.float64) / max(1, corrupted_selected)
+    return counts, ratios_in_mask, ratios_among_corrupted
+
+
+def print_corruption_type_statistics(
+    path: Path,
+    mask: np.ndarray,
+    info: CorruptionInfo | None,
+) -> None:
+    """Print experiment-3 corruption counts and proportions in one line."""
+    if info is None:
+        return
+    counts, ratios_in_mask, ratios_among_corrupted = corruption_type_mask_statistics(
+        mask, info
+    )
+    parts = [
+        (
+            f"{name}={int(counts[index])} "
+            f"(mask={100.0 * ratios_in_mask[index]:.2f}%, "
+            f"corrupted={100.0 * ratios_among_corrupted[index]:.2f}%)"
+        )
+        for index, name in enumerate(CORRUPTION_TYPE_NAMES)
+    ]
+    print(f"[Stage 6][Corruption] {path} | " + ", ".join(parts))
+
+
+def print_saved_corruption_type_statistics(
+    path: Path,
+    info: CorruptionInfo | None,
+) -> None:
+    """Load a reused mask and print the same corruption statistics."""
+    if info is None:
+        return
+    with np.load(path, allow_pickle=False) as data:
+        if "mask" not in data.files:
+            raise KeyError(f"mask array missing from cached file: {path}")
+        mask = np.asarray(data["mask"], dtype=np.uint8)
+    print_corruption_type_statistics(path, mask, info)
+
+
 def mask_metadata(args, mask, known, unseen, info: CorruptionInfo | None, keep_ratio):
     selected = np.flatnonzero(mask).astype(np.int64)
     target_pool = np.arange(len(mask))
@@ -338,6 +497,8 @@ def mask_cache_valid(path, args, num_samples, known, unseen, info, keep_ratio):
 def save_mask(args, mask, known, unseen, info, keep_ratio):
     path = mask_path_for(args.exp, args.mode, args.dataset, args.seed, keep_ratio)
     _atomic_savez(path, **mask_metadata(args, mask, known, unseen, info, keep_ratio))
+    if args.exp == 3 and info is not None:
+        print_corruption_type_statistics(path, mask, info)
     return path
 
 
@@ -365,31 +526,20 @@ def expected_adapter_metadata(args, known_indices, unseen_indices, info, *, batc
 
 
 def validate_adapter_cache(adapter_dir, args, known_indices, unseen_indices, info) -> tuple[bool, str]:
+    """Accept every historical Adapter cache that contains both required weight files.
+
+    Adapter metadata is intentionally not part of cache validity.  Older runs may
+    have no ``meta.json`` or may use a different metadata schema, but the saved
+    image and context Adapter weights remain loadable by the downstream scorer.
+    """
     adapter_dir = Path(adapter_dir)
-    paths = {name: adapter_dir / name for name in ("adapter_image.pt", "adapter_context.pt", "meta.json")}
-    for name, path in paths.items():
-        if not path.is_file():
-            return False, f"missing {name}"
-    try:
-        meta = json.loads(paths["meta.json"].read_text(encoding="utf-8"))
-    except Exception as exc:
-        return False, f"invalid meta.json: {exc}"
-    if not isinstance(meta, dict):
-        return False, "invalid meta.json: expected an object"
-    expected = expected_adapter_metadata(args, known_indices, unseen_indices, info,
-                                         batch_size=adapter_batch_size(args.dataset))
-    for field, value in expected.items():
-        if field not in meta:
-            return False, f"metadata mismatch: {field} (missing field)"
-        if meta[field] != value:
-            return False, f"metadata mismatch: {field}"
-    for name in ("adapter_image.pt", "adapter_context.pt"):
-        try:
-            state = torch.load(paths[name], map_location="cpu", weights_only=True)
-            if not isinstance(state, dict):
-                return False, f"failed to load {name}: expected a state_dict"
-        except Exception as exc:
-            return False, f"failed to load {name}: {exc}"
+    image_path = adapter_dir / "adapter_image.pt"
+    context_path = adapter_dir / "adapter_context.pt"
+
+    if not image_path.is_file():
+        return False, "missing adapter_image.pt"
+    if not context_path.is_file():
+        return False, "missing adapter_context.pt"
     return True, "valid"
 
 
@@ -424,10 +574,14 @@ def train_adapter_on_known(args, known_indices, unseen_indices, full_factory, in
         train_adapter_module.train_for_seed(ns, args.seed, multi_seed=False)
     if not ((out / "adapter_image.pt").is_file() and (out / "adapter_context.pt").is_file()):
         raise RuntimeError("adapter training did not produce both adapter files")
+    # Metadata is best-effort bookkeeping only.  Cache validity intentionally
+    # depends solely on the two Adapter weight files for backward compatibility.
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError(f"adapter training did not produce valid base metadata: {exc}") from exc
+        if not isinstance(meta, dict):
+            meta = {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        meta = {}
     meta.update(expected_adapter_metadata(args, known_indices, unseen_indices, info,
                                           batch_size=adapter_batch_size(args.dataset)))
     _atomic_json(meta_path, meta)
@@ -437,11 +591,80 @@ def train_adapter_on_known(args, known_indices, unseen_indices, full_factory, in
     return out, True
 
 
+def unseen_proxy_schedule(dataset: str) -> dict[str, Any]:
+    try:
+        schedule = UNSEEN_PROXY_SCHEDULES[dataset]
+    except KeyError as exc:
+        raise ValueError(f"unsupported unseen proxy dataset: {dataset}") from exc
+    return {
+        "epochs": int(schedule["epochs"]),
+        "lr_milestones": list(schedule["lr_milestones"]),
+        "phase_boundaries": tuple(int(value) for value in schedule["phase_boundaries"]),
+    }
+
+
+def resolve_unseen_epoch_windows(dataset: str, num_epochs: int):
+    """Return early/middle/late windows aligned with unseen-proxy LR phases."""
+    schedule = unseen_proxy_schedule(dataset)
+    expected_epochs = int(schedule["epochs"])
+    if int(num_epochs) != expected_epochs:
+        return dynamic_utils.resolve_epoch_windows(int(num_epochs))
+    first, second, final = schedule["phase_boundaries"]
+    if final != expected_epochs or not (0 < first < second < final):
+        raise RuntimeError(f"invalid unseen proxy phase boundaries: {schedule}")
+    return (
+        np.arange(0, first, dtype=np.int64),
+        np.arange(first, second, dtype=np.int64),
+        np.arange(second, final, dtype=np.int64),
+    )
+
+
+@contextlib.contextmanager
+def patch_dynamic_epoch_windows(dataset: str) -> Iterator[None]:
+    """Temporarily align A/C/T early-middle-late windows with LR milestones."""
+    original_default = dynamic_utils.resolve_epoch_windows
+
+    def resolver(num_epochs: int):
+        schedule = unseen_proxy_schedule(dataset)
+        if int(num_epochs) == int(schedule["epochs"]):
+            first, second, final = schedule["phase_boundaries"]
+            return (
+                np.arange(0, first, dtype=np.int64),
+                np.arange(first, second, dtype=np.int64),
+                np.arange(second, final, dtype=np.int64),
+            )
+        return original_default(int(num_epochs))
+
+    modules = [dynamic_utils]
+    for component_class in COMPONENTS.values():
+        module = sys.modules.get(component_class.__module__)
+        if module is not None and module not in modules:
+            modules.append(module)
+
+    previous = []
+    for module in modules:
+        if hasattr(module, "resolve_epoch_windows"):
+            previous.append((module, getattr(module, "resolve_epoch_windows")))
+            setattr(module, "resolve_epoch_windows", resolver)
+    try:
+        yield
+    finally:
+        for module, old_value in reversed(previous):
+            setattr(module, "resolve_epoch_windows", old_value)
+
+
 def make_proxy_args(args):
+    schedule = unseen_proxy_schedule(args.dataset)
     proxy_args = SimpleNamespace(dataset=args.dataset, data_root=str(args.data_root), model=args.proxy_model,
-        epochs=None, batch_size=None, num_workers=4, lr=None, momentum=None, weight_decay=None,
-        lr_milestones=None, lr_gamma=None, device=args.device or "", k_folds=K_FOLDS, seed=str(args.seed))
-    return train_proxy_module.apply_dataset_defaults(proxy_args)
+        epochs=schedule["epochs"], batch_size=None, num_workers=4, lr=None, momentum=None, weight_decay=None,
+        lr_milestones=schedule["lr_milestones"], lr_gamma=None,
+        device=args.device or "", k_folds=K_FOLDS, seed=str(args.seed))
+    proxy_args = train_proxy_module.apply_dataset_defaults(proxy_args)
+    if int(proxy_args.epochs) != int(schedule["epochs"]):
+        raise RuntimeError("unseen proxy max_epochs was unexpectedly overwritten")
+    if list(proxy_args.lr_milestones) != list(schedule["lr_milestones"]):
+        raise RuntimeError("unseen proxy LR milestones were unexpectedly overwritten")
+    return proxy_args
 
 
 def resolve_proxy_epochs(args) -> int:
@@ -476,6 +699,7 @@ def proxy_cache_valid(proxy_dir, args, known_indices, unseen_indices, proxy_epoc
                 and int(meta["unseen_ratio"]) == args.config.unseen_ratio
                 and meta["known_indices"] == known_indices.tolist() and meta["unseen_indices"] == unseen_indices.tolist()
                 and model == args.proxy_model and meta["proxy_model"] == args.proxy_model
+                and list(meta.get("lr_milestones", [])) == unseen_proxy_schedule(args.dataset)["lr_milestones"]
                 and meta["static_reference_scope"] == args.config.static_reference_scope
                 and meta["selection_scope"] == args.config.selection_scope and _corruption_json_matches(meta, info)):
             return False
@@ -502,7 +726,7 @@ def proxy_cache_valid(proxy_dir, args, known_indices, unseen_indices, proxy_epoc
 
 def train_proxy_on_known(args, known_indices, unseen_indices, full_factory, info=None,
                          *, upstream_dirty=False):
-    """Run the unchanged five-fold proxy implementation on local known indices."""
+    """Run five-fold proxy training with the unseen-protocol schedule."""
     proxy_args = make_proxy_args(args)
     epochs = int(proxy_args.epochs)
     out = cache_paths(args.exp, args.dataset, args.seed, args.proxy_model, epochs)["proxy"]
@@ -511,8 +735,12 @@ def train_proxy_on_known(args, known_indices, unseen_indices, full_factory, info
     if reuse and proxy_cache_valid(out, args, known_indices, unseen_indices, epochs, info):
         print(f"[Stage 3][Reuse] valid proxy cache: {out}")
         return out, epochs, False
-    print("[Stage 3][Recompute] requested cache is invalid" if reuse else
-          "[Stage 3][Force] retraining proxy")
+    if reuse:
+        print("[Stage 3][Recompute] requested reuse but proxy cache is invalid")
+    elif upstream_dirty:
+        print("[Stage 3][Dependency] retraining proxy because an upstream artifact changed")
+    else:
+        print("[Stage 3][Force] retraining proxy")
     meta_path.unlink(missing_ok=True)
     for fold_no in range(1, K_FOLDS + 1): (out / f"fold_{fold_no}.npz").unlink(missing_ok=True)
     original_loader = train_proxy_module.BaseDataLoader
@@ -554,20 +782,60 @@ def split_fingerprint(known, unseen, num_samples: int | None = None) -> str:
     return digest.hexdigest()
 
 
-def _strip_known_indices(payload: Any) -> Any:
-    """Remove the deprecated verbose field from every weight entry."""
+def _compact_weight_payload(payload: Any) -> Any:
+    """Remove verbose split-index arrays from every scoring-weight entry.
+
+    Legacy entries that still contain both index arrays are migrated first by
+    deriving ``known_count``, ``unseen_count`` and ``split_fingerprint``.  The
+    arrays are then removed recursively, so every JSON write is compact even
+    when the file contains several datasets or seeds.
+    """
     if isinstance(payload, dict):
+        has_known = "known_indices" in payload
+        has_unseen = "unseen_indices" in payload
+        if has_known and has_unseen:
+            try:
+                known_array = np.asarray(payload["known_indices"], dtype=np.int64)
+                unseen_array = np.asarray(payload["unseen_indices"], dtype=np.int64)
+                if known_array.ndim == 1 and unseen_array.ndim == 1:
+                    payload["known_count"] = int(known_array.size)
+                    payload["unseen_count"] = int(unseen_array.size)
+                    payload["split_fingerprint"] = split_fingerprint(
+                        known_array, unseen_array
+                    )
+            except (TypeError, ValueError, OverflowError):
+                # Malformed legacy entries remain invalid, but verbose arrays
+                # are still removed from the JSON written by this script.
+                pass
+        if "corruption_indices" in payload and "corruption_type_ids" in payload:
+            try:
+                corruption_indices = np.asarray(payload["corruption_indices"], dtype=np.int64)
+                corruption_type_ids = np.asarray(payload["corruption_type_ids"], dtype=np.int16)
+                if (
+                    corruption_indices.ndim == 1
+                    and corruption_type_ids.ndim == 1
+                    and corruption_indices.shape == corruption_type_ids.shape
+                ):
+                    payload["corruption_count"] = int(corruption_indices.size)
+                    payload["corruption_fingerprint"] = corruption_fingerprint_from_arrays(
+                        corruption_indices, corruption_type_ids
+                    )
+            except (TypeError, ValueError, OverflowError):
+                pass
         payload.pop("known_indices", None)
+        payload.pop("unseen_indices", None)
+        payload.pop("corruption_indices", None)
+        payload.pop("corruption_type_ids", None)
         for value in payload.values():
-            _strip_known_indices(value)
+            _compact_weight_payload(value)
     elif isinstance(payload, list):
         for value in payload:
-            _strip_known_indices(value)
+            _compact_weight_payload(value)
     return payload
 
 
 def write_weight_payload(path: Path, payload: dict[str, Any]) -> None:
-    _atomic_json(path, _strip_known_indices(payload))
+    _atomic_json(path, _compact_weight_payload(payload))
 
 
 def load_scoring_weights(path, args, known, unseen, proxy_epochs, info):
@@ -575,32 +843,40 @@ def load_scoring_weights(path, args, known, unseen, proxy_epochs, info):
         payload = json.loads(path.read_text(encoding="utf-8"))
         entry = payload[args.dataset][str(args.seed)]
         required = {"sa", "div", "dds", "bias", "ratio_lambda", "exp", "dataset", "seed",
-            "known_ratio", "unseen_ratio", "unseen_indices", "proxy_model",
-            "proxy_epochs", "clip_model", "static_reference_scope", "selection_scope"}
+            "known_ratio", "unseen_ratio", "proxy_model", "proxy_epochs",
+            "clip_model", "static_reference_scope", "selection_scope"}
         if not required.issubset(entry): return None
         values = np.asarray([entry[key] for key in ("sa", "div", "dds", "bias")], dtype=np.float64)
         weights = values[:3]
-        legacy = "known_indices" in entry
-        split_valid = ((legacy and entry["known_indices"] == known.tolist()
-                        and entry["unseen_indices"] == unseen.tolist()) or
-                       (not legacy and int(entry.get("known_count", -1)) == len(known)
-                        and int(entry.get("unseen_count", -1)) == len(unseen)
-                        and entry.get("split_fingerprint") == split_fingerprint(known, unseen)))
+        has_legacy_arrays = "known_indices" in entry or "unseen_indices" in entry
+        compact_split_valid = (
+            int(entry.get("known_count", -1)) == len(known)
+            and int(entry.get("unseen_count", -1)) == len(unseen)
+            and entry.get("split_fingerprint") == split_fingerprint(known, unseen)
+        )
+        legacy_split_valid = (
+            "known_indices" in entry
+            and "unseen_indices" in entry
+            and entry["known_indices"] == known.tolist()
+            and entry["unseen_indices"] == unseen.tolist()
+        )
+        split_valid = compact_split_valid or legacy_split_valid
         valid = (np.isfinite(values).all() and np.all(weights > 0)
             and np.isclose(weights.sum(), 1.0, atol=1e-4, rtol=0.0)
-            and float(entry["ratio_lambda"]) == 1e-3 and int(entry["exp"]) == args.exp
+            and float(entry["ratio_lambda"]) == RATIO_LAMBDA_DEFAULT
+            and int(entry["exp"]) == args.exp
             and entry["dataset"] == args.dataset and int(entry["seed"]) == args.seed
             and float(entry["known_ratio"]) == args.config.known_ratio
             and int(entry["unseen_ratio"]) == args.config.unseen_ratio
-            and split_valid and entry["unseen_indices"] == unseen.tolist()
+            and split_valid
             and entry["proxy_model"] == args.proxy_model and int(entry["proxy_epochs"]) == proxy_epochs
             and entry["clip_model"] == args.clip_model
             and entry["static_reference_scope"] == args.config.static_reference_scope
             and entry["selection_scope"] == args.config.selection_scope
-            and _corruption_json_matches(entry, info))
+            and _weight_corruption_matches(entry, info))
         if not valid:
             return None
-        if legacy:
+        if has_legacy_arrays:
             entry.update(known_count=len(known), unseen_count=len(unseen),
                          split_fingerprint=split_fingerprint(known, unseen))
             write_weight_payload(path, payload)
@@ -695,18 +971,40 @@ def run_dynamic_stage(args, proxy_dir, proxy_epochs, known, unseen, labels, info
             folds, labels_all = dynamic_utils.load_cv_fold_logs(proxy_dir, args.dataset, str(args.data_root))
         finally:
             dynamic_utils.load_dataset_labels = old_labels
-    for name in missing:
-        value = COMPONENTS[name]().compute(folds=folds, labels_all=labels_all)
-        components[name] = value
-        _atomic_savez(cache_dir / f"{name}.npz", labels=labels_all, raw_foldwise=value.raw_foldwise,
-            fold_normalized=value.fold_normalized, aggregated=value.aggregated,
-            final_normalized=value.final_normalized, component=name, exp=args.exp, dataset=args.dataset,
-            **_dynamic_metadata(args, known, unseen, labels_all, proxy_epochs, info))
+    with patch_dynamic_epoch_windows(args.dataset):
+        for name in missing:
+            value = COMPONENTS[name]().compute(folds=folds, labels_all=labels_all)
+            components[name] = value
+            component_payload = _dynamic_metadata(
+                args, known, unseen, labels_all, proxy_epochs, info
+            )
+            component_payload.update(
+                raw_foldwise=value.raw_foldwise,
+                fold_normalized=value.fold_normalized,
+                aggregated=value.aggregated,
+                final_normalized=value.final_normalized,
+                component=name,
+            )
+            _atomic_savez(cache_dir / f"{name}.npz", **component_payload)
+
     pseudo, _ = build_dynamic_target(components)
-    _atomic_savez(cache_dir / "pseudo_labels.npz", dynamic_target=pseudo,
-                  **_dynamic_metadata(args, known, unseen, labels, proxy_epochs, info))
-    reused = ",".join(name for name in COMPONENTS if name not in missing) or "none"
-    print(f"[Stage 4][Partial reuse] reused {reused}; recomputed {','.join(missing) or 'pseudo labels'} and pseudo labels")
+    pseudo_payload = _dynamic_metadata(
+        args, known, unseen, labels, proxy_epochs, info
+    )
+    pseudo_payload["dynamic_target"] = pseudo
+    _atomic_savez(cache_dir / "pseudo_labels.npz", **pseudo_payload)
+
+    if reuse:
+        reused_names = [name for name in COMPONENTS if name not in missing]
+        recomputed_text = ",".join(missing) if missing else "pseudo labels only"
+        print(
+            f"[Stage 4][Partial reuse] reused {','.join(reused_names) or 'none'}; "
+            f"recomputed {recomputed_text}"
+        )
+    elif upstream_dirty:
+        print("[Stage 4][Dependency] recomputed A,C,T and pseudo labels")
+    else:
+        print("[Stage 4][Force] recomputed A,C,T and pseudo labels")
     return components, pseudo, True
 
 
@@ -731,26 +1029,37 @@ def prepare_proxy_and_weights(args, known, unseen, static, full_factory, info=No
         cached = load_scoring_weights(weight_path, args, known, unseen, epochs, info)
         if cached is not None:
             print(f"[Stage 5][Reuse] valid scoring weights: {weight_path}")
+            print_scoring_weights(cached)
             return cached, (proxy_recomputed, dynamic_recomputed, False)
-    print("[Stage 5][Dependency] refitting weights because an upstream stage changed" if dirty else
-          "[Stage 5][Force] refitting scoring weights")
+    if dirty:
+        print("[Stage 5][Dependency] refitting weights because an upstream stage changed")
+    elif 5 in args.skip_saved_stages:
+        print("[Stage 5][Recompute] requested reuse but scoring-weight cache is invalid")
+    else:
+        print("[Stage 5][Force] refitting scoring weights")
     features = np.stack([standard_zscore_by_class(static[key], labels) for key in ("sa", "div", "dds")], axis=1)
     device = torch.device(args.device) if args.device else CONFIG.global_device
-    fit = fit_softplus_ratio_regression(features, dynamic_target, ratio_lambda=1e-3,
+    fit = fit_softplus_ratio_regression(
+        features, dynamic_target, ratio_lambda=RATIO_LAMBDA_DEFAULT,
         learning_rate=2e-3, max_iter=10000, tol=1e-6, device=device)
     weights = np.asarray(fit["normalized_weights"], dtype=np.float64)
+    if (weights.shape != (3,) or not np.isfinite(weights).all()
+            or np.any(weights <= 0) or not np.isclose(weights.sum(), 1.0, atol=1e-6)):
+        raise RuntimeError(f"invalid fitted scoring weights: {weights!r}")
     entry = dict(sa=float(weights[0]), div=float(weights[1]), dds=float(weights[2]), bias=float(fit["bias"]),
-        ratio_lambda=1e-3, exp=args.exp, dataset=args.dataset, seed=args.seed,
+        ratio_lambda=RATIO_LAMBDA_DEFAULT, exp=args.exp, dataset=args.dataset, seed=args.seed,
         known_ratio=args.config.known_ratio, unseen_ratio=args.config.unseen_ratio,
         known_count=len(known), unseen_count=len(unseen), split_fingerprint=split_fingerprint(known, unseen),
-        unseen_indices=unseen.tolist(), proxy_model=args.proxy_model,
+        proxy_model=args.proxy_model,
         proxy_epochs=epochs, clip_model=args.clip_model, static_reference_scope=args.config.static_reference_scope,
-        selection_scope=args.config.selection_scope, **_json_corruption_context(info))
+        selection_scope=args.config.selection_scope, **compact_corruption_context(info))
     try: payload = json.loads(weight_path.read_text()) if weight_path.exists() else {}
     except (OSError, json.JSONDecodeError): payload = {}
     payload.setdefault(args.dataset, {})[str(args.seed)] = entry
     write_weight_payload(weight_path, payload)
-    return {key: entry[key] for key in ("sa", "div", "dds")}, (proxy_recomputed, dynamic_recomputed, True)
+    learned_weights = {key: entry[key] for key in ("sa", "div", "dds")}
+    print_scoring_weights(learned_weights)
+    return learned_weights, (proxy_recomputed, dynamic_recomputed, True)
 
 
 def static_reference_scope(args, cache_kind):
@@ -760,6 +1069,19 @@ def static_reference_scope(args, cache_kind):
 def static_sample_indices(dataset):
     if isinstance(dataset, IndexedSubsetDataset): return dataset.indices.copy()
     return np.arange(len(dataset), dtype=np.int64)
+
+
+def _score_array(result: Any) -> np.ndarray:
+    """Convert a scorer result to a finite one-dimensional NumPy array."""
+    scores = getattr(result, "scores", result)
+    if torch.is_tensor(scores):
+        scores = scores.detach().cpu().numpy()
+    values = np.asarray(scores)
+    if values.ndim != 1:
+        raise ValueError(f"score output must be one-dimensional, got shape {values.shape}")
+    if not np.isfinite(values).all():
+        raise ValueError("score output contains NaN or infinity")
+    return values
 
 
 def load_static_cache(path, args, cache_kind, labels, sample_indices, known, unseen, info):
@@ -802,8 +1124,12 @@ def compute_static_scores(args, dataset, adapter_dir, cache_kind, known, unseen,
         if cached is not None:
             print(f"[Stage 2][Reuse] valid static scores: {path}")
             return (cached, False) if return_status else cached
-    print("[Stage 2][Dependency] recomputing static scores" if upstream_dirty else
-          "[Stage 2][Force] recomputing static scores")
+    if reuse:
+        print("[Stage 2][Recompute] requested reuse but static-score cache is invalid")
+    elif upstream_dirty:
+        print("[Stage 2][Dependency] recomputing static scores")
+    else:
+        print("[Stage 2][Force] recomputing static scores")
     device = torch.device(args.device) if args.device else CONFIG.global_device
     classes = resolve_class_names_for_prompts(args.dataset, args.data_root, dataset.classes)
     dds = DifficultyDirection(class_names=classes, clip_model=args.clip_model, device=device)
@@ -819,9 +1145,21 @@ def compute_static_scores(args, dataset, adapter_dir, cache_kind, known, unseen,
         elif hasattr(base, "transform"): base.transform = preprocess
         view = IndexedSubsetDataset(base, dataset.indices) if isinstance(dataset, IndexedSubsetDataset) else base
         return DataLoader(view, batch_size=128, shuffle=False, num_workers=4)
-    sa_scores = sa.score_dataset(loader(sa.extractor.preprocess), adapter_image=image, adapter_text=text).scores.numpy()
-    div_scores = div.score_dataset(loader(div.extractor.preprocess), adapter=image).scores.numpy()
-    dds_scores = dds.score_dataset(loader(dds.extractor.preprocess), adapter=image).scores.numpy()
+    sa_scores = _score_array(
+        sa.score_dataset(loader(sa.extractor.preprocess), adapter_image=image, adapter_text=text)
+    )
+    div_scores = _score_array(
+        div.score_dataset(loader(div.extractor.preprocess), adapter=image)
+    )
+    dds_scores = _score_array(
+        dds.score_dataset(loader(dds.extractor.preprocess), adapter=image)
+    )
+    expected_shape = (len(dataset),)
+    for name, values in (("SA", sa_scores), ("Div", div_scores), ("DDS", dds_scores)):
+        if values.shape != expected_shape:
+            raise RuntimeError(
+                f"{name} score count mismatch: got {values.shape}, expected {expected_shape}"
+            )
     _atomic_savez(path, sa=sa_scores, div=div_scores, dds=dds_scores, labels=labels, exp=args.exp,
         dataset=args.dataset, seed=args.seed, known_ratio=args.config.known_ratio, unseen_ratio=args.config.unseen_ratio,
         known_indices=known, unseen_indices=unseen, clip_model=args.clip_model,
@@ -867,6 +1205,10 @@ def resolve_group_weights(args, known, unseen, static_selection, known_ds, selec
 
 
 def run_group_solver(args, static, dataset, adapter_dir, weights, target_size):
+    if not 0 <= int(target_size) <= len(dataset):
+        raise ValueError(
+            f"target_size must be between 0 and {len(dataset)}, got {target_size}"
+        )
     device = torch.device(args.device) if args.device else CONFIG.global_device
     classes = resolve_class_names_for_prompts(args.dataset, args.data_root, dataset.classes)
     div = Div(class_names=classes, clip_model=args.clip_model, device=device)
@@ -904,8 +1246,12 @@ def main() -> None:
         for kr in args.keep_ratios:
             path = mask_path_for(args.exp, args.mode, args.dataset, args.seed, kr)
             if stage_reuse_requested(args, 6) and mask_cache_valid(path, args, len(full), known, unseen, info, kr):
-                print(f"[Stage 6][Reuse] valid mask, kr={kr}: {path}"); continue
-            print(f"[Stage 6][Force] regenerating mask, kr={kr}")
+                print(f"[Stage 6][Reuse] valid mask, kr={kr}: {path}")
+                if args.exp == 3 and info is not None:
+                    print_saved_corruption_type_statistics(path, info)
+                continue
+            status = "Recompute" if 6 in args.skip_saved_stages else "Force"
+            print(f"[Stage 6][{status}] regenerating mask, kr={kr}")
             target = round(len(full) * kr / 100)
             save_mask(args, generate_random_mask(pool_indices, len(full), target, args.seed, args.exp, kr), known, unseen, info, kr)
         return
@@ -930,7 +1276,10 @@ def main() -> None:
         path = mask_path_for(args.exp, args.mode, args.dataset, args.seed, kr)
         if stage_reuse_requested(args, 6, upstream_dirty=stage6_dirty) and mask_cache_valid(
                 path, args, len(full), known, unseen, info, kr):
-            print(f"[Stage 6][Reuse] valid mask, kr={kr}: {path}"); continue
+            print(f"[Stage 6][Reuse] valid mask, kr={kr}: {path}")
+            if args.exp == 3 and info is not None:
+                print_saved_corruption_type_statistics(path, info)
+            continue
         print(f"[Stage 6][{'Dependency' if stage6_dirty else 'Force'}] regenerating mask, kr={kr}")
         target = round(len(full) * kr / 100)
         mask = run_group_solver(args, static_selection, full, adapter, weights, target)

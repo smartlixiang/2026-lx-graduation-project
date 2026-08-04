@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
         default="result",
         help="Root directory that stores result/<method>/<dataset>/<model>/<seed>/result_*.json",
     )
-    parser.add_argument("--dataset", default="cifar10", help="Dataset name")
+    parser.add_argument("--dataset", default="cifar100", help="Dataset name")
     parser.add_argument("--model", default="resnet50", help="Model name")
     parser.add_argument(
         "--methods",

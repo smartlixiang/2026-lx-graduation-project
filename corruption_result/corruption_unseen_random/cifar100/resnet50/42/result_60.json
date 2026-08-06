@@ -1,0 +1,70 @@
+{
+  "metadata": {
+    "dataset": "cifar100",
+    "data_root": "data",
+    "exp": "corruption",
+    "result_root": "corruption_result",
+    "model": "resnet50",
+    "keep_ratio": 60,
+    "selection_method": "corruption_unseen_random",
+    "seed": 42,
+    "epochs": 200,
+    "batch_size": 128,
+    "physical_batch_size": 128,
+    "grad_accum_steps": 1,
+    "effective_batch_size": 128,
+    "reference_effective_batch_size": 128,
+    "weight_decay": 0.0005,
+    "init_lr": 0.1,
+    "num_selected": 30000,
+    "num_total": 50000,
+    "optimizer": "SGD",
+    "momentum": 0.9,
+    "lr_schedule": {
+      "type": "MultiStepLR",
+      "milestones": [
+        60,
+        120,
+        160
+      ],
+      "gamma": 0.2
+    },
+    "use_amp": false,
+    "corruption_root": "corruption_data",
+    "corruption_path": "corruption_data/cifar100/corruption_list_42.txt",
+    "corruption_rate": 0.2,
+    "num_corrupted_total": 10000,
+    "corruption_type_counts": {
+      "gaussian_noise": 2000,
+      "partial_occlusion": 2000,
+      "resolution_degradation": 2000,
+      "fog": 2000,
+      "motion_blur": 2000
+    },
+    "num_corrupted_selected": 5989,
+    "corruption_ratio_in_selection": 0.19963333333333333,
+    "selected_corruption_type_counts": {
+      "gaussian_noise": 1229,
+      "partial_occlusion": 1202,
+      "resolution_degradation": 1219,
+      "fog": 1160,
+      "motion_blur": 1179
+    }
+  },
+  "accuracy": 0.6773,
+  "accuracy_mean": 0.6773,
+  "accuracy_std": 0.0009,
+  "accuracy_samples": [
+    0.6776,
+    0.677,
+    0.6757,
+    0.6765,
+    0.6774,
+    0.6783,
+    0.6768,
+    0.6787,
+    0.6784,
+    0.6767
+  ],
+  "time_seconds": 7575.502874135971
+}

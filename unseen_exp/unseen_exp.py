@@ -96,9 +96,9 @@ UNSEEN_PROXY_SCHEDULES = {
         "phase_boundaries": (40, 75, 100),
     },
     TINY_IMAGENET: {
-        "epochs": 45,
-        "lr_milestones": (15, 30),
-        "phase_boundaries": (15, 30, 45),
+        "epochs": 60,
+        "lr_milestones": (35, 50),
+        "phase_boundaries": (35, 50, 60),
     },
 }
 

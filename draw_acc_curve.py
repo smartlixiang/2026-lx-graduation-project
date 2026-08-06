@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
             "random", "herding", "EL2N", "GraNd", "Forgetting", "MDS",
             "MoSo", "yangclip", "RLSelector", "ours"
         ],
+        # default=["random", "ours", "unseen_learned_group"],
         help="Selection methods to compare",
     )
     parser.add_argument(

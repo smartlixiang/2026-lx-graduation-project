@@ -1,0 +1,488 @@
+{
+  "cifar100": {
+    "96": {
+      "sa": 0.8803715268793625,
+      "div": 0.01134981627971828,
+      "dds": 0.10827865684091921,
+      "bias": -2.660847734360983e-05,
+      "method_version": "softplus_ratio",
+      "ratio_lambda": 0.001,
+      "transferability_component": "TransferabilityScore",
+      "proxy_log": "/nvme/home/lixiang/code/noise_exp/weights/proxy_logs/cifar100/resnet18/96/200",
+      "dynamic_components": [
+        "A",
+        "C",
+        "T"
+      ],
+      "dynamic_cache_path": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/96/160",
+      "dynamic_component_cache_paths": {
+        "A": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/96/160/A.npz",
+        "C": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/96/160/C.npz",
+        "T": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/96/160/T.npz"
+      },
+      "proxy_training_seed": 96,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
+      "output_seed": 96,
+      "adapter_seed": 96,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": 0.7694813586223709,
+            "Div": -0.579033398328467,
+            "DDS": -0.18361777314972966
+          },
+          "C": {
+            "SA": -0.2130156227465541,
+            "Div": 0.10769573949832446,
+            "DDS": 0.12464228025154916
+          },
+          "T": {
+            "SA": 0.0015195492507151485,
+            "Div": 0.00018277781621441123,
+            "DDS": 0.0010218402002175088
+          }
+        },
+        "weight_solver": "softplus_ratio_no_simplex",
+        "method_version": "softplus_ratio",
+        "raw_weights": [
+          0.36947040948830373,
+          0.004763240450709345,
+          0.045441905446062816
+        ],
+        "mse": 0.8712392673518348,
+        "ratio_regularizer": 1.360691829231336,
+        "iterations": 10000,
+        "weights_sum": 1.0,
+        "weights_min": 0.01134981627971828,
+        "sa_gt_one_third_warning": true,
+        "div_is_lowest_warning": true
+      }
+    },
+    "naive": {
+      "dds": 0.3333333333333333,
+      "div": 0.3333333333333333,
+      "sa": 0.3333333333333333
+    },
+    "42": {
+      "sa": 0.8963277055357001,
+      "div": 0.011366909911462058,
+      "dds": 0.09230538455283788,
+      "bias": 2.5572229822433066e-05,
+      "method_version": "softplus_ratio",
+      "ratio_lambda": 0.001,
+      "transferability_component": "TransferabilityScore",
+      "proxy_log": "/nvme/home/lixiang/code/noise_exp/weights/proxy_logs/cifar100/resnet18/42/200",
+      "dynamic_components": [
+        "A",
+        "C",
+        "T"
+      ],
+      "dynamic_cache_path": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/42/160",
+      "dynamic_component_cache_paths": {
+        "A": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/42/160/A.npz",
+        "C": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/42/160/C.npz",
+        "T": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/42/160/T.npz"
+      },
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
+      "output_seed": 42,
+      "adapter_seed": 42,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": 0.7688149967008684,
+            "Div": -0.5768160031997872,
+            "DDS": -0.1776592535898665
+          },
+          "C": {
+            "SA": -0.20055467104862154,
+            "Div": 0.09927173508168681,
+            "DDS": 0.12095381586463322
+          },
+          "T": {
+            "SA": 0.008458342980266154,
+            "Div": -0.0067055795586293985,
+            "DDS": -0.0058913601346789095
+          }
+        },
+        "weight_solver": "softplus_ratio_no_simplex",
+        "method_version": "softplus_ratio",
+        "raw_weights": [
+          0.3775955974079653,
+          0.004788533381477726,
+          0.03888545072180922
+        ],
+        "mse": 0.8644776597378326,
+        "ratio_regularizer": 1.4361264919420913,
+        "iterations": 10000,
+        "weights_sum": 1.0,
+        "weights_min": 0.011366909911462058,
+        "sa_gt_one_third_warning": true,
+        "div_is_lowest_warning": true
+      }
+    },
+    "22": {
+      "sa": 0.8572967368123785,
+      "div": 0.01194713369146927,
+      "dds": 0.13075612949615226,
+      "bias": -0.0003266565002625363,
+      "method_version": "softplus_ratio",
+      "ratio_lambda": 0.001527864045,
+      "proxy_log": "",
+      "dynamic_components": [
+        "A",
+        "C",
+        "T"
+      ],
+      "dynamic_cache_path": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/22/160",
+      "dynamic_component_cache_paths": {
+        "A": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/22/160/A.npz",
+        "C": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/22/160/C.npz",
+        "T": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar100/resnet18/22/160/T.npz"
+      },
+      "proxy_training_seed": 22,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
+      "output_seed": 22,
+      "adapter_seed": 22,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": 0.7691760106502404,
+            "Div": -0.578800228323452,
+            "DDS": -0.16291902228293018
+          },
+          "C": {
+            "SA": -0.21778555957833226,
+            "Div": 0.11101707140232617,
+            "DDS": 0.12156979496152365
+          },
+          "T": {
+            "SA": -0.0287721016439943,
+            "Div": 0.013661722979452217,
+            "DDS": 0.01249996060450809
+          }
+        },
+        "weight_solver": "softplus_ratio_no_simplex",
+        "method_version": "softplus_ratio",
+        "raw_weights": [
+          0.34945234466479264,
+          0.004869905251279843,
+          0.05329897347051688
+        ],
+        "mse": 0.8846407193368823,
+        "ratio_regularizer": 1.256565955047216,
+        "iterations": 9970,
+        "weights_sum": 1.0,
+        "weights_min": 0.01194713369146927,
+        "sa_gt_one_third_warning": true,
+        "div_is_lowest_warning": true
+      }
+    }
+  },
+  "tiny-imagenet": {
+    "96": {
+      "sa": 0.8433371330351974,
+      "div": 0.006413501148079331,
+      "dds": 0.15024936581672324,
+      "bias": -2.6267278072895145e-07,
+      "method_version": "softplus_ratio",
+      "ratio_lambda": 0.001,
+      "transferability_component": "TransferabilityScore",
+      "proxy_log": "/nvme/home/lixiang/code/noise_exp/weights/proxy_logs/tiny-imagenet/resnet18/96/90",
+      "dynamic_components": [
+        "A",
+        "C",
+        "T"
+      ],
+      "dynamic_cache_path": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/96/80",
+      "dynamic_component_cache_paths": {
+        "A": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/96/80/A.npz",
+        "C": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/96/80/C.npz",
+        "T": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/96/80/T.npz"
+      },
+      "proxy_training_seed": 96,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
+      "output_seed": 96,
+      "adapter_seed": 96,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": 0.732088337468382,
+            "Div": -0.6342650995480331,
+            "DDS": -0.038090903517770426
+          },
+          "C": {
+            "SA": -0.09582046670314534,
+            "Div": 0.020221147700524557,
+            "DDS": 0.10250272197077409
+          },
+          "T": {
+            "SA": 0.0008005692819696074,
+            "Div": 0.0016684399091606112,
+            "DDS": 0.00019753778153764045
+          }
+        },
+        "weight_solver": "softplus_ratio_no_simplex",
+        "method_version": "softplus_ratio",
+        "raw_weights": [
+          0.37633156383922955,
+          0.0028619668483643715,
+          0.06704741981437219
+        ],
+        "mse": 0.8592183142913844,
+        "ratio_regularizer": 1.201485316356189,
+        "iterations": 10000,
+        "weights_sum": 1.0,
+        "weights_min": 0.006413501148079331,
+        "sa_gt_one_third_warning": true,
+        "div_is_lowest_warning": true
+      }
+    },
+    "naive": {
+      "dds": 0.3333333333333333,
+      "div": 0.3333333333333333,
+      "sa": 0.3333333333333333
+    },
+    "42": {
+      "sa": 0.8270155844927644,
+      "div": 0.006789797870171039,
+      "dds": 0.1661946176370647,
+      "bias": -2.975473652001427e-09,
+      "method_version": "softplus_ratio",
+      "ratio_lambda": 0.001527864045,
+      "proxy_log": "/nvme/home/lixiang/code/noise_exp/weights/proxy_logs/tiny-imagenet/resnet18/42/90",
+      "dynamic_components": [
+        "A",
+        "C",
+        "T"
+      ],
+      "dynamic_cache_path": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/42/80",
+      "dynamic_component_cache_paths": {
+        "A": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/42/80/A.npz",
+        "C": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/42/80/C.npz",
+        "T": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/42/80/T.npz"
+      },
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
+      "output_seed": 42,
+      "adapter_seed": 42,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": 0.7295498901926291,
+            "Div": -0.6362988378954632,
+            "DDS": -0.04370784546555507
+          },
+          "C": {
+            "SA": -0.09446181164570647,
+            "Div": 0.015294751956735466,
+            "DDS": 0.10494738539549626
+          },
+          "T": {
+            "SA": -0.05889604928529363,
+            "Div": 0.0541134172499958,
+            "DDS": 0.002629092135959145
+          }
+        },
+        "weight_solver": "softplus_ratio_no_simplex",
+        "method_version": "softplus_ratio",
+        "raw_weights": [
+          0.3418307896542717,
+          0.002806430750609108,
+          0.06869330935040514
+        ],
+        "mse": 0.8836368122477493,
+        "ratio_regularizer": 1.1348496175923768,
+        "iterations": 10000,
+        "weights_sum": 1.0000000000000002,
+        "weights_min": 0.006789797870171039,
+        "sa_gt_one_third_warning": true,
+        "div_is_lowest_warning": true
+      }
+    },
+    "22": {
+      "sa": 0.8197786256897754,
+      "div": 0.006874623946671649,
+      "dds": 0.17334675036355296,
+      "bias": 3.269702879239874e-11,
+      "method_version": "softplus_ratio",
+      "ratio_lambda": 0.001527864045,
+      "proxy_log": "/nvme/home/lixiang/code/noise_exp/weights/proxy_logs/tiny-imagenet/resnet18/22/90",
+      "dynamic_components": [
+        "A",
+        "C",
+        "T"
+      ],
+      "dynamic_cache_path": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/22/80",
+      "dynamic_component_cache_paths": {
+        "A": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/22/80/A.npz",
+        "C": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/22/80/C.npz",
+        "T": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/tiny-imagenet/resnet18/22/80/T.npz"
+      },
+      "proxy_training_seed": 22,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
+      "output_seed": 22,
+      "adapter_seed": 22,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": 0.7316233709336345,
+            "Div": -0.6373750637797497,
+            "DDS": -0.03167438469526221
+          },
+          "C": {
+            "SA": -0.09753199104115622,
+            "Div": 0.02407334003579777,
+            "DDS": 0.10127597311599777
+          },
+          "T": {
+            "SA": -0.05754943844533034,
+            "Div": 0.0473222347411016,
+            "DDS": 0.005494882944409509
+          }
+        },
+        "weight_solver": "softplus_ratio_no_simplex",
+        "method_version": "softplus_ratio",
+        "raw_weights": [
+          0.34108101439140465,
+          0.0028602889070415208,
+          0.0721234777324247
+        ],
+        "mse": 0.8834526377986333,
+        "ratio_regularizer": 1.1063852559065626,
+        "iterations": 10000,
+        "weights_sum": 1.0,
+        "weights_min": 0.006874623946671649,
+        "sa_gt_one_third_warning": true,
+        "div_is_lowest_warning": true
+      }
+    }
+  },
+  "cifar10": {
+    "96": {
+      "sa": 0.6564113382535969,
+      "div": 0.3188367265296218,
+      "dds": 0.024751935216781398,
+      "bias": -1.0489865668229352e-07,
+      "ratio_lambda": 0.001,
+      "transferability_component": "TransferabilityScore",
+      "proxy_log": "/nvme/home/lixiang/code/noise_exp/weights/proxy_logs/cifar10/resnet18/96/160",
+      "dynamic_components": [
+        "A",
+        "C",
+        "T"
+      ],
+      "dynamic_cache_path": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar10/resnet18/96/160",
+      "dynamic_component_cache_paths": {
+        "A": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar10/resnet18/96/160/A.npz",
+        "C": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar10/resnet18/96/160/C.npz",
+        "T": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar10/resnet18/96/160/T.npz"
+      },
+      "proxy_training_seed": 96,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
+      "output_seed": 96,
+      "adapter_seed": 96,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": 0.7798852236929223,
+            "Div": -0.4475651552062107,
+            "DDS": -0.7410922873845236
+          },
+          "C": {
+            "SA": -0.022644240387307637,
+            "Div": 0.13395204634623215,
+            "DDS": -0.039879105159778175
+          },
+          "T": {
+            "SA": -0.0020920854321873337,
+            "Div": 0.004563219983775281,
+            "DDS": -0.0018892026423690264
+          }
+        },
+        "weight_solver": "softplus_ratio_no_simplex",
+        "raw_weights": [
+          0.7100333793278372,
+          0.3448824010169546,
+          0.026773913219770157
+        ],
+        "mse": 0.7680578378049768,
+        "ratio_regularizer": 0.5994155611010062,
+        "iterations": 10000,
+        "weights_sum": 1.0,
+        "weights_min": 0.024751935216781398,
+        "sa_gt_one_third_warning": true,
+        "div_is_lowest_warning": false
+      }
+    },
+    "naive": {
+      "dds": 0.3333333333333333,
+      "div": 0.3333333333333333,
+      "sa": 0.3333333333333333
+    },
+    "42": {
+      "sa": 0.6482568609218026,
+      "div": 0.3110743694808926,
+      "dds": 0.0406687695973047,
+      "bias": 0.00044954250008546006,
+      "ratio_lambda": 0.001,
+      "transferability_component": "TransferabilityScore",
+      "proxy_log": "/nvme/home/lixiang/code/noise_exp/weights/proxy_logs/cifar10/resnet18/42/160",
+      "dynamic_components": [
+        "A",
+        "C",
+        "T"
+      ],
+      "dynamic_cache_path": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar10/resnet18/42/160",
+      "dynamic_component_cache_paths": {
+        "A": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar10/resnet18/42/160/A.npz",
+        "C": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar10/resnet18/42/160/C.npz",
+        "T": "/nvme/home/lixiang/code/noise_exp/weights/dynamic_cache/cifar10/resnet18/42/160/T.npz"
+      },
+      "proxy_training_seed": 42,
+      "proxy_log_seed_free": false,
+      "dynamic_cache_seed_free": false,
+      "output_seed": 42,
+      "adapter_seed": 42,
+      "diagnostics": {
+        "dynamic_static_pearson": {
+          "A": {
+            "SA": 0.7836604897756103,
+            "Div": -0.44108879897056436,
+            "DDS": -0.7450780691559556
+          },
+          "C": {
+            "SA": 0.008823470327175868,
+            "Div": 0.12807132081518305,
+            "DDS": -0.07140743576718787
+          },
+          "T": {
+            "SA": -0.0015670036438189046,
+            "Div": -0.004251482133742562,
+            "DDS": 0.0008031005434548294
+          }
+        },
+        "weight_solver": "softplus_ratio_no_simplex",
+        "raw_weights": [
+          0.7571901875726965,
+          0.3633474234909921,
+          0.047502764931705854
+        ],
+        "mse": 0.7488694876994629,
+        "ratio_regularizer": 0.555953905203386,
+        "iterations": 9540,
+        "weights_sum": 0.9999999999999999,
+        "weights_min": 0.0406687695973047,
+        "sa_gt_one_third_warning": true,
+        "div_is_lowest_warning": false
+      }
+    }
+  }
+}

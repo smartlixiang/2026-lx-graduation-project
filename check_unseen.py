@@ -1,20 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Diagnose proxy dynamics and static/dynamic score alignment for one unseen experiment.
+"""Diagnose the three internal terms of dynamic component A in unseen Exp. 1.
 
-Run from the project root, for example:
+This script is intentionally specialized for the unseen-sample experiment 1 and
+for comparing CIFAR-100 (the normal reference) with Tiny-ImageNet (the suspected
+abnormal setting). It reads existing caches only and never modifies them.
 
-    python check_unseen.py --exp 1 --dataset tiny-imagenet
-    python check_unseen.py --exp 3 --dataset cifar100 --seed 22 --epochs 100
+Typical usage from the project root:
 
-The script reads one experiment/dataset/seed combination from:
+    python check_unseen_1.py
+    python check_unseen_1.py --dataset tiny-imagenet --seed 22
+    python check_unseen_1.py --dataset both --seed 22
 
-    unseen_exp/proxy_logs/<exp>/<dataset>/<proxy_model>/<seed>/<epochs>/
-    unseen_exp/dynamic_cache/<exp>/<dataset>/<proxy_model>/<seed>/<epochs>/
-    unseen_exp/static_scores/<exp>/selection/<dataset>/<seed>/static_scores.npz
+Inputs:
 
-It prints diagnostics to the terminal and saves PNG figures only. It does not
-modify any cache file.
+    unseen_exp/proxy_logs/1/<dataset>/<proxy_model>/<seed>/<epochs>/fold_*.npz
+    unseen_exp/dynamic_cache/1/<dataset>/<proxy_model>/<seed>/<epochs>/A.npz
+    unseen_exp/static_scores/1/selection/<dataset>/<seed>/static_scores.npz
+
+Main diagnostics:
+
+1. Reconstruct A exactly from its three terms:
+   - Boundary: mean p_y(1-p_y) in the early phase.
+   - Gain: sqrt(mean_early(p_y) * mean_mid(p_y)) *
+           (mean_mid(p_y) - mean_early(p_y)).
+   - Stability: Var_late(CE) - Var_mid(CE).
+2. Correlate each exact additive A contribution with class-standardized
+   SA, Div, and DDS.
+3. Locate suspicious single-epoch changes using true-label probability,
+   support-weighted one-step gain, boundary information, and loss improvement.
+4. Compare first/second boundary sensitivity without retraining the proxy model.
+5. Compare learning-time behaviour between low/high static-score groups.
+
+The boundary scan only changes how the fixed trajectory is partitioned. It does
+not simulate a different MultiStepLR training trajectory.
 """
 
 from __future__ import annotations
@@ -26,7 +45,7 @@ import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterable, Mapping
+from typing import BinaryIO, Iterable, Mapping, Sequence
 
 import matplotlib
 
@@ -36,20 +55,24 @@ import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+EXP_ID = 1
 STATIC_NAMES = ("SA", "Div", "DDS")
 STATIC_KEYS = ("sa", "div", "dds")
-DYNAMIC_NAMES = ("A", "C", "T")
+A_TERM_NAMES = ("Boundary", "Gain", "Stability")
 SUPPORTED_DATASETS = ("cifar100", "tiny-imagenet")
 EPS = 1e-12
+ZSCORE_EPS = 1e-6
+SAFE_ZSCORE_EPS = 1e-8
 
 
 @dataclass(frozen=True)
 class Target:
-    exp: int
     dataset: str
     seed: int
     proxy_model: str
     epochs: int
+    first_boundary: int
+    second_boundary: int
 
 
 @dataclass(frozen=True)
@@ -57,7 +80,6 @@ class CachePaths:
     proxy_dir: Path
     dynamic_dir: Path
     static_path: Path
-    weights_path: Path
 
 
 @dataclass(frozen=True)
@@ -68,45 +90,73 @@ class NpyStreamInfo:
 
 
 @dataclass
-class ProxyMetrics:
-    epochs: np.ndarray
-    train_loss: np.ndarray
-    val_loss: np.ndarray
-    val_accuracy: np.ndarray
-    num_folds: int
+class FoldTrajectory:
+    fold_id: int
+    train_indices: np.ndarray
+    true_probability: np.ndarray  # (epochs, train samples), float32
+    loss: np.ndarray              # (epochs, train samples), float32
 
 
 @dataclass
-class DiagnosticData:
-    known_indices: np.ndarray
-    labels: np.ndarray
-    static_raw: dict[str, np.ndarray]
+class DecompositionResult:
+    contributions: dict[str, np.ndarray]
+    reconstructed_a: np.ndarray
+    pearson_matrix: np.ndarray
+    spearman_matrix: np.ndarray
+    variance_shares: dict[str, float]
+    saved_pearson: float
+    saved_spearman: float
+    saved_max_abs_error: float
+
+
+@dataclass
+class EpochDiagnostics:
+    epochs: np.ndarray
+    true_probability_spearman: np.ndarray
+    boundary_spearman: np.ndarray
+    one_step_gain_spearman: np.ndarray
+    loss_improvement_spearman: np.ndarray
+    mean_true_probability: np.ndarray
+    mean_loss: np.ndarray
+    mean_accuracy: np.ndarray
+    final_true_probability: np.ndarray
+    final_correct_rate: np.ndarray
+    first_stable_correct_epoch: np.ndarray
+    first_probability_05_epoch: np.ndarray
+    first_probability_09_epoch: np.ndarray
+
+
+@dataclass
+class ScanPoint:
+    boundary: int
+    pearson_matrix: np.ndarray
+    spearman_matrix: np.ndarray
+
+
+@dataclass
+class DatasetResult:
+    target: Target
     static_class_z: dict[str, np.ndarray]
-    dynamic: dict[str, np.ndarray]
-    pseudo_target: np.ndarray
-    is_corrupted: np.ndarray | None
-
-
-@dataclass(frozen=True)
-class FitResult:
-    weights: np.ndarray
-    r2: float
-    prediction_std: float
+    saved_a: np.ndarray
+    decomposition: DecompositionResult
+    epoch_diagnostics: EpochDiagnostics
+    first_scan: list[ScanPoint]
+    second_scan: list[ScanPoint]
+    output_paths: list[Path]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Diagnose one unseen-sample experiment by plotting proxy dynamics "
-            "and analysing SA/Div/DDS against A/C/T."
+            "Diagnose Boundary/Gain/Stability inside A for unseen experiment 1, "
+            "with optional CIFAR-100 vs Tiny-ImageNet comparison."
         )
     )
-    parser.add_argument("--exp", type=int, required=True, choices=(1, 3))
     parser.add_argument(
         "--dataset",
-        required=True,
-        choices=SUPPORTED_DATASETS,
-        help="Experiment 3 supports only cifar100.",
+        choices=("both", *SUPPORTED_DATASETS),
+        default="both",
+        help="Default: compare CIFAR-100 and Tiny-ImageNet.",
     )
     parser.add_argument("--seed", type=int, default=22)
     parser.add_argument("--proxy-model", default="resnet18")
@@ -114,50 +164,90 @@ def parse_args() -> argparse.Namespace:
         "--epochs",
         type=int,
         default=None,
+        help="Exact epoch directory; valid only for a single dataset.",
+    )
+    parser.add_argument("--cifar100-epochs", type=int, default=None)
+    parser.add_argument("--tiny-imagenet-epochs", type=int, default=None)
+    parser.add_argument(
+        "--boundaries",
+        type=int,
+        nargs=2,
+        metavar=("FIRST", "SECOND"),
+        default=None,
         help=(
-            "Exact numeric cache directory. If omitted, use the largest epoch "
-            "directory present in both proxy_logs and dynamic_cache."
+            "Override phase boundaries for a single dataset. By default read the "
+            "first two lr_milestones from proxy meta.json."
         ),
     )
     parser.add_argument(
         "--unseen-root",
         type=Path,
         default=Path("unseen_exp"),
-        help="Unseen-experiment root relative to the project root.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("check_unseen_output"),
-        help="Directory in which PNG figures are saved.",
     )
     parser.add_argument(
-        "--normalization",
-        choices=("relative", "none"),
-        default="relative",
-        help="Normalization used only for the proxy-dynamics figure.",
-    )
-    parser.add_argument(
-        "--smooth-window",
+        "--scan-radius",
         type=int,
-        default=1,
-        help="Moving-average window used only for the proxy-dynamics figure.",
+        default=8,
+        help="Boundary sensitivity scan radius in epochs.",
     )
     parser.add_argument(
-        "--top-k",
+        "--scan-step",
+        type=int,
+        default=2,
+        help="Boundary sensitivity scan step.",
+    )
+    parser.add_argument(
+        "--minimum-phase-length",
         type=int,
         default=5,
-        help="Number of strongest cross-component correlations printed separately.",
+    )
+    parser.add_argument(
+        "--top-k-epochs",
+        type=int,
+        default=8,
+        help="Number of most suspicious one-step epochs printed.",
+    )
+    parser.add_argument(
+        "--learn-patience",
+        type=int,
+        default=3,
+        help="Consecutive epochs required for a sample to be stably correct.",
+    )
+    parser.add_argument(
+        "--group-quantile",
+        type=float,
+        default=0.20,
+        help="Fraction used for low/high static-score learning-time groups.",
     )
     args = parser.parse_args()
-    if args.exp == 3 and args.dataset != "cifar100":
-        parser.error("Experiment 3 supports only --dataset cifar100")
-    if args.epochs is not None and args.epochs <= 0:
-        parser.error("--epochs must be positive")
-    if args.smooth_window <= 0:
-        parser.error("--smooth-window must be positive")
-    if args.top_k <= 0:
-        parser.error("--top-k must be positive")
+
+    if args.seed < 0:
+        parser.error("--seed must be non-negative")
+    if args.dataset == "both" and args.epochs is not None:
+        parser.error("--epochs can only be used with one dataset")
+    if args.dataset == "both" and args.boundaries is not None:
+        parser.error("--boundaries can only be used with one dataset")
+    for name in ("epochs", "cifar100_epochs", "tiny_imagenet_epochs"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.scan_radius < 0:
+        parser.error("--scan-radius must be non-negative")
+    if args.scan_step <= 0:
+        parser.error("--scan-step must be positive")
+    if args.minimum_phase_length <= 0:
+        parser.error("--minimum-phase-length must be positive")
+    if args.top_k_epochs <= 0:
+        parser.error("--top-k-epochs must be positive")
+    if args.learn_patience <= 0:
+        parser.error("--learn-patience must be positive")
+    if not 0.0 < args.group_quantile < 0.5:
+        parser.error("--group-quantile must lie in (0, 0.5)")
     return args
 
 
@@ -165,7 +255,7 @@ def resolve_project_path(path: Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def numeric_cache_dirs(root: Path, *, require_folds: bool = False) -> dict[int, Path]:
+def numeric_epoch_dirs(root: Path, *, require_folds: bool) -> dict[int, Path]:
     if not root.is_dir():
         return {}
     result: dict[int, Path] = {}
@@ -178,67 +268,117 @@ def numeric_cache_dirs(root: Path, *, require_folds: bool = False) -> dict[int, 
     return result
 
 
-def resolve_target(args: argparse.Namespace) -> tuple[Target, CachePaths]:
+def requested_epochs(args: argparse.Namespace, dataset: str) -> int | None:
+    if args.dataset != "both" and args.epochs is not None:
+        return int(args.epochs)
+    if dataset == "cifar100" and args.cifar100_epochs is not None:
+        return int(args.cifar100_epochs)
+    if dataset == "tiny-imagenet" and args.tiny_imagenet_epochs is not None:
+        return int(args.tiny_imagenet_epochs)
+    return None
+
+
+def resolve_cache_paths(
+    args: argparse.Namespace,
+    dataset: str,
+) -> tuple[int, CachePaths]:
     unseen_root = resolve_project_path(args.unseen_root)
     proxy_seed_root = (
         unseen_root
         / "proxy_logs"
-        / str(args.exp)
-        / args.dataset
+        / str(EXP_ID)
+        / dataset
         / args.proxy_model
         / str(args.seed)
     )
     dynamic_seed_root = (
         unseen_root
         / "dynamic_cache"
-        / str(args.exp)
-        / args.dataset
+        / str(EXP_ID)
+        / dataset
         / args.proxy_model
         / str(args.seed)
     )
 
-    if args.epochs is None:
-        proxy_epochs = numeric_cache_dirs(proxy_seed_root, require_folds=True)
-        dynamic_epochs = numeric_cache_dirs(dynamic_seed_root)
-        common = sorted(set(proxy_epochs) & set(dynamic_epochs))
+    exact = requested_epochs(args, dataset)
+    if exact is None:
+        proxy = numeric_epoch_dirs(proxy_seed_root, require_folds=True)
+        dynamic = numeric_epoch_dirs(dynamic_seed_root, require_folds=False)
+        common = sorted(set(proxy) & set(dynamic))
+        common = [epoch for epoch in common if (dynamic[epoch] / "A.npz").is_file()]
         if not common:
             raise FileNotFoundError(
-                "No common numeric epoch directory exists in both proxy and dynamic "
-                f"caches. proxy={proxy_seed_root}, dynamic={dynamic_seed_root}"
+                "No shared epoch cache containing proxy folds and A.npz: "
+                f"proxy={proxy_seed_root}, dynamic={dynamic_seed_root}"
             )
         epochs = common[-1]
     else:
-        epochs = int(args.epochs)
+        epochs = exact
 
-    target = Target(
-        exp=int(args.exp),
-        dataset=str(args.dataset),
-        seed=int(args.seed),
-        proxy_model=str(args.proxy_model),
-        epochs=epochs,
-    )
     paths = CachePaths(
         proxy_dir=proxy_seed_root / str(epochs),
         dynamic_dir=dynamic_seed_root / str(epochs),
         static_path=(
             unseen_root
             / "static_scores"
-            / str(args.exp)
+            / str(EXP_ID)
             / "selection"
-            / args.dataset
+            / dataset
             / str(args.seed)
             / "static_scores.npz"
         ),
-        weights_path=unseen_root / "weights" / str(args.exp) / "scoring_weights.json",
     )
-
     if not paths.proxy_dir.is_dir():
         raise FileNotFoundError(f"Proxy cache not found: {paths.proxy_dir}")
-    if not paths.dynamic_dir.is_dir():
-        raise FileNotFoundError(f"Dynamic cache not found: {paths.dynamic_dir}")
+    if not (paths.dynamic_dir / "A.npz").is_file():
+        raise FileNotFoundError(f"A cache not found: {paths.dynamic_dir / 'A.npz'}")
     if not paths.static_path.is_file():
-        raise FileNotFoundError(f"Static-score cache not found: {paths.static_path}")
-    return target, paths
+        raise FileNotFoundError(f"Static cache not found: {paths.static_path}")
+    return epochs, paths
+
+
+def read_phase_boundaries(
+    args: argparse.Namespace,
+    dataset: str,
+    epochs: int,
+    proxy_dir: Path,
+) -> tuple[int, int]:
+    if args.dataset != "both" and args.boundaries is not None:
+        first, second = map(int, args.boundaries)
+    else:
+        first = second = -1
+        meta_path = proxy_dir / "meta.json"
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                milestones = [
+                    int(value)
+                    for value in meta.get("lr_milestones", [])
+                    if 0 < int(value) < epochs
+                ]
+                if len(milestones) >= 2:
+                    first, second = milestones[:2]
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+
+        if first < 0:
+            known_defaults = {
+                ("cifar100", 100): (40, 75),
+                ("tiny-imagenet", 55): (25, 40),
+                ("tiny-imagenet", 50): (20, 35),
+            }
+            if (dataset, epochs) in known_defaults:
+                first, second = known_defaults[(dataset, epochs)]
+            else:
+                first = max(1, int(round(0.40 * epochs)))
+                second = max(first + 1, int(round(0.75 * epochs)))
+
+    if not (0 < first < second < epochs):
+        raise ValueError(
+            f"Invalid phase boundaries for {dataset}: first={first}, "
+            f"second={second}, epochs={epochs}"
+        )
+    return first, second
 
 
 def fold_sort_key(path: Path) -> tuple[float, str]:
@@ -258,7 +398,7 @@ def _read_npy_header(stream: BinaryIO) -> NpyStreamInfo:
     elif version == (3, 0):
         reader = getattr(np.lib.format, "_read_array_header", None)
         if reader is None:
-            raise ValueError("NPY 3.0 headers are unsupported by this NumPy version")
+            raise ValueError("NPY 3.0 headers are unsupported by this NumPy")
         shape, fortran_order, dtype = reader(stream, version)
     else:
         raise ValueError(f"Unsupported NPY version: {version}")
@@ -272,7 +412,7 @@ def _read_npy_header(stream: BinaryIO) -> NpyStreamInfo:
 def _read_exact(stream: BinaryIO, num_bytes: int) -> bytes:
     chunks: list[bytes] = []
     remaining = num_bytes
-    while remaining > 0:
+    while remaining:
         chunk = stream.read(remaining)
         if not chunk:
             raise EOFError(f"Unexpected end of NPY member; missing {remaining} bytes")
@@ -289,7 +429,7 @@ def inspect_logits_shape(npz_path: Path, array_name: str) -> tuple[int, int, int
         with archive.open(member, mode="r") as stream:
             info = _read_npy_header(stream)
     if len(info.shape) != 3:
-        raise ValueError(f"{array_name} must be 3-D, got {info.shape}")
+        raise ValueError(f"{array_name} must be 3-D; got {info.shape}")
     return int(info.shape[0]), int(info.shape[1]), int(info.shape[2])
 
 
@@ -301,11 +441,9 @@ def iter_logits_epochs(npz_path: Path, array_name: str) -> Iterable[np.ndarray]:
         with archive.open(member, mode="r") as stream:
             info = _read_npy_header(stream)
             if len(info.shape) != 3:
-                raise ValueError(f"{array_name} must be 3-D, got {info.shape}")
+                raise ValueError(f"{array_name} must be 3-D; got {info.shape}")
             if info.fortran_order:
-                raise ValueError(
-                    f"Fortran-order logits are unsupported: {npz_path}:{array_name}"
-                )
+                raise ValueError("Fortran-order logits are unsupported")
             num_epochs, num_samples, num_classes = info.shape
             values_per_epoch = num_samples * num_classes
             bytes_per_epoch = values_per_epoch * info.dtype.itemsize
@@ -315,154 +453,32 @@ def iter_logits_epochs(npz_path: Path, array_name: str) -> Iterable[np.ndarray]:
                 yield values.reshape(num_samples, num_classes)
 
 
-def cross_entropy_sum(logits: np.ndarray, labels: np.ndarray) -> float:
-    values = np.asarray(logits, dtype=np.float64)
-    labels = np.asarray(labels, dtype=np.int64)
-    if values.ndim != 2 or labels.shape != (values.shape[0],):
-        raise ValueError(
-            f"Labels/logits mismatch: labels={labels.shape}, logits={values.shape}"
-        )
-    if np.any(labels < 0) or np.any(labels >= values.shape[1]):
-        raise ValueError("Label out of range for logits")
-    row_max = np.max(values, axis=1)
-    shifted = values - row_max[:, None]
-    log_sum_exp = row_max + np.log(np.exp(shifted).sum(axis=1))
-    result = log_sum_exp - values[np.arange(values.shape[0]), labels]
-    if not np.isfinite(result).all():
-        raise ValueError("Cross entropy contains NaN or infinity")
-    return float(result.sum())
-
-
-def load_known_indices_from_dynamic(dynamic_dir: Path) -> np.ndarray:
-    for name in (*DYNAMIC_NAMES, "pseudo_labels"):
-        path = dynamic_dir / f"{name}.npz"
-        if not path.is_file():
-            continue
-        with np.load(path, allow_pickle=False) as data:
-            if "known_indices" in data.files:
-                known = np.asarray(data["known_indices"], dtype=np.int64)
-                if known.ndim == 1 and np.unique(known).size == known.size:
-                    return known
-    raise KeyError(f"No valid known_indices found under {dynamic_dir}")
-
-
-def load_static_cache(
-    static_path: Path,
-    dynamic_known: np.ndarray,
-) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray | None]:
-    with np.load(static_path, allow_pickle=False) as data:
-        required = set(STATIC_KEYS) | {"labels"}
-        if not required.issubset(data.files):
-            missing = sorted(required - set(data.files))
-            raise KeyError(f"{static_path} missing arrays: {missing}")
-
-        labels = np.asarray(data["labels"], dtype=np.int64)
-        scores = {
-            name: np.asarray(data[key], dtype=np.float64)
-            for name, key in zip(STATIC_NAMES, STATIC_KEYS)
-        }
-        lengths = {len(values) for values in scores.values()} | {len(labels)}
-        if len(lengths) != 1:
-            raise ValueError(f"Static arrays have inconsistent lengths: {lengths}")
-        n_static = len(labels)
-
-        if "sample_indices" in data.files:
-            sample_indices = np.asarray(data["sample_indices"], dtype=np.int64)
-        else:
-            sample_indices = np.arange(n_static, dtype=np.int64)
-        if sample_indices.shape != (n_static,):
-            raise ValueError("static sample_indices shape mismatch")
-        if np.unique(sample_indices).size != sample_indices.size:
-            raise ValueError("static sample_indices contains duplicates")
-
-        order = np.argsort(sample_indices)
-        sorted_indices = sample_indices[order]
-        positions = np.searchsorted(sorted_indices, dynamic_known)
-        if (
-            np.any(positions >= len(sorted_indices))
-            or not np.array_equal(sorted_indices[positions], dynamic_known)
-        ):
-            raise ValueError(
-                "Static cache does not cover every dynamic known index. "
-                f"static={static_path}"
-            )
-        static_positions = order[positions]
-        aligned_scores = {name: values[static_positions] for name, values in scores.items()}
-        aligned_labels = labels[static_positions]
-
-        is_corrupted: np.ndarray | None = None
-        if "is_corrupted" in data.files:
-            full_corrupted = np.asarray(data["is_corrupted"], dtype=bool)
-            if full_corrupted.shape == (n_static,):
-                is_corrupted = full_corrupted[static_positions]
-
-    for name, values in aligned_scores.items():
-        validate_vector(name, values, len(dynamic_known))
-    return aligned_scores, aligned_labels, static_positions, is_corrupted
-
-
-def load_dynamic_components(
-    dynamic_dir: Path,
-    expected_known: np.ndarray,
-    expected_labels: np.ndarray,
-) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray | None]:
-    components: dict[str, np.ndarray] = {}
-    dynamic_corrupted: np.ndarray | None = None
-    for name in DYNAMIC_NAMES:
-        path = dynamic_dir / f"{name}.npz"
-        if not path.is_file():
-            raise FileNotFoundError(f"Dynamic component cache not found: {path}")
-        with np.load(path, allow_pickle=False) as data:
-            required = {"final_normalized", "known_indices", "labels"}
-            if not required.issubset(data.files):
-                missing = sorted(required - set(data.files))
-                raise KeyError(f"{path} missing arrays: {missing}")
-            known = np.asarray(data["known_indices"], dtype=np.int64)
-            labels = np.asarray(data["labels"], dtype=np.int64)
-            values = np.asarray(data["final_normalized"], dtype=np.float64)
-            if not np.array_equal(known, expected_known):
-                raise ValueError(f"known_indices mismatch in {path}")
-            if not np.array_equal(labels, expected_labels):
-                raise ValueError(f"labels mismatch in {path}")
-            validate_vector(name, values, len(expected_known))
-            components[name] = values
-            if "is_corrupted" in data.files:
-                candidate = np.asarray(data["is_corrupted"], dtype=bool)
-                if candidate.shape == (len(expected_known),):
-                    dynamic_corrupted = candidate
-                elif candidate.ndim == 1 and len(candidate) > int(expected_known.max()):
-                    dynamic_corrupted = candidate[expected_known]
-
-    pseudo_path = dynamic_dir / "pseudo_labels.npz"
-    pseudo: np.ndarray | None = None
-    if pseudo_path.is_file():
-        with np.load(pseudo_path, allow_pickle=False) as data:
-            if "dynamic_target" in data.files:
-                candidate = np.asarray(data["dynamic_target"], dtype=np.float64)
-                if candidate.shape == (len(expected_known),) and np.isfinite(candidate).all():
-                    pseudo = candidate
-    if pseudo is None:
-        pseudo = standard_zscore(
-            sum(components[name] for name in DYNAMIC_NAMES) / len(DYNAMIC_NAMES)
-        )
-    return components, pseudo, dynamic_corrupted
-
-
-def validate_vector(name: str, values: np.ndarray, expected_length: int) -> None:
-    if values.shape != (expected_length,):
-        raise ValueError(
-            f"{name} shape mismatch: got {values.shape}, expected {(expected_length,)}"
-        )
-    if not np.isfinite(values).all():
-        raise ValueError(f"{name} contains NaN or infinity")
-
-
-def standard_zscore(values: np.ndarray) -> np.ndarray:
+def standard_zscore(values: np.ndarray, eps: float = ZSCORE_EPS) -> np.ndarray:
     values = np.asarray(values, dtype=np.float64)
-    std = float(np.std(values))
-    if not np.isfinite(std) or std < EPS:
-        return np.zeros_like(values)
-    return (values - float(np.mean(values))) / std
+    if values.ndim != 1:
+        raise ValueError("standard_zscore expects a 1-D vector")
+    finite = np.isfinite(values)
+    output = np.zeros(values.shape, dtype=np.float64)
+    if int(finite.sum()) < 2:
+        return output
+    finite_values = values[finite]
+    mean = float(np.mean(finite_values))
+    std = float(np.std(finite_values))
+    if not np.isfinite(mean) or not np.isfinite(std) or std < eps:
+        return output
+    output[finite] = (finite_values - mean) / (std + eps)
+    return output
+
+
+def safe_standardize(values: np.ndarray, eps: float = SAFE_ZSCORE_EPS) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    mean = float(np.nanmean(values)) if values.size else 0.0
+    std = float(np.nanstd(values)) if values.size else 0.0
+    if not np.isfinite(mean):
+        mean = 0.0
+    if not np.isfinite(std) or std < eps:
+        return np.zeros_like(values, dtype=np.float64)
+    return (values - mean) / (std + eps)
 
 
 def classwise_zscore(values: np.ndarray, labels: np.ndarray) -> np.ndarray:
@@ -475,132 +491,20 @@ def classwise_zscore(values: np.ndarray, labels: np.ndarray) -> np.ndarray:
     return output
 
 
-def load_diagnostic_data(paths: CachePaths) -> DiagnosticData:
-    known = load_known_indices_from_dynamic(paths.dynamic_dir)
-    static_raw, labels, _, static_corrupted = load_static_cache(paths.static_path, known)
-    dynamic, pseudo, dynamic_corrupted = load_dynamic_components(
-        paths.dynamic_dir,
-        known,
-        labels,
-    )
-    static_class_z = {
-        name: classwise_zscore(static_raw[name], labels) for name in STATIC_NAMES
-    }
-    is_corrupted = dynamic_corrupted if dynamic_corrupted is not None else static_corrupted
-    return DiagnosticData(
-        known_indices=known,
-        labels=labels,
-        static_raw=static_raw,
-        static_class_z=static_class_z,
-        dynamic=dynamic,
-        pseudo_target=pseudo,
-        is_corrupted=is_corrupted,
-    )
-
-
-def select_fold_labels(
-    indices: np.ndarray,
-    known_labels: np.ndarray,
-    full_static_labels: np.ndarray | None = None,
-) -> np.ndarray:
-    indices = np.asarray(indices, dtype=np.int64)
-    if indices.ndim != 1 or np.any(indices < 0):
-        raise ValueError("Fold indices must be non-negative one-dimensional integers")
-    if indices.size == 0:
-        return np.empty(0, dtype=np.int64)
-    max_index = int(indices.max())
-    if max_index < len(known_labels):
-        return known_labels[indices]
-    if full_static_labels is not None and max_index < len(full_static_labels):
-        return full_static_labels[indices]
-    raise ValueError(
-        f"Fold index {max_index} exceeds known-label length {len(known_labels)}"
-    )
-
-
-def compute_proxy_metrics(proxy_dir: Path, known_labels: np.ndarray) -> ProxyMetrics:
-    fold_paths = sorted(proxy_dir.glob("fold_*.npz"), key=fold_sort_key)
-    if not fold_paths:
-        raise FileNotFoundError(f"No fold_*.npz files found in {proxy_dir}")
-
-    train_total: np.ndarray | None = None
-    val_total: np.ndarray | None = None
-    correct_total: np.ndarray | None = None
-    train_count = 0
-    val_count = 0
-
-    for fold_path in fold_paths:
-        print(f"[Proxy] reading {fold_path}")
-        with np.load(fold_path, allow_pickle=False) as data:
-            required = {"train_indices", "val_indices"}
-            if not required.issubset(data.files):
-                missing = sorted(required - set(data.files))
-                raise KeyError(f"{fold_path} missing arrays: {missing}")
-            train_indices = np.asarray(data["train_indices"], dtype=np.int64)
-            val_indices = np.asarray(data["val_indices"], dtype=np.int64)
-
-        train_labels = select_fold_labels(train_indices, known_labels)
-        val_labels = select_fold_labels(val_indices, known_labels)
-        train_shape = inspect_logits_shape(fold_path, "train_logits")
-        val_shape = inspect_logits_shape(fold_path, "val_logits")
-        if train_shape[0] != val_shape[0]:
-            raise ValueError(f"Epoch count mismatch in {fold_path}")
-        if train_shape[1] != len(train_labels) or val_shape[1] != len(val_labels):
-            raise ValueError(f"Sample count mismatch in {fold_path}")
-        if train_shape[2] != val_shape[2]:
-            raise ValueError(f"Class count mismatch in {fold_path}")
-
-        fold_train_loss = np.empty(train_shape[0], dtype=np.float64)
-        for epoch, logits in enumerate(iter_logits_epochs(fold_path, "train_logits")):
-            fold_train_loss[epoch] = cross_entropy_sum(logits, train_labels)
-
-        fold_val_loss = np.empty(val_shape[0], dtype=np.float64)
-        fold_correct = np.empty(val_shape[0], dtype=np.float64)
-        for epoch, logits in enumerate(iter_logits_epochs(fold_path, "val_logits")):
-            fold_val_loss[epoch] = cross_entropy_sum(logits, val_labels)
-            fold_correct[epoch] = float(
-                np.count_nonzero(np.argmax(logits, axis=1) == val_labels)
-            )
-
-        if train_total is None:
-            train_total = np.zeros_like(fold_train_loss)
-            val_total = np.zeros_like(fold_val_loss)
-            correct_total = np.zeros_like(fold_correct)
-        elif len(fold_train_loss) != len(train_total):
-            raise ValueError(f"Fold epoch count mismatch in {proxy_dir}")
-
-        train_total += fold_train_loss
-        val_total += fold_val_loss
-        correct_total += fold_correct
-        train_count += len(train_labels)
-        val_count += len(val_labels)
-
-    assert train_total is not None
-    assert val_total is not None
-    assert correct_total is not None
-    return ProxyMetrics(
-        epochs=np.arange(1, len(train_total) + 1, dtype=np.int64),
-        train_loss=train_total / train_count,
-        val_loss=val_total / val_count,
-        val_accuracy=correct_total / val_count,
-        num_folds=len(fold_paths),
-    )
-
-
 def rankdata(values: np.ndarray) -> np.ndarray:
-    """Average ranks for ties, equivalent to scipy.stats.rankdata(method='average')."""
+    """Vectorized average ranks for ties (equivalent to scipy rankdata)."""
     values = np.asarray(values, dtype=np.float64)
     order = np.argsort(values, kind="mergesort")
     sorted_values = values[order]
-    ranks = np.empty(len(values), dtype=np.float64)
-    start = 0
-    while start < len(values):
-        end = start + 1
-        while end < len(values) and sorted_values[end] == sorted_values[start]:
-            end += 1
-        average_rank = 0.5 * (start + end - 1) + 1.0
-        ranks[order[start:end]] = average_rank
-        start = end
+    n = len(values)
+    ranks = np.empty(n, dtype=np.float64)
+    if n == 0:
+        return ranks
+    starts = np.r_[0, np.flatnonzero(sorted_values[1:] != sorted_values[:-1]) + 1]
+    ends = np.r_[starts[1:], n]
+    counts = ends - starts
+    average_ranks = 0.5 * (starts + ends - 1) + 1.0
+    ranks[order] = np.repeat(average_ranks, counts)
     return ranks
 
 
@@ -608,9 +512,9 @@ def pearson(x: np.ndarray, y: np.ndarray) -> float:
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     if x.shape != y.shape:
-        raise ValueError("Correlation vectors must have the same shape")
-    x_centered = x - np.mean(x)
-    y_centered = y - np.mean(y)
+        raise ValueError("Correlation vectors must share a shape")
+    x_centered = x - float(np.mean(x))
+    y_centered = y - float(np.mean(y))
     denominator = float(np.linalg.norm(x_centered) * np.linalg.norm(y_centered))
     if denominator < EPS:
         return 0.0
@@ -622,373 +526,649 @@ def spearman(x: np.ndarray, y: np.ndarray) -> float:
 
 
 def correlation_matrix(
-    left: Mapping[str, np.ndarray],
-    right: Mapping[str, np.ndarray],
+    static_values: Mapping[str, np.ndarray],
+    component_values: Mapping[str, np.ndarray],
     method: str,
 ) -> np.ndarray:
-    function = pearson if method == "pearson" else spearman
+    if method == "pearson":
+        left = static_values
+        right = component_values
+    elif method == "spearman":
+        left = {name: rankdata(values) for name, values in static_values.items()}
+        right = {name: rankdata(values) for name, values in component_values.items()}
+    else:
+        raise ValueError(f"Unsupported correlation method: {method}")
     return np.asarray(
-        [[function(left[lname], right[rname]) for rname in right] for lname in left],
+        [
+            [pearson(left[sname], right[cname]) for cname in right]
+            for sname in left
+        ],
         dtype=np.float64,
     )
 
 
-def pairwise_matrix(values: Mapping[str, np.ndarray], method: str) -> np.ndarray:
-    return correlation_matrix(values, values, method)
+def load_a_and_static(
+    paths: CachePaths,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]:
+    a_path = paths.dynamic_dir / "A.npz"
+    with np.load(a_path, allow_pickle=False) as data:
+        required = {"known_indices", "labels", "final_normalized"}
+        if not required.issubset(data.files):
+            raise KeyError(f"{a_path} missing {sorted(required - set(data.files))}")
+        known = np.asarray(data["known_indices"], dtype=np.int64)
+        labels = np.asarray(data["labels"], dtype=np.int64)
+        saved_a = np.asarray(data["final_normalized"], dtype=np.float64)
+    if known.ndim != 1 or labels.shape != known.shape or saved_a.shape != known.shape:
+        raise ValueError("A cache arrays have inconsistent shapes")
+    if np.unique(known).size != known.size:
+        raise ValueError("known_indices contains duplicates")
+    if not np.isfinite(saved_a).all():
+        raise ValueError("Saved A contains NaN or infinity")
 
-
-def positive_fit(features: np.ndarray, target: np.ndarray) -> FitResult:
-    """Fit a centered non-negative linear model for diagnostic purposes.
-
-    SciPy NNLS is used when available. A projected-gradient fallback keeps the
-    script usable in minimal environments. This is not a replacement for stage
-    5's softplus-ratio regression; it is an interpretable diagnostic showing
-    which static component can positively explain each dynamic component.
-    """
-    x = np.asarray(features, dtype=np.float64)
-    y = np.asarray(target, dtype=np.float64)
-    x = x - np.mean(x, axis=0, keepdims=True)
-    y = y - np.mean(y)
-
-    try:
-        from scipy.optimize import nnls
-
-        coefficients, _ = nnls(x, y)
-    except Exception:
-        gram = x.T @ x
-        lipschitz = float(np.linalg.norm(gram, ord=2))
-        step = 1.0 / max(lipschitz, EPS)
-        coefficients = np.zeros(x.shape[1], dtype=np.float64)
-        for _ in range(20_000):
-            gradient = x.T @ (x @ coefficients - y)
-            updated = np.maximum(0.0, coefficients - step * gradient)
-            if np.max(np.abs(updated - coefficients)) < 1e-10:
-                coefficients = updated
-                break
-            coefficients = updated
-
-    prediction = x @ coefficients
-    residual = float(np.sum((y - prediction) ** 2))
-    total = float(np.sum(y**2))
-    r2 = 0.0 if total < EPS else 1.0 - residual / total
-    coefficient_sum = float(np.sum(coefficients))
-    weights = (
-        coefficients / coefficient_sum
-        if coefficient_sum > EPS
-        else np.zeros_like(coefficients)
-    )
-    return FitResult(
-        weights=weights,
-        r2=float(r2),
-        prediction_std=float(np.std(prediction)),
-    )
-
-
-def vector_summary(values: np.ndarray) -> dict[str, float]:
-    values = np.asarray(values, dtype=np.float64)
-    mean = float(np.mean(values))
-    std = float(np.std(values))
-    centered = values - mean
-    skewness = 0.0 if std < EPS else float(np.mean((centered / std) ** 3))
-    kurtosis = 0.0 if std < EPS else float(np.mean((centered / std) ** 4) - 3.0)
-    return {
-        "mean": mean,
-        "std": std,
-        "min": float(np.min(values)),
-        "q01": float(np.quantile(values, 0.01)),
-        "q05": float(np.quantile(values, 0.05)),
-        "median": float(np.median(values)),
-        "q95": float(np.quantile(values, 0.95)),
-        "q99": float(np.quantile(values, 0.99)),
-        "max": float(np.max(values)),
-        "skew": skewness,
-        "excess_kurtosis": kurtosis,
-        "outlier_fraction": float(np.mean(np.abs(standard_zscore(values)) > 3.0)),
-        "unique_ratio": float(np.unique(values).size / max(1, values.size)),
-    }
-
-
-def load_saved_weights(path: Path, target: Target) -> dict[str, float] | None:
-    if not path.is_file():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        entry = payload[target.dataset][str(target.seed)]
-        return {name: float(entry[key]) for name, key in zip(STATIC_NAMES, STATIC_KEYS)}
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        return None
-
-
-def print_matrix(title: str, matrix: np.ndarray, rows: tuple[str, ...], columns: tuple[str, ...]) -> None:
-    width = 11
-    print(f"\n{title}")
-    print("".ljust(width) + "".join(name.rjust(width) for name in columns))
-    for row_name, row in zip(rows, matrix):
-        print(row_name.ljust(width) + "".join(f"{value:>{width}.5f}" for value in row))
-
-
-def print_component_summaries(data: DiagnosticData) -> None:
-    print("\n[Component distribution summaries]")
-    print(
-        f"{'name':<8}{'mean':>11}{'std':>11}{'q01':>11}{'median':>11}"
-        f"{'q99':>11}{'skew':>11}{'kurt':>11}{'outlier%':>11}"
-    )
-    all_values = {
-        **{name: data.static_class_z[name] for name in STATIC_NAMES},
-        **data.dynamic,
-        "Target": data.pseudo_target,
-    }
-    for name, values in all_values.items():
-        stats = vector_summary(values)
-        print(
-            f"{name:<8}{stats['mean']:>11.5f}{stats['std']:>11.5f}"
-            f"{stats['q01']:>11.5f}{stats['median']:>11.5f}{stats['q99']:>11.5f}"
-            f"{stats['skew']:>11.5f}{stats['excess_kurtosis']:>11.5f}"
-            f"{100.0 * stats['outlier_fraction']:>10.3f}%"
-        )
-
-
-def print_positive_fits(data: DiagnosticData) -> dict[str, FitResult]:
-    x = np.column_stack([data.static_class_z[name] for name in STATIC_NAMES])
-    targets = {**data.dynamic, "Target": data.pseudo_target}
-    results = {name: positive_fit(x, values) for name, values in targets.items()}
-    print("\n[Positive diagnostic fits: static components -> each target]")
-    print(f"{'target':<10}{'SA':>11}{'Div':>11}{'DDS':>11}{'R2':>11}{'pred_std':>12}")
-    for name in (*DYNAMIC_NAMES, "Target"):
-        result = results[name]
-        print(
-            f"{name:<10}{result.weights[0]:>11.5f}{result.weights[1]:>11.5f}"
-            f"{result.weights[2]:>11.5f}{result.r2:>11.5f}"
-            f"{result.prediction_std:>12.5f}"
-        )
-    return results
-
-
-def print_strongest_correlations(
-    pearson_cross: np.ndarray,
-    spearman_cross: np.ndarray,
-    top_k: int,
-) -> None:
-    rows: list[tuple[float, str, str, float, float]] = []
-    for i, static_name in enumerate(STATIC_NAMES):
-        for j, dynamic_name in enumerate(DYNAMIC_NAMES):
-            rows.append(
-                (
-                    abs(float(spearman_cross[i, j])),
-                    static_name,
-                    dynamic_name,
-                    float(pearson_cross[i, j]),
-                    float(spearman_cross[i, j]),
-                )
+    with np.load(paths.static_path, allow_pickle=False) as data:
+        required = set(STATIC_KEYS) | {"labels"}
+        if not required.issubset(data.files):
+            raise KeyError(
+                f"{paths.static_path} missing {sorted(required - set(data.files))}"
             )
-    rows.sort(reverse=True)
-    print(f"\n[Top {min(top_k, len(rows))} static/dynamic relationships by |Spearman|]")
-    for _, static_name, dynamic_name, p_value, s_value in rows[:top_k]:
-        print(
-            f"  {static_name:>3} vs {dynamic_name}: "
-            f"Pearson={p_value:+.5f}, Spearman={s_value:+.5f}"
+        full_labels = np.asarray(data["labels"], dtype=np.int64)
+        full_scores = {
+            name: np.asarray(data[key], dtype=np.float64)
+            for name, key in zip(STATIC_NAMES, STATIC_KEYS)
+        }
+        n = len(full_labels)
+        if any(values.shape != (n,) for values in full_scores.values()):
+            raise ValueError("Static score arrays have inconsistent shapes")
+        sample_indices = (
+            np.asarray(data["sample_indices"], dtype=np.int64)
+            if "sample_indices" in data.files
+            else np.arange(n, dtype=np.int64)
         )
 
-
-def print_corruption_effects(data: DiagnosticData) -> None:
-    if data.is_corrupted is None:
-        return
-    corrupted = np.asarray(data.is_corrupted, dtype=bool)
-    if corrupted.shape != (len(data.labels),) or not np.any(corrupted) or np.all(corrupted):
-        return
-    print("\n[Experiment-3 clean/corrupted component effects]")
-    print(f"{'name':<9}{'clean_mean':>13}{'corr_mean':>13}{'Cohen_d':>12}")
-    values_map = {
-        **{name: data.static_class_z[name] for name in STATIC_NAMES},
-        **data.dynamic,
-        "Target": data.pseudo_target,
+    if sample_indices.shape != (len(full_labels),):
+        raise ValueError("static sample_indices shape mismatch")
+    order = np.argsort(sample_indices)
+    sorted_indices = sample_indices[order]
+    positions = np.searchsorted(sorted_indices, known)
+    if (
+        np.any(positions >= len(sorted_indices))
+        or not np.array_equal(sorted_indices[positions], known)
+    ):
+        raise ValueError("Static cache does not cover every known index")
+    aligned_positions = order[positions]
+    aligned_labels = full_labels[aligned_positions]
+    if not np.array_equal(aligned_labels, labels):
+        raise ValueError("Static labels do not match A-cache labels")
+    static_raw = {
+        name: values[aligned_positions] for name, values in full_scores.items()
     }
-    for name, values in values_map.items():
-        clean_values = values[~corrupted]
-        corrupt_values = values[corrupted]
-        pooled = math.sqrt(
-            0.5 * (float(np.var(clean_values)) + float(np.var(corrupt_values)))
-        )
-        effect = 0.0 if pooled < EPS else (
-            float(np.mean(corrupt_values)) - float(np.mean(clean_values))
-        ) / pooled
-        print(
-            f"{name:<9}{float(np.mean(clean_values)):>13.5f}"
-            f"{float(np.mean(corrupt_values)):>13.5f}{effect:>12.5f}"
-        )
+    static_class_z = {
+        name: classwise_zscore(static_raw[name], labels) for name in STATIC_NAMES
+    }
+    return known, labels, saved_a, static_raw, static_class_z
 
 
-def diagnose_components(
-    data: DiagnosticData,
-    spearman_cross: np.ndarray,
-    dynamic_pairwise: np.ndarray,
-    fits: Mapping[str, FitResult],
-) -> None:
-    print("\n[Heuristic diagnosis]")
-    contributions: list[tuple[float, str, float, float, float]] = []
-    for dynamic_index, dynamic_name in enumerate(DYNAMIC_NAMES):
-        sa_abs = abs(float(spearman_cross[0, dynamic_index]))
-        other_abs = max(
-            abs(float(spearman_cross[1, dynamic_index])),
-            abs(float(spearman_cross[2, dynamic_index])),
+def select_labels(indices: np.ndarray, known_labels: np.ndarray) -> np.ndarray:
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.ndim != 1 or np.any(indices < 0):
+        raise ValueError("Fold indices must be non-negative 1-D integers")
+    if indices.size and int(indices.max()) >= len(known_labels):
+        raise ValueError(
+            "Fold indices are not local to the known subset; this diagnostic "
+            "expects unseen-exp proxy caches generated by the current protocol"
         )
-        sa_gap = sa_abs - other_abs
-        fit = fits[dynamic_name]
-        sa_fit_weight = float(fit.weights[0])
-        score = max(0.0, sa_gap) * max(0.0, fit.r2) * sa_fit_weight
-        contributions.append((score, dynamic_name, sa_gap, sa_fit_weight, fit.r2))
+    return known_labels[indices]
 
-    contributions.sort(reverse=True)
-    for score, name, gap, sa_weight, r2 in contributions:
-        print(
-            f"  {name}: SA-gap={gap:+.5f}, positive-fit-SA={sa_weight:.5f}, "
-            f"fit-R2={r2:.5f}, suspicion-score={score:.6f}"
-        )
 
-    target_correlations = np.asarray(
-        [spearman(data.static_class_z[name], data.pseudo_target) for name in STATIC_NAMES]
-    )
-    abs_target = np.abs(target_correlations)
-    order = np.argsort(abs_target)[::-1]
-    leading = STATIC_NAMES[int(order[0])]
-    gap = float(abs_target[order[0]] - abs_target[order[1]])
-    print(
-        "  Pseudo-target correlations: "
-        + ", ".join(
-            f"{name}={value:+.5f}" for name, value in zip(STATIC_NAMES, target_correlations)
-        )
+def true_probability_and_loss(
+    logits: np.ndarray,
+    labels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    values = np.asarray(logits, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int64)
+    if values.ndim != 2 or labels.shape != (values.shape[0],):
+        raise ValueError("Logits/labels shape mismatch")
+    row_max = np.max(values, axis=1)
+    shifted = values - row_max[:, None]
+    log_sum_exp = row_max + np.log(np.exp(shifted).sum(axis=1))
+    true_logits = values[np.arange(values.shape[0]), labels]
+    loss = log_sum_exp - true_logits
+    probability = np.exp(np.clip(true_logits - log_sum_exp, -80.0, 0.0))
+    correct = np.argmax(values, axis=1) == labels
+    return (
+        probability.astype(np.float32),
+        loss.astype(np.float32),
+        correct.astype(np.uint8),
     )
 
-    max_dynamic_redundancy = 0.0
-    redundant_pair: tuple[str, str] | None = None
-    for i in range(len(DYNAMIC_NAMES)):
-        for j in range(i + 1, len(DYNAMIC_NAMES)):
-            value = abs(float(dynamic_pairwise[i, j]))
-            if value > max_dynamic_redundancy:
-                max_dynamic_redundancy = value
-                redundant_pair = (DYNAMIC_NAMES[i], DYNAMIC_NAMES[j])
 
-    if max(abs_target) < 0.08:
-        print(
-            "  Conclusion: all static components are weakly related to the pseudo target; "
-            "a highly concentrated learned weight is likely unstable rather than evidence "
-            "that one static metric is genuinely dominant."
+def load_fold_trajectories(
+    proxy_dir: Path,
+    labels: np.ndarray,
+    epochs: int,
+) -> tuple[list[FoldTrajectory], np.ndarray, np.ndarray, np.ndarray]:
+    fold_paths = sorted(proxy_dir.glob("fold_*.npz"), key=fold_sort_key)
+    if not fold_paths:
+        raise FileNotFoundError(f"No fold_*.npz files in {proxy_dir}")
+
+    num_samples = len(labels)
+    probability_sum = np.zeros((epochs, num_samples), dtype=np.float32)
+    loss_sum = np.zeros((epochs, num_samples), dtype=np.float32)
+    correct_sum = np.zeros((epochs, num_samples), dtype=np.uint8)
+    train_count = np.zeros(num_samples, dtype=np.uint8)
+    folds: list[FoldTrajectory] = []
+
+    for fold_id, fold_path in enumerate(fold_paths, start=1):
+        print(f"[Proxy] reading train trajectory: {fold_path}")
+        with np.load(fold_path, allow_pickle=False) as data:
+            if "train_indices" not in data.files:
+                raise KeyError(f"{fold_path} missing train_indices")
+            train_indices = np.asarray(data["train_indices"], dtype=np.int64)
+        train_labels = select_labels(train_indices, labels)
+        shape = inspect_logits_shape(fold_path, "train_logits")
+        if shape[0] != epochs:
+            raise ValueError(
+                f"Epoch mismatch in {fold_path}: cache={shape[0]}, expected={epochs}"
+            )
+        if shape[1] != len(train_indices):
+            raise ValueError(f"Sample mismatch in {fold_path}")
+
+        probability = np.empty((epochs, len(train_indices)), dtype=np.float32)
+        loss = np.empty_like(probability)
+        correct = np.empty((epochs, len(train_indices)), dtype=np.uint8)
+        for epoch_index, logits in enumerate(iter_logits_epochs(fold_path, "train_logits")):
+            p, l, c = true_probability_and_loss(logits, train_labels)
+            probability[epoch_index] = p
+            loss[epoch_index] = l
+            correct[epoch_index] = c
+
+        probability_sum[:, train_indices] += probability
+        loss_sum[:, train_indices] += loss
+        correct_sum[:, train_indices] += correct
+        train_count[train_indices] += 1
+        folds.append(
+            FoldTrajectory(
+                fold_id=fold_id,
+                train_indices=train_indices,
+                true_probability=probability,
+                loss=loss,
+            )
         )
-    elif leading == "SA" and gap >= 0.08:
-        likely_dynamic = contributions[0][1]
-        print(
-            f"  Conclusion: the pseudo target structurally favours SA. The dynamic "
-            f"component most likely contributing to that preference is {likely_dynamic}."
-        )
+
+    if np.any(train_count == 0):
+        missing = np.flatnonzero(train_count == 0)
+        raise ValueError(f"Samples absent from all train folds: {missing[:10]}")
+    divisor = train_count.astype(np.float32)[None, :]
+    return (
+        folds,
+        probability_sum / divisor,
+        loss_sum / divisor,
+        correct_sum.astype(np.float32) / divisor,
+    )
+
+
+def fold_raw_terms(
+    fold: FoldTrajectory,
+    first: int,
+    second: int,
+) -> dict[str, np.ndarray]:
+    epochs = fold.true_probability.shape[0]
+    if not (0 < first < second < epochs):
+        raise ValueError(f"Invalid boundaries {(first, second, epochs)}")
+    p = fold.true_probability.astype(np.float64, copy=False)
+    loss = fold.loss.astype(np.float64, copy=False)
+    early = slice(0, first)
+    middle = slice(first, second)
+    late = slice(second, epochs)
+
+    early_mean = np.mean(p[early], axis=0)
+    middle_mean = np.mean(p[middle], axis=0)
+    boundary = np.mean(p[early] * (1.0 - p[early]), axis=0)
+    support = np.sqrt(np.clip(early_mean * middle_mean, 0.0, 1.0))
+    gain = support * (middle_mean - early_mean)
+    stability = np.var(loss[late], axis=0) - np.var(loss[middle], axis=0)
+    return {
+        "Boundary": boundary,
+        "Gain": gain,
+        "Stability": stability,
+    }
+
+
+def reconstruct_a(
+    folds: Sequence[FoldTrajectory],
+    num_samples: int,
+    first: int,
+    second: int,
+    static_class_z: Mapping[str, np.ndarray],
+    saved_a: np.ndarray,
+) -> DecompositionResult:
+    contribution_sum = {
+        name: np.zeros(num_samples, dtype=np.float64) for name in A_TERM_NAMES
+    }
+    count = np.zeros(num_samples, dtype=np.int64)
+
+    for fold in folds:
+        raw_terms = fold_raw_terms(fold, first, second)
+        standardized = {
+            name: safe_standardize(raw_terms[name]) for name in A_TERM_NAMES
+        }
+        combined = sum(standardized[name] for name in A_TERM_NAMES)
+        combined_mean = float(np.mean(combined))
+        combined_std = float(np.std(combined))
+        denominator = combined_std + ZSCORE_EPS
+        if not np.isfinite(combined_std) or combined_std < ZSCORE_EPS:
+            fold_contributions = {
+                name: np.zeros_like(combined) for name in A_TERM_NAMES
+            }
+        else:
+            fold_contributions = {
+                name: (standardized[name] - float(np.mean(standardized[name]))) / denominator
+                for name in A_TERM_NAMES
+            }
+            reconstructed_fold = sum(fold_contributions.values())
+            expected_fold = (combined - combined_mean) / denominator
+            if np.max(np.abs(reconstructed_fold - expected_fold)) > 1e-5:
+                raise RuntimeError("Internal fold decomposition is not additive")
+
+        indices = fold.train_indices
+        for name in A_TERM_NAMES:
+            contribution_sum[name][indices] += fold_contributions[name]
+        count[indices] += 1
+
+    if np.any(count == 0):
+        raise ValueError("Some samples were not covered by A train-fold aggregation")
+    aggregated_terms = {
+        name: contribution_sum[name] / count for name in A_TERM_NAMES
+    }
+    aggregated_a = sum(aggregated_terms.values())
+    final_mean = float(np.mean(aggregated_a))
+    final_std = float(np.std(aggregated_a))
+    denominator = final_std + ZSCORE_EPS
+    if not np.isfinite(final_std) or final_std < ZSCORE_EPS:
+        contributions = {
+            name: np.zeros(num_samples, dtype=np.float64) for name in A_TERM_NAMES
+        }
+        reconstructed_a = np.zeros(num_samples, dtype=np.float64)
     else:
-        print(
-            f"  Conclusion: the pseudo target is not uniquely dominated by SA; its "
-            f"strongest static association is {leading}, with an absolute-correlation "
-            f"gap of {gap:.5f}."
+        contributions = {
+            name: (aggregated_terms[name] - float(np.mean(aggregated_terms[name]))) / denominator
+            for name in A_TERM_NAMES
+        }
+        reconstructed_a = (aggregated_a - final_mean) / denominator
+
+    component_values = {
+        **contributions,
+        "A(rebuilt)": reconstructed_a,
+        "A(saved)": saved_a,
+    }
+    pearson_matrix = correlation_matrix(static_class_z, component_values, "pearson")
+    spearman_matrix = correlation_matrix(static_class_z, component_values, "spearman")
+
+    variance = float(np.var(reconstructed_a))
+    variance_shares: dict[str, float] = {}
+    for name in A_TERM_NAMES:
+        covariance = float(
+            np.mean(
+                (contributions[name] - np.mean(contributions[name]))
+                * (reconstructed_a - np.mean(reconstructed_a))
+            )
         )
+        variance_shares[name] = 0.0 if variance < EPS else covariance / variance
 
-    if redundant_pair is not None and max_dynamic_redundancy >= 0.90:
-        print(
-            f"  Warning: {redundant_pair[0]} and {redundant_pair[1]} are highly redundant "
-            f"(|Spearman|={max_dynamic_redundancy:.5f}); averaging them gives that signal "
-            "double influence in the pseudo target."
-        )
-
-    weak_components = []
-    for index, name in enumerate(DYNAMIC_NAMES):
-        if float(np.max(np.abs(spearman_cross[:, index]))) < 0.05:
-            weak_components.append(name)
-    if weak_components:
-        print(
-            "  Warning: dynamic components with almost no monotonic relationship to any "
-            f"static component: {', '.join(weak_components)}."
-        )
+    return DecompositionResult(
+        contributions=contributions,
+        reconstructed_a=reconstructed_a,
+        pearson_matrix=pearson_matrix,
+        spearman_matrix=spearman_matrix,
+        variance_shares=variance_shares,
+        saved_pearson=pearson(reconstructed_a, saved_a),
+        saved_spearman=spearman(reconstructed_a, saved_a),
+        saved_max_abs_error=float(np.max(np.abs(reconstructed_a - saved_a))),
+    )
 
 
-def moving_average(values: np.ndarray, window: int) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64)
-    if window <= 1:
-        return values.copy()
-    if window > len(values):
-        raise ValueError(f"smooth window {window} exceeds epoch count {len(values)}")
-    cumulative = np.cumsum(np.insert(values, 0, 0.0))
-    result = np.empty_like(values)
-    for index in range(len(values)):
-        start = max(0, index + 1 - window)
-        result[index] = (
-            cumulative[index + 1] - cumulative[start]
-        ) / (index + 1 - start)
+def static_correlation_over_epochs(
+    static_class_z: Mapping[str, np.ndarray],
+    epoch_values: np.ndarray,
+) -> np.ndarray:
+    if epoch_values.ndim != 2:
+        raise ValueError("epoch_values must have shape (epochs, samples)")
+    static_ranks = {name: rankdata(values) for name, values in static_class_z.items()}
+    result = np.empty((epoch_values.shape[0], len(STATIC_NAMES)), dtype=np.float64)
+    for epoch in range(epoch_values.shape[0]):
+        value_ranks = rankdata(epoch_values[epoch])
+        for index, name in enumerate(STATIC_NAMES):
+            result[epoch, index] = pearson(static_ranks[name], value_ranks)
     return result
 
 
-def prepare_proxy_curves(
-    metrics: ProxyMetrics,
-    normalization: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
-    if normalization == "none":
-        return (
-            metrics.train_loss.copy(),
-            metrics.val_loss.copy(),
-            metrics.val_accuracy.copy(),
-            "Value",
+def first_sustained_true(mask: np.ndarray, patience: int) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    epochs, samples = mask.shape
+    result = np.full(samples, epochs + 1, dtype=np.int64)
+    if patience > epochs:
+        return result
+    running = np.zeros(samples, dtype=np.int64)
+    for epoch in range(epochs):
+        running = np.where(mask[epoch], running + 1, 0)
+        newly = (running >= patience) & (result == epochs + 1)
+        result[newly] = epoch - patience + 2  # 1-indexed first epoch in the run
+    return result
+
+
+def build_epoch_diagnostics(
+    static_class_z: Mapping[str, np.ndarray],
+    average_probability: np.ndarray,
+    average_loss: np.ndarray,
+    average_correct: np.ndarray,
+    learn_patience: int,
+) -> EpochDiagnostics:
+    epochs = average_probability.shape[0]
+    if average_loss.shape != average_probability.shape or average_correct.shape != average_probability.shape:
+        raise ValueError("Aggregated trajectory shapes do not match")
+
+    boundary = average_probability * (1.0 - average_probability)
+    one_step_gain = np.zeros_like(average_probability)
+    loss_improvement = np.zeros_like(average_loss)
+    if epochs > 1:
+        previous = average_probability[:-1]
+        current = average_probability[1:]
+        support = np.sqrt(np.clip(previous * current, 0.0, 1.0))
+        one_step_gain[1:] = support * (current - previous)
+        loss_improvement[1:] = average_loss[:-1] - average_loss[1:]
+
+    majority_correct = average_correct >= 0.5
+    first_correct = first_sustained_true(majority_correct, learn_patience)
+    first_p05 = first_sustained_true(average_probability >= 0.5, learn_patience)
+    first_p09 = first_sustained_true(average_probability >= 0.9, learn_patience)
+
+    return EpochDiagnostics(
+        epochs=np.arange(1, epochs + 1, dtype=np.int64),
+        true_probability_spearman=static_correlation_over_epochs(
+            static_class_z, average_probability
+        ),
+        boundary_spearman=static_correlation_over_epochs(static_class_z, boundary),
+        one_step_gain_spearman=static_correlation_over_epochs(
+            static_class_z, one_step_gain
+        ),
+        loss_improvement_spearman=static_correlation_over_epochs(
+            static_class_z, loss_improvement
+        ),
+        mean_true_probability=np.mean(average_probability, axis=1),
+        mean_loss=np.mean(average_loss, axis=1),
+        mean_accuracy=np.mean(average_correct, axis=1),
+        final_true_probability=average_probability[-1].copy(),
+        final_correct_rate=average_correct[-1].copy(),
+        first_stable_correct_epoch=first_correct,
+        first_probability_05_epoch=first_p05,
+        first_probability_09_epoch=first_p09,
+    )
+
+
+def boundary_candidates(
+    center: int,
+    low: int,
+    high: int,
+    radius: int,
+    step: int,
+) -> list[int]:
+    start = max(low, center - radius)
+    stop = min(high, center + radius)
+    values = list(range(start, stop + 1, step))
+    if center not in values:
+        values.append(center)
+    return sorted(set(values))
+
+
+def scan_boundaries(
+    folds: Sequence[FoldTrajectory],
+    num_samples: int,
+    first: int,
+    second: int,
+    static_class_z: Mapping[str, np.ndarray],
+    saved_a: np.ndarray,
+    radius: int,
+    step: int,
+    minimum_phase: int,
+) -> tuple[list[ScanPoint], list[ScanPoint]]:
+    epochs = folds[0].true_probability.shape[0]
+    first_values = boundary_candidates(
+        first,
+        minimum_phase,
+        second - minimum_phase,
+        radius,
+        step,
+    )
+    second_values = boundary_candidates(
+        second,
+        first + minimum_phase,
+        epochs - minimum_phase,
+        radius,
+        step,
+    )
+
+    first_scan: list[ScanPoint] = []
+    for candidate in first_values:
+        result = reconstruct_a(
+            folds,
+            num_samples,
+            candidate,
+            second,
+            static_class_z,
+            saved_a,
         )
-    loss_low = float(min(np.min(metrics.train_loss), np.min(metrics.val_loss)))
-    loss_high = float(max(np.max(metrics.train_loss), np.max(metrics.val_loss)))
-    train_curve = minmax(metrics.train_loss, loss_low, loss_high)
-    val_curve = minmax(metrics.val_loss, loss_low, loss_high)
-    accuracy_curve = minmax(
-        metrics.val_accuracy,
-        float(np.min(metrics.val_accuracy)),
-        float(np.max(metrics.val_accuracy)),
-    )
-    return train_curve, val_curve, accuracy_curve, "Relative value"
+        first_scan.append(
+            ScanPoint(candidate, result.pearson_matrix, result.spearman_matrix)
+        )
+
+    second_scan: list[ScanPoint] = []
+    for candidate in second_values:
+        result = reconstruct_a(
+            folds,
+            num_samples,
+            first,
+            candidate,
+            static_class_z,
+            saved_a,
+        )
+        second_scan.append(
+            ScanPoint(candidate, result.pearson_matrix, result.spearman_matrix)
+        )
+    return first_scan, second_scan
 
 
-def minmax(values: np.ndarray, low: float, high: float) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64)
-    if high - low < EPS:
-        return np.zeros_like(values)
-    return (values - low) / (high - low)
-
-
-def save_proxy_plot(
-    path: Path,
-    target: Target,
-    metrics: ProxyMetrics,
-    normalization: str,
-    smooth_window: int,
+def print_matrix(
+    title: str,
+    matrix: np.ndarray,
+    rows: Sequence[str],
+    columns: Sequence[str],
 ) -> None:
-    train_curve, val_curve, accuracy_curve, y_label = prepare_proxy_curves(
-        metrics,
-        normalization,
+    print(f"\n{title}")
+    print(" " * 14 + "".join(f"{column:>14s}" for column in columns))
+    for row_name, row in zip(rows, matrix):
+        print(f"{row_name:<14s}" + "".join(f"{value:14.5f}" for value in row))
+
+
+def print_decomposition_summary(
+    target: Target,
+    result: DecompositionResult,
+) -> None:
+    columns = (*A_TERM_NAMES, "A(rebuilt)", "A(saved)")
+    print_matrix(
+        "[Pearson] static vs exact A contributions",
+        result.pearson_matrix,
+        STATIC_NAMES,
+        columns,
     )
-    train_curve = moving_average(train_curve, smooth_window)
-    val_curve = moving_average(val_curve, smooth_window)
-    accuracy_curve = moving_average(accuracy_curve, smooth_window)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    figure, axis = plt.subplots(figsize=(10, 6))
-    axis.plot(metrics.epochs, train_curve, label="Train mean loss", linewidth=2)
-    axis.plot(metrics.epochs, val_curve, label="Validation mean loss", linewidth=2)
-    axis.plot(metrics.epochs, accuracy_curve, label="Validation accuracy", linewidth=2)
-    axis.set_xlabel("Training epoch")
-    axis.set_ylabel(y_label)
-    axis.set_title(
-        f"Experiment {target.exp} - {target.dataset} proxy dynamics\n"
-        f"Seed: {target.seed}, epochs: {target.epochs}"
+    print_matrix(
+        "[Spearman] static vs exact A contributions",
+        result.spearman_matrix,
+        STATIC_NAMES,
+        columns,
     )
-    axis.grid(True, alpha=0.3)
-    axis.legend()
-    if normalization == "relative":
-        axis.set_ylim(-0.05, 1.05)
-    figure.tight_layout()
-    figure.savefig(path, dpi=220, bbox_inches="tight")
-    plt.close(figure)
+    print("\n[A reconstruction check]")
+    print(
+        f"  boundaries=[{target.first_boundary}, {target.second_boundary}, {target.epochs}] | "
+        f"Pearson={result.saved_pearson:.8f}, "
+        f"Spearman={result.saved_spearman:.8f}, "
+        f"max_abs_error={result.saved_max_abs_error:.8g}"
+    )
+    if result.saved_pearson < 0.999:
+        print(
+            "  WARNING: reconstructed A does not match saved A. The dynamic cache may "
+            "have been generated with different phase boundaries or different A code."
+        )
+
+    print("\n[Exact contribution to variance of reconstructed A]")
+    for name in A_TERM_NAMES:
+        values = result.contributions[name]
+        print(
+            f"  {name:<10s}: covariance_share={result.variance_shares[name]:+.5f}, "
+            f"std={np.std(values):.5f}, corr_with_A={pearson(values, result.reconstructed_a):+.5f}"
+        )
+    print(
+        "  covariance shares sum to "
+        f"{sum(result.variance_shares.values()):.5f} (approximately 1 by additivity)."
+    )
 
 
-def annotate_heatmap(axis, matrix: np.ndarray, rows: tuple[str, ...], columns: tuple[str, ...], title: str) -> None:
+def print_epoch_localization(
+    target: Target,
+    diagnostics: EpochDiagnostics,
+    top_k: int,
+) -> None:
+    sa = STATIC_NAMES.index("SA")
+    div = STATIC_NAMES.index("Div")
+    dds = STATIC_NAMES.index("DDS")
+    gain = diagnostics.one_step_gain_spearman
+    preference = gain[:, sa] - np.maximum(gain[:, div], gain[:, dds])
+    preference[0] = -np.inf
+    order = np.argsort(preference)[::-1]
+
+    print("\n[Most SA-favouring one-step absorption gains]")
+    print("epoch      SA       Div       DDS    SA-gap   mean-p    mean-loss    accuracy")
+    printed = 0
+    for index in order:
+        if not np.isfinite(preference[index]):
+            continue
+        print(
+            f"{index + 1:5d}  "
+            f"{gain[index, sa]:+8.5f} {gain[index, div]:+9.5f} "
+            f"{gain[index, dds]:+9.5f} {preference[index]:+9.5f} "
+            f"{diagnostics.mean_true_probability[index]:8.5f} "
+            f"{diagnostics.mean_loss[index]:10.5f} "
+            f"{diagnostics.mean_accuracy[index]:9.5f}"
+        )
+        printed += 1
+        if printed >= top_k:
+            break
+
+    print("\n[Milestone-local diagnostics]")
+    for boundary in (target.first_boundary, target.second_boundary):
+        index = boundary  # transition from epoch boundary to boundary+1, zero-based row=boundary
+        if index >= target.epochs:
+            continue
+        before = max(1, index - 2)
+        after = min(target.epochs - 1, index + 2)
+        print(
+            f"  milestone={boundary}: step(epoch {boundary}->{boundary + 1}) "
+            f"gain Spearman SA={gain[index, sa]:+.5f}, "
+            f"Div={gain[index, div]:+.5f}, DDS={gain[index, dds]:+.5f}; "
+            f"mean-p {diagnostics.mean_true_probability[index - 1]:.5f}"
+            f"->{diagnostics.mean_true_probability[index]:.5f}; "
+            f"accuracy {diagnostics.mean_accuracy[index - 1]:.5f}"
+            f"->{diagnostics.mean_accuracy[index]:.5f}"
+        )
+        before_sa = float(np.mean(gain[before:index + 1, sa]))
+        after_sa = float(np.mean(gain[index + 1:after + 1, sa])) if after > index else 0.0
+        before_div = float(np.mean(gain[before:index + 1, div]))
+        after_div = float(np.mean(gain[index + 1:after + 1, div])) if after > index else 0.0
+        print(
+            f"    nearby mean one-step correlation: "
+            f"SA {before_sa:+.5f}->{after_sa:+.5f}, "
+            f"Div {before_div:+.5f}->{after_div:+.5f}"
+        )
+
+
+def epoch_with_never_as_end(values: np.ndarray, epochs: int) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    return np.where(values > epochs, epochs + 1, values)
+
+
+def print_learning_time_diagnostics(
+    target: Target,
+    static_class_z: Mapping[str, np.ndarray],
+    diagnostics: EpochDiagnostics,
+    quantile: float,
+) -> None:
+    first = epoch_with_never_as_end(
+        diagnostics.first_stable_correct_epoch, target.epochs
+    )
+    print("\n[Static score vs first stably-correct epoch]")
+    for name in STATIC_NAMES:
+        print(
+            f"  {name:<4s}: Pearson={pearson(static_class_z[name], first):+.5f}, "
+            f"Spearman={spearman(static_class_z[name], first):+.5f}"
+        )
+
+    print(f"\n[Low/high {quantile:.0%} groups: stable learning time]")
+    print(
+        "metric group      n   median-first  never%   final-mean-p  final-accuracy"
+    )
+    final_p = diagnostics.final_true_probability
+    final_correct_rate = diagnostics.final_correct_rate
+    for name in STATIC_NAMES:
+        values = static_class_z[name]
+        low_threshold = float(np.quantile(values, quantile))
+        high_threshold = float(np.quantile(values, 1.0 - quantile))
+        for group_name, mask in (
+            ("low", values <= low_threshold),
+            ("high", values >= high_threshold),
+        ):
+            group_first = diagnostics.first_stable_correct_epoch[mask]
+            learned = group_first <= target.epochs
+            median = (
+                float(np.median(group_first[learned])) if np.any(learned) else float("nan")
+            )
+            never = float(np.mean(~learned))
+            print(
+                f"{name:<6s} {group_name:<5s} {int(mask.sum()):6d} "
+                f"{median:12.3f} {100.0 * never:7.3f}% "
+                f"{float(np.mean(final_p[mask])):13.5f} "
+                f"{float(np.mean(final_correct_rate[mask])):14.5f}"
+            )
+
+
+def scan_table(
+    title: str,
+    points: Sequence[ScanPoint],
+    actual_boundary: int,
+) -> None:
+    columns = (*A_TERM_NAMES, "A(rebuilt)", "A(saved)")
+    a_index = columns.index("A(rebuilt)")
+    gain_index = columns.index("Gain")
+    stability_index = columns.index("Stability")
+    print(f"\n{title}")
+    print("boundary actual  A-SA     A-Div    A-DDS   Gain-SA  Stability-SA")
+    for point in points:
+        matrix = point.spearman_matrix
+        print(
+            f"{point.boundary:8d} {'*' if point.boundary == actual_boundary else ' ':>6s} "
+            f"{matrix[0, a_index]:+8.5f} {matrix[1, a_index]:+9.5f} "
+            f"{matrix[2, a_index]:+9.5f} {matrix[0, gain_index]:+9.5f} "
+            f"{matrix[0, stability_index]:+13.5f}"
+        )
+
+
+def annotate_heatmap(
+    axis,
+    matrix: np.ndarray,
+    rows: Sequence[str],
+    columns: Sequence[str],
+    title: str,
+):
     image = axis.imshow(matrix, vmin=-1.0, vmax=1.0, cmap="coolwarm", aspect="auto")
-    axis.set_xticks(np.arange(len(columns)), labels=columns)
+    axis.set_xticks(np.arange(len(columns)), labels=columns, rotation=25, ha="right")
     axis.set_yticks(np.arange(len(rows)), labels=rows)
     axis.set_title(title)
     for row in range(matrix.shape[0]):
@@ -999,170 +1179,377 @@ def annotate_heatmap(axis, matrix: np.ndarray, rows: tuple[str, ...], columns: t
                 f"{matrix[row, column]:.3f}",
                 ha="center",
                 va="center",
+                fontsize=9,
             )
     return image
 
 
-def save_correlation_plot(
+def save_component_figure(
     path: Path,
     target: Target,
-    pearson_cross: np.ndarray,
-    spearman_cross: np.ndarray,
-    static_pairwise: np.ndarray,
-    dynamic_pairwise: np.ndarray,
+    result: DecompositionResult,
+) -> None:
+    columns = (*A_TERM_NAMES, "A(rebuilt)", "A(saved)")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    image = annotate_heatmap(
+        axes[0], result.pearson_matrix, STATIC_NAMES, columns, "Pearson"
+    )
+    annotate_heatmap(
+        axes[1], result.spearman_matrix, STATIC_NAMES, columns, "Spearman"
+    )
+    figure.colorbar(image, ax=axes.ravel().tolist(), shrink=0.82, label="Correlation")
+    figure.suptitle(
+        f"A decomposition - Exp.1 {target.dataset}, seed {target.seed}\n"
+        f"phases: 1-{target.first_boundary}, "
+        f"{target.first_boundary + 1}-{target.second_boundary}, "
+        f"{target.second_boundary + 1}-{target.epochs}",
+        fontsize=14,
+    )
+    figure.subplots_adjust(left=0.07, right=0.93, bottom=0.18, top=0.82, wspace=0.28)
+    figure.savefig(path, dpi=230, bbox_inches="tight")
+    plt.close(figure)
+
+
+def save_epoch_localization_figure(
+    path: Path,
+    target: Target,
+    diagnostics: EpochDiagnostics,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure, axes = plt.subplots(2, 2, figsize=(12, 10))
-    image = annotate_heatmap(
-        axes[0, 0],
-        pearson_cross,
-        STATIC_NAMES,
-        DYNAMIC_NAMES,
-        "Static vs dynamic: Pearson",
+    figure, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
+    panels = (
+        (diagnostics.true_probability_spearman, "True-class probability"),
+        (diagnostics.boundary_spearman, "Boundary p(1-p)"),
+        (diagnostics.one_step_gain_spearman, "One-step supported gain"),
+        (diagnostics.loss_improvement_spearman, "One-step loss improvement"),
     )
-    annotate_heatmap(
-        axes[0, 1],
-        spearman_cross,
-        STATIC_NAMES,
-        DYNAMIC_NAMES,
-        "Static vs dynamic: Spearman",
-    )
-    annotate_heatmap(
-        axes[1, 0],
-        static_pairwise,
-        STATIC_NAMES,
-        STATIC_NAMES,
-        "Static pairwise: Spearman",
-    )
-    annotate_heatmap(
-        axes[1, 1],
-        dynamic_pairwise,
-        DYNAMIC_NAMES,
-        DYNAMIC_NAMES,
-        "Dynamic pairwise: Spearman",
-    )
-    figure.colorbar(image, ax=axes.ravel().tolist(), shrink=0.8, label="Correlation")
+    for axis, (matrix, title) in zip(axes.ravel(), panels):
+        for index, name in enumerate(STATIC_NAMES):
+            axis.plot(diagnostics.epochs, matrix[:, index], label=name, linewidth=1.7)
+        axis.axhline(0.0, linewidth=1)
+        for boundary in (target.first_boundary, target.second_boundary):
+            axis.axvline(boundary, linestyle="--", linewidth=1.2)
+        axis.set_title(title)
+        axis.set_ylabel("Spearman correlation")
+        axis.grid(True, alpha=0.3)
+    axes[1, 0].set_xlabel("Epoch")
+    axes[1, 1].set_xlabel("Epoch")
+    axes[0, 0].legend()
     figure.suptitle(
-        f"Experiment {target.exp} - {target.dataset} - seed {target.seed}",
+        f"Epoch-level localization - Exp.1 {target.dataset}, seed {target.seed}",
         fontsize=15,
     )
-    figure.subplots_adjust(left=0.08, right=0.92, bottom=0.07, top=0.91, wspace=0.28, hspace=0.28)
-    figure.savefig(path, dpi=220, bbox_inches="tight")
+    figure.tight_layout(rect=(0, 0, 1, 0.96))
+    figure.savefig(path, dpi=230, bbox_inches="tight")
     plt.close(figure)
 
 
-def save_distribution_plot(path: Path, target: Target, data: DiagnosticData) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    names = (*STATIC_NAMES, *DYNAMIC_NAMES, "Target")
-    values = [
-        *(data.static_class_z[name] for name in STATIC_NAMES),
-        *(data.dynamic[name] for name in DYNAMIC_NAMES),
-        data.pseudo_target,
-    ]
-    figure, axis = plt.subplots(figsize=(11, 6))
-    try:
-        axis.boxplot(values, tick_labels=names, showfliers=False)
-    except TypeError:
-        # Compatibility with Matplotlib versions before ``tick_labels``.
-        axis.boxplot(values, labels=names, showfliers=False)
-    axis.axhline(0.0, linewidth=1)
-    axis.set_ylabel("Standardized value")
-    axis.set_title(
-        f"Component distributions - experiment {target.exp}, "
-        f"{target.dataset}, seed {target.seed}"
+def scan_series(
+    points: Sequence[ScanPoint],
+    component_name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    columns = (*A_TERM_NAMES, "A(rebuilt)", "A(saved)")
+    component_index = columns.index(component_name)
+    x = np.asarray([point.boundary for point in points], dtype=np.int64)
+    y = np.asarray(
+        [point.spearman_matrix[:, component_index] for point in points],
+        dtype=np.float64,
     )
-    axis.grid(True, axis="y", alpha=0.3)
-    figure.tight_layout()
-    figure.savefig(path, dpi=220, bbox_inches="tight")
+    return x, y
+
+
+def save_boundary_scan_figure(
+    path: Path,
+    target: Target,
+    first_scan: Sequence[ScanPoint],
+    second_scan: Sequence[ScanPoint],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure, axes = plt.subplots(2, 2, figsize=(14, 9))
+    configurations = (
+        (axes[0, 0], first_scan, "A(rebuilt)", "Scan first boundary: A"),
+        (axes[0, 1], first_scan, "Gain", "Scan first boundary: Gain"),
+        (axes[1, 0], second_scan, "A(rebuilt)", "Scan second boundary: A"),
+        (axes[1, 1], second_scan, "Stability", "Scan second boundary: Stability"),
+    )
+    for axis, points, component, title in configurations:
+        x, matrix = scan_series(points, component)
+        for index, name in enumerate(STATIC_NAMES):
+            axis.plot(x, matrix[:, index], marker="o", label=name)
+        actual = target.first_boundary if points is first_scan else target.second_boundary
+        axis.axvline(actual, linestyle="--", linewidth=1.2)
+        axis.axhline(0.0, linewidth=1)
+        axis.set_title(title)
+        axis.set_xlabel("Candidate boundary")
+        axis.set_ylabel("Spearman correlation")
+        axis.grid(True, alpha=0.3)
+    axes[0, 0].legend()
+    figure.suptitle(
+        f"Fixed-trajectory phase sensitivity - Exp.1 {target.dataset}, seed {target.seed}",
+        fontsize=15,
+    )
+    figure.tight_layout(rect=(0, 0, 1, 0.96))
+    figure.savefig(path, dpi=230, bbox_inches="tight")
     plt.close(figure)
+
+
+def save_learning_figure(
+    path: Path,
+    target: Target,
+    static_class_z: Mapping[str, np.ndarray],
+    diagnostics: EpochDiagnostics,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure, axes = plt.subplots(1, 3, figsize=(15, 4.8), sharey=True)
+    learning_epoch = epoch_with_never_as_end(
+        diagnostics.first_stable_correct_epoch, target.epochs
+    )
+    bins = np.linspace(-3.0, 3.0, 13)
+    for axis, name in zip(axes, STATIC_NAMES):
+        values = static_class_z[name]
+        centers: list[float] = []
+        medians: list[float] = []
+        never_rates: list[float] = []
+        for left, right in zip(bins[:-1], bins[1:]):
+            mask = (values >= left) & (values < right)
+            if int(mask.sum()) < 5:
+                continue
+            centers.append(0.5 * (left + right))
+            medians.append(float(np.median(learning_epoch[mask])))
+            never_rates.append(
+                float(np.mean(diagnostics.first_stable_correct_epoch[mask] > target.epochs))
+            )
+        axis.plot(centers, medians, marker="o", label="Median first stable epoch")
+        secondary = axis.twinx()
+        secondary.plot(centers, never_rates, marker="s", linestyle="--", label="Never learned")
+        axis.set_title(name)
+        axis.set_xlabel("Class-standardized score")
+        axis.grid(True, alpha=0.3)
+        secondary.set_ylim(-0.02, 1.02)
+        if name == "DDS":
+            secondary.set_ylabel("Never-learned fraction")
+    axes[0].set_ylabel("First stable-correct epoch (end+1 = never)")
+    figure.suptitle(
+        f"Learning time vs static scores - Exp.1 {target.dataset}, seed {target.seed}",
+        fontsize=15,
+    )
+    figure.tight_layout(rect=(0, 0, 1, 0.94))
+    figure.savefig(path, dpi=230, bbox_inches="tight")
+    plt.close(figure)
+
+
+def process_dataset(args: argparse.Namespace, dataset: str) -> DatasetResult:
+    epochs, paths = resolve_cache_paths(args, dataset)
+    first, second = read_phase_boundaries(args, dataset, epochs, paths.proxy_dir)
+    target = Target(
+        dataset=dataset,
+        seed=int(args.seed),
+        proxy_model=str(args.proxy_model),
+        epochs=epochs,
+        first_boundary=first,
+        second_boundary=second,
+    )
+
+    print("\n" + "=" * 88)
+    print(
+        f"[Target] exp=1, dataset={dataset}, seed={target.seed}, "
+        f"proxy_model={target.proxy_model}, epochs={epochs}, "
+        f"phases=[1-{first}], [{first + 1}-{second}], [{second + 1}-{epochs}]"
+    )
+    print(f"[Cache] proxy={paths.proxy_dir}")
+    print(f"[Cache] A={paths.dynamic_dir / 'A.npz'}")
+    print(f"[Cache] static={paths.static_path}")
+
+    _, labels, saved_a, _, static_class_z = load_a_and_static(paths)
+    folds, average_probability, average_loss, average_correct = load_fold_trajectories(
+        paths.proxy_dir,
+        labels,
+        epochs,
+    )
+
+    decomposition = reconstruct_a(
+        folds,
+        len(labels),
+        first,
+        second,
+        static_class_z,
+        saved_a,
+    )
+    print_decomposition_summary(target, decomposition)
+
+    epoch_diagnostics = build_epoch_diagnostics(
+        static_class_z,
+        average_probability,
+        average_loss,
+        average_correct,
+        args.learn_patience,
+    )
+    print_epoch_localization(target, epoch_diagnostics, args.top_k_epochs)
+    print_learning_time_diagnostics(
+        target,
+        static_class_z,
+        epoch_diagnostics,
+        args.group_quantile,
+    )
+
+    first_scan, second_scan = scan_boundaries(
+        folds,
+        len(labels),
+        first,
+        second,
+        static_class_z,
+        saved_a,
+        args.scan_radius,
+        args.scan_step,
+        args.minimum_phase_length,
+    )
+    scan_table(
+        "[Fixed-trajectory scan] first boundary (second fixed)",
+        first_scan,
+        first,
+    )
+    scan_table(
+        "[Fixed-trajectory scan] second boundary (first fixed)",
+        second_scan,
+        second,
+    )
+
+    output_dir = resolve_project_path(args.output_dir)
+    stem = f"exp1_{dataset.replace('-', '_')}_seed{target.seed}_A"
+    component_path = output_dir / f"{stem}_component_correlations.png"
+    epoch_path = output_dir / f"{stem}_epoch_localization.png"
+    scan_path = output_dir / f"{stem}_boundary_scan.png"
+    learning_path = output_dir / f"{stem}_learning_time.png"
+    save_component_figure(component_path, target, decomposition)
+    save_epoch_localization_figure(epoch_path, target, epoch_diagnostics)
+    save_boundary_scan_figure(scan_path, target, first_scan, second_scan)
+    save_learning_figure(learning_path, target, static_class_z, epoch_diagnostics)
+
+    output_paths = [component_path, epoch_path, scan_path, learning_path]
+    print("\n[Saved figures]")
+    for path in output_paths:
+        print(f"  {path}")
+
+    return DatasetResult(
+        target=target,
+        static_class_z=static_class_z,
+        saved_a=saved_a,
+        decomposition=decomposition,
+        epoch_diagnostics=epoch_diagnostics,
+        first_scan=first_scan,
+        second_scan=second_scan,
+        output_paths=output_paths,
+    )
+
+
+def save_comparison_figure(
+    path: Path,
+    cifar: DatasetResult,
+    tiny: DatasetResult,
+) -> None:
+    columns = (*A_TERM_NAMES, "A(rebuilt)", "A(saved)")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure, axes = plt.subplots(1, 3, figsize=(18, 5.6))
+    image = annotate_heatmap(
+        axes[0],
+        cifar.decomposition.spearman_matrix,
+        STATIC_NAMES,
+        columns,
+        f"CIFAR-100 ({cifar.target.epochs} epochs)",
+    )
+    annotate_heatmap(
+        axes[1],
+        tiny.decomposition.spearman_matrix,
+        STATIC_NAMES,
+        columns,
+        f"Tiny-ImageNet ({tiny.target.epochs} epochs)",
+    )
+    delta = tiny.decomposition.spearman_matrix - cifar.decomposition.spearman_matrix
+    annotate_heatmap(
+        axes[2],
+        delta,
+        STATIC_NAMES,
+        columns,
+        "Tiny minus CIFAR",
+    )
+    figure.colorbar(image, ax=axes.ravel().tolist(), shrink=0.82, label="Correlation")
+    figure.suptitle(
+        f"A decomposition comparison - unseen Exp.1, seed {cifar.target.seed}",
+        fontsize=15,
+    )
+    figure.subplots_adjust(left=0.05, right=0.95, bottom=0.19, top=0.83, wspace=0.32)
+    figure.savefig(path, dpi=230, bbox_inches="tight")
+    plt.close(figure)
+
+
+def print_cross_dataset_comparison(cifar: DatasetResult, tiny: DatasetResult) -> None:
+    columns = (*A_TERM_NAMES, "A(rebuilt)", "A(saved)")
+    delta = tiny.decomposition.spearman_matrix - cifar.decomposition.spearman_matrix
+    print("\n" + "=" * 88)
+    print("[Cross-dataset comparison: Tiny-ImageNet minus CIFAR-100 Spearman]")
+    print_matrix("[Delta]", delta, STATIC_NAMES, columns)
+
+    candidates: list[tuple[float, str, str, float, float]] = []
+    for row, static_name in enumerate(STATIC_NAMES):
+        for column, component_name in enumerate(columns[:-1]):
+            change = float(delta[row, column])
+            candidates.append(
+                (
+                    abs(change),
+                    static_name,
+                    component_name,
+                    float(cifar.decomposition.spearman_matrix[row, column]),
+                    float(tiny.decomposition.spearman_matrix[row, column]),
+                )
+            )
+    candidates.sort(reverse=True)
+    print("\n[Largest normal-to-abnormal changes]")
+    for _, static_name, component_name, cifar_value, tiny_value in candidates[:8]:
+        print(
+            f"  {static_name:>3s} vs {component_name:<11s}: "
+            f"CIFAR={cifar_value:+.5f}, Tiny={tiny_value:+.5f}, "
+            f"delta={tiny_value - cifar_value:+.5f}"
+        )
+
+    a_column = columns.index("A(rebuilt)")
+    tiny_a = tiny.decomposition.spearman_matrix[:, a_column]
+    cifar_a = cifar.decomposition.spearman_matrix[:, a_column]
+    print("\n[Compact interpretation aid]")
+    print(
+        "  A correlation shift: "
+        + ", ".join(
+            f"{name} {cifar_value:+.5f}->{tiny_value:+.5f}"
+            for name, cifar_value, tiny_value in zip(STATIC_NAMES, cifar_a, tiny_a)
+        )
+    )
+    term_delta = delta[:, : len(A_TERM_NAMES)]
+    row, column = np.unravel_index(np.argmax(np.abs(term_delta)), term_delta.shape)
+    print(
+        f"  Largest internal-term shift: {STATIC_NAMES[row]} vs "
+        f"{A_TERM_NAMES[column]}, delta={term_delta[row, column]:+.5f}."
+    )
 
 
 def main() -> int:
     args = parse_args()
-    target, paths = resolve_target(args)
-    output_dir = resolve_project_path(args.output_dir)
-
-    print(
-        f"[Target] exp={target.exp}, dataset={target.dataset}, seed={target.seed}, "
-        f"proxy_model={target.proxy_model}, epochs={target.epochs}"
+    datasets = (
+        list(SUPPORTED_DATASETS) if args.dataset == "both" else [args.dataset]
     )
-    print(f"[Cache] proxy={paths.proxy_dir}")
-    print(f"[Cache] dynamic={paths.dynamic_dir}")
-    print(f"[Cache] static={paths.static_path}")
+    results: dict[str, DatasetResult] = {}
+    for dataset in datasets:
+        results[dataset] = process_dataset(args, dataset)
 
-    data = load_diagnostic_data(paths)
-    metrics = compute_proxy_metrics(paths.proxy_dir, data.labels)
-
-    static_primary = {name: data.static_class_z[name] for name in STATIC_NAMES}
-    pearson_cross = correlation_matrix(static_primary, data.dynamic, "pearson")
-    spearman_cross = correlation_matrix(static_primary, data.dynamic, "spearman")
-    static_pairwise = pairwise_matrix(static_primary, "spearman")
-    dynamic_pairwise = pairwise_matrix(data.dynamic, "spearman")
-
-    print_matrix(
-        "[Pearson] class-standardized static vs dynamic",
-        pearson_cross,
-        STATIC_NAMES,
-        DYNAMIC_NAMES,
-    )
-    print_matrix(
-        "[Spearman] class-standardized static vs dynamic",
-        spearman_cross,
-        STATIC_NAMES,
-        DYNAMIC_NAMES,
-    )
-    print_matrix(
-        "[Spearman] static-component redundancy",
-        static_pairwise,
-        STATIC_NAMES,
-        STATIC_NAMES,
-    )
-    print_matrix(
-        "[Spearman] dynamic-component redundancy",
-        dynamic_pairwise,
-        DYNAMIC_NAMES,
-        DYNAMIC_NAMES,
-    )
-    print_strongest_correlations(pearson_cross, spearman_cross, args.top_k)
-    print_component_summaries(data)
-    fits = print_positive_fits(data)
-
-    saved_weights = load_saved_weights(paths.weights_path, target)
-    if saved_weights is not None:
-        print(
-            "\n[Saved stage-5 weights] "
-            + ", ".join(f"{name}={saved_weights[name]:.5f}" for name in STATIC_NAMES)
+    if len(results) == 2:
+        cifar = results["cifar100"]
+        tiny = results["tiny-imagenet"]
+        print_cross_dataset_comparison(cifar, tiny)
+        comparison_path = (
+            resolve_project_path(args.output_dir)
+            / f"exp1_seed{args.seed}_A_component_comparison.png"
         )
-
-    print_corruption_effects(data)
-    diagnose_components(data, spearman_cross, dynamic_pairwise, fits)
-
-    stem = f"exp{target.exp}_{target.dataset.replace('-', '_')}_seed{target.seed}"
-    proxy_path = output_dir / f"{stem}_proxy_dynamics.png"
-    correlation_path = output_dir / f"{stem}_component_correlations.png"
-    distribution_path = output_dir / f"{stem}_component_distributions.png"
-
-    save_proxy_plot(
-        proxy_path,
-        target,
-        metrics,
-        args.normalization,
-        args.smooth_window,
-    )
-    save_correlation_plot(
-        correlation_path,
-        target,
-        pearson_cross,
-        spearman_cross,
-        static_pairwise,
-        dynamic_pairwise,
-    )
-    save_distribution_plot(distribution_path, target, data)
-
-    print("\n[Saved figures]")
-    print(f"  {proxy_path}")
-    print(f"  {correlation_path}")
-    print(f"  {distribution_path}")
+        save_comparison_figure(comparison_path, cifar, tiny)
+        print(f"\n[Saved comparison figure]\n  {comparison_path}")
     return 0
 
 

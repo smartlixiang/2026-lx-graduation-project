@@ -11,6 +11,8 @@ noise_exp/mask/
 noise_exp/adapters/
 noise_exp/static_scores/
 noise_checkpoint/
+noise_exp/weights/dynamic_cache/
+noise_exp/weights/proxy_logs/
 picture/
 picture_old/
 result/
@@ -20,8 +22,8 @@ unseen_result/mask/
 unseen_result/static_scores/
 unseen_result/weights/
 weights/dynamic_cache/
-noise_exp/weights/
-corruption_exp/weights/
+corruption_exp/weights/dynamic_cache/
+corruption_exp/weights/proxy_logs/
 corruption_exp/static_scores/
 corruption_exp/adapters/
 corruption_exp/contexts/

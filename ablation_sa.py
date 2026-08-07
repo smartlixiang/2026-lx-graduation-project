@@ -1,326 +1,269 @@
+"""Learned-group static-metric ablations.
+
+This module contains the shared type-1 solver used by the three entry points.  It
+deliberately reads ACT caches only: an ablation run never trains a proxy or
+falls back to proxy logs.
+"""
 from __future__ import annotations
 
 import argparse
-import json
-import sys
 import time
 from math import ceil
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from calculate_my_mask import _build_dataset, build_score_loader, compute_full_class_means, parse_ratio_list
+from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10
+from learn_scoring_weights import resolve_default_proxy_epochs, resolve_dynamic_component_cache_path
+from model.adapter import load_trained_adapters
+from scoring import DifficultyDirection, Div, SemanticAlignment
+from utils.class_name_utils import resolve_class_names_for_prompts
+from utils.global_config import CONFIG
+from utils.path_rules import resolve_mask_path
+from utils.score_utils import standard_zscore, standard_zscore_by_class
+from utils.seed import parse_seed_list, set_seed
+from utils.static_score_cache import get_or_compute_static_scores
+from weights.calibration import build_dynamic_target, fit_softplus_ratio_regression
+
 PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from calculate_my_mask import (  # noqa: E402
-    _build_dataset,
-    build_score_loader,
-    parse_ratio_list,
-    select_group_mask,
-    select_topk_mask,
-)
-from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR100  # noqa: E402
-from model.adapter import load_trained_adapters  # noqa: E402
-from scoring import DifficultyDirection, Div, SemanticAlignment  # noqa: E402
-from utils.class_name_utils import resolve_class_names_for_prompts  # noqa: E402
-from utils.global_config import CONFIG  # noqa: E402
-from utils.path_rules import resolve_mask_path  # noqa: E402
-from utils.seed import parse_seed_list, set_seed  # noqa: E402
-from utils.score_utils import standard_zscore_by_class  # noqa: E402
-from utils.static_score_cache import get_or_compute_static_scores  # noqa: E402
+COMPONENT_NAMES = ("A", "C", "T")
 
 
-ABLATION_NAME = "ablation_sa"
-ABLATION_COMPONENT = "sa"
-ACTIVE_COMPONENTS = ("dds", "div")
-ALL_COMPONENTS = ("dds", "div", "sa")
-
-
-class RatioBandDifficultyDirection(DifficultyDirection):
-    """DDS variant using eigenvalue-ratio band [lower, upper].
-
-    The repository's current DifficultyDirection class keeps the historical
-    2%-20% cache parameters, but its default direction selector is the dominant
-    cumulative-ratio version. This subclass restores the ablation setting that
-    selects PCA directions whose individual eigenvalue ratio lies in [2%, 20%].
-    """
-
-    def _select_difficulty_dirs(
-        self,
-        eigenvalues: torch.Tensor,
-        eigenvectors: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        feat_dim = eigenvalues.shape[0]
-        if feat_dim == 0:
-            return eigenvectors[:, :0], eigenvalues[:0]
-
-        eigvals = torch.clamp(eigenvalues, min=0.0).flip(0)
-        eigvecs = eigenvectors.flip(1)
-        total = eigvals.sum()
-        if total.item() <= 0:
-            return eigvecs[:, :1], eigvals[:1]
-
-        ratios = eigvals / total
-        keep = (ratios >= self.eigval_lower_bound) & (ratios <= self.eigval_upper_bound)
-        if not bool(keep.any()):
-            # Robust fallback: choose the direction whose ratio is closest to the band.
-            lower_gap = torch.clamp(self.eigval_lower_bound - ratios, min=0.0)
-            upper_gap = torch.clamp(ratios - self.eigval_upper_bound, min=0.0)
-            nearest = torch.argmin(lower_gap + upper_gap)
-            keep = torch.zeros_like(ratios, dtype=torch.bool)
-            keep[nearest] = True
-        return eigvecs[:, keep], eigvals[keep]
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Ablate SA and calculate masks.")
-    parser.add_argument("--dataset", type=str, default=CIFAR100, choices=AVAILABLE_DATASETS)
-    parser.add_argument("--kr", type=str, default="20,30,40,50,60,70,80,90")
-    parser.add_argument("--clip-model", type=str, default="ViT-B/32")
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--seed", type=str, default="22,42,96")
-    parser.add_argument("--weight-group", type=str, default="learned", choices=("naive", "learned"))
-    parser.add_argument("--method", type=str, default="group", choices=("topk", "group"))
-    parser.add_argument("--model-name", type=str, default="resnet50")
+def build_parser(description: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--dataset", default=CIFAR10, choices=AVAILABLE_DATASETS)
+    parser.add_argument("--kr", default="20,30,40,50,60,70,80,90")
+    parser.add_argument("--seed", default=",".join(map(str, CONFIG.exp_seeds)))
+    parser.add_argument("--clip-model", default="ViT-B/32")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--model-name", default="resnet50")
     parser.add_argument("--skip-saved", action="store_true")
-    parser.add_argument("--group-candidate-pool-size", type=int, default=1)
+    parser.add_argument("--group-candidate-pool-size", type=int, default=5)
+    parser.add_argument("--group-init-count", type=int, default=10)
+    parser.add_argument("--proxy-model", default="resnet18")
+    parser.add_argument("--proxy-epochs", type=int, default=None)
+    parser.add_argument("--ratio-lambda", type=float, default=1e-2)
+    parser.add_argument("--regression-learning-rate", type=float, default=2e-3)
+    parser.add_argument("--regression-max-iter", type=int, default=10000)
+    parser.add_argument("--regression-tol", type=float, default=1e-6)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--debug-prompts", action="store_true")
-    return parser.parse_args()
+    return parser
 
 
-def _renormalize_without_ablation(weights: dict[str, object]) -> dict[str, float]:
-    out = {k: 0.0 for k in ALL_COMPONENTS}
-    active_sum = 0.0
-    for key in ACTIVE_COMPONENTS:
-        try:
-            value = float(weights.get(key, 0.0))
-        except (TypeError, ValueError):
-            value = 0.0
-        value = max(value, 0.0)
-        out[key] = value
-        active_sum += value
-    if active_sum <= 1e-12:
-        for key in ACTIVE_COMPONENTS:
-            out[key] = 1.0 / len(ACTIVE_COMPONENTS)
-    else:
-        for key in ACTIVE_COMPONENTS:
-            out[key] /= active_sum
-    out[ABLATION_COMPONENT] = 0.0
-    return out
+def load_dynamic_target(dataset: str, proxy_model: str, seed: int, epochs: int, num_samples: int) -> np.ndarray:
+    """Load only ``final_normalized`` from the canonical per-seed ACT caches."""
+    results = {}
+    expected_length = int(num_samples)
+    for name in COMPONENT_NAMES:
+        path = resolve_dynamic_component_cache_path(dataset, proxy_model, seed, epochs, name)
+        if not path.is_file():
+            raise FileNotFoundError(f"Required dynamic cache is missing: {path}")
+        with np.load(path, allow_pickle=False) as cache:
+            if "final_normalized" not in cache:
+                raise ValueError(f"Dynamic cache has no final_normalized array: {path}")
+            values = np.asarray(cache["final_normalized"], dtype=np.float64)
+        if values.shape != (expected_length,):
+            raise ValueError(f"{path}: expected final_normalized shape {(expected_length,)}, got {values.shape}")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"{path}: final_normalized contains NaN/inf")
+        results[name] = SimpleNamespace(final_normalized=values)
+    dynamic_target, _ = build_dynamic_target(results)
+    return dynamic_target
 
 
-def _load_original_weights(dataset_name: str) -> dict[str, dict[str, object]]:
-    path = PROJECT_ROOT / "weights" / "scoring_weights.json"
-    if not path.exists():
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    entry = data.get(dataset_name, {})
-    return entry if isinstance(entry, dict) else {}
+def select_ablation_group_mask(
+    *, active: tuple[str, str], scores: dict[str, np.ndarray], div_metric: Div,
+    div_loader: DataLoader, image_adapter, labels: np.ndarray, weights: dict[str, float],
+    num_classes: int, keep_ratio: int, device: torch.device, seed: int,
+    candidate_pool_size: int, group_init_count: int,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Current type-1 solver with exactly the named static metrics present."""
+    if not 0 < keep_ratio <= 100:
+        raise ValueError("kr must be in [1, 100]")
+    active_set = set(active)
+    labels = np.asarray(labels, dtype=np.int64)
+    n = labels.size
+    class_indices = [np.flatnonzero(labels == c).astype(np.int64) for c in range(num_classes)]
+    target = min(n, max(1, int(round(keep_ratio / 100.0 * n))))
+    sizes = np.asarray([x.size for x in class_indices], dtype=np.int64)
+    raw_budgets = sizes * (keep_ratio / 100.0)
+    budgets = np.minimum(np.floor(raw_budgets).astype(np.int64), sizes)
+    need = target - int(budgets.sum())
+    for class_id in np.lexsort((np.arange(num_classes), -(raw_budgets - budgets))):
+        if need <= 0:
+            break
+        if budgets[class_id] < sizes[class_id]:
+            budgets[class_id] += 1
+            need -= 1
+    if need:
+        raise RuntimeError("Could not allocate exact class budgets")
+
+    rng = np.random.default_rng(seed)
+    features_t, _ = div_metric._encode_images(div_loader, image_adapter)
+    features = (features_t.detach().cpu().numpy() if isinstance(features_t, torch.Tensor) else np.asarray(features_t)).astype(np.float32)
+    full_means = compute_full_class_means(features, labels, num_classes)
+    selected = np.zeros(n, dtype=np.uint8)
+    counts = np.zeros(num_classes, dtype=np.int64)
+    sums = np.zeros((num_classes, features.shape[1]), dtype=np.float32)
+    init_per_class = np.zeros(num_classes, dtype=np.int64)
+
+    for c, indices in enumerate(class_indices):
+        init_count = min(max(0, int(group_init_count)), int(budgets[c]), indices.size)
+        if init_count == 0:
+            continue
+        if "sa" not in active_set:  # SA ablation: uniform over the complete class.
+            init_pool = indices
+        else:  # Main type-1 initialization: uniform over the raw-SA top 50% pool.
+            pool_size = min(indices.size, max(init_count, int(np.ceil(0.5 * indices.size))))
+            init_pool = indices[np.argsort(-scores["sa"][indices], kind="mergesort")[:pool_size]]
+        chosen = init_pool if init_pool.size <= init_count else rng.choice(init_pool, init_count, replace=False)
+        selected[chosen] = 1
+        counts[c] = init_count
+        init_per_class[c] = init_count
+        sums[c] = features[chosen].sum(axis=0, dtype=np.float32)
+
+    history = [int(selected.sum())]
+    total_to_add = int(budgets.sum() - init_per_class.sum())
+    dist_max = max(0.0, 0.7 - 0.004 * keep_ratio)
+    dist_min = 0.5 * dist_max
+    pool_size = max(1, int(candidate_pool_size))
+    pbar = tqdm(total=total_to_add, desc="[ablation group] classwise greedy add", unit="sample")
+    while True:
+        remaining = budgets - counts
+        active_classes = np.flatnonzero(remaining > 0)
+        if not active_classes.size:
+            break
+        remain_total = int(remaining.sum())
+        chosen_classes = (np.sort(rng.choice(active_classes, remain_total, replace=False))
+                          if remain_total < active_classes.size else active_classes)
+        for c in chosen_classes:
+            candidates = class_indices[c][selected[class_indices[c]] == 0]
+            current_count = int(counts[c])
+            if candidates.size == 0 or current_count <= 0:
+                continue
+            progress = float(np.clip(current_count / float(budgets[c]), 0.0, 1.0))
+            dist_weight = dist_min + (dist_max - dist_min) * progress
+            old_dist = float(np.linalg.norm(sums[c] / current_count - full_means[c]))
+            new_means = (sums[c][None, :] + features[candidates]) / float(current_count + 1)
+            dist_local = standard_zscore(old_dist - np.linalg.norm(new_means - full_means[c][None, :], axis=1))
+            combined = dist_weight * dist_local
+            if "sa" in active_set:
+                combined = combined + weights["sa"] * standard_zscore(scores["sa"][candidates])
+            if "dds" in active_set:
+                combined = combined + weights["dds"] * standard_zscore(scores["dds"][candidates])
+            if "div" in active_set:
+                refs = class_indices[c][selected[class_indices[c]] > 0]
+                div_raw = div_metric._knn_mean_distance_to_reference(
+                    query_features=torch.as_tensor(features[candidates], dtype=torch.float32, device=device),
+                    reference_features=torch.as_tensor(features[refs], dtype=torch.float32, device=device),
+                    k=float(max(3, int(ceil(0.05 * current_count)))),
+                    query_indices=torch.as_tensor(candidates, dtype=torch.long, device=device),
+                    reference_indices=torch.as_tensor(refs, dtype=torch.long, device=device),
+                ).detach().cpu().numpy().astype(np.float32)
+                combined = combined + weights["div"] * standard_zscore(div_raw)
+            rank = np.argsort(-combined, kind="mergesort")[:min(pool_size, candidates.size)]
+            candidate_pool = candidates[rank]
+            picked = int(candidate_pool[0] if candidate_pool.size == 1 else rng.choice(candidate_pool))
+            selected[picked] = 1
+            counts[c] += 1
+            sums[c] += features[picked]
+            history.append(int(selected.sum()))
+            pbar.update(1)
+    pbar.close()
+
+    selected_bool = selected.astype(bool)
+    comprehensive = np.zeros(n, dtype=np.float64)
+    for name in active:
+        if name == "div":
+            labels_t = torch.as_tensor(labels, dtype=torch.long, device=device)
+            final_div = np.asarray(div_metric.score_dataset_dynamic(div_loader, adapter=image_adapter,
+                selected_mask=selected, image_features=features_t, labels=labels_t).scores)
+            comprehensive += weights[name] * standard_zscore_by_class(final_div, labels)
+        else:
+            comprehensive += weights[name] * standard_zscore_by_class(scores[name], labels)
+    shifts = [np.linalg.norm(sums[c] / counts[c] - full_means[c]) for c in range(num_classes) if counts[c] > 0]
+    stats = {
+        "solver": "group_classwise_greedy_add", "type": 1,
+        "dist_weight": float(dist_max), "dist_weight_max": float(dist_max), "dist_weight_min": float(dist_min),
+        "dist_weight_schedule": "linear_increase_by_class_progress",
+        "selected_by_class": {c: int(counts[c]) for c in range(num_classes)},
+        "class_budgets": {c: int(budgets[c]) for c in range(num_classes)},
+        "init_per_class": {c: int(init_per_class[c]) for c in range(num_classes)},
+        "candidate_pool_size": pool_size, "selected_count_history": history,
+        "subset_comprehensive_score": float(comprehensive[selected_bool].sum()),
+        "distribution_shift": float(np.mean(shifts)) if shifts else 0.0,
+    }
+    return selected, stats
 
 
-def load_ablation_weights(dataset_name: str, weight_group: str, seed: int) -> dict[str, float]:
-    path = PROJECT_ROOT / "weights" / "ablation_weights.json"
-    data: dict[str, object] = {}
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        if isinstance(loaded, dict):
-            data = loaded
+def run_ablation(args: argparse.Namespace, *, active: tuple[str, str], mode: str) -> None:
+    device = torch.device(args.device) if args.device else CONFIG.global_device
+    dataset_name = args.dataset.strip().lower()
+    epochs = args.proxy_epochs if args.proxy_epochs is not None else resolve_default_proxy_epochs(dataset_name)
+    dataset = _build_dataset(dataset_name, transform=None)
+    class_names = list(resolve_class_names_for_prompts(dataset_name=dataset_name, data_root=PROJECT_ROOT / "data", class_names=dataset.classes))
+    dds_metric = DifficultyDirection(class_names=class_names, clip_model=args.clip_model, device=device)
+    div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
+    sa_metric = SemanticAlignment(class_names=class_names, clip_model=args.clip_model, device=device,
+                                  dataset_name=dataset_name, data_root=str(PROJECT_ROOT / "data"), debug_prompts=args.debug_prompts)
+    dds_loader = build_score_loader(dds_metric.extractor.preprocess, dataset_name, device, args.batch_size, args.num_workers)
+    div_loader = build_score_loader(div_metric.extractor.preprocess, dataset_name, device, args.batch_size, args.num_workers)
+    sa_loader = build_score_loader(sa_metric.extractor.preprocess, dataset_name, device, args.batch_size, args.num_workers)
+    labels = np.asarray(dataset.targets, dtype=np.int64)
 
-    dataset_entry = data.setdefault(dataset_name, {})
-    if not isinstance(dataset_entry, dict):
-        dataset_entry = {}
-        data[dataset_name] = dataset_entry
-    ablation_entry = dataset_entry.setdefault(ABLATION_NAME, {})
-    if not isinstance(ablation_entry, dict):
-        ablation_entry = {}
-        dataset_entry[ABLATION_NAME] = ablation_entry
-
-    key = "naive" if weight_group == "naive" else str(seed)
-    selected = ablation_entry.get(key)
-    if isinstance(selected, dict):
-        weights = _renormalize_without_ablation(selected)
-    elif weight_group == "naive":
-        weights = {"dds": 0.5, "div": 0.5, "sa": 0.0}
-    else:
-        original = _load_original_weights(dataset_name)
-        fallback = original.get(str(seed)) or original.get("learned") or original.get("naive") or {}
-        weights = _renormalize_without_ablation(fallback if isinstance(fallback, dict) else {})
-        print(
-            f"[Warning] weights/ablation_weights.json missing {dataset_name}/{ABLATION_NAME}/{key}; "
-            "use renormalized original weights as fallback."
-        )
-
-    ablation_entry[key] = weights
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    return weights
+    for seed in parse_seed_list(args.seed):
+        set_seed(seed)
+        image_adapter, text_adapter, paths = load_trained_adapters(dataset_name=dataset_name, clip_model=args.clip_model,
+            input_dim=dds_metric.extractor.embed_dim, seed=seed, map_location=device)
+        image_adapter.to(device).eval(); text_adapter.to(device).eval()
+        def compute_scores() -> dict[str, np.ndarray]:
+            return {
+                "dds": np.asarray(dds_metric.score_dataset(tqdm(dds_loader, desc="Scoring DDS"), adapter=image_adapter).scores),
+                "div": np.asarray(div_metric.score_dataset(tqdm(div_loader, desc="Scoring Div"), adapter=image_adapter).scores),
+                "sa": np.asarray(sa_metric.score_dataset(tqdm(sa_loader, desc="Scoring SA"), adapter_image=image_adapter, adapter_text=text_adapter).scores),
+                "labels": labels,
+            }
+        scores = get_or_compute_static_scores(cache_root=PROJECT_ROOT / "static_scores", dataset=dataset_name, seed=seed,
+            clip_model=args.clip_model, adapter_image_path=str(paths["image_path"]), adapter_text_path=str(paths["text_path"]),
+            div_k=div_metric.k, dds_k=dds_metric.k, dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
+            dds_eigval_upper_bound=dds_metric.eigval_upper_bound, prompt_template=sa_metric.prompt_template,
+            num_samples=len(dataset), compute_fn=compute_scores)
+        if not np.array_equal(labels, scores["labels"]):
+            raise ValueError("Static cache labels do not match the current dataset")
+        # Feature order is exactly ``active`` (SA ablation: Div, DDS).
+        features = np.stack([standard_zscore_by_class(scores[name], labels) for name in active], axis=1).astype(np.float64)
+        target = load_dynamic_target(dataset_name, args.proxy_model, seed, int(epochs), len(dataset))
+        fit = fit_softplus_ratio_regression(features, target, args.ratio_lambda, args.regression_learning_rate,
+                                            args.regression_max_iter, args.regression_tol, device)
+        fitted = np.asarray(fit["normalized_weights"], dtype=np.float64)
+        if not np.isclose(fitted.sum(), 1.0):
+            raise RuntimeError("Fitted active weights do not sum to one")
+        weights = dict(zip(active, fitted.tolist()))
+        print(f"[seed={seed}] active={active}, weights={weights}")
+        for keep_ratio in parse_ratio_list(args.kr):
+            path = resolve_mask_path(mode=mode, dataset=dataset_name, model=args.model_name, seed=seed, keep_ratio=keep_ratio)
+            if args.skip_saved and path.exists():
+                print(f"[skip] {path}"); continue
+            start = time.perf_counter()
+            mask, stats = select_ablation_group_mask(active=active, scores=scores, div_metric=div_metric,
+                div_loader=div_loader, image_adapter=image_adapter, labels=labels, weights=weights,
+                num_classes=len(class_names), keep_ratio=keep_ratio, device=device, seed=seed,
+                candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(path, mask=mask.astype(np.uint8))
+            print(f"[saved] {path} selected={int(mask.sum())} elapsed={time.perf_counter()-start:.2f}s stats={stats}")
 
 
 def main() -> None:
-    total_start = time.perf_counter()
-    args = parse_args()
-    dataset_name = args.dataset.strip().lower()
-    device = torch.device(args.device) if args.device is not None else CONFIG.global_device
-
-    keep_ratios = parse_ratio_list(args.kr)
-    seeds = parse_seed_list(args.seed)
-    if not keep_ratios or not seeds:
-        raise ValueError("kr 和 seed 均不能为空。")
-
-    dataset_for_names = _build_dataset(dataset_name, transform=None)
-    class_names = resolve_class_names_for_prompts(
-        dataset_name=dataset_name,
-        data_root=PROJECT_ROOT / "data",
-        class_names=dataset_for_names.classes,  # type: ignore[attr-defined]
-    )
-    print(f"[Init] {dataset_name} samples={len(dataset_for_names)} classes={len(class_names)}")
-
-    dds_metric = RatioBandDifficultyDirection(
-        class_names=class_names,
-        clip_model=args.clip_model,
-        device=device,
-        eigval_lower_bound=0.02,
-        eigval_upper_bound=0.20,
-    )
-    div_metric = Div(class_names=class_names, clip_model=args.clip_model, device=device)
-    sa_metric = SemanticAlignment(
-        class_names=class_names,
-        clip_model=args.clip_model,
-        device=device,
-        dataset_name=dataset_name,
-        data_root=str(PROJECT_ROOT / "data"),
-        debug_prompts=args.debug_prompts,
-    )
-
-    batch_size = 128
-    num_workers = 4
-    dds_loader = build_score_loader(dds_metric.extractor.preprocess, dataset_name, device, batch_size, num_workers)
-    div_loader = build_score_loader(div_metric.extractor.preprocess, dataset_name, device, batch_size, num_workers)
-    sa_loader = build_score_loader(sa_metric.extractor.preprocess, dataset_name, device, batch_size, num_workers)
-
-    method_name = f"{ABLATION_NAME}_{args.weight_group}_{args.method}"
-    total_tasks = len(seeds) * len(keep_ratios)
-    task_idx = 0
-
-    for seed in seeds:
-        set_seed(seed)
-        weights = load_ablation_weights(dataset_name, args.weight_group, seed)
-        print(f"[Seed {seed}] weights={weights}")
-
-        image_adapter, text_adapter, adapter_paths = load_trained_adapters(
-            dataset_name=dataset_name,
-            clip_model=args.clip_model,
-            input_dim=dds_metric.extractor.embed_dim,
-            seed=seed,
-            map_location=device,
-        )
-        image_adapter.to(device).eval()
-        text_adapter.to(device).eval()
-
-        def _compute_scores() -> dict[str, np.ndarray]:
-            dds_scores = dds_metric.score_dataset(tqdm(dds_loader, desc="Scoring DDS(2%-20%)", unit="batch"), adapter=image_adapter).scores
-            div_scores = div_metric.score_dataset(tqdm(div_loader, desc="Scoring Div", unit="batch"), adapter=image_adapter).scores
-            sa_scores = sa_metric.score_dataset(
-                tqdm(sa_loader, desc="Scoring SA", unit="batch"),
-                adapter_image=image_adapter,
-                adapter_text=text_adapter,
-            ).scores
-            return {
-                "dds": np.asarray(dds_scores),
-                "div": np.asarray(div_scores),
-                "sa": np.asarray(sa_scores),
-                "labels": np.asarray(dataset_for_names.targets),
-            }
-
-        static_start = time.perf_counter()
-        static_scores = get_or_compute_static_scores(
-            cache_root=PROJECT_ROOT / "static_scores" / "ablation_2_20",
-            dataset=dataset_name,
-            seed=seed,
-            clip_model=args.clip_model,
-            adapter_image_path=str(adapter_paths["image_path"]),
-            adapter_text_path=str(adapter_paths["text_path"]),
-            div_k=div_metric.k,
-            dds_k=dds_metric.k,
-            dds_eigval_lower_bound=dds_metric.eigval_lower_bound,
-            dds_eigval_upper_bound=dds_metric.eigval_upper_bound,
-            prompt_template=sa_metric.prompt_template,
-            num_samples=len(dataset_for_names),
-            compute_fn=_compute_scores,
-        )
-        static_seconds = time.perf_counter() - static_start
-
-        dds_scores_np = np.asarray(static_scores["dds"], dtype=np.float32)
-        div_scores_np = np.asarray(static_scores["div"], dtype=np.float32)
-        sa_scores_np = np.asarray(static_scores["sa"], dtype=np.float32)
-        labels = np.asarray(dataset_for_names.targets)
-
-        dds_global_z = standard_zscore_by_class(dds_scores_np, labels)
-        div_global_z = standard_zscore_by_class(div_scores_np, labels)
-        total_scores_np = weights["dds"] * dds_global_z + weights["div"] * div_global_z
-
-        for keep_ratio in keep_ratios:
-            task_idx += 1
-            print(f"[Mask {task_idx}/{total_tasks}] {method_name} | seed={seed} | kr={keep_ratio}")
-            mask_path = resolve_mask_path(
-                mode=method_name,
-                dataset=dataset_name,
-                model=args.model_name,
-                seed=seed,
-                keep_ratio=keep_ratio,
-            )
-            if args.skip_saved and mask_path.exists():
-                print(f"[Skip] {mask_path}")
-                continue
-
-            group_stats = None
-            if args.method == "topk":
-                mask, selected_by_class = select_topk_mask(
-                    total_scores_np,
-                    labels,
-                    num_classes=len(class_names),
-                    keep_ratio=keep_ratio,
-                )
-            else:
-                # SA ablation is straightforward: SA is kept for cache compatibility,
-                # but its score and weight are zeroed in the group objective.
-                mask, selected_by_class, group_stats = select_group_mask(
-                    np.zeros_like(sa_scores_np, dtype=np.float32),
-                    div_metric=div_metric,
-                    div_loader=div_loader,
-                    image_adapter=image_adapter,
-                    labels=labels,
-                    weights=weights,
-                    num_classes=len(class_names),
-                    keep_ratio=keep_ratio,
-                    device=device,
-                    dataset_name=dataset_name,
-                    seed=seed,
-                    weight_group=args.weight_group,
-                    clip_model=args.clip_model,
-                    adapter_image_path=str(adapter_paths["image_path"]),
-                    div_static_scores=div_scores_np,
-                    dds_static_scores=dds_scores_np,
-                    group_candidate_pool_size=args.group_candidate_pool_size,
-                )
-
-            mask_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(mask_path, mask=mask.astype(np.uint8))
-            print(
-                f"saved: {mask_path} | selected={int(mask.sum())} | "
-                f"static_seconds={static_seconds:.2f} | total_seconds={time.perf_counter() - total_start:.2f}"
-            )
-            if group_stats is not None:
-                print(
-                    f"group_summary: subset_score={group_stats['subset_comprehensive_score']:.6f} | "
-                    f"distribution_shift={group_stats['distribution_shift']:.6f}"
-                )
+    args = build_parser("Learned-group ablation without SA").parse_args()
+    run_ablation(args, active=("div", "dds"), mode="ablation_sa")
 
 
 if __name__ == "__main__":

@@ -258,7 +258,13 @@ def run_ablation(args: argparse.Namespace, *, active: tuple[str, str], mode: str
                 candidate_pool_size=args.group_candidate_pool_size, group_init_count=args.group_init_count)
             path.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(path, mask=mask.astype(np.uint8))
-            print(f"[saved] {path} selected={int(mask.sum())} elapsed={time.perf_counter()-start:.2f}s stats={stats}")
+            print(
+                f"[saved] {path} "
+                f"selected={int(mask.sum())} "
+                f"elapsed={time.perf_counter()-start:.2f}s "
+                f"subset_score={stats['subset_comprehensive_score']:.6f} "
+                f"distribution_shift={stats['distribution_shift']:.6f}"
+            )
 
 
 def main() -> None:

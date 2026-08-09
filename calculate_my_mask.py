@@ -88,13 +88,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-candidate-pool-size",
         type=int,
-        default=5,
+        default=10,
         help="group 模式下类内贪心候选池大小，1 表示纯贪心。",
     )
     parser.add_argument(
         "--group-init-count",
         type=int,
-        default=10,
+        default=2,
         help="group 模式下每个类别随机初始化的样本数。",
     )
     parser.add_argument(

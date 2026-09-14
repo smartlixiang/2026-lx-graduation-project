@@ -46,10 +46,13 @@ def parse_args() -> argparse.Namespace:
         "--methods",
         nargs="+",
         # default=[
-        #     "random", "herding", "EL2N", "GraNd", "Forgetting", "MDS",
-        #     "MoSo", "yangclip", "RLSelector", "ours"
+        #     "Random", "Herding", "EL2N", "GraNd", "Forgetting", "MDS",
+        #     "MoSo", "YangCLIP", "RLSelector", "Ours"
         # ],
-        default=["random", "ablation_sa", "ablation_div", "ablation_sv", "learned_topk", "naive_group", "ours"],
+        default=[
+            "Random", "ablation_sa", "ablation_div", "ablation_sv", "ablation_distribution", 
+            "ablation_A", "ablation_C", "ablation_T", "learned_topk", "naive_group", "Ours"
+        ],
         help="Selection methods to compare",
     )
     parser.add_argument(
@@ -64,6 +67,15 @@ def parse_args() -> argparse.Namespace:
         default=320,
         help="Output image resolution (default: 320)",
     )
+    parser.add_argument(
+        "--legend-scale",
+        type=float,
+        default=1.2,
+        help=(
+            "Uniform scale for the entire legend. "
+            "1.0 keeps the baseline size; 1.2 enlarges it by about 20%%."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -77,12 +89,65 @@ def configure_plot_style() -> None:
             "axes.linewidth": 1.18,
             "xtick.labelsize": 13.8,
             "ytick.labelsize": 13.8,
-            "legend.fontsize": 14.0,
             "lines.solid_capstyle": "round",
             "lines.solid_joinstyle": "round",
             "axes.unicode_minus": False,
         }
     )
+
+
+def build_legend_size_config(scale: float = 1.0) -> dict[str, object]:
+    """
+    集中管理所有与图例大小、内部比例和右下角框尺寸有关的参数。
+
+    最常用的手动调节方式：
+        --legend-scale 1.00   基准大小
+        --legend-scale 1.10   整体约放大 10%
+        --legend-scale 1.20   整体约放大 20%
+        --legend-scale 0.90   整体约缩小 10%
+
+    所有图例文字统一使用 text_size，因此文字始终等大。
+
+    注意：handle_length、handle_text_pad、border_pad、label_spacing 和
+    column_spacing 在 Matplotlib 中是相对于字体大小的比例参数。
+    因此这里保持这些比例常数不变，只让 text_size 随 scale 改变，
+    它们的实际物理尺寸就会自然同比缩放。若再乘一次 scale，会造成
+    图例框相对文字被二次放大。
+    """
+    if scale <= 0:
+        raise ValueError("--legend-scale must be greater than 0")
+
+    return {
+        # ===== 一键整体缩放的绝对尺寸 =====
+        "text_size": 14.8 * scale,
+
+        # 普通方法：所有普通方法使用完全相同的图例尺寸。
+        "regular_marker_size": 7.4 * scale,
+        "regular_line_width": 2.2 * scale,
+        "regular_marker_edge_width": 0.95 * scale,
+
+        # 最后一个重点方法：仅符号和线条更醒目，文字仍与其他方法等大。
+        "focus_marker_size": 10.2 * scale,
+        "focus_line_width": 2.9 * scale,
+        "focus_marker_edge_width": 1.00 * scale,
+
+        # 图例外框边线。
+        "frame_line_width": 1.08 * scale,
+
+        # ===== 图例框内部的相对比例 =====
+        # 这些值会随 text_size 的变化自然改变实际像素尺寸。
+        "handle_length": 2.70,      # 图例中示例线段长度
+        "handle_text_pad": 0.82,    # 线段/marker 与文字之间的水平距离
+        "border_pad": 0.94,         # 图例内容到外框的内边距，直接影响框大小
+        "label_spacing": 0.56,      # 各方法之间的垂直行距
+        "column_spacing": 1.00,     # 多列图例时的列间距
+        "ncol": 1,
+
+        # ===== 图例位置 =====
+        # 位置本身不是大小，但放在同一配置函数中便于统一调节。
+        "loc": "lower right",
+        "bbox_to_anchor": (0.996, 0.012),
+    }
 
 
 def parse_kr_list(raw: str) -> list[int]:
@@ -198,24 +263,24 @@ def load_method_seed_stats(
     return stats_by_kr
 
 
-def inject_kr100_from_random(
+def inject_kr100_from_Random(
     method_to_stats: dict[str, dict[int, tuple[float, float]]],
     methods: list[str],
 ) -> None:
     """
     特殊处理 kr=100：
-    - 只有 random 的 kr=100 文件是合法来源；
-    - 其他方法一律复用 random 的 kr=100 结果；
+    - 只有 Random 的 kr=100 文件是合法来源；
+    - 其他方法一律复用 Random 的 kr=100 结果；
     - 从而所有方法在 kr=100 处重合，但 marker 不同。
     """
-    if "random" not in method_to_stats or 100 not in method_to_stats["random"]:
+    if "Random" not in method_to_stats or 100 not in method_to_stats["Random"]:
         return
 
-    random_kr100_stats = method_to_stats["random"][100]
+    Random_kr100_stats = method_to_stats["Random"][100]
     for method in methods:
         if method not in method_to_stats:
             continue
-        method_to_stats[method][100] = random_kr100_stats
+        method_to_stats[method][100] = Random_kr100_stats
 
 
 def choose_y_tick_step(ymin: float, ymax: float) -> float:
@@ -239,7 +304,7 @@ def compute_y_limits(
     keep_ratios: list[int],
 ) -> tuple[float, float] | None:
     """
-    纵轴下界采用“最小 kr 的所有方法均值中的最小值 × 0.8”。
+    纵轴下界采用“最小 kr 下所有方法实验结果的平均值 × 0.98”。
     这样可避免个别极低离群点把整张图拉得过扁。
     若有点低于该下界，它会被裁到图外，只保留折线连接效果。
     """
@@ -285,22 +350,18 @@ def build_legend_handles(
     focus_method: str | None,
     marker_map: dict[str, str],
     style_map: dict[str, dict],
+    legend_config: dict[str, object],
 ) -> tuple[list[Line2D], list[str]]:
     """
-    构造独立图例句柄：
-    - 除最后一个重点方法外，其余所有图例符号大小完全一致；
-    - 重点方法允许更大一些。
+    构造独立图例句柄。
+
+    所有尺寸参数全部来自 build_legend_size_config()：
+    - 普通方法的图例尺寸完全一致；
+    - 最后一个重点方法只放大 marker/线条；
+    - 所有方法的文字大小完全一致。
     """
     handles: list[Line2D] = []
     labels: list[str] = []
-
-    regular_ms = 7.4
-    regular_lw = 2.2
-    regular_mew = 0.95
-
-    focus_ms = 10.2
-    focus_lw = 2.9
-    focus_mew = 1.00
 
     for method in valid_methods:
         is_focus = method == focus_method
@@ -311,9 +372,21 @@ def build_legend_handles(
                 color=style_map[method]["color"],
                 marker=marker_map[method],
                 linestyle="-",
-                linewidth=focus_lw if is_focus else regular_lw,
-                markersize=focus_ms if is_focus else regular_ms,
-                markeredgewidth=focus_mew if is_focus else regular_mew,
+                linewidth=(
+                    legend_config["focus_line_width"]
+                    if is_focus
+                    else legend_config["regular_line_width"]
+                ),
+                markersize=(
+                    legend_config["focus_marker_size"]
+                    if is_focus
+                    else legend_config["regular_marker_size"]
+                ),
+                markeredgewidth=(
+                    legend_config["focus_marker_edge_width"]
+                    if is_focus
+                    else legend_config["regular_marker_edge_width"]
+                ),
                 markeredgecolor=style_map[method]["markeredgecolor"],
                 alpha=1.0,
             )
@@ -333,6 +406,7 @@ def main() -> None:
 
     marker_map = build_marker_map(methods)
     style_map = build_style_map(methods)
+    legend_config = build_legend_size_config(args.legend_scale)
 
     output_name = args.output or f"{args.dataset}_{args.model}.png"
     output_path = Path("picture") / Path(output_name).name
@@ -355,9 +429,9 @@ def main() -> None:
         method_to_stats[method] = stats_by_kr
         valid_methods.append(method)
 
-    # 特殊处理 kr=100：所有方法统一复用 random 的 kr=100 结果
+    # 特殊处理 kr=100：所有方法统一复用 Random 的 kr=100 结果
     if 100 in keep_ratios:
-        inject_kr100_from_random(method_to_stats, valid_methods)
+        inject_kr100_from_Random(method_to_stats, valid_methods)
 
     method_to_mean: dict[str, dict[int, float]] = {
         method: {kr: stats[0] for kr, stats in kr_to_stats.items()}
@@ -545,28 +619,31 @@ def main() -> None:
             focus_method=focus_method,
             marker_map=marker_map,
             style_map=style_map,
+            legend_config=legend_config,
         )
 
-        # 右下角视作安全区域，尽量放大图例和文字。
+        # 右下角图例的所有尺寸/内部比例均由 build_legend_size_config() 管理。
         legend = ax.legend(
             legend_handles,
             legend_labels,
-            loc="lower right",
-            bbox_to_anchor=(0.996, 0.012),
+            loc=legend_config["loc"],
+            bbox_to_anchor=legend_config["bbox_to_anchor"],
             frameon=True,
             fancybox=False,
             framealpha=0.985,
             facecolor="white",
             edgecolor="#888888",
-            fontsize=14.8,
-            ncol=1,
-            handlelength=2.70,
-            handletextpad=0.82,
-            borderpad=0.94,
-            labelspacing=0.56,
-            columnspacing=1.0,
+            fontsize=legend_config["text_size"],
+            ncol=legend_config["ncol"],
+            handlelength=legend_config["handle_length"],
+            handletextpad=legend_config["handle_text_pad"],
+            borderpad=legend_config["border_pad"],
+            labelspacing=legend_config["label_spacing"],
+            columnspacing=legend_config["column_spacing"],
         )
-        legend.get_frame().set_linewidth(1.08)
+        legend.get_frame().set_linewidth(
+            legend_config["frame_line_width"]
+        )
 
     # 手动留白比 tight_layout 更稳定，避免大图例和大字号挤压坐标轴。
     fig.subplots_adjust(left=0.105, right=0.985, bottom=0.108, top=0.985)
@@ -576,8 +653,8 @@ def main() -> None:
     plt.close(fig)
     print(f"Saved figure to {output_path}")
 
-    if 100 in keep_ratios and ("random" not in method_to_stats or 100 not in method_to_stats["random"]):
-        print("[WARN] 请求绘制 kr=100，但未找到 random 的 kr=100 合法结果，因此无法为所有方法补齐 kr=100 节点。")
+    if 100 in keep_ratios and ("Random" not in method_to_stats or 100 not in method_to_stats["Random"]):
+        print("[WARN] 请求绘制 kr=100，但未找到 Random 的 kr=100 合法结果，因此无法为所有方法补齐 kr=100 节点。")
 
     if missing_methods:
         print(f"未保存结果的方法（已忽略）: {', '.join(missing_methods)}")

@@ -122,6 +122,308 @@
         "div": 0.0,
         "sa": 0.41039490299806075
       }
+    },
+    "ablation_A": {
+      "22": {
+        "experiment": "ablation_A",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "C",
+          "T"
+        ],
+        "sa": 0.30843459743336726,
+        "div": 0.3970582472624557,
+        "dds": 0.29450715530417704,
+        "bias": 1.423598271370479e-10,
+        "ratio_lambda": 0.001,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 22,
+        "dynamic_component_cache_paths": {
+          "C": "weights/dynamic_cache/cifar100/resnet18/22/160/C.npz",
+          "T": "weights/dynamic_cache/cifar100/resnet18/22/160/T.npz"
+        },
+        "adapter_seed": 22,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.13494039212130368,
+            0.17371331240545515,
+            0.12884712464158876
+          ],
+          "mse": 0.9839085325552246,
+          "ratio_regularizer": 0.018555977871666796,
+          "iterations": 3150,
+          "weights_sum": 1.0
+        }
+      },
+      "42": {
+        "experiment": "ablation_A",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "C",
+          "T"
+        ],
+        "sa": 0.3015600884377713,
+        "div": 0.4128038933473023,
+        "dds": 0.28563601821492635,
+        "bias": -9.720632259892089e-11,
+        "ratio_lambda": 0.001,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 42,
+        "dynamic_component_cache_paths": {
+          "C": "weights/dynamic_cache/cifar100/resnet18/42/160/C.npz",
+          "T": "weights/dynamic_cache/cifar100/resnet18/42/160/T.npz"
+        },
+        "adapter_seed": 42,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.13386633153448083,
+            0.18324886138557345,
+            0.12679743566409907
+          ],
+          "mse": 0.9827311217586714,
+          "ratio_regularizer": 0.028787620713075487,
+          "iterations": 3178,
+          "weights_sum": 0.9999999999999999
+        }
+      },
+      "96": {
+        "experiment": "ablation_A",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "C",
+          "T"
+        ],
+        "sa": 0.31014580144427345,
+        "div": 0.4005758752011401,
+        "dds": 0.2892783233545864,
+        "bias": -1.0472084398758338e-07,
+        "ratio_lambda": 0.01,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 96,
+        "dynamic_component_cache_paths": {
+          "C": "weights/dynamic_cache/cifar100/resnet18/96/160/C.npz",
+          "T": "weights/dynamic_cache/cifar100/resnet18/96/160/T.npz"
+        },
+        "adapter_seed": 96,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.13109732626848652,
+            0.16932173823402255,
+            0.1222767310168828
+          ],
+          "mse": 0.9853151972008478,
+          "ratio_regularizer": 0.02099150225287319,
+          "iterations": 3248,
+          "weights_sum": 1.0
+        }
+      }
+    },
+    "ablation_C": {
+      "22": {
+        "experiment": "ablation_C",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "A",
+          "T"
+        ],
+        "sa": 0.41599561212251757,
+        "div": 0.3758559930603193,
+        "dds": 0.20814839481716324,
+        "bias": -1.694171113998183e-10,
+        "ratio_lambda": 0.001,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 22,
+        "dynamic_component_cache_paths": {
+          "A": "weights/dynamic_cache/cifar100/resnet18/22/160/A.npz",
+          "T": "weights/dynamic_cache/cifar100/resnet18/22/160/T.npz"
+        },
+        "adapter_seed": 22,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.07973973542280689,
+            0.07204560954570682,
+            0.03989873317825826
+          ],
+          "mse": 0.9999641555297458,
+          "ratio_regularizer": 0.07290437921841926,
+          "iterations": 5492,
+          "weights_sum": 1.0
+        }
+      },
+      "96": {
+        "experiment": "ablation_C",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "A",
+          "T"
+        ],
+        "sa": 0.39276318297586826,
+        "div": 0.3628195202684446,
+        "dds": 0.24441729675568707,
+        "bias": -1.682650220522893e-09,
+        "ratio_lambda": 0.01,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 96,
+        "dynamic_component_cache_paths": {
+          "A": "weights/dynamic_cache/cifar100/resnet18/96/160/A.npz",
+          "T": "weights/dynamic_cache/cifar100/resnet18/96/160/T.npz"
+        },
+        "adapter_seed": 96,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.06891121063911322,
+            0.06365752562591123,
+            0.04288358112631105
+          ],
+          "mse": 1.0008528085152149,
+          "ratio_regularizer": 0.036913218868922404,
+          "iterations": 5365,
+          "weights_sum": 1.0
+        }
+      }
+    },
+    "ablation_T": {
+      "22": {
+        "experiment": "ablation_T",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "A",
+          "C"
+        ],
+        "sa": 0.3484213214677172,
+        "div": 0.43299495068923016,
+        "dds": 0.21858372784305263,
+        "bias": -1.7836181446905107e-06,
+        "ratio_lambda": 0.001,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 22,
+        "dynamic_component_cache_paths": {
+          "A": "weights/dynamic_cache/cifar100/resnet18/22/160/A.npz",
+          "C": "weights/dynamic_cache/cifar100/resnet18/22/160/C.npz"
+        },
+        "adapter_seed": 22,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.1836429431956712,
+            0.22821929151314096,
+            0.11520924995831246
+          ],
+          "mse": 0.975705932282268,
+          "ratio_regularizer": 0.0699566530610537,
+          "iterations": 3308,
+          "weights_sum": 1.0
+        }
+      },
+      "42": {
+        "experiment": "ablation_T",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "A",
+          "C"
+        ],
+        "sa": 0.34715554178571906,
+        "div": 0.43423396208691173,
+        "dds": 0.2186104961273693,
+        "bias": 0.00040122917478595195,
+        "ratio_lambda": 0.001,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 42,
+        "dynamic_component_cache_paths": {
+          "A": "weights/dynamic_cache/cifar100/resnet18/42/160/A.npz",
+          "C": "weights/dynamic_cache/cifar100/resnet18/42/160/C.npz"
+        },
+        "adapter_seed": 42,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.186001539918377,
+            0.23265705400398792,
+            0.11712873345720501
+          ],
+          "mse": 0.9748011379515281,
+          "ratio_regularizer": 0.07057377890399646,
+          "iterations": 3263,
+          "weights_sum": 1.0000000000000002
+        }
+      },
+      "96": {
+        "experiment": "ablation_T",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "A",
+          "C"
+        ],
+        "sa": 0.3507870595563365,
+        "div": 0.4250866240634208,
+        "dds": 0.22412631638024283,
+        "bias": 2.1939248826821598e-08,
+        "ratio_lambda": 0.01,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 96,
+        "dynamic_component_cache_paths": {
+          "A": "weights/dynamic_cache/cifar100/resnet18/96/160/A.npz",
+          "C": "weights/dynamic_cache/cifar100/resnet18/96/160/C.npz"
+        },
+        "adapter_seed": 96,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.1807282418204647,
+            0.21900795965947184,
+            0.11547163443351947
+          ],
+          "mse": 0.9774184109982383,
+          "ratio_regularizer": 0.0619257541401169,
+          "iterations": 3280,
+          "weights_sum": 1.0
+        }
+      }
     }
   },
   "cifar10": {
@@ -246,6 +548,308 @@
         "dds": 0.5608903416059643,
         "div": 0.0,
         "sa": 0.43910965839403565
+      }
+    },
+    "ablation_A": {
+      "96": {
+        "experiment": "ablation_A",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "C",
+          "T"
+        ],
+        "sa": 0.3763315692868081,
+        "div": 0.3742104363543657,
+        "dds": 0.24945799435882626,
+        "bias": -4.7735912331924354e-11,
+        "ratio_lambda": 0.05,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 96,
+        "dynamic_component_cache_paths": {
+          "C": "weights/dynamic_cache/cifar10/resnet18/96/160/C.npz",
+          "T": "weights/dynamic_cache/cifar10/resnet18/96/160/T.npz"
+        },
+        "adapter_seed": 96,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.1895252147433774,
+            0.1884569860659846,
+            0.12563011931182697
+          ],
+          "mse": 0.985434850250838,
+          "ratio_regularizer": 0.031661154046097845,
+          "iterations": 3209,
+          "weights_sum": 1.0
+        }
+      },
+      "22": {
+        "experiment": "ablation_A",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "C",
+          "T"
+        ],
+        "sa": 0.37442061707343466,
+        "div": 0.3694527743385352,
+        "dds": 0.25612660858803027,
+        "bias": -4.007023628607004e-08,
+        "ratio_lambda": 0.05,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 22,
+        "dynamic_component_cache_paths": {
+          "C": "weights/dynamic_cache/cifar10/resnet18/22/160/C.npz",
+          "T": "weights/dynamic_cache/cifar10/resnet18/22/160/T.npz"
+        },
+        "adapter_seed": 22,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.16998509681869126,
+            0.1677297209398937,
+            0.11628020566543847
+          ],
+          "mse": 0.9890727034742108,
+          "ratio_regularizer": 0.02686037569972981,
+          "iterations": 3424,
+          "weights_sum": 1.0
+        }
+      },
+      "42": {
+        "experiment": "ablation_A",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "C",
+          "T"
+        ],
+        "sa": 0.37436984329602774,
+        "div": 0.38559268963082977,
+        "dds": 0.24003746707314247,
+        "bias": 7.993154450457806e-11,
+        "ratio_lambda": 0.05,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 42,
+        "dynamic_component_cache_paths": {
+          "C": "weights/dynamic_cache/cifar10/resnet18/42/160/C.npz",
+          "T": "weights/dynamic_cache/cifar10/resnet18/42/160/T.npz"
+        },
+        "adapter_seed": 42,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.1955629043240115,
+            0.20142548236900773,
+            0.12539050633489182
+          ],
+          "mse": 0.9835818070347389,
+          "ratio_regularizer": 0.039351371140401915,
+          "iterations": 3180,
+          "weights_sum": 1.0
+        }
+      }
+    },
+    "ablation_C": {
+      "96": {
+        "experiment": "ablation_C",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "A",
+          "T"
+        ],
+        "sa": 0.21640591800961312,
+        "div": 0.4821527846620702,
+        "dds": 0.30144129732831676,
+        "bias": -1.1838678675152756e-10,
+        "ratio_lambda": 0.05,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 96,
+        "dynamic_component_cache_paths": {
+          "A": "weights/dynamic_cache/cifar10/resnet18/96/160/A.npz",
+          "T": "weights/dynamic_cache/cifar10/resnet18/96/160/T.npz"
+        },
+        "adapter_seed": 96,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.0865119350430722,
+            0.1927487509175626,
+            0.12050626976203263
+          ],
+          "mse": 0.9736290219949469,
+          "ratio_regularizer": 0.11048593806517323,
+          "iterations": 3136,
+          "weights_sum": 1.0
+        }
+      },
+      "42": {
+        "experiment": "ablation_C",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "A",
+          "T"
+        ],
+        "sa": 0.21145250776116242,
+        "div": 0.5000652128904717,
+        "dds": 0.28848227934836584,
+        "bias": -1.481325485266372e-11,
+        "ratio_lambda": 0.05,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 42,
+        "dynamic_component_cache_paths": {
+          "A": "weights/dynamic_cache/cifar10/resnet18/42/160/A.npz",
+          "T": "weights/dynamic_cache/cifar10/resnet18/42/160/T.npz"
+        },
+        "adapter_seed": 42,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.08655713484907278,
+            0.2046994501213519,
+            0.11808892606432674
+          ],
+          "mse": 0.9701554680771504,
+          "ratio_regularizer": 0.13397007912379857,
+          "iterations": 3158,
+          "weights_sum": 1.0
+        }
+      },
+      "22": {
+        "experiment": "ablation_C",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "A",
+          "T"
+        ],
+        "sa": 0.2130671862262076,
+        "div": 0.4845515598895716,
+        "dds": 0.3023812538842207,
+        "bias": -9.341372380236983e-11,
+        "ratio_lambda": 0.05,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 22,
+        "dynamic_component_cache_paths": {
+          "A": "weights/dynamic_cache/cifar10/resnet18/22/160/A.npz",
+          "T": "weights/dynamic_cache/cifar10/resnet18/22/160/T.npz"
+        },
+        "adapter_seed": 22,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.08235466434472684,
+            0.18728872230026702,
+            0.11687631074892178
+          ],
+          "mse": 0.9748932902181202,
+          "ratio_regularizer": 0.11484388579175488,
+          "iterations": 3187,
+          "weights_sum": 1.0
+        }
+      }
+    },
+    "ablation_T": {
+      "96": {
+        "experiment": "ablation_T",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "A",
+          "C"
+        ],
+        "sa": 0.2581119210107634,
+        "div": 0.4976617544142828,
+        "dds": 0.24422632457495377,
+        "bias": -1.0911578658759695e-11,
+        "ratio_lambda": 0.05,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 96,
+        "dynamic_component_cache_paths": {
+          "A": "weights/dynamic_cache/cifar10/resnet18/96/160/A.npz",
+          "C": "weights/dynamic_cache/cifar10/resnet18/96/160/C.npz"
+        },
+        "adapter_seed": 96,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.1625763425934086,
+            0.3134610271561975,
+            0.15383025494886365
+          ],
+          "mse": 0.941548025700542,
+          "ratio_regularizer": 0.1217754408475331,
+          "iterations": 2618,
+          "weights_sum": 0.9999999999999999
+        }
+      },
+      "22": {
+        "experiment": "ablation_T",
+        "static_components": [
+          "SA",
+          "Div",
+          "DDS"
+        ],
+        "dynamic_components": [
+          "A",
+          "C"
+        ],
+        "sa": 0.2627327919055198,
+        "div": 0.4971963703489488,
+        "dds": 0.24007083774553145,
+        "bias": -6.731208580525399e-11,
+        "ratio_lambda": 0.05,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "proxy_training_seed": 22,
+        "dynamic_component_cache_paths": {
+          "A": "weights/dynamic_cache/cifar10/resnet18/22/160/A.npz",
+          "C": "weights/dynamic_cache/cifar10/resnet18/22/160/C.npz"
+        },
+        "adapter_seed": 22,
+        "diagnostics": {
+          "weight_solver": "softplus_ratio_no_simplex",
+          "raw_weights": [
+            0.16633344604047137,
+            0.31476994188336654,
+            0.15198639441397488
+          ],
+          "mse": 0.942587853718976,
+          "ratio_regularizer": 0.12156928308552051,
+          "iterations": 2640,
+          "weights_sum": 1.0
+        }
       }
     }
   }

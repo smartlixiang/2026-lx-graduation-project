@@ -1,0 +1,37 @@
+{
+  "dataset": "cifar10",
+  "model": "sl_vit",
+  "training_recipe": "sl_vit_official_code_v1",
+  "source": {
+    "repository": "https://github.com/aanna0701/SPT_LSA_ViT",
+    "revision": "54bd796acd28fa11deac21a97b14b154379b34e7",
+    "learning_rate_note": "Official main.py defaults to 0.001; paper section 4.1 specifies 0.003 for ViT. This recipe follows code defaults."
+  },
+  "epochs": 100,
+  "batch_size": 128,
+  "init_lr": 0.001,
+  "weight_decay": 0.05,
+  "optimizer": "adamw",
+  "betas": [0.9, 0.999],
+  "eps": 1e-8,
+  "scheduler": "batch_cosine_warmup",
+  "warmup_epochs": 10,
+  "min_lr": 1e-6,
+  "use_amp": false,
+  "label_smoothing": 0.1,
+  "stochastic_depth": 0.1,
+  "augmentation": {
+    "horizontal_flip_probability": 0.5,
+    "crop_size": 32,
+    "crop_padding": 4,
+    "autoaugment": "official_CIFAR10Policy",
+    "epoch_length_factor": 3,
+    "drop_last": true,
+    "random_erasing": {"probability": 0.25, "min_area": 0.02, "max_area": 0.4, "min_aspect": 0.3},
+    "mix_probability": 0.5,
+    "cutmix_switch_probability": 0.5,
+    "mixup_alpha": 1.0,
+    "cutmix_beta": 1.0
+  },
+  "normalization": {"mean": [0.4914, 0.4822, 0.4465], "std": [0.2470, 0.2435, 0.2616]}
+}

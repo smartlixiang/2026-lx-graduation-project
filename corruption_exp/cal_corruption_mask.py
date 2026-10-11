@@ -716,7 +716,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--k-folds", type=int, default=5)
     p.add_argument("--group-candidate-pool-size", type=int, default=10)
-    p.add_argument("--group-init-count", type=int, default=2)
+    p.add_argument("--group-init-count", type=int, default=5)
     p.add_argument("--debug-prompts", action="store_true")
     p.add_argument("--skip-saved", action="store_true")
     p.add_argument("--force", action="store_true")

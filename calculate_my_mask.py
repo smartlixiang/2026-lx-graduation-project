@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-init-count",
         type=int,
-        default=2,
+        default=5,
         help="group 模式下每个类别随机初始化的样本数。",
     )
     parser.add_argument(
@@ -326,8 +326,8 @@ def select_group_mask(
     weight_group: str,
     div_static_scores: np.ndarray | None = None,
     dds_static_scores: np.ndarray | None = None,
-    group_candidate_pool_size: int = 1,
-    group_init_count: int = 10,
+    group_candidate_pool_size: int = 10,
+    group_init_count: int = 5,
     dist_weight_factor: float = 1.0,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
@@ -571,8 +571,8 @@ def select_group_mask_by_center_repair(
     device: torch.device,
     seed: int,
     dds_static_scores: np.ndarray | None = None,
-    group_candidate_pool_size: int = 1,
-    group_init_count: int = 10,
+    group_candidate_pool_size: int = 10,
+    group_init_count: int = 5,
 ) -> tuple[np.ndarray, dict[int, int], dict[str, object]]:
     if keep_ratio <= 0 or keep_ratio > 100:
         raise ValueError("kr 必须在 1-100 之间。")
@@ -631,7 +631,7 @@ def select_group_mask_by_center_repair(
         return budgets
 
     class_budgets = _allocate_class_budgets()
-    candidate_pool_floor = max(1, int(group_candidate_pool_size))
+    candidate_pool_size = max(1, int(group_candidate_pool_size))
 
     selected_mask = np.zeros(num_samples, dtype=np.uint8)
     class_selected_counts = np.zeros(num_classes, dtype=np.int64)
@@ -690,7 +690,7 @@ def select_group_mask_by_center_repair(
             dds_local = standard_zscore(dds_raw_np[candidate_indices])
             combined_scores = (weights["sa"] * sa_local + weights["dds"] * dds_local + weights["div"] * div_local).astype(np.float32)
             rank = np.argsort(-combined_scores, kind="mergesort")
-            pool_n = min(candidate_indices.size, max(candidate_pool_floor, int(ceil(np.sqrt(candidate_indices.size)))))
+            pool_n = min(candidate_indices.size, candidate_pool_size)
             pool_indices = candidate_indices[rank[:pool_n]]
             pool_features = div_features_np[pool_indices]
 
@@ -776,7 +776,7 @@ def select_group_mask_by_center_repair(
         "selected_by_class": selected_by_class,
         "class_budgets": {int(c): int(v) for c, v in enumerate(class_budgets.tolist())},
         "init_per_class": {int(c): int(v) for c, v in enumerate(init_per_class.tolist())},
-        "candidate_pool_size": int(candidate_pool_floor),
+        "candidate_pool_size": int(candidate_pool_size),
         "selected_count_history": selected_count_history,
         "accumulated_greedy_score": float(total_score_acc),
         "subset_comprehensive_score": subset_comprehensive_score,

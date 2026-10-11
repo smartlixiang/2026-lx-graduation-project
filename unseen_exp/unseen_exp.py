@@ -169,7 +169,7 @@ Experiment 3: corrupt full CIFAR-100 first, 50/50 views, full corrupted referenc
     parser.add_argument("--skip-saved", nargs="?", const="1,2,3,4,5,6", metavar="STAGES",
                         help="Comma-separated stages whose valid caches may be reused (bare flag: all stages).")
     parser.add_argument("--group-candidate-pool-size", type=int, default=10)
-    parser.add_argument("--group-init-count", type=int, default=2)
+    parser.add_argument("--group-init-count", type=int, default=5)
     parser.add_argument("--dist-weight-factor", type=float, default=1.0)
     parser.add_argument("--debug-prompts", action="store_true")
     args = parser.parse_args()

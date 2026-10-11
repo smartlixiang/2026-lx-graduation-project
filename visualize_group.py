@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--num-auto-classes", type=int, default=3)
-    parser.add_argument("--group-init-count", type=int, default=2)
+    parser.add_argument("--group-init-count", type=int, default=5)
     parser.add_argument(
         "--late-fraction",
         type=float,

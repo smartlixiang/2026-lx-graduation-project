@@ -30,10 +30,11 @@ from tqdm import tqdm
 from dataset.dataset import BaseDataLoader
 from dataset.dataset_config import AVAILABLE_DATASETS
 from model.model_config import get_model
+from utils.checkpoint import add_checkpoint_interval_argument
 from utils.global_config import CONFIG
 from utils.path_rules import resolve_checkpoint_path, resolve_mask_path, resolve_result_path
 from utils.seed import parse_seed_list, set_seed
-from utils.training_defaults import apply_dataset_training_defaults
+from utils.training_defaults import apply_dataset_training_defaults, apply_target_model_training_defaults
 
 try:
     from utils.progress import (
@@ -63,6 +64,8 @@ except Exception:  # pragma: no cover - compatibility fallback for older snapsho
 
 
 def apply_dataset_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    if args.model == "sl_vit":
+        return apply_target_model_training_defaults(args, lr_attr="init_lr")
     return apply_dataset_training_defaults(args, lr_attr="init_lr")
 
 
@@ -95,6 +98,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", type=str, default="resnet50")
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--warmup_epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--init_lr", type=float, default=None)
@@ -145,6 +149,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="是否严格检查 noisy_label 与原始标签不同、sample_id 不重复且标签范围合法",
     )
+    add_checkpoint_interval_argument(parser)
     return parser.parse_args()
 
 
@@ -415,6 +420,12 @@ def _selected_noise_stats(selected_indices: np.ndarray, noise_info: dict) -> dic
 
 
 def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
+    if args.model == "sl_vit":
+        from train_after_selection import normalize_mode_for_experiment, run_for_seed as run_target, validate_model_dataset
+        validate_model_dataset(args.model, args.dataset)
+        args.exp = "label_noise"
+        args.base_mode, args.storage_mode = normalize_mode_for_experiment(args.mode, args.exp)
+        return run_target(args, seed, multi_seed)
     set_seed(seed)
     device = torch.device(args.device) if args.device else CONFIG.global_device
     data_loader = BaseDataLoader(
@@ -569,7 +580,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 test_status.update(
                     f"Last-10 test accs ({len(accuracy_samples)}/10): [{formatted}]"
                 )
-            if epoch % 20 == 0:
+            if epoch % args.checkpoint_interval == 0 or epoch == args.epochs:
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(
                     {

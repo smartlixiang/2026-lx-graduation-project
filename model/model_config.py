@@ -9,6 +9,7 @@ from model.densenet import densenet121
 from model.resnet import resnet18, resnet50
 from model.swin import swin_t
 from model.vit import vit_small
+from model.sl_vit import sl_vit
 
 MODEL_REGISTRY: dict[str, Callable[..., nn.Module]] = {
     "densenet121": densenet121,
@@ -17,6 +18,7 @@ MODEL_REGISTRY: dict[str, Callable[..., nn.Module]] = {
     "swin_t": swin_t,
     "swin_tiny": swin_t,
     "vit_small": vit_small,
+    "sl_vit": sl_vit,
 }
 
 

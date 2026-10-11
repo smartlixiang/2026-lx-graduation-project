@@ -17,6 +17,7 @@ from tqdm import tqdm
 from dataset.dataset_config import AVAILABLE_DATASETS, CIFAR10, CIFAR100, TINY_IMAGENET
 from model.adapter import AdapterMLP, CLIPFeatureExtractor, resolve_adapter_dir
 from utils.class_name_utils import build_class_prompts
+from utils.checkpoint import add_checkpoint_interval_argument
 from utils.global_config import CONFIG
 from utils.seed import parse_seed_list, set_seed
 
@@ -48,6 +49,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="打印 tiny-imagenet 前几个最终英文 prompt（调试用）。",
     )
+    add_checkpoint_interval_argument(parser)
     return parser.parse_args()
 
 
@@ -117,6 +119,10 @@ def train_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> Non
     with torch.no_grad():
         base_text_features = extractor.encode_text(prompts).to(device)
 
+    output_dir = resolve_adapter_dir(args.dataset, seed)
+    image_path = output_dir / "adapter_image.pt"
+    text_path = output_dir / "adapter_context.pt"
+
     image_adapter.train()
     text_adapter.train()
     start_time = time.perf_counter()
@@ -158,6 +164,9 @@ def train_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> Non
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
             )
         scheduler.step()
+        if (epoch + 1) % args.checkpoint_interval == 0 or epoch + 1 == args.epochs:
+            torch.save(image_adapter.state_dict(), image_path)
+            torch.save(text_adapter.state_dict(), text_path)
         epoch_loss = running_loss / len(dataset)
         progress_bar.write(
             f"[seed={seed}] epoch {epoch + 1}/{args.epochs} "
@@ -166,12 +175,6 @@ def train_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> Non
     progress_bar.close()
 
     total_time = time.perf_counter() - start_time
-
-    output_dir = resolve_adapter_dir(args.dataset, seed)
-    image_path = output_dir / "adapter_image.pt"
-    text_path = output_dir / "adapter_context.pt"
-    torch.save(image_adapter.state_dict(), image_path)
-    torch.save(text_adapter.state_dict(), text_path)
 
     meta = {
         "dataset": args.dataset,

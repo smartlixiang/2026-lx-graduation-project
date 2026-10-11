@@ -1,13 +1,13 @@
 {
   "cifar100": {
     "22": {
-      "sa": 0.5047468515399683,
-      "div": 0.24764895818183275,
-      "dds": 0.24760419027819883,
-      "bias": 0.0004186640250470187,
-      "method_version": "softplus_ratio",
-      "ratio_lambda": 0.005,
-      "proxy_log": "/nvme/home/lixiang/code/corruption_exp/weights/proxy_logs/cifar100/resnet18/22/200",
+      "sa": 0.5273797447411935,
+      "div": 0.24325993544180594,
+      "dds": 0.22936031981700053,
+      "bias": -0.00041811776651322694,
+      "ratio_lambda": 0.001,
+      "transferability_component": "TransferabilityScore",
+      "proxy_log": "",
       "dynamic_components": [
         "A",
         "C",
@@ -37,33 +37,32 @@
             "DDS": -0.007327394544213714
           },
           "T": {
-            "SA": 0.009091080349854588,
-            "Div": -0.006134762451595879,
-            "DDS": 0.004660832365721151
+            "SA": -0.0009150645220946308,
+            "Div": 0.004567672968765007,
+            "DDS": -0.004401497755333808
           }
         },
         "weight_solver": "softplus_ratio_no_simplex",
-        "method_version": "softplus_ratio",
         "raw_weights": [
-          0.18709800047216435,
-          0.09179774921521536,
-          0.09178115478727651
+          0.18494948214172122,
+          0.08531006269091608,
+          0.08043553586767167
         ],
-        "mse": 0.9777065209015338,
-        "ratio_regularizer": 0.132203910032278,
-        "iterations": 4826,
-        "weights_sum": 0.9999999999999999,
-        "weights_min": 0.24760419027819883,
+        "mse": 0.9783944358407319,
+        "ratio_regularizer": 0.16971219582869668,
+        "iterations": 5459,
+        "weights_sum": 1.0,
+        "weights_min": 0.22936031981700053,
         "sa_gt_one_third_warning": true,
         "div_is_lowest_warning": false
       },
       "corruption_context": {
         "dataset": "cifar100",
         "seed": 22,
+        "proxy_model": "resnet18",
+        "proxy_epochs": 160,
+        "clip_model": "ViT-B/32",
         "num_samples": 50000,
-        "num_corrupted": 10000,
-        "corruption_ratio": 0.2,
-        "corruption_list_hash": "8e074b8f729d5a05b67ec947606047b9df265d7b",
         "corruption_type_counts": {
           "gaussian_noise": 2000,
           "partial_occlusion": 2000,
@@ -71,11 +70,8 @@
           "fog": 2000,
           "motion_blur": 2000
         },
-        "proxy_model": "resnet18",
-        "proxy_epochs": 160,
-        "clip_model": "ViT-B/32",
-        "adapter_image_sha1": "f92169d4eb2a9b28194d82f2f33653600e983aff",
-        "adapter_text_sha1": "57065bd99958f386b5bbe063a7e4c4531cda0848"
+        "ratio_lambda": 0.001,
+        "transferability_component": "TransferabilityScore"
       }
     },
     "42": {

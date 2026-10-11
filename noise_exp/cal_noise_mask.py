@@ -130,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--k-folds", type=int, default=5)
     parser.add_argument("--group-candidate-pool-size", type=int, default=10)
-    parser.add_argument("--group-init-count", type=int, default=2)
+    parser.add_argument("--group-init-count", type=int, default=5)
     parser.add_argument("--debug-prompts", action="store_true")
     parser.add_argument("--skip-saved", action="store_true", help="Skip existing final masks.")
     parser.add_argument("--force", action="store_true", help="Rerun intermediate stages even if files exist.")

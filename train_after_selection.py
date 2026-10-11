@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 from pathlib import Path
 
@@ -60,7 +61,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.cuda.amp import GradScaler, autocast
-from torch.optim import Adam, SGD
+from torch.optim import Adam, AdamW, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR, MultiStepLR
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
@@ -70,10 +71,15 @@ from corruption_exp import corruption_opt
 from dataset.dataset import BaseDataLoader
 from dataset.dataset_config import AVAILABLE_DATASETS
 from model.model_config import get_model
+from utils.checkpoint import add_checkpoint_interval_argument
 from utils.global_config import CONFIG
 from utils.path_rules import resolve_checkpoint_path, resolve_mask_path, resolve_result_path
 from utils.progress import PersistentStatusLine, create_persistent_bar, create_transient_batch_bar
 from utils.seed import parse_seed_list, set_seed
+from utils.sl_vit_training import (
+    BatchCosineWarmup, RepeatedAugmentationBatchSampler, build_sl_vit_transforms,
+    mix_sl_vit_batch, sl_vit_training_metadata,
+)
 from utils.training_defaults import (
     VIT_SMALL_CIFAR10_TRAINING_RECIPE,
     apply_target_model_training_defaults,
@@ -98,7 +104,18 @@ def is_vit_small_cifar10(args: argparse.Namespace) -> bool:
 def build_optimizer_and_scheduler(
     args: argparse.Namespace,
     model: nn.Module,
+    steps_per_epoch: int | None = None,
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
+    if args.model == "sl_vit":
+        if steps_per_epoch is None or steps_per_epoch <= 0:
+            raise ValueError("SL-ViT batch scheduler requires a positive steps_per_epoch.")
+        config = args.sl_vit_config
+        optimizer = AdamW(model.parameters(), lr=args.init_lr, weight_decay=args.weight_decay,
+                          betas=tuple(config["betas"]), eps=config["eps"])
+        return optimizer, BatchCosineWarmup(
+            optimizer, args.epochs*steps_per_epoch, args.warmup_epochs*steps_per_epoch,
+            args.init_lr, config["min_lr"],
+        )
     if is_vit_small_cifar10(args):
         optimizer = Adam(
             model.parameters(), lr=args.init_lr, betas=(0.9, 0.999), eps=1e-8,
@@ -139,6 +156,8 @@ def validate_vit_checkpoint(checkpoint: dict, checkpoint_path: Path, args: argpa
 
 
 def build_training_metadata(args: argparse.Namespace, runtime_use_amp: bool) -> dict[str, object]:
+    if args.model == "sl_vit":
+        return sl_vit_training_metadata(args, runtime_use_amp)
     if is_vit_small_cifar10(args):
         return {
             "training_recipe": args.training_recipe,
@@ -173,9 +192,9 @@ def build_training_metadata(args: argparse.Namespace, runtime_use_amp: bool) -> 
 
 def validate_model_dataset(model_name: str, dataset_name: str) -> None:
     """Reject dataset/model combinations whose input contract is unsupported."""
-    if model_name == "vit_small" and dataset_name not in {"cifar10", "cifar100"}:
+    if model_name in {"vit_small", "sl_vit"} and dataset_name not in {"cifar10", "cifar100"}:
         raise ValueError(
-            "vit_small currently supports only cifar10 and cifar100 because this "
+            f"{model_name} currently supports only cifar10 and cifar100 because this "
             "implementation is designed for 32x32 CIFAR images; "
             f"received dataset={dataset_name}."
         )
@@ -204,6 +223,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", type=str, default="resnet50")
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--warmup_epochs", type=int, default=None,
+                        help="SL-ViT 的 warmup epoch 数，官方默认 10。")
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--init_lr", type=float, default=None)
@@ -274,6 +295,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="训练开始前是否加载已有 checkpoint",
     )
+    add_checkpoint_interval_argument(parser)
     return parser.parse_args()
 
 
@@ -650,6 +672,8 @@ def train_one_epoch(
     grad_accum_steps: int,
     scaler: GradScaler,
     position: int = 1,
+    batch_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    sl_vit_config: dict | None = None,
 ) -> float:
     model.train()
     running_loss = 0.0
@@ -660,13 +684,19 @@ def train_one_epoch(
     )
     optimizer.zero_grad(set_to_none=True)
     total_batches = len(loader)
+    num_seen = 0
     for batch_idx, (images, labels) in enumerate(progress, start=1):
         images = images.to(device)
         labels = labels.to(device)
+        if sl_vit_config is not None:
+            images, labels_a, labels_b, lam = mix_sl_vit_batch(images, labels, sl_vit_config)
 
         with autocast(enabled=use_amp):
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            if sl_vit_config is None:
+                loss = criterion(outputs, labels)
+            else:
+                loss = lam*criterion(outputs, labels_a) + (1-lam)*criterion(outputs, labels_b)
 
         loss_for_backward = loss / grad_accum_steps
         if scaler.is_enabled():
@@ -682,10 +712,13 @@ def train_one_epoch(
             else:
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            if batch_scheduler is not None:
+                batch_scheduler.step()
 
         running_loss += loss.item() * images.size(0)
+        num_seen += images.size(0)
 
-    return running_loss / len(loader.dataset)
+    return running_loss / num_seen if num_seen else 0.0
 
 
 def prepare_selection_indices(
@@ -771,6 +804,9 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
     )
     train_loader, _, test_loader = data_loader.load()
     train_dataset = train_loader.dataset
+    is_sl_vit = args.model == "sl_vit"
+    if is_sl_vit:
+        train_dataset.transform, test_loader.dataset.transform = build_sl_vit_transforms(args.sl_vit_config)
 
     noise_info: dict[str, object] | None = None
     corruption_info: dict[str, object] | None = None
@@ -876,18 +912,25 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         subset = Subset(train_dataset, selected_indices.tolist())
 
         generator = torch.Generator().manual_seed(seed)
-        subset_loader = DataLoader(
-            subset,
-            batch_size=args.physical_batch_size,
-            shuffle=True,
-            generator=generator,
-            num_workers=args.num_workers,
-            drop_last=False,
-        )
+        if is_sl_vit:
+            batch_sampler = RepeatedAugmentationBatchSampler(
+                len(subset), args.physical_batch_size,
+                factor=args.sl_vit_config["augmentation"]["epoch_length_factor"], seed=seed,
+            )
+            subset_loader = DataLoader(subset, batch_sampler=batch_sampler, generator=generator,
+                                      num_workers=args.num_workers, pin_memory=device.type == "cuda")
+        else:
+            subset_loader = DataLoader(
+                subset, batch_size=args.physical_batch_size, shuffle=True, generator=generator,
+                num_workers=args.num_workers, drop_last=False,
+            )
 
-        model = model_factory(num_classes=data_loader.num_classes).to(device)
-        criterion = nn.CrossEntropyLoss()
-        optimizer, scheduler = build_optimizer_and_scheduler(args, model)
+        model_kwargs = {"num_classes": data_loader.num_classes}
+        if is_sl_vit:
+            model_kwargs["stochastic_depth"] = args.sl_vit_config["stochastic_depth"]
+        model = model_factory(**model_kwargs).to(device)
+        criterion = nn.CrossEntropyLoss(label_smoothing=args.sl_vit_config["label_smoothing"] if is_sl_vit else 0.0)
+        optimizer, scheduler = build_optimizer_and_scheduler(args, model, steps_per_epoch=len(subset_loader))
         runtime_use_amp = (
             device.type == "cuda"
             if is_vit_small_cifar10(args)
@@ -901,6 +944,13 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
         if args.load_checkpoint and checkpoint_path.exists():
             checkpoint = torch.load(checkpoint_path, map_location=device)
             validate_vit_checkpoint(checkpoint, checkpoint_path, args)
+            if is_sl_vit:
+                expected = {"sl_vit_config": args.sl_vit_config, "steps_per_epoch": len(subset_loader),
+                            "num_selected": len(subset), "seed": seed, "keep_ratio": keep_ratio,
+                            "selection_method": args.storage_mode}
+                mismatches = [key for key, value in expected.items() if checkpoint.get(key) != value]
+                if mismatches:
+                    raise RuntimeError(f"Incompatible SL-ViT checkpoint {checkpoint_path}: {', '.join(mismatches)}")
             model.load_state_dict(checkpoint["model_state"])
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -910,6 +960,14 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             start_epoch = int(checkpoint["epoch"]) + 1
             elapsed_time = float(checkpoint.get("elapsed_time", 0.0))
             start_time = time.time() - elapsed_time
+            if is_sl_vit and "rng_state" in checkpoint:
+                rng = checkpoint["rng_state"]
+                random.setstate(rng["python"])
+                np.random.set_state(rng["numpy"])
+                torch.set_rng_state(rng["torch"].cpu())
+                generator.set_state(rng["loader"].cpu())
+                if device.type == "cuda" and rng["cuda"] is not None:
+                    torch.cuda.set_rng_state_all([state.cpu() for state in rng["cuda"]])
 
         epoch_bar = create_persistent_bar(
             total=args.epochs,
@@ -928,6 +986,8 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             )
 
         for epoch in range(start_epoch, args.epochs + 1):
+            if is_sl_vit:
+                batch_sampler.set_epoch(epoch-1)
             epoch_bar.set_postfix_str(f"epoch={epoch}/{args.epochs}")
             train_one_epoch(
                 model,
@@ -941,8 +1001,11 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 args.grad_accum_steps,
                 scaler,
                 position=1,
+                batch_scheduler=scheduler if is_sl_vit else None,
+                sl_vit_config=args.sl_vit_config if is_sl_vit else None,
             )
-            scheduler.step()
+            if not is_sl_vit:
+                scheduler.step()
             if epoch >= start_eval_epoch:
                 eval_accuracy = round(
                     float(evaluate(model, test_loader, device)),
@@ -953,7 +1016,7 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                 test_status.update(
                     f"Last-10 test accs ({len(accuracy_samples)}/10): [{formatted}]"
                 )
-            if epoch % 20 == 0:
+            if epoch % args.checkpoint_interval == 0 or epoch == args.epochs:
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 checkpoint_payload = {
                     "epoch": epoch,
@@ -982,6 +1045,16 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
                             "weight_decay": args.weight_decay,
                         }
                     )
+                if is_sl_vit:
+                    checkpoint_payload.update({
+                        "sl_vit_config": args.sl_vit_config, "steps_per_epoch": len(subset_loader),
+                        "num_selected": len(subset), "seed": seed, "keep_ratio": keep_ratio,
+                        "selection_method": args.storage_mode,
+                        "training_recipe": args.training_recipe,
+                        "rng_state": {"python": random.getstate(), "numpy": np.random.get_state(),
+                                      "torch": torch.get_rng_state(), "loader": generator.get_state(),
+                                      "cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else None},
+                    })
                 if noise_info is not None:
                     checkpoint_payload["noise_path"] = noise_info["noise_path"]
                 if corruption_info is not None:
@@ -1019,6 +1092,9 @@ def run_for_seed(args: argparse.Namespace, seed: int, multi_seed: bool) -> None:
             "num_total": len(train_dataset),
         }
         metadata.update(build_training_metadata(args, runtime_use_amp))
+        if is_sl_vit:
+            metadata["steps_per_epoch"] = len(subset_loader)
+            metadata["training_images_per_epoch"] = len(subset_loader)*args.physical_batch_size
         if noise_info is not None:
             metadata.update(
                 {

@@ -1,0 +1,4 @@
+dataset,seed,method,experiment,keep_ratio,num_selected,num_total,mask_path,num_corrupted_selected,corruption_ratio_in_mask,corruption_percentage_in_mask
+tiny-imagenet,42,DBCore,corruption,30,30000,100000,/nvme/home/lixiang/baseline/DBCore/corruption_DBCore/tiny-imagenet/42/mask_30.npz,4877,0.16256666666666666,16.256666666666668
+tiny-imagenet,42,DBCore,corruption,50,50000,100000,/nvme/home/lixiang/baseline/DBCore/corruption_DBCore/tiny-imagenet/42/mask_50.npz,7485,0.1497,14.97
+tiny-imagenet,42,DBCore,corruption,70,70000,100000,/nvme/home/lixiang/baseline/DBCore/corruption_DBCore/tiny-imagenet/42/mask_70.npz,9493,0.13561428571428571,13.561428571428571

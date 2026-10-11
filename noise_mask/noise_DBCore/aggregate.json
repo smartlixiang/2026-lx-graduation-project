@@ -1,0 +1,74 @@
+[
+  {
+    "dataset": "all-datasets",
+    "keep_ratio": 30,
+    "runs": 5,
+    "seeds": [
+      22,
+      42,
+      96,
+      22,
+      96
+    ],
+    "noise_percentage_in_mask_mean": 0.9226666666666666,
+    "noise_percentage_in_mask_sample_std": 0.8800959543645733
+  },
+  {
+    "dataset": "all-datasets",
+    "keep_ratio": 50,
+    "runs": 4,
+    "seeds": [
+      22,
+      96,
+      22,
+      96
+    ],
+    "noise_percentage_in_mask_mean": 1.016,
+    "noise_percentage_in_mask_sample_std": 0.8761248008512638
+  },
+  {
+    "dataset": "cifar10",
+    "keep_ratio": 30,
+    "runs": 3,
+    "seeds": [
+      22,
+      42,
+      96
+    ],
+    "noise_percentage_in_mask_mean": 0.2822222222222222,
+    "noise_percentage_in_mask_sample_std": 0.040734006177385255
+  },
+  {
+    "dataset": "cifar10",
+    "keep_ratio": 50,
+    "runs": 2,
+    "seeds": [
+      22,
+      96
+    ],
+    "noise_percentage_in_mask_mean": 0.264,
+    "noise_percentage_in_mask_sample_std": 0.03959797974644664
+  },
+  {
+    "dataset": "cifar100",
+    "keep_ratio": 30,
+    "runs": 2,
+    "seeds": [
+      22,
+      96
+    ],
+    "noise_percentage_in_mask_mean": 1.8833333333333333,
+    "noise_percentage_in_mask_sample_std": 0.13670731102939937
+  },
+  {
+    "dataset": "cifar100",
+    "keep_ratio": 50,
+    "runs": 2,
+    "seeds": [
+      22,
+      96
+    ],
+    "noise_percentage_in_mask_mean": 1.7679999999999998,
+    "noise_percentage_in_mask_sample_std": 0.19798989873223333
+  }
+]

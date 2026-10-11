@@ -1,0 +1,10 @@
+dataset,seed,method,experiment,keep_ratio,num_selected,num_total,mask_path,num_noisy_selected,noise_ratio_in_mask,noise_percentage_in_mask
+cifar10,22,DBCore,noise,30,15000,50000,/nvme/home/lixiang/baseline/DBCore/noise_DBCore/cifar10/22/mask_30.npz,49,0.003266666666666667,0.32666666666666666
+cifar10,22,DBCore,noise,50,25000,50000,/nvme/home/lixiang/baseline/DBCore/noise_DBCore/cifar10/22/mask_50.npz,73,0.00292,0.292
+cifar10,42,DBCore,noise,30,15000,50000,/nvme/home/lixiang/baseline/DBCore/noise_DBCore/cifar10/42/mask_30.npz,37,0.0024666666666666665,0.24666666666666665
+cifar10,96,DBCore,noise,30,15000,50000,/nvme/home/lixiang/baseline/DBCore/noise_DBCore/cifar10/96/mask_30.npz,41,0.0027333333333333333,0.2733333333333333
+cifar10,96,DBCore,noise,50,25000,50000,/nvme/home/lixiang/baseline/DBCore/noise_DBCore/cifar10/96/mask_50.npz,59,0.00236,0.23600000000000002
+cifar100,22,DBCore,noise,30,15000,50000,/nvme/home/lixiang/baseline/DBCore/noise_DBCore/cifar100/22/mask_30.npz,297,0.0198,1.9800000000000002
+cifar100,22,DBCore,noise,50,25000,50000,/nvme/home/lixiang/baseline/DBCore/noise_DBCore/cifar100/22/mask_50.npz,477,0.01908,1.908
+cifar100,96,DBCore,noise,30,15000,50000,/nvme/home/lixiang/baseline/DBCore/noise_DBCore/cifar100/96/mask_30.npz,268,0.017866666666666666,1.7866666666666666
+cifar100,96,DBCore,noise,50,25000,50000,/nvme/home/lixiang/baseline/DBCore/noise_DBCore/cifar100/96/mask_50.npz,407,0.01628,1.628

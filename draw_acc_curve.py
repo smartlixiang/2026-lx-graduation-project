@@ -46,13 +46,16 @@ def parse_args() -> argparse.Namespace:
         "--methods",
         nargs="+",
         # default=[
-        #     "Random", "Herding", "EL2N", "GraNd", "Forgetting", "MDS",
-        #     "MoSo", "YangCLIP", "RLSelector", "Ours"
-        # ],
+        #             "Random", "unseen_learned_group", "Ours"
+        #         ],
         default=[
-            "Random", "ablation_sa", "ablation_div", "ablation_sv", "ablation_distribution", 
-            "ablation_A", "ablation_C", "ablation_T", "learned_topk", "naive_group", "Ours"
+            "Random", "Herding", "EL2N", "GraNd", "Forgetting", "MDS",
+            "MoSo", "YangCLIP", "RLSelector", "DBCore", "Ours"
         ],
+        # default=[
+        #     "Random", "ablation_sa", "ablation_div", "ablation_sv", "ablation_distribution", 
+        #     "ablation_A", "ablation_C", "ablation_T", "learned_topk", "naive_group", "Ours"
+        # ],
         help="Selection methods to compare",
     )
     parser.add_argument(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from utils.sl_vit_training import load_sl_vit_config
 
 
 DATASET_DEFAULT_TRAINING_CONFIGS = {
@@ -158,7 +159,25 @@ def apply_target_model_training_defaults(
     *,
     lr_attr: str = "init_lr",
 ) -> argparse.Namespace:
-    """Apply target-model defaults, isolating the CIFAR-10 ViT recipe."""
+    """Apply independent target-model recipes before generic dataset defaults."""
+    if args.model == "sl_vit":
+        config = load_sl_vit_config(args.dataset)
+        for attr, key in (("epochs", "epochs"), ("batch_size", "batch_size"),
+                          (lr_attr, "init_lr"), ("weight_decay", "weight_decay"),
+                          ("warmup_epochs", "warmup_epochs")):
+            if getattr(args, attr, None) is None:
+                setattr(args, attr, config[key])
+            config[key] = getattr(args, attr)
+        if args.epochs <= 0 or args.batch_size <= 0 or not 0 <= args.warmup_epochs < args.epochs:
+            raise ValueError("SL-ViT requires positive epochs/batch_size and 0 <= warmup_epochs < epochs.")
+        if getattr(args, lr_attr) < config["min_lr"] or args.weight_decay < 0:
+            raise ValueError("SL-ViT requires init_lr >= min_lr and non-negative weight_decay.")
+        args.sl_vit_config = config
+        args.optimizer_name, args.scheduler_name = config["optimizer"], config["scheduler"]
+        args.training_recipe, args.use_amp = config["training_recipe"], config["use_amp"]
+        args.physical_batch_size = args.effective_batch_size = int(args.batch_size)
+        args.reference_effective_batch_size, args.grad_accum_steps = 128, 1
+        return args
     if args.dataset != "cifar10" or args.model != "vit_small":
         return apply_dataset_training_defaults(args, lr_attr=lr_attr)
 

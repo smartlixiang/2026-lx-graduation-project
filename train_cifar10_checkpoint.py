@@ -16,6 +16,7 @@ from train_after_selection import (
     load_selection_mask,
     select_random_indices_by_class,
 )
+from utils.checkpoint import DEFAULT_CHECKPOINT_INTERVAL, add_checkpoint_interval_argument
 from utils.global_config import CONFIG
 from utils.path_rules import resolve_checkpoint_path
 from utils.progress import create_persistent_bar, create_transient_batch_bar
@@ -31,7 +32,7 @@ DATA_ROOT = Path("data")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train ResNet-50 on CIFAR-10 selected subsets and save final checkpoints."
+        description="Train ResNet-50 on CIFAR-10 selected subsets and save latest checkpoints every 5 epochs by default."
     )
     parser.add_argument(
         "--mode",
@@ -45,12 +46,14 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Keep ratio(s), e.g. 50 or 20,50",
     )
+    add_checkpoint_interval_argument(parser)
     return parser.parse_args()
 
 
-def build_train_args() -> argparse.Namespace:
+def build_train_args(checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL) -> argparse.Namespace:
     args = argparse.Namespace()
     args.dataset = DATASET_NAME
+    args.checkpoint_interval = checkpoint_interval
     args.epochs = None
     args.batch_size = None
     args.init_lr = None
@@ -161,15 +164,16 @@ def train_one_epoch(
     return running_loss / len(loader.dataset)
 
 
-def save_final_checkpoint(
+def save_checkpoint(
     mode: str,
     keep_ratio: int,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: MultiStepLR,
     scaler: GradScaler,
-    final_accuracy: float,
+    final_accuracy: float | None,
     train_args: argparse.Namespace,
+    epoch: int,
 ) -> Path:
     checkpoint_path = resolve_checkpoint_path(
         mode=mode,
@@ -187,12 +191,15 @@ def save_final_checkpoint(
             "mode": mode,
             "keep_ratio": keep_ratio,
             "seed": FIXED_SEED,
-            "epoch": train_args.epochs,
+            "epoch": epoch,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
             "scaler_state": scaler.state_dict() if scaler.is_enabled() else None,
-            "final_test_accuracy": float(final_accuracy),
+            **(
+                {"final_test_accuracy": float(final_accuracy)}
+                if final_accuracy is not None else {}
+            ),
             "batch_size": train_args.physical_batch_size,
             "effective_batch_size": train_args.effective_batch_size,
             "init_lr": train_args.init_lr,
@@ -281,6 +288,18 @@ def run_single(mode: str, keep_ratio: int, train_args: argparse.Namespace) -> No
             position=1,
         )
         scheduler.step()
+        if epoch % train_args.checkpoint_interval == 0 and epoch < train_args.epochs:
+            save_checkpoint(
+                mode=mode,
+                keep_ratio=keep_ratio,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                final_accuracy=None,
+                train_args=train_args,
+                epoch=epoch,
+            )
         epoch_bar.update(1)
 
         if epoch in {1, 50, 100, 150, train_args.epochs}:
@@ -291,7 +310,7 @@ def run_single(mode: str, keep_ratio: int, train_args: argparse.Namespace) -> No
             )
 
     final_test_accuracy = evaluate(model, test_loader, device)
-    checkpoint_path = save_final_checkpoint(
+    checkpoint_path = save_checkpoint(
         mode=mode,
         keep_ratio=keep_ratio,
         model=model,
@@ -300,6 +319,7 @@ def run_single(mode: str, keep_ratio: int, train_args: argparse.Namespace) -> No
         scaler=scaler,
         final_accuracy=final_test_accuracy,
         train_args=train_args,
+        epoch=train_args.epochs,
     )
     print(
         f"[Done] mode={mode}, kr={keep_ratio}, final_test_accuracy={final_test_accuracy:.4f}\n"
@@ -321,7 +341,7 @@ def main() -> None:
         if kr <= 0 or kr > 100:
             raise ValueError(f"Invalid keep ratio: {kr}")
 
-    train_args = build_train_args()
+    train_args = build_train_args(checkpoint_interval=cli_args.checkpoint_interval)
 
     for mode in modes:
         for keep_ratio in keep_ratios:

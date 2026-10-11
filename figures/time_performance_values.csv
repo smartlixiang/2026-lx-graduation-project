@@ -1,0 +1,13 @@
+﻿Method,Selection_time_minutes,Accuracy_60pct,Accuracy_70pct,Accuracy_80pct,Accuracy_90pct,Mean_accuracy_pct,Accuracy_source,Time_source
+Herding,4.251667,71.47,74.04,75.13,76.77,74.3525,Table 1,User-supplied runtime estimate
+EL2N,5.001667,70.66,74.76,75.50,75.93,74.2125,Table 1,User-supplied runtime estimate
+GraNd,7.650000,71.23,73.75,75.09,76.41,74.1200,Table 1,User-supplied runtime estimate
+Forgetting,45.985000,69.92,73.09,73.62,75.92,73.1375,Table 1,User-supplied runtime estimate
+DBCore,45.985000,71.23666666666666666666666667,72.07533333333333333333333333,73.90266666666666666666666667,76.47400,73.4222,"/nvme/home/lixiang/code/result/DBCore/cifar100/resnet50/<seed>/result_*.json; last-10 mean per seed, then mean across seeds","Estimated equal to Forgetting, as specified by user"
+MDS,19.021667,70.12,72.96,74.68,77.01,73.6925,Table 1,User-supplied runtime estimate
+YangCLIP,20.955000,69.62,73.09,74.77,75.75,73.3075,Table 1,User-supplied runtime estimate
+RLSelector,151.000000,71.34,73.83,74.10,76.54,73.9525,Table 1,User-supplied runtime estimate
+MoSo,240.000000,71.73,72.44,75.49,75.25,73.7275,Table 1,User-supplied runtime estimate
+Ours (Full),140.000000,71.78,74.62,75.54,77.18,74.7800,Table 1; Table 4 Ours-Full,User-supplied runtime estimate
+Ours (50%-seen),80.000000,72.55,74.15,75.26,77.02,74.7450,Table 4 Ours-Reuse,User-supplied runtime estimate
+Ours (Reuse),9.500000,71.78,74.62,75.54,77.18,74.7800,"Same as Full, as specified",Illustrative estimate within supplied <10 min range

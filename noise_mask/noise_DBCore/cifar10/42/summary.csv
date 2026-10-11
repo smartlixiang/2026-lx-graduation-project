@@ -1,0 +1,2 @@
+dataset,seed,method,experiment,keep_ratio,num_selected,num_total,mask_path,num_noisy_selected,noise_ratio_in_mask,noise_percentage_in_mask
+cifar10,42,DBCore,noise,30,15000,50000,/nvme/home/lixiang/baseline/DBCore/noise_DBCore/cifar10/42/mask_30.npz,37,0.0024666666666666665,0.24666666666666665

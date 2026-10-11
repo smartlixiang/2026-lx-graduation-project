@@ -1,0 +1,38 @@
+[
+  {
+    "dataset": "tiny-imagenet",
+    "keep_ratio": 30,
+    "runs": 3,
+    "seeds": [
+      22,
+      42,
+      96
+    ],
+    "corruption_percentage_in_mask_mean": 16.88,
+    "corruption_percentage_in_mask_sample_std": 0.5422893856399708
+  },
+  {
+    "dataset": "tiny-imagenet",
+    "keep_ratio": 50,
+    "runs": 3,
+    "seeds": [
+      22,
+      42,
+      96
+    ],
+    "corruption_percentage_in_mask_mean": 15.459333333333333,
+    "corruption_percentage_in_mask_sample_std": 0.4288838226528642
+  },
+  {
+    "dataset": "tiny-imagenet",
+    "keep_ratio": 70,
+    "runs": 3,
+    "seeds": [
+      22,
+      42,
+      96
+    ],
+    "corruption_percentage_in_mask_mean": 13.887619047619047,
+    "corruption_percentage_in_mask_sample_std": 0.28259848683583677
+  }
+]

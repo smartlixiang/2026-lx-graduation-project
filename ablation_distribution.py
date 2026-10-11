@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", type=str, default="resnet50")
     parser.add_argument("--skip-saved", action="store_true")
     parser.add_argument("--group-candidate-pool-size", type=int, default=10)
-    parser.add_argument("--group-init-count", type=int, default=2)
+    parser.add_argument("--group-init-count", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--debug-prompts", action="store_true")
